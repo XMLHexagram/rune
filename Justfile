@@ -10,7 +10,6 @@ macos-ci-all-appstore: macos-ci-clean macos-ci-install
   ./scripts/macos_3_prepare_before_sign_for_appstore.sh
   ./scripts/macos_4_replace_dylib.sh
   ./scripts/macos_5_codesign_and_submit_to_appstore.sh
-  echo 114514
 
 macos-ci-clean:
   ./scripts/macos_7_clean.sh
