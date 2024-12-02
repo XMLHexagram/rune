@@ -1,15 +1,14 @@
 import 'dart:io';
 
-import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:fluent_ui/fluent_ui.dart';
 import 'package:bitsdojo_window/bitsdojo_window.dart';
-import 'package:flutter_fullscreen/flutter_fullscreen.dart';
 
 import '../../main.dart';
+import '../../providers/full_screen.dart';
 import '../../utils/router/navigation.dart';
 import '../../utils/navigation/utils/escape_from_search.dart';
-import '../../widgets/title_bar/darg_move_window_area.dart';
+import 'drag_move_window_area.dart';
 import '../../providers/router_path.dart';
 import '../../providers/responsive_providers.dart';
 
@@ -25,29 +24,7 @@ class WindowFrameForWindows extends StatefulWidget {
   State<WindowFrameForWindows> createState() => _WindowFrameForWindowsState();
 }
 
-class _WindowFrameForWindowsState extends State<WindowFrameForWindows>
-    with FullScreenListener {
-  bool isFullScreen = FullScreen.isFullScreen;
-
-  @override
-  void initState() {
-    super.initState();
-    FullScreen.addListener(this);
-  }
-
-  @override
-  dispose() {
-    super.dispose();
-    FullScreen.removeListener(this);
-  }
-
-  @override
-  void onFullScreenChanged(bool enabled, SystemUiMode? systemUiMode) {
-    setState(() {
-      isFullScreen = enabled;
-    });
-  }
-
+class _WindowFrameForWindowsState extends State<WindowFrameForWindows> {
   @override
   Widget build(BuildContext context) {
     if (!Platform.isWindows) {
@@ -56,6 +33,8 @@ class _WindowFrameForWindowsState extends State<WindowFrameForWindows>
 
     final path = Provider.of<RouterPathProvider>(context).path;
     Provider.of<ScreenSizeProvider>(context);
+
+    final fullScreen = Provider.of<FullScreenProvider>(context);
 
     final isSearch = path == '/search';
 
@@ -73,7 +52,7 @@ class _WindowFrameForWindowsState extends State<WindowFrameForWindows>
           builder: (context, activeBreakpoint) {
             if (activeBreakpoint == DeviceType.band ||
                 activeBreakpoint == DeviceType.dock) {
-              return DargMoveWindowArea();
+              return DragMoveWindowArea();
             }
 
             return SizedBox(
@@ -82,9 +61,9 @@ class _WindowFrameForWindowsState extends State<WindowFrameForWindows>
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
                   Expanded(
-                    child: DargMoveWindowArea(),
+                    child: DragMoveWindowArea(),
                   ),
-                  if (isFullScreen)
+                  if (fullScreen.isFullScreen)
                     WindowIconButton(
                       onPressed: () {
                         if (isSearch) {
@@ -100,10 +79,10 @@ class _WindowFrameForWindowsState extends State<WindowFrameForWindows>
                         ),
                       ),
                     ),
-                  if (isFullScreen)
+                  if (fullScreen.isFullScreen)
                     WindowIconButton(
                       onPressed: () {
-                        FullScreen.setFullScreen(false);
+                        fullScreen.setFullScreen(false);
                       },
                       child: Center(
                         child: Icon(
@@ -112,7 +91,7 @@ class _WindowFrameForWindowsState extends State<WindowFrameForWindows>
                         ),
                       ),
                     ),
-                  if (!isFullScreen)
+                  if (!fullScreen.isFullScreen)
                     activeBreakpoint == DeviceType.zune ||
                             activeBreakpoint == DeviceType.belt
                         ? Container()
@@ -131,7 +110,7 @@ class _WindowFrameForWindowsState extends State<WindowFrameForWindows>
                               ),
                             ),
                           ),
-                  if (!isFullScreen)
+                  if (!fullScreen.isFullScreen)
                     WindowIconButton(
                       onPressed: () async {
                         appWindow.minimize();
@@ -145,7 +124,7 @@ class _WindowFrameForWindowsState extends State<WindowFrameForWindows>
                               ),
                             ),
                     ),
-                  if (!isFullScreen)
+                  if (!fullScreen.isFullScreen)
                     MouseRegion(
                       onEnter: (event) async {
                         // await platform.invokeMethod('maximumButtonEnter');
@@ -171,7 +150,7 @@ class _WindowFrameForWindowsState extends State<WindowFrameForWindows>
                               ),
                       ),
                     ),
-                  if (!isFullScreen)
+                  if (!fullScreen.isFullScreen)
                     WindowIconButton(
                       onPressed: () {
                         appWindow.close();
@@ -185,7 +164,7 @@ class _WindowFrameForWindowsState extends State<WindowFrameForWindows>
                               ),
                             ),
                     ),
-                  if (!isFullScreen)
+                  if (!fullScreen.isFullScreen)
                     appWindow.isMaximized
                         ? SizedBox(width: 2)
                         : SizedBox(width: 7),

@@ -1,4 +1,5 @@
 mod analyze;
+mod apple_bridge;
 mod collection;
 mod connection;
 mod cover_art;
