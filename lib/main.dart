@@ -161,20 +161,6 @@ void main(List<String> arguments) async {
     shortcutPolicy: ShortcutPolicy.requireCreate,
   );
 
-  await systemTray.initSystemTray(
-    title: Platform.isMacOS ? null : 'Rune',
-    iconPath: TrayManager.getTrayIconPath(),
-    isTemplate: true,
-  );
-
-  final Menu menu = Menu();
-  await menu.buildFrom([
-    MenuItemLabel(label: 'Show', onClicked: (menuItem) => appWindow.show()),
-  ]);
-  await systemTray.setContextMenu(menu);
-
-  TrayManager.registerEventHandlers();
-
   final windowSizeMode =
       await settingsManager.getValue<String>(windowSizeKey) ?? 'normal';
   final bool? rememberWindowSize =
