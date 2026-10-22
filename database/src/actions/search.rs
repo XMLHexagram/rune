@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use deunicode::deunicode;
@@ -130,10 +130,16 @@ pub async fn search_for(
             [ format!("\"{}\"", query_str.replace("\"", "\"\"")).into(), collection_type.to_string().into(), (n * 2).to_string().into() ],
         )).all(main_db).await?;
 
+        // Each entry is indexed under its name and under its ASCII transliteration, so it can
+        // match twice; keep the best-ranked match and at most `n` entries.
+        let ids = results.entry(collection_type.clone()).or_default();
+        let mut seen = HashSet::new();
         for item in top_docs {
             let id = item.key.parse::<i64>();
             if let Ok(id) = id {
-                results.entry(collection_type.clone()).or_default().push(id);
+                if seen.insert(id) && ids.len() < n {
+                    ids.push(id);
+                }
             } else {
                 warn!("Invalid document ID found!");
             }
