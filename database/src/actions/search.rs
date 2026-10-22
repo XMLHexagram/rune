@@ -109,11 +109,11 @@ pub async fn search_for(
         return Ok(results);
     }
 
+    // Folders are not indexed.
     for collection_type in [
         CollectionQueryType::Track,
         CollectionQueryType::Artist,
         CollectionQueryType::Album,
-        CollectionQueryType::Directory,
         CollectionQueryType::Playlist,
     ] {
         if let Some(ref search_fields) = search_fields
