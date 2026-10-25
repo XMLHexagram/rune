@@ -165,7 +165,7 @@ type = "choice"
 group = { zh = "天球仪", en = "Sphere" }
 label = { zh = "环的样子", en = "How the rings look" }
 default = 3
-options = [{ zh = "玻璃：半透明金色，发光的边和刻度", en = "Glass: clear gold, glowing edges and ticks" }, { zh = "实物：暗青铜，只被光球照亮", en = "Instrument: dark bronze, lit only by the core" }, { zh = "线稿：细光线，像星图", en = "Lines: fine lines of light, as a star chart" }, { zh = "标记：一颗颗点和十字，近大远小，重音时彗星沿环跑", en = "Marks: strings of dots and crosses, bigger as they are nearer, a comet running round on an accent" }]
+options = [{ zh = "玻璃：半透明金色，发光的边和刻度", en = "Glass: clear gold, glowing edges and ticks" }, { zh = "实物：暗青铜，只被光球照亮", en = "Instrument: dark bronze, lit only by the core" }, { zh = "线稿：细光线，像星图", en = "Lines: fine lines of light, as a star chart" }, { zh = "标记：一颗颗点和十字，近大远小，重音时环上的点依次点亮", en = "Marks: strings of dots and crosses, bigger as they are nearer, an accent lighting a ring's dots" }]
 
 [[param]]
 id = "accent"
@@ -255,32 +255,33 @@ max = 0.08
 step = 0.001
 
 [[param]]
-id = "comet_reach"
+id = "light_reach"
 group = { zh = "天球仪", en = "Sphere" }
-label = { zh = "标记：彗星冲出去绕多少圈", en = "Marks: how far round a comet rushes (turns)" }
-default = 0.3
+label = { zh = "标记：重音点亮环上多大一段（圈）", en = "Marks: how much of a ring an accent lights (turns)" }
+default = 1.0
 min = 0.05
 max = 1.0
 step = 0.05
 
 [[param]]
-id = "comet_beats"
+id = "light_spread"
 group = { zh = "天球仪", en = "Sphere" }
-label = { zh = "标记：彗星暗掉一半要几拍", en = "Marks: beats before a comet has faded by half" }
+label = { zh = "标记：点亮铺开要几拍（0 则一下全亮）", en = "Marks: beats for the lighting to spread (0: all at once)" }
+unit = "拍"
+default = 0.5
+min = 0.0
+max = 4.0
+step = 0.25
+
+[[param]]
+id = "light_beats"
+group = { zh = "天球仪", en = "Sphere" }
+label = { zh = "标记：点亮后暗掉一半要几拍", en = "Marks: beats before a lit ring has dimmed by half" }
 unit = "拍"
 default = 2.0
 min = 0.25
 max = 8.0
 step = 0.25
-
-[[param]]
-id = "trail_beads"
-group = { zh = "天球仪", en = "Sphere" }
-label = { zh = "标记：彗星尾巴拖多少颗点", en = "Marks: how many dots a comet's trail reaches back" }
-default = 12.0
-min = 2.0
-max = 40.0
-step = 1.0
 
 [[param]]
 id = "planet"

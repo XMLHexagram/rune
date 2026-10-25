@@ -1,0 +1,548 @@
+format = 1
+name = "Growth"
+license = "MPL-2.0"
+description = { zh = "白光里向上生长的方块塔，每一拍长一截", en = "A tower of plates growing up into white light, a step on every beat" }
+
+common = ["tower.wgsl"]
+
+[state]
+file = "state.wgsl"
+update = "update.wgsl"
+
+[[asset]]
+id = "concrete"
+file = "assets/surface.png"
+# Data, not colour: the normal, how open each spot is and the face's tone.
+linear = true
+source = "Made by tools/make_surface.py"
+
+[[buffer]]
+id = "lit"
+# Drawn at two thirds of the screen's resolution: the haze and the depth of field hide it, and
+# it costs under half as much (for phones). 0.5 is faster still, with a little stair-stepping.
+scale = 0.67
+
+[[pass]]
+shader = "view.wgsl"
+target = "lit"
+
+[[pass]]
+shader = "dof.wgsl"
+target = "out"
+inputs = ["lit"]
+
+[post]
+exposure = 0.0
+bloom = { intensity = 0.7, threshold = 0.95, radius = 0.8 }
+tonemap = "agx"
+grain = 0.04
+chromatic = 0.0008
+vignette = 0.12
+contrast = 0.95
+saturation = 0.85
+
+# ---- 节拍 ----
+
+[[param]]
+id = "conf"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "节拍置信度门槛（低于它不踩拍）", en = "Beat confidence needed" }
+default = 0.4
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "hits"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "拍与拍之间的底鼓也带动跳动", en = "Kicks between beats" }
+default = 0.5
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "kick_decay"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "每拍冲击的衰减时间", en = "Kick decay" }
+unit = "s"
+default = 0.15
+min = 0.04
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "glow"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "泛光", en = "Glow" }
+default = 0.7
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "glow_beat"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "每拍的泛光", en = "Glow on the beat" }
+default = 0.5
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "pump"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "每拍提亮", en = "Brighten on the beat" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "zoom"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "每拍的轻微拉近", en = "Zoom on the beat" }
+default = 0.012
+min = 0.0
+max = 0.1
+step = 0.002
+
+[[param]]
+id = "accent_level"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "重音门槛", en = "How strong an accent must be" }
+default = 0.95
+min = 0.5
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "accent_gap"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "两次重音闪白至少相隔", en = "Least time between accent flashes" }
+unit = "s"
+default = 6.0
+min = 1.0
+max = 30.0
+step = 0.5
+
+[[param]]
+id = "build_bars"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "换段前几小节开始蓄力", en = "Bars of build-up before a section" }
+default = 4.0
+min = 0.25
+max = 16.0
+step = 0.25
+
+# ---- 生长 ----
+
+[[param]]
+id = "grow"
+group = { zh = "生长", en = "Growth" }
+label = { zh = "每拍长几层", en = "Layers grown on a beat" }
+default = 1.5
+min = 0.5
+max = 8.0
+step = 0.25
+
+[[param]]
+id = "bar_boost"
+group = { zh = "生长", en = "Growth" }
+label = { zh = "小节第一拍多长几倍", en = "Growth on a bar's first beat (times)" }
+default = 2.5
+min = 1.0
+max = 6.0
+step = 0.25
+
+[[param]]
+id = "snap"
+group = { zh = "生长", en = "Growth" }
+label = { zh = "每次生长的快慢", en = "How fast each growth snaps up" }
+unit = "s"
+default = 0.12
+min = 0.02
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "arrive"
+group = { zh = "生长", en = "Growth" }
+label = { zh = "新板子砸进位置的时间", en = "How fast new plates slam into place" }
+unit = "s"
+default = 0.2
+min = 0.04
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "fly"
+group = { zh = "生长", en = "Growth" }
+label = { zh = "新板子从多远飞入（格）", en = "How far new plates fly in from (cells)" }
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "scatter"
+group = { zh = "塔", en = "Tower" }
+label = { zh = "大板之间的小板多少", en = "Small plates between the big ones" }
+default = 0.35
+min = 0.0
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "fresh"
+group = { zh = "生长", en = "Growth" }
+label = { zh = "新长出的板子闪白", en = "Flash of new plates" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "song_pace"
+group = { zh = "生长", en = "Growth" }
+label = { zh = "整首歌的快慢对生长的影响", en = "How much the song's pace sets the growth" }
+default = 1.2
+min = 0.0
+max = 3.0
+step = 0.1
+
+[[param]]
+id = "moment_pace"
+group = { zh = "生长", en = "Growth" }
+label = { zh = "歌内快慢变化对生长的放大", en = "How much the moment's pace changes it" }
+default = 1.5
+min = 0.0
+max = 4.0
+step = 0.1
+
+[[param]]
+id = "feel_smooth"
+group = { zh = "生长", en = "Growth" }
+label = { zh = "听感速度的平滑时间", en = "Smoothing of the pace" }
+unit = "s"
+default = 4.0
+min = 0.5
+max = 20.0
+step = 0.5
+
+# ---- 塔 ----
+
+[[param]]
+id = "girth"
+group = { zh = "塔", en = "Tower" }
+label = { zh = "塔的粗细", en = "Girth of the tower" }
+unit = "m"
+default = 5.0
+min = 2.0
+max = 16.0
+step = 0.25
+
+[[param]]
+id = "vary"
+group = { zh = "塔", en = "Tower" }
+label = { zh = "每层粗细的变化", en = "How much each layer's width varies" }
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "taper"
+group = { zh = "塔", en = "Tower" }
+label = { zh = "塔尖收窄的长度", en = "Length of the taper to the tip" }
+unit = "m"
+default = 16.0
+min = 2.0
+max = 60.0
+step = 1.0
+
+[[param]]
+id = "density"
+group = { zh = "塔", en = "Tower" }
+label = { zh = "每层铺板的多少", en = "How many slabs each layer lays" }
+default = 0.8
+min = 0.05
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "loose"
+group = { zh = "塔", en = "Tower" }
+label = { zh = "四周漂浮的散板", en = "Loose plates floating round" }
+default = 0.3
+min = 0.0
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "core"
+group = { zh = "塔", en = "Tower" }
+label = { zh = "中空的半径", en = "Radius of the hollow core" }
+unit = "m"
+default = 1.2
+min = 0.0
+max = 4.0
+step = 0.1
+
+# ---- 镜头 ----
+
+[[param]]
+id = "same_view"
+type = "bool"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "同一类段落用同一个机位", en = "Same view for the same kind of section" }
+default = true
+
+[[param]]
+id = "glide"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "机位之间移动的时间", en = "Time to glide between views" }
+unit = "s"
+default = 4.0
+min = 0.5
+max = 20.0
+step = 0.5
+
+[[param]]
+id = "follow"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "镜头追上塔尖的时间", en = "Time for the camera to catch the tip" }
+unit = "s"
+default = 0.8
+min = 0.05
+max = 5.0
+step = 0.05
+
+[[param]]
+id = "keep_below"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "镜头以下保留多少塔身（越小越省）", en = "How much of the tower below the camera is kept (less is cheaper)" }
+unit = "m"
+default = 10.0
+min = 0.0
+max = 60.0
+step = 1.0
+
+[[param]]
+id = "view_bars"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "每隔几小节可能换机位", en = "Bars between possible view changes" }
+default = 8.0
+min = 1.0
+max = 32.0
+step = 1.0
+
+[[param]]
+id = "view_chance"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "到时换机位的概率", en = "Chance of changing then" }
+unit = "%"
+default = 40.0
+min = 0.0
+max = 100.0
+step = 1.0
+
+[[param]]
+id = "view_gap"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "两次换机位至少相隔", en = "Least time between view changes" }
+unit = "s"
+default = 8.0
+min = 1.0
+max = 60.0
+step = 1.0
+
+# ---- 画面 ----
+
+[[param]]
+id = "style"
+type = "choice"
+group = { zh = "画面", en = "Look" }
+label = { zh = "风格", en = "Style" }
+default = 1
+options = [{ zh = "白光（参考视频）", en = "White light (the video)" }, { zh = "混凝土", en = "Concrete" }]
+
+[[param]]
+id = "light"
+type = "choice"
+group = { zh = "画面", en = "Look" }
+label = { zh = "混凝土风格的光", en = "Light on the concrete" }
+default = 1
+options = [{ zh = "随段落切换", en = "By section" }, { zh = "低角暖光", en = "Low warm sun" }, { zh = "高处白光", en = "High white sun" }, { zh = "蓝调时刻", en = "Blue hour" }]
+
+[[param]]
+id = "surface"
+group = { zh = "画面", en = "Look" }
+label = { zh = "表面细节（气孔、模板缝、螺栓孔）", en = "Surface detail (pores, seams, tie holes)" }
+default = 1.0
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "bevel"
+group = { zh = "画面", en = "Look" }
+label = { zh = "板边圆角", en = "Rounding of the edges" }
+unit = "m"
+default = 0.05
+min = 0.0
+max = 0.15
+step = 0.005
+
+[[param]]
+id = "shadows"
+group = { zh = "画面", en = "Look" }
+label = { zh = "投影", en = "Shadows" }
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "rod_light"
+group = { zh = "画面", en = "Look" }
+label = { zh = "光柱照亮塔心", en = "The rod lighting the core" }
+default = 0.3
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "player_colour"
+type = "bool"
+group = { zh = "画面", en = "Look" }
+label = { zh = "跟随播放器的主题色（系统强调色、自选颜色或封面主色）：各主题的明暗、浓淡不变，色相换成它的", en = "Follow the player's theme colour (the system's accent, the chosen colour or the cover's): each theme keeps its lights and darks and how colourful it is, in its hue" }
+default = true
+
+[[param]]
+id = "chroma"
+group = { zh = "画面", en = "Look" }
+label = { zh = "跟随播放器时的色彩浓淡（0 为黑白）", en = "How colourful, following the player (0 is black and white)" }
+default = 1.0
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "theme"
+type = "choice"
+group = { zh = "画面", en = "Look" }
+label = { zh = "白光风格的主题色", en = "Theme of the white light" }
+default = 0
+options = [{ zh = "随段落切换", en = "By section" }, { zh = "象牙白", en = "Ivory" }, { zh = "金色", en = "Gold" }, { zh = "午夜蓝", en = "Midnight" }, { zh = "玫瑰", en = "Rose" }, { zh = "冰蓝", en = "Ice" }]
+
+[[param]]
+id = "theme_fade"
+group = { zh = "画面", en = "Look" }
+label = { zh = "主题切换的过渡时间", en = "Time to fade between themes" }
+unit = "s"
+default = 0.5
+min = 0.05
+max = 10.0
+step = 0.05
+
+[[param]]
+id = "theme_bars"
+group = { zh = "画面", en = "Look" }
+label = { zh = "没有谱面时每隔几小节换主题", en = "Bars between themes without a chart" }
+default = 16.0
+min = 4.0
+max = 64.0
+step = 4.0
+
+[[param]]
+id = "fog"
+group = { zh = "画面", en = "Look" }
+label = { zh = "雾（远处变白）", en = "Haze" }
+default = 0.6
+min = 0.0
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "dof"
+group = { zh = "画面", en = "Look" }
+label = { zh = "景深虚化", en = "Depth of field" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "rod_width"
+group = { zh = "画面", en = "Look" }
+label = { zh = "光柱粗细", en = "Width of the rod of light" }
+unit = "m"
+default = 0.07
+min = 0.0
+max = 0.5
+step = 0.01
+
+[[param]]
+id = "rod_glow"
+group = { zh = "画面", en = "Look" }
+label = { zh = "光柱的光晕", en = "Glow of the rod" }
+default = 1.0
+min = 0.0
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "dust"
+group = { zh = "画面", en = "Look" }
+label = { zh = "空中的颗粒", en = "Dust" }
+default = 1.0
+min = 0.0
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "flash"
+group = { zh = "画面", en = "Look" }
+label = { zh = "重音时闪白", en = "Flash on accents" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "warm_kick"
+group = { zh = "画面", en = "Look" }
+label = { zh = "底鼓时暖黄过曝", en = "Warm overexposure on the kick" }
+default = 0.6
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "glitch"
+group = { zh = "画面", en = "Look" }
+label = { zh = "反相故障的强度", en = "Strength of the inverted glitch" }
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "glitch_bars"
+group = { zh = "画面", en = "Look" }
+label = { zh = "每隔几小节一次故障（0 为只在重音）", en = "Bars between glitches (0: only on accents)" }
+default = 4.0
+min = 0.0
+max = 32.0
+step = 1.0
+
+[[param]]
+id = "exposure"
+group = { zh = "画面", en = "Look" }
+label = { zh = "曝光", en = "Exposure" }
+unit = "EV"
+default = 0.5
+min = -3.0
+max = 3.0
+step = 0.05
