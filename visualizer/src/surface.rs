@@ -1,4 +1,4 @@
-//! macOS: render straight into IOSurface-backed pixel buffers, which the app hands to Flutter
+//! Apple (macOS, iOS): render straight into IOSurface-backed pixel buffers, which the app hands to Flutter
 //! without copying a pixel (backlog decision-1).
 //!
 //! A CoreVideo pool hands out BGRA buffers. Each buffer's IOSurface is wrapped in a Metal texture
