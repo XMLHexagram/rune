@@ -1,0 +1,544 @@
+format = 1
+name = "CRT Wall"
+license = "MPL-2.0"
+description = { zh = "一面没有尽头、堆得高低错落的老电视墙，每台各自跟着拍子闪切换台", en = "An endless wall of old television sets piled every which way, each flicking to another channel on its own beat" }
+
+common = ["wall.wgsl"]
+# Covers from the library, for the screens that show one.
+covers = true
+
+[state]
+file = "state.wgsl"
+update = "update.wgsl"
+
+# The whole picture's resolution, per side, stretched to the screen after. 1 draws every pixel;
+# for phones 0.6 keeps the scan lines and grilles readable close up, 0.5 softens them.
+[render]
+scale = 1.0
+
+[[asset]]
+id = "plastic"
+file = "assets/plastic.png"
+# Data, not colour: the normal, how open each spot is and the face's tone.
+linear = true
+source = "Made by tools/make_textures.py"
+
+# The scopes' trace, small: it is only ever seen on a screen.
+[[buffer]]
+id = "scope_buf"
+scale = 0.3
+persistent = true
+
+[[pass]]
+shader = "scope.wgsl"
+target = "scope_buf"
+inputs = ["prev:scope_buf"]
+
+[[pass]]
+shader = "view.wgsl"
+target = "out"
+inputs = ["scope_buf"]
+
+[post]
+exposure = 0.0
+bloom = { intensity = 0.25, threshold = 1.0, radius = 0.6 }
+tonemap = "agx"
+grain = 0.025
+chromatic = 0.0
+vignette = 0.4
+contrast = 1.1
+saturation = 1.0
+
+# ---- 节拍 ----
+
+[[param]]
+id = "conf"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "节拍置信度门槛（低于它不踩拍）", en = "Beat confidence needed" }
+default = 0.4
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "hits"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "拍与拍之间的底鼓也算", en = "Kicks between beats" }
+default = 0.4
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "kick_decay"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "每拍冲击的衰减时间", en = "Kick decay" }
+unit = "s"
+default = 0.2
+min = 0.04
+max = 1.0
+step = 0.01
+
+# ---- 屏幕 ----
+
+[[param]]
+id = "share"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "每拍换台的屏幕比例", en = "Share of screens changing channel on a beat" }
+default = 0.25
+min = 0.02
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "stagger"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "各屏幕换台最多晚多少拍（按四分之一拍对齐）", en = "Most a screen lags the beat (in quarter beats)" }
+unit = "beats"
+default = 0.75
+min = 0.0
+max = 2.0
+step = 0.25
+
+[[param]]
+id = "flash"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "换台时的闪光", en = "Flash on a change of channel" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "flash_time"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "闪光落回的时间", en = "How fast the flash fades" }
+unit = "s"
+default = 0.12
+min = 0.02
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "react"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "每拍有反应的屏幕比例（雪花撕裂、图形加速）", en = "Share of screens jolted by a beat (snow torn, figures sped)" }
+default = 0.5
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "snow"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "雪花的比重", en = "Weight of snow" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "scope"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "示波器的比重", en = "Weight of scopes" }
+default = 0.35
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "cover"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "封面的比重", en = "Weight of covers" }
+default = 1.4
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "now_playing"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "封面里正在播放的那张所占的比例", en = "Share of covers that are the song playing" }
+default = 0.3
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "cover_light"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "封面的亮度", en = "Cover brightness" }
+default = 0.6
+min = 0.1
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "group"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "相邻屏幕同一频道的倾向", en = "How much neighbouring screens share a channel" }
+default = 0.6
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "off_always"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "常态关掉的屏幕", en = "Screens always off" }
+default = 0.2
+min = 0.0
+max = 0.8
+step = 0.05
+
+[[param]]
+id = "off"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "安静段落关掉的屏幕（有谱面时）", en = "Screens dark in quiet sections (with a chart)" }
+default = 0.6
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "brightness"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "屏幕亮度", en = "Screen brightness" }
+default = 0.9
+min = 0.1
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "persist"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "示波器余辉", en = "Scope persistence" }
+unit = "s"
+default = 0.12
+min = 0.01
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "gaps"
+group = { zh = "屏幕", en = "Screens" }
+label = { zh = "空着的位置", en = "Empty slots" }
+default = 0.04
+min = 0.0
+max = 0.5
+step = 0.01
+
+# ---- 材质与光 ----
+
+[[param]]
+id = "cabinet"
+group = { zh = "材质与光", en = "Material and light" }
+label = { zh = "炭灰机壳的反射率", en = "Charcoal cabinet albedo" }
+default = 0.045
+min = 0.005
+max = 0.5
+step = 0.005
+
+[[param]]
+id = "wear"
+group = { zh = "材质与光", en = "Material and light" }
+label = { zh = "旧（污渍、灰尘、磨损、发黄、贴纸和胶带、缺旋钮）", en = "Wear (grime, dust, rubbed edges, yellowing, stickers and tape, lost knobs)" }
+default = 0.8
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "odd"
+group = { zh = "材质与光", en = "Material and light" }
+label = { zh = "暗红机壳的比例", en = "Share of red cabinets" }
+default = 0.04
+min = 0.0
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "surface"
+group = { zh = "材质与光", en = "Material and light" }
+label = { zh = "塑料表面细节（法线贴图）", en = "Plastic surface detail (normal map)" }
+default = 1.0
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "glass"
+group = { zh = "材质与光", en = "Material and light" }
+label = { zh = "玻璃反光", en = "Glass reflections" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "key"
+group = { zh = "材质与光", en = "Material and light" }
+label = { zh = "主光强度", en = "Key light" }
+default = 0.8
+min = 0.0
+max = 10.0
+step = 0.1
+
+[[param]]
+id = "shadows"
+group = { zh = "材质与光", en = "Material and light" }
+label = { zh = "投影", en = "Shadows" }
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "spill"
+group = { zh = "材质与光", en = "Material and light" }
+label = { zh = "屏幕照亮相邻机壳", en = "Screens lighting the sets beside them" }
+default = 3.0
+min = 0.0
+max = 10.0
+step = 0.1
+
+[[param]]
+id = "pools"
+group = { zh = "材质与光", en = "Material and light" }
+label = { zh = "主光成一团团光池（关掉则均匀）", en = "Key light in pools (0 is even)" }
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "fill"
+group = { zh = "材质与光", en = "Material and light" }
+label = { zh = "房间的环境光", en = "The room's fill light" }
+default = 0.02
+min = 0.0
+max = 0.3
+step = 0.005
+
+# ---- 镜头 ----
+
+[[param]]
+id = "distance"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "正面镜头离墙的距离", en = "Front view's distance from the wall" }
+unit = "m"
+default = 4.0
+min = 1.0
+max = 8.0
+step = 0.1
+
+[[param]]
+id = "side_angle"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "侧面镜头的偏转", en = "Side view's turn" }
+unit = "°"
+default = 30.0
+min = 5.0
+max = 60.0
+step = 1
+
+[[param]]
+id = "front"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "正面机位的比重", en = "Weight of the front view" }
+default = 3.0
+min = 0.0
+max = 10.0
+step = 0.5
+
+[[param]]
+id = "side"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "侧面机位的比重", en = "Weight of the side view" }
+default = 2.0
+min = 0.0
+max = 10.0
+step = 0.5
+
+[[param]]
+id = "far"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "远景机位的比重", en = "Weight of the far view" }
+default = 1.0
+min = 0.0
+max = 10.0
+step = 0.5
+
+[[param]]
+id = "close"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "长焦特写机位的比重", en = "Weight of the close view" }
+default = 0.5
+min = 0.0
+max = 10.0
+step = 0.5
+
+[[param]]
+id = "cruise"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "巡航速度（中速歌）", en = "Cruise speed (a song of middling pace)" }
+unit = "m/s"
+default = 0.35
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "push"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "每拍加速", en = "Push on each beat" }
+default = 0.6
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "ease"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "加速后回到巡航的时间", en = "Easing back to cruise" }
+unit = "s"
+default = 0.6
+min = 0.05
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "accel"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "速度跟随的平滑", en = "Speed smoothing" }
+unit = "s"
+default = 0.25
+min = 0.01
+max = 2.0
+step = 0.01
+
+[[param]]
+id = "energy_speed"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "段落能量对速度的影响", en = "Section energy on speed" }
+default = 0.4
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "feel_smooth"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "快慢感的平滑", en = "Smoothing of how fast it sounds" }
+unit = "s"
+default = 4.0
+min = 0.5
+max = 20.0
+step = 0.5
+
+[[param]]
+id = "song_pace"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "整首歌的快慢对速度的影响", en = "The song's pace on speed" }
+default = 1.5
+min = 0.0
+max = 4.0
+step = 0.1
+
+[[param]]
+id = "moment_pace"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "此刻相对整首的快慢对速度的影响", en = "This moment's pace against the song's" }
+default = 2.0
+min = 0.0
+max = 4.0
+step = 0.1
+
+[[param]]
+id = "view_bars"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "每几小节可能换机位", en = "Bars between possible view changes" }
+default = 16.0
+min = 1.0
+max = 64.0
+step = 1
+
+[[param]]
+id = "view_gap"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "两次换机位至少相隔", en = "Least time between view changes" }
+unit = "s"
+default = 20.0
+min = 2.0
+max = 120.0
+step = 1
+
+[[param]]
+id = "view_chance"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "到点时换机位的几率", en = "Chance of a view change when due" }
+unit = "%"
+default = 60.0
+min = 0.0
+max = 100.0
+step = 5
+
+[[param]]
+id = "same_view"
+type = "bool"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "同一类段落用同一个机位", en = "Same view for the same kind of section" }
+default = true
+
+# ---- 颜色与画面 ----
+
+[[param]]
+id = "player_colour"
+type = "bool"
+group = { zh = "颜色与画面", en = "Colour and look" }
+label = { zh = "荧光色跟随播放器的主题色（系统强调色、自选颜色或封面主色）", en = "Phosphor in the player's theme colour (the system's accent, the chosen colour or the cover's)" }
+default = true
+
+[[param]]
+id = "tint"
+type = "color"
+group = { zh = "颜色与画面", en = "Colour and look" }
+label = { zh = "不跟随时的荧光色", en = "Phosphor colour when not following" }
+default = "#8cf0b0"
+
+[[param]]
+id = "chroma"
+group = { zh = "颜色与画面", en = "Colour and look" }
+label = { zh = "荧光色的浓淡", en = "How colourful the phosphor is" }
+default = 1.0
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "exposure"
+group = { zh = "颜色与画面", en = "Colour and look" }
+label = { zh = "曝光", en = "Exposure" }
+unit = "EV"
+default = -1.6
+min = -3.0
+max = 3.0
+step = 0.1
+
+[[param]]
+id = "glow"
+group = { zh = "颜色与画面", en = "Colour and look" }
+label = { zh = "泛光", en = "Glow" }
+default = 0.5
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "grain"
+group = { zh = "颜色与画面", en = "Colour and look" }
+label = { zh = "颗粒", en = "Grain" }
+default = 0.045
+min = 0.0
+max = 0.2
+step = 0.005

@@ -1,0 +1,761 @@
+format = 1
+name = "Neon Street"
+license = "MPL-2.0"
+description = { zh = "夜里的商店街，踩着拍子往前走", en = "A shopping street at night, walked on the beat" }
+
+common = ["glyphs.wgsl", "city.wgsl"]
+
+[state]
+file = "state.wgsl"
+update = "update.wgsl"
+
+[[asset]]
+id = "glyphs"
+file = "assets/glyphs.png"
+linear = true
+source = "Rendered from Noto Sans JP (SIL Open Font License 1.1, assets/OFL.txt) by tools/make_glyphs.py"
+
+# The street is drawn at 0.75 of the screen's size and scaled up: about 1.75 times as fast.
+[render]
+scale = 0.75
+
+[[buffer]]
+id = "street"
+
+[[buffer]]
+id = "inked"
+
+[[buffer]]
+id = "trail"
+persistent = true
+
+[[pass]]
+shader = "street.wgsl"
+target = "street"
+
+[[pass]]
+shader = "ink.wgsl"
+target = "inked"
+inputs = ["street"]
+
+[[pass]]
+shader = "compose.wgsl"
+target = "trail"
+inputs = ["inked", "prev:trail"]
+
+[[pass]]
+shader = "grade.wgsl"
+target = "out"
+inputs = ["trail"]
+
+[post]
+exposure = 0.0
+bloom = { intensity = 0.55, threshold = 1.0, radius = 0.7 }
+tonemap = "agx"
+grain = 0.035
+chromatic = 0.0012
+vignette = 0.45
+contrast = 1.22
+saturation = 1.05
+
+# ---- 节拍 ----
+
+[[param]]
+id = "conf"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "节拍置信度门槛（低于它不踩拍）", en = "Beat confidence needed" }
+default = 0.4
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "hits"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "拍与拍之间的底鼓也带动跳动", en = "Kicks between beats" }
+default = 0.5
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "kick_decay"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "冲击的衰减时间", en = "Kick decay" }
+unit = "s"
+default = 0.15
+min = 0.04
+max = 0.6
+step = 0.01
+
+[[param]]
+id = "shake"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "重音时画面抖动的幅度", en = "Shake" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "shake_energy"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "抖动随响度变化（0 每拍一样）", en = "Shake follows loudness" }
+default = 1.0
+min = 0.0
+max = 1.5
+step = 0.05
+
+[[param]]
+id = "accent_level"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "多重的一下鼓才算重音（0..1）", en = "How hard a hit must be to shake" }
+default = 0.97
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "shake_gap"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "两次抖动至少相隔", en = "Shortest gap between shakes" }
+unit = "s"
+default = 10.0
+min = 0.5
+max = 20.0
+step = 0.5
+
+[[param]]
+id = "shake_decay"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "抖动持续时间", en = "How long a shake lasts" }
+unit = "s"
+default = 0.35
+min = 0.05
+max = 1.5
+step = 0.05
+
+[[param]]
+id = "pump"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "每拍整体提亮", en = "Brightness on the kick" }
+default = 0.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "zoom"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "每拍镜头拉近", en = "Zoom on the kick" }
+default = 0.0
+min = 0.0
+max = 0.2
+step = 0.005
+
+# ---- 镜头 ----
+
+[[param]]
+id = "cruise"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "中速歌曲的前进速度", en = "Speed for music of middling pace" }
+unit = "m/s"
+default = 4.5
+min = 0.0
+max = 15.0
+step = 0.1
+
+[[param]]
+id = "song_pace"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "整首歌听起来越快走得越快的程度", en = "Speed follows how fast the song sounds" }
+default = 1.5
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "moment_pace"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "歌里快慢段落之间速度差别的放大程度", en = "How much faster and slower parts differ" }
+default = 2.5
+min = 0.0
+max = 5.0
+step = 0.1
+
+[[param]]
+id = "feel_smooth"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "速度跟上快慢变化所需的时间", en = "How long the speed takes to follow" }
+unit = "s"
+default = 4.0
+min = 0.5
+max = 20.0
+step = 0.5
+
+[[param]]
+id = "energy_speed"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "段落能量影响速度的程度", en = "Speed follows the energy" }
+default = 0.3
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "push"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "每拍加速", en = "Push on the beat" }
+unit = "m/s"
+default = 1.5
+min = 0.0
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "ease"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "加速后回到巡航的时间", en = "Back to cruise" }
+unit = "s"
+default = 0.5
+min = 0.05
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "accel"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "加减速的柔和程度", en = "Smoothness" }
+unit = "s"
+default = 0.12
+min = 0.01
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "build_bars"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "换段前几小节开始蓄力", en = "Build-up bars" }
+default = 2.0
+min = 0.25
+max = 8.0
+step = 0.25
+
+[[param]]
+id = "build"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "蓄力时镜头前推（下一段更响时）", en = "Push in before a louder section" }
+default = 1.0
+min = 0.0
+max = 2.0
+step = 0.05
+
+# ---- 跳切 ----
+
+[[param]]
+id = "same_view"
+type = "bool"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "同一类段落用同一个机位", en = "Same view for the same kind of section" }
+default = true
+
+[[param]]
+id = "cut_bars"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "段落内每几小节可以跳切一次", en = "Bars between cut chances" }
+default = 4.0
+min = 1.0
+max = 16.0
+step = 1.0
+
+[[param]]
+id = "cut_chance"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "可跳切时跳切的概率（越响越常切）", en = "Cut chance" }
+unit = "%"
+default = 40.0
+min = 0.0
+max = 100.0
+step = 1.0
+
+[[param]]
+id = "cut_gap"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "两次跳切的最短间隔", en = "Shortest gap between cuts" }
+unit = "s"
+default = 2.0
+min = 0.5
+max = 10.0
+step = 0.5
+
+[[param]]
+id = "side"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "靠一侧斜看对面店铺的概率", en = "Side view chance" }
+unit = "%"
+default = 30.0
+min = 0.0
+max = 100.0
+step = 1.0
+
+[[param]]
+id = "yaw"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "斜看的角度", en = "Side view angle" }
+unit = "°"
+default = 18.0
+min = 0.0
+max = 60.0
+step = 1.0
+
+[[param]]
+id = "yaw_var"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "斜看角度的随机增量", en = "Side view angle spread" }
+unit = "°"
+default = 10.0
+min = 0.0
+max = 30.0
+step = 1.0
+
+[[param]]
+id = "eye"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "街上机位的高度", en = "Street view height" }
+unit = "m"
+default = 3.0
+min = 1.5
+max = 6.0
+step = 0.1
+
+[[param]]
+id = "high"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "招牌上方往前看的概率", en = "High view chance" }
+unit = "%"
+default = 15.0
+min = 0.0
+max = 100.0
+step = 1.0
+
+[[param]]
+id = "high_eye"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "招牌上方机位的高度", en = "High view height" }
+unit = "m"
+default = 10.0
+min = 3.0
+max = 20.0
+step = 0.5
+
+[[param]]
+id = "overview"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "整体俯视的概率", en = "Overview chance" }
+unit = "%"
+default = 15.0
+min = 0.0
+max = 100.0
+step = 1.0
+
+[[param]]
+id = "overview_height"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "俯视的高度", en = "Overview height" }
+unit = "m"
+default = 45.0
+min = 15.0
+max = 120.0
+step = 1.0
+
+[[param]]
+id = "overview_pitch"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "俯视的角度", en = "Overview pitch" }
+unit = "°"
+default = 55.0
+min = 20.0
+max = 89.0
+step = 1.0
+
+[[param]]
+id = "flash"
+group = { zh = "跳切", en = "Cuts" }
+label = { zh = "跳切闪光", en = "Flash on a cut" }
+default = 0.0
+min = 0.0
+max = 2.0
+step = 0.05
+
+# ---- 招牌 ----
+
+[[param]]
+id = "swing"
+group = { zh = "招牌", en = "Signs" }
+label = { zh = "灯笼随拍左右摆动的幅度", en = "How far the lanterns swing with the beat" }
+default = 0.25
+min = 0.0
+max = 0.8
+step = 0.01
+
+[[param]]
+id = "pulse"
+group = { zh = "招牌", en = "Signs" }
+label = { zh = "招牌每拍跳亮的强度", en = "Sign pulse" }
+default = 0.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "react"
+group = { zh = "招牌", en = "Signs" }
+label = { zh = "每拍参与跳亮的招牌比例", en = "Share of signs on a beat" }
+default = 0.6
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "stagger"
+group = { zh = "招牌", en = "Signs" }
+label = { zh = "招牌之间跳亮的错开时间", en = "Stagger" }
+unit = "s"
+default = 0.25
+min = 0.0
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "switch_share"
+group = { zh = "招牌", en = "Signs" }
+label = { zh = "每拍换字的招牌比例", en = "Share of signs changing text on a beat" }
+default = 0.5
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "dark_quiet"
+group = { zh = "招牌", en = "Signs" }
+label = { zh = "最安静的段落里熄灭的招牌比例", en = "Signs off in the quietest sections" }
+default = 0.6
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "bass_glow"
+group = { zh = "招牌", en = "Signs" }
+label = { zh = "店面和招牌跟持续低音变亮", en = "Glow with the bass" }
+default = 0.0
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "street_things"
+group = { zh = "街道", en = "Street" }
+label = { zh = "店门口放东西的多少（幟旗、立式看板、自行车）", en = "How many shops have things out front (banners, standing boards, bicycles)" }
+default = 0.6
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "shrines"
+group = { zh = "街道", en = "Street" }
+label = { zh = "路边小神社的多少", en = "How many little roadside shrines" }
+default = 0.05
+min = 0.0
+max = 0.3
+step = 0.01
+
+[[param]]
+id = "arches"
+group = { zh = "街道", en = "Street" }
+label = { zh = "街区入口有商店街拱门的比例", en = "How many blocks start with the shopping street's arch" }
+default = 0.7
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "roof_torii"
+group = { zh = "街道", en = "Street" }
+label = { zh = "屋顶上有小鸟居的楼有多少", en = "How many buildings have a small torii on the roof" }
+default = 0.2
+min = 0.0
+max = 0.5
+step = 0.01
+
+[[param]]
+id = "people"
+group = { zh = "街道", en = "Street" }
+label = { zh = "街上行人的多少", en = "People in the street" }
+default = 0.6
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "detail"
+group = { zh = "街道", en = "Street" }
+label = { zh = "小物件画到多远（米，行人再远六成）", en = "How far small things are drawn (m; people 60% further)" }
+default = 45.0
+min = 15.0
+max = 120.0
+step = 5.0
+
+[[param]]
+id = "palette_spread"
+group = { zh = "招牌", en = "Signs" }
+label = { zh = "同一街区颜色的分散程度", en = "Colour spread within a district" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "sign_saturation"
+group = { zh = "招牌", en = "Signs" }
+label = { zh = "招牌颜色的饱和度", en = "Sign saturation" }
+default = 0.78
+min = 0.0
+max = 1.0
+step = 0.02
+
+# ---- 画面 ----
+
+[[param]]
+id = "exposure"
+group = { zh = "画面", en = "Look" }
+label = { zh = "曝光", en = "Exposure" }
+unit = "EV"
+default = 0.0
+min = -3.0
+max = 3.0
+step = 0.1
+
+[[param]]
+id = "ambient"
+group = { zh = "画面", en = "Look" }
+label = { zh = "夜色里楼面的亮度", en = "Night light on the buildings" }
+default = 0.025
+min = 0.0
+max = 0.15
+step = 0.005
+
+[[param]]
+id = "glow"
+group = { zh = "画面", en = "Look" }
+label = { zh = "泛光", en = "Bloom" }
+default = 0.55
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "glow_beat"
+group = { zh = "画面", en = "Look" }
+label = { zh = "节拍时泛光增强", en = "Bloom on the kick" }
+default = 0.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "chroma"
+group = { zh = "画面", en = "Look" }
+label = { zh = "色差", en = "Chromatic aberration" }
+default = 1.0
+min = 0.0
+max = 5.0
+step = 0.1
+
+[[param]]
+id = "blur"
+group = { zh = "画面", en = "Look" }
+label = { zh = "运动模糊", en = "Motion blur" }
+default = 0.25
+min = 0.0
+max = 0.9
+step = 0.01
+
+[[param]]
+id = "wet"
+group = { zh = "画面", en = "Look" }
+label = { zh = "地面湿润程度", en = "Wet street" }
+default = 0.25
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "puddles"
+group = { zh = "画面", en = "Look" }
+label = { zh = "水洼多少", en = "Puddles" }
+default = 0.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "sheen"
+group = { zh = "画面", en = "Look" }
+label = { zh = "地面光斑的亮度", en = "Light pools on the street" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "spill"
+group = { zh = "画面", en = "Look" }
+label = { zh = "店门口洒在地上的光", en = "Shop light on the street" }
+default = 0.7
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "wet_dark"
+group = { zh = "画面", en = "Look" }
+label = { zh = "湿地面变暗", en = "Wet street darkens" }
+default = 0.8
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "roughness"
+group = { zh = "画面", en = "Look" }
+label = { zh = "地面的磨砂程度", en = "Frosted street" }
+default = 0.3
+min = 0.1
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "fog"
+group = { zh = "画面", en = "Look" }
+label = { zh = "雾", en = "Fog" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "cool_shadows"
+group = { zh = "画面", en = "Look" }
+label = { zh = "暗部偏冷", en = "Cool shadows" }
+default = 1.0
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "palette"
+type = "choice"
+group = { zh = "画面", en = "Look" }
+label = { zh = "配色", en = "Palette" }
+default = 5
+options = [{ zh = "原色", en = "Own colours" }, { zh = "红", en = "Reds" }, { zh = "黑白，只留红灯", en = "Ink, red lights only" }, { zh = "红和黑白按段落轮换", en = "Reds and ink by section" }, { zh = "主题色（播放器的强调色）", en = "The theme colour (the player's accent)" }, { zh = "主题色和黑白按段落轮换", en = "The theme colour and ink by section" }]
+
+[[param]]
+id = "palette_key"
+group = { zh = "画面", en = "Look" }
+label = { zh = "配色的明暗中点（越小画面越亮）", en = "Palette midpoint" }
+default = 0.2
+min = 0.02
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "relief"
+group = { zh = "画面", en = "Look" }
+label = { zh = "墙面的起伏（楼层线、窗台凸出，窗户凹进的明暗）", en = "Relief on the walls (floor bands and sills standing out, windows set in)" }
+default = 1.0
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "ink"
+group = { zh = "画面", en = "Look" }
+label = { zh = "物体轮廓的墨线（像漫画）", en = "Ink lines round things (as in a comic)" }
+default = 0.85
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "ink_width"
+group = { zh = "画面", en = "Look" }
+label = { zh = "墨线的粗细", en = "How wide the ink lines are" }
+unit = "px"
+default = 2.0
+min = 0.5
+max = 4.0
+step = 0.25
+
+[[param]]
+id = "halftone"
+group = { zh = "画面", en = "Look" }
+label = { zh = "色阶之间的网点大小（0 不用网点）", en = "Halftone dots between the tone steps (0 none)" }
+unit = "px"
+default = 5.0
+min = 0.0
+max = 12.0
+step = 0.5
+
+[[param]]
+id = "crush"
+group = { zh = "画面", en = "Look" }
+label = { zh = "单色配色时最暗的一级压成纯黑（像 P5 的黑色剪影）", en = "In a single-colour palette, the darkest step solid black (as Persona 5's black shapes)" }
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "wipe_time"
+group = { zh = "画面", en = "Look" }
+label = { zh = "跳切时红黑斜切转场的时长（0 不用）", en = "How long the slanted red and black wipe at a cut takes (0 none)" }
+unit = "s"
+default = 0.3
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "posterize"
+group = { zh = "画面", en = "Look" }
+label = { zh = "色阶分层（0 不分层，越少越像版画）", en = "Posterize steps (0 off)" }
+default = 5.0
+min = 0.0
+max = 10.0
+step = 1.0
+
+[[param]]
+id = "accent"
+group = { zh = "画面", en = "Look" }
+label = { zh = "黑白配色里红灯的保留程度", en = "Red lights kept in ink" }
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "player_colour"
+type = "bool"
+group = { zh = "画面", en = "Look" }
+label = { zh = "主题色配色跟随播放器的主题色（系统强调色、自选颜色或封面主色）", en = "The theme colour palette follows the player's theme colour (the system's accent, the chosen colour or the cover's)" }
+default = true
+
+[[param]]
+id = "theme"
+type = "color"
+group = { zh = "画面", en = "Look" }
+label = { zh = "不跟随播放器时用的主题色；只取它的色相", en = "The theme colour when not following the player; only its hue is taken" }
+default = "#007aff"

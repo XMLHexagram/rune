@@ -3,13 +3,15 @@
 //! The thread owns a headless wgpu device and the scene on screen (see [`scene`]). Each frame it
 //! drains the PCM ring buffer and renders. On Apple platforms it draws straight into an IOSurface-backed pixel buffer, on
 //! Windows into a DirectX 12 texture shared with Flutter's adapter, and on Linux into a Vulkan
-//! image whose memory Flutter's OpenGL context imports, which the app can show without a copy;
-//! elsewhere, or if that fails, it renders into an offscreen texture that is copied into a
-//! readback buffer, and the mapped buffer itself is the frame.
-//! Either way the result is the latest [`Frame`]. Readers ([`Visualizer::latest_frame`]) only
+//! image whose memory Flutter's OpenGL context imports, which the app can show without a copy.
+//! On Android it presents into the native window of a Flutter texture (`Visualizer::set_window`),
+//! where Flutter takes the frame itself, so no [`Frame`] is made. Elsewhere, or if that fails, it
+//! renders into an offscreen texture that is copied into a readback buffer, and the mapped
+//! buffer itself is the frame. Apart from Android, the result is the latest [`Frame`]. Readers ([`Visualizer::latest_frame`]) only
 //! clone an `Arc` under a short lock and never wait for the GPU. A reader that keeps frames holds
 //! their buffers, and the renderer skips frames while none is free.
 
+mod builtin;
 mod chart;
 mod covers;
 mod pipeline;
@@ -23,6 +25,8 @@ mod shared_dx12;
 mod shared_vulkan;
 #[cfg(target_vendor = "apple")]
 mod surface;
+#[cfg(target_os = "android")]
+mod window;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -41,11 +45,13 @@ pub use chart::{Chart, ChartState, chart_dir, chart_key};
 use chart::{ChartFollower, Playback};
 pub use pipeline::{DEFAULT_PRESET_NAME, Transport};
 use pipeline::{Pipeline, Rendered};
-pub use presets::PresetInfo;
 use presets::{AutoSwitch, Preset, PresetList};
+pub use presets::{Location, PresetInfo};
 pub use rhythm::{BeatTracker, Rhythm};
 #[cfg(target_os = "linux")]
 pub use shared_vulkan::SharedFrame;
+#[cfg(target_os = "android")]
+pub use window::Window;
 
 pub const DEFAULT_FPS: u32 = 60;
 
@@ -181,7 +187,7 @@ pub struct Status {
     pub target_fps: u32,
     pub measured_fps: f32,
     pub preset_name: String,
-    /// Presets in the chosen folders (0 without any).
+    /// Scenes to choose from: the built-in ones and those of the chosen folders.
     pub preset_count: usize,
     pub adapter: String,
     /// How frames leave the GPU, once the render thread runs.
@@ -191,17 +197,28 @@ pub struct Status {
 
 enum Command {
     Resize(u32, u32),
-    /// Show the scene in this folder, which is then watched for changes.
-    LoadScene(PathBuf),
-    /// Show the built-in scene (no scene folder is left).
+    /// Show this scene; one from a folder is then watched for changes.
+    LoadScene(Location),
+    /// Show the built-in scene that comes first (no scene folder is left).
     LoadDefaultScene,
+    /// Android: present frames of this size into this window from now on.
+    #[cfg(target_os = "android")]
+    ReplaceWindow(Window, u32, u32),
     Stop,
 }
 
-/// The scenes of the folders the user chose, if any.
-#[derive(Default)]
+/// The built-in scenes and those of the folders the user chose, if any.
 struct Library {
     folder: PresetList,
+}
+
+impl Default for Library {
+    fn default() -> Self {
+        let names = builtin::scenes().into_iter().map(|s| s.name).collect();
+        Self {
+            folder: PresetList::with_builtins(names),
+        }
+    }
 }
 
 impl Library {
@@ -253,6 +270,9 @@ struct Shared {
     /// The app could not show a shared frame: the render thread reads frames back from its next
     /// frame on.
     fall_back: AtomicBool,
+    /// Android: the window the next render thread presents into, which it takes.
+    #[cfg(target_os = "android")]
+    window: Mutex<Option<Window>>,
 }
 
 /// The atlas of covers made last (none: there are no covers) and how often it was replaced.
@@ -300,10 +320,15 @@ impl Default for Visualizer {
 
 impl Visualizer {
     pub fn new() -> Self {
+        let library = Library::default();
+        let status = Status {
+            preset_count: library.folder.len(),
+            ..Status::default()
+        };
         Self {
             shared: Arc::new(Shared {
                 latest: Mutex::new(None),
-                status: Mutex::new(Status::default()),
+                status: Mutex::new(status),
                 next_frame_id: AtomicU64::new(1),
                 auto_switch_paused: AtomicBool::new(false),
                 // `RUNE_VISUALIZER_READBACK=1` picks the readback path, to compare the two.
@@ -326,9 +351,11 @@ impl Visualizer {
                 adapter_luid: AtomicU64::new(0),
                 device_uuids: Mutex::new(None),
                 fall_back: AtomicBool::new(false),
+                #[cfg(target_os = "android")]
+                window: Mutex::new(None),
             }),
             worker: Mutex::new(None),
-            library: Arc::new(Mutex::new(Library::default())),
+            library: Arc::new(Mutex::new(library)),
         }
     }
 
@@ -458,6 +485,21 @@ impl Visualizer {
         self.shared.fall_back.store(true, Ordering::Relaxed);
     }
 
+    /// Android: the window the render thread presents frames into, from the next [`Self::start`]
+    /// (`None`: no window, so frames are read back and nothing shows them). The render thread
+    /// takes it and holds it until it stops or is given another one ([`Self::replace_window`]).
+    #[cfg(target_os = "android")]
+    pub fn set_window(&self, window: Option<Window>) {
+        *lock(&self.shared.window) = window;
+    }
+
+    /// Android: present frames of `width` by `height` into `window` from now on, in place of the
+    /// running render thread's window, which it lets go of first.
+    #[cfg(target_os = "android")]
+    pub fn replace_window(&self, window: Window, width: u32, height: u32) -> Result<()> {
+        self.send(Command::ReplaceWindow(window, width, height))
+    }
+
     /// Start the render thread. It returns at once; a missing GPU or an engine error shows up
     /// in [`Status::last_error`] with `running` false. Fails if a thread is already there, so
     /// call [`Self::stop`] first (it gives the `PcmInput` back).
@@ -512,15 +554,21 @@ impl Visualizer {
         self.load_entry(&Preset::from_path(path))
     }
 
+    /// Show the scene at `location`: a folder (watched for changes) or a built-in scene.
+    pub fn load_preset(&self, location: Location) -> Result<()> {
+        self.send(Command::LoadScene(location))
+    }
+
     fn load_entry(&self, preset: &Preset) -> Result<()> {
-        self.send(Command::LoadScene(preset.path.clone()))
+        self.load_preset(preset.location.clone())
     }
 
     /// Scan the folders `dirs` and their subfolders for scenes (folders with a `scene.toml`) for
-    /// next/previous/random, replacing the earlier folders and emptying the history. Returns the
-    /// number of scenes, each folder once. A folder that cannot be read is skipped and shows up in
-    /// [`Status::last_error`]. Without scenes a running visualizer changes to the built-in one;
-    /// otherwise the caller loads one.
+    /// next/previous/random, replacing the earlier folders and emptying the history. A scene
+    /// folder named like a built-in scene replaces it. Returns the number of scenes to choose
+    /// from, the built-in ones included. A folder that cannot be read is skipped and shows up in
+    /// [`Status::last_error`]. Without scenes in the folders a running visualizer changes to the
+    /// first built-in scene; otherwise the caller loads one.
     pub fn set_preset_dirs(&self, dirs: &[PathBuf]) -> Result<usize> {
         let mut library = lock(&self.library);
         let (count, errors) = library.folder.scan_all(dirs);
@@ -530,13 +578,13 @@ impl Visualizer {
             self.shared.set_error(message.join("; "));
         }
         // Not running: `start` begins with the built-in scene anyway.
-        if count == 0 {
+        if library.folder.folder_len() == 0 {
             let _ = self.send(Command::LoadDefaultScene);
         }
         Ok(count)
     }
 
-    /// Every scene of the scene folders, by group and name, for choosing one.
+    /// Every scene, by group and name, for choosing one.
     pub fn list_presets(&self) -> Vec<PresetInfo> {
         lock(&self.library).folder.infos()
     }
@@ -695,6 +743,8 @@ fn run(
         adapter_luid,
         device_uuids,
         on_gpu_error,
+        #[cfg(target_os = "android")]
+        lock(&shared.window).take(),
     )?;
     let mut transport = pipeline.transport();
     info!(
@@ -837,7 +887,7 @@ fn run(
                     &mut pipeline,
                     &mut auto_switch,
                     &mut watched,
-                    Command::LoadScene(preset.path),
+                    Command::LoadScene(preset.location),
                 ),
                 Some(Err(e)) => shared.set_error(format!("{e:#}")),
                 None => {}
@@ -875,6 +925,8 @@ fn run(
             }
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             Rendered::Shared(texture) => publish(shared, width, height, FrameData::Shared(texture)),
+            #[cfg(target_os = "android")]
+            Rendered::Presented => {}
             Rendered::Nothing => {}
         }
         // The output falls back to reading frames back if pixel buffers, shared textures or shared
@@ -934,8 +986,15 @@ fn apply(
             status.width = width;
             status.height = height;
         }),
-        Command::LoadScene(dir) => pipeline.load_scene(&dir).map(|()| {
-            *watched = Some(Watched::new(dir));
+        Command::LoadScene(location) => match &location {
+            Location::Folder(dir) => pipeline.load_scene(dir),
+            Location::Builtin(name) => pipeline.load_builtin_scene(name),
+        }
+        .map(|()| {
+            *watched = match location {
+                Location::Folder(dir) => Some(Watched::new(dir)),
+                Location::Builtin(_) => None,
+            };
             shared.status().preset_name = pipeline.preset_name().to_string();
             if pipeline.wants_covers() {
                 shared.wants_covers.store(true, Ordering::Relaxed);
@@ -949,6 +1008,15 @@ fn apply(
             *watched = None;
             shared.status().preset_name = pipeline.preset_name().to_string();
         }),
+        #[cfg(target_os = "android")]
+        Command::ReplaceWindow(window, width, height) => {
+            pipeline.replace_window(window, width, height).map(|()| {
+                let (width, height) = pipeline.size();
+                let mut status = shared.status();
+                status.width = width;
+                status.height = height;
+            })
+        }
         Command::Stop => Ok(()),
     };
     match result {

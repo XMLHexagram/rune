@@ -1,0 +1,846 @@
+format = 1
+name = "Torii Sea"
+license = "MPL-2.0"
+description = { zh = "海上蜿蜒的无限鸟居，浪随音乐拍在礁石上", en = "Endless torii winding over the sea, waves breaking with the music" }
+
+common = ["sea.wgsl"]
+
+[state]
+file = "state.wgsl"
+update = "update.wgsl"
+
+# The whole picture's resolution, per side, stretched to the screen after: 1 draws every pixel;
+# 0.75 keeps the sea's crosses crosses (at 0.5 they blur into dots; the torii, listed per tile of
+# the screen, cost a quarter of what they did, which pays for it); 0.5 a quarter of the pixels,
+# 0.35 a little soft, below 0.25 the torii's edges turn to steps.
+[render]
+scale = 0.75
+
+[[pass]]
+shader = "view.wgsl"
+target = "out"
+
+[post]
+exposure = 0.0
+bloom = { intensity = 0.4, threshold = 1.0, radius = 0.7 }
+tonemap = "agx"
+grain = 0.03
+chromatic = 0.0
+vignette = 0.2
+contrast = 1.12
+saturation = 1.05
+
+# ---- 节拍 ----
+
+[[param]]
+id = "conf"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "节拍置信度门槛（低于它不踩拍）", en = "Beat confidence needed" }
+default = 0.4
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "hits"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "拍与拍之间的底鼓也带动跳动", en = "Kicks between beats" }
+default = 0.5
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "kick_decay"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "每拍冲击的衰减时间", en = "Kick decay" }
+unit = "s"
+default = 0.18
+min = 0.04
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "beat_lock"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "按拍子穿过鸟居", en = "Pass a torii on the beat" }
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "lanterns"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "灯笼的亮度（随音乐变化）", en = "Lanterns (glowing with the music)" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "lantern_swing"
+group = { zh = "画面", en = "Look" }
+label = { zh = "灯笼慢慢摆动的幅度", en = "How far the lanterns sway, slowly" }
+unit = "rad"
+default = 0.08
+min = 0.0
+max = 0.8
+step = 0.01
+
+[[param]]
+id = "sea_beats"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "海面每隔几拍整套换一次", en = "Beats between new sets of the sea's triangles" }
+default = 2.0
+min = 1.0
+max = 16.0
+step = 1.0
+
+[[param]]
+id = "wave_kick"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "底鼓时换上的海面更高", en = "A set coming on a kick stands taller" }
+default = 0.7
+min = 0.0
+max = 1.5
+step = 0.05
+
+[[param]]
+id = "glow"
+group = { zh = "节拍", en = "Beat" }
+label = { zh = "泛光", en = "Glow" }
+default = 0.25
+min = 0.0
+max = 2.0
+step = 0.05
+
+# ---- 光灵 ----
+
+[[param]]
+id = "mode"
+type = "choice"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "行动方式", en = "How the spirits move" }
+default = 0
+options = [{ zh = "随段落切换", en = "By section" }, { zh = "螺旋缠绕", en = "Braid" }, { zh = "首尾相接", en = "Snake" }, { zh = "扇形散开", en = "Fan" }, { zh = "门内外穿梭", en = "Weaving in and out" }]
+
+[[param]]
+id = "min_spirits"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "光灵最少几颗（最多 5）", en = "Fewest spirits (up to 5)" }
+default = 3.0
+min = 1.0
+max = 5.0
+step = 1.0
+
+[[param]]
+id = "mode_bars"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "每隔几小节换行动方式", en = "Bars between changes of pattern" }
+default = 8.0
+min = 1.0
+max = 32.0
+step = 1.0
+
+[[param]]
+id = "spread"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "光灵在两座鸟居之间散开的半径", en = "How far the spirits spread between gates" }
+unit = "m"
+default = 1.6
+min = 0.2
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "pinch"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "穿门时收拢到多少（相对散开）", en = "How close they draw in at a gate" }
+default = 0.3
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "orbit"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "每拍转多少（弧度的倍数）", en = "How far they turn on a beat" }
+default = 1.0
+min = 0.0
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "stagger"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "前后错开的距离", en = "How far they string out" }
+unit = "m"
+default = 1.5
+min = 0.0
+max = 5.0
+step = 0.1
+
+[[param]]
+id = "stiff"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "跟随的力度", en = "How hard each keeps its place" }
+default = 30
+min = 2.0
+max = 200.0
+step = 1.0
+
+[[param]]
+id = "damp"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "跟随的阻尼", en = "Damping of the spirits" }
+default = 0.75
+min = 0.2
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "weave"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "穿梭时甩出门外的幅度", en = "How far they swing out of the gates when weaving" }
+default = 1.0
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[param]]
+id = "breathe"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "队形随响度开合", en = "Formation opening with the loudness" }
+default = 0.8
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "pose_beats"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "每隔几拍换一次位", en = "Beats between moves to a new spot" }
+default = 2.0
+min = 1.0
+max = 8.0
+step = 1.0
+
+[[param]]
+id = "kick_burst"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "底鼓时向外炸开的程度", en = "How far a kick throws them out" }
+default = 0.4
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "energy_motion"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "此刻的响度对光灵动作幅度的影响", en = "How much the loudness of the moment drives the spirits' moves" }
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "wander"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "换位的幅度", en = "How far each moves to a new spot" }
+unit = "m"
+default = 0.6
+min = 0.0
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "trip_chance"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "每拍脱队出游的机会", en = "Chance on a beat that one strays off" }
+default = 0.12
+min = 0.0
+max = 0.6
+step = 0.01
+
+[[param]]
+id = "surge"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "每拍向前冲的距离", en = "How far they surge on the beat" }
+unit = "m"
+default = 3.0
+min = 0.0
+max = 6.0
+step = 0.1
+
+[[param]]
+id = "surge_decay"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "冲刺回落的时间", en = "How fast a surge dies away" }
+unit = "s"
+default = 0.25
+min = 0.03
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "react"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "尾巴跟随各自频段的程度", en = "How much each trail follows its band" }
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "flick"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "军鼓时被甩开的距离", en = "How far a snare flicks them" }
+unit = "m"
+default = 0.3
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "leap"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "重音时冲上天的高度", en = "How high they leap on an accent" }
+unit = "m"
+default = 12.0
+min = 0.0
+max = 40.0
+step = 0.5
+
+[[param]]
+id = "leap_time"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "冲天一次的时长", en = "How long a leap takes" }
+unit = "s"
+default = 1.6
+min = 0.3
+max = 5.0
+step = 0.1
+
+[[param]]
+id = "trail_time"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "尾巴的长度（秒）", en = "Length of the trails" }
+unit = "s"
+default = 2.5
+min = 0.2
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "trail_width"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "纸带的宽度", en = "Width of the paper ribbon" }
+unit = "m"
+default = 0.35
+min = 0.05
+max = 1.2
+step = 0.01
+
+[[param]]
+id = "twist"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "纸带的扭转（每个点转多少）", en = "Twist of the ribbon (per point)" }
+unit = "rad"
+default = 0.35
+min = 0.0
+max = 1.5
+step = 0.01
+
+[[param]]
+id = "zigzag"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "纸带的折角（像纸垂那样之字形）", en = "Folds of the ribbon (zigzag, as shide paper)" }
+default = 0.5
+min = 0.0
+max = 1.5
+step = 0.05
+
+[[param]]
+id = "trail_fade"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "纸带的光往后变暗的快慢", en = "How fast the ribbon's glow fades" }
+default = 0.8
+min = 0.2
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "trail_glow"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "纸带自身的光", en = "The ribbon's own glow" }
+default = 0.8
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "glitter_amount"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "纸带剥落的碎片（每个点的几率）", en = "Flakes shed by the ribbon (chance per point)" }
+default = 0.6
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "glitter_size"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "碎片的大小", en = "Size of the flakes" }
+unit = "m"
+default = 0.14
+min = 0.02
+max = 0.6
+step = 0.01
+
+[[param]]
+id = "flake_fall"
+group = { zh = "光灵", en = "Spirits" }
+label = { zh = "碎片下落的速度", en = "How fast the flakes fall" }
+unit = "m/s"
+default = 1.2
+min = 0.0
+max = 5.0
+step = 0.05
+
+# ---- 速度 ----
+
+[[param]]
+id = "cruise"
+group = { zh = "速度", en = "Speed" }
+label = { zh = "巡航速度", en = "Cruise speed" }
+unit = "m/s"
+default = 8.0
+min = 1.0
+max = 30.0
+step = 0.5
+
+[[param]]
+id = "song_pace"
+group = { zh = "速度", en = "Speed" }
+label = { zh = "整首歌的快慢对速度的影响", en = "How much the song's pace sets the speed" }
+default = 1.5
+min = 0.0
+max = 3.0
+step = 0.1
+
+[[param]]
+id = "moment_pace"
+group = { zh = "速度", en = "Speed" }
+label = { zh = "歌内快慢变化对速度的放大", en = "How much the moment's pace changes it" }
+default = 2.0
+min = 0.0
+max = 4.0
+step = 0.1
+
+[[param]]
+id = "feel_smooth"
+group = { zh = "速度", en = "Speed" }
+label = { zh = "听感速度的平滑时间", en = "Smoothing of the pace" }
+unit = "s"
+default = 4.0
+min = 0.5
+max = 20.0
+step = 0.5
+
+[[param]]
+id = "energy_speed"
+group = { zh = "速度", en = "Speed" }
+label = { zh = "能量对速度的影响", en = "Energy on the speed" }
+default = 0.3
+min = 0.0
+max = 1.0
+step = 0.05
+
+# ---- 镜头 ----
+
+[[param]]
+id = "same_view"
+type = "bool"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "同一类段落用同一个机位", en = "Same view for the same kind of section" }
+default = true
+
+[[param]]
+id = "through"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "鸟居中间的高度", en = "Height through the gates" }
+unit = "m"
+default = 3.0
+min = 1.0
+max = 4.0
+step = 0.1
+
+[[param]]
+id = "rear_height"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "侧后方镜头的高度", en = "Height of the shot from behind and to the side" }
+unit = "m"
+default = 6.0
+min = 2.0
+max = 20.0
+step = 0.5
+
+[[param]]
+id = "high"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "左侧偏后高空镜头的高度", en = "Height of the high shot from the left, a little behind" }
+unit = "m"
+default = 22.0
+min = 4.0
+max = 40.0
+step = 1.0
+
+[[param]]
+id = "low"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "贴着水面的高度", en = "Height low over the water" }
+unit = "m"
+default = 2.0
+min = 1.0
+max = 5.0
+step = 0.1
+
+[[param]]
+id = "side_offset"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "侧面机位离鸟居列的距离", en = "Distance beside the line" }
+unit = "m"
+default = 8.0
+min = 4.0
+max = 20.0
+step = 0.5
+
+[[param]]
+id = "cam_dist"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "追在光灵后面的距离", en = "How far behind the spirits the camera chases" }
+unit = "m"
+default = 10.0
+min = 3.0
+max = 40.0
+step = 0.5
+
+[[param]]
+id = "view_bars"
+group = { zh = "镜头", en = "Camera" }
+label = { zh = "每隔几小节可能换机位", en = "Bars between possible view changes" }
+default = 16.0
+min = 1.0
+max = 32.0
+step = 1.0
+
+# ---- 鸟居 ----
+
+[[param]]
+id = "spacing"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "鸟居的间距", en = "Spacing of the torii" }
+unit = "m"
+default = 10
+min = 4.0
+max = 30.0
+step = 0.5
+
+[[param]]
+id = "winding"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "路线的弯曲程度", en = "How much the line winds" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.1
+
+[[param]]
+id = "stone"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "石鸟居的比例", en = "Share of stone torii" }
+default = 0.12
+min = 0.0
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "old"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "褪色旧鸟居的比例", en = "Share of old, faded torii" }
+default = 0.12
+min = 0.0
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "broken"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "两侧鸟居里残破的比例", en = "Share of the strays broken" }
+default = 0.75
+min = 0.0
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "line_jitter"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "路上鸟居间距的浮动（占间距的比例，0.3 即 ±30%）", en = "How uneven the line's gaps are (share of the spacing, 0.3 for ±30%)" }
+default = 0.3
+min = 0.0
+max = 0.9
+step = 0.01
+
+[[param]]
+id = "line_ruin"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "路上残破鸟居的比例", en = "Share of the line's torii broken" }
+default = 0.35
+min = 0.0
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "line_crooked"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "路上歪扭鸟居的比例（倾斜、转向、笠木滑落）", en = "Share of the line's torii crooked (leaning, turned, kasagi slipped)" }
+default = 0.35
+min = 0.0
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "missing"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "空缺的比例", en = "Share of gaps" }
+default = 0.04
+min = 0.0
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "scatter"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "中间一列左右错开的程度", en = "How far the line's torii stray across" }
+unit = "m"
+default = 0.6
+min = 0.0
+max = 6.0
+step = 0.1
+
+[[param]]
+id = "sunk"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "两侧散落的鸟居里半潜的比例", en = "Share of the strays half sunk" }
+default = 0.4
+min = 0.0
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "stray_reach"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "两侧散落鸟居最远离开路线多远", en = "How far out the strays reach" }
+unit = "m"
+default = 60.0
+min = 5.0
+max = 150.0
+step = 1.0
+
+[[param]]
+id = "strays"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "两侧散落的鸟居多少", en = "Torii strewn on either side" }
+default = 0.7
+min = 0.0
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "grand_every"
+group = { zh = "鸟居", en = "Torii" }
+label = { zh = "每隔几座有一座大鸟居（0 为没有）", en = "A grand torii every so many (0 none)" }
+default = 13.0
+min = 0.0
+max = 50.0
+step = 1.0
+
+# ---- 海 ----
+
+[[param]]
+id = "wave_height"
+group = { zh = "海", en = "Sea" }
+label = { zh = "浪的高度", en = "Wave height" }
+unit = "m"
+default = 0.6
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "wave_energy"
+group = { zh = "海", en = "Sea" }
+label = { zh = "响度对浪高的影响", en = "Loudness on the waves" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "swell"
+group = { zh = "海", en = "Sea" }
+label = { zh = "重音时大浪的高度", en = "Big swell on accents" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+[[param]]
+id = "accent_level"
+group = { zh = "海", en = "Sea" }
+label = { zh = "重音门槛", en = "How strong an accent must be" }
+default = 0.95
+min = 0.5
+max = 1.0
+step = 0.01
+
+[[param]]
+id = "accent_gap"
+group = { zh = "海", en = "Sea" }
+label = { zh = "两次大浪至少相隔", en = "Least time between big swells" }
+unit = "s"
+default = 6.0
+min = 1.0
+max = 30.0
+step = 0.5
+
+[[param]]
+id = "build_bars"
+group = { zh = "海", en = "Sea" }
+label = { zh = "换段前几小节开始蓄力", en = "Bars of build-up before a section" }
+default = 4.0
+min = 0.25
+max = 16.0
+step = 0.25
+
+[[param]]
+id = "stacks"
+group = { zh = "海", en = "Sea" }
+label = { zh = "海中礁石的多少", en = "Sea stacks" }
+default = 0.35
+min = 0.0
+max = 1.0
+step = 0.01
+
+# ---- 光 ----
+
+[[param]]
+id = "light_mode"
+type = "choice"
+group = { zh = "光", en = "Light" }
+label = { zh = "光线", en = "Light" }
+default = 0
+options = [{ zh = "随段落切换（跟镜头一起换）", en = "By section (with the cut)" }, { zh = "白天", en = "Day" }, { zh = "前方低垂的太阳（逆光）", en = "A low sun ahead (backlight)" }, { zh = "蓝调时刻", en = "Blue hour" }, { zh = "月夜", en = "Night" }]
+
+[[param]]
+id = "shadows"
+group = { zh = "画面", en = "Look" }
+label = { zh = "鸟居的投影", en = "Shadows of the torii" }
+default = 1
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[param]]
+id = "spirit_light"
+group = { zh = "画面", en = "Look" }
+label = { zh = "光灵照亮鸟居和水面", en = "Spirits lighting the torii and the water" }
+default = 1.0
+min = 0.0
+max = 4.0
+step = 0.05
+
+[[param]]
+id = "facet"
+group = { zh = "画面", en = "Look" }
+label = { zh = "海面三角面的边长", en = "Side of the sea's triangles" }
+unit = "m"
+default = 4.9
+min = 1.0
+max = 12.0
+step = 0.1
+
+[[param]]
+id = "facet_rough"
+group = { zh = "画面", en = "Look" }
+label = { zh = "三角面各自的起伏", en = "Roughness of the triangles" }
+unit = "m"
+default = 0.18
+min = 0.0
+max = 1.5
+step = 0.05
+
+[[param]]
+id = "exposure"
+group = { zh = "光", en = "Light" }
+label = { zh = "曝光", en = "Exposure" }
+unit = "EV"
+default = 0.0
+min = -3.0
+max = 3.0
+step = 0.05
+
+# ---- 海 ----
+
+[[param]]
+id = "sea_look"
+type = "choice"
+group = { zh = "海", en = "Sea" }
+label = { zh = "海的样子", en = "How the sea looks" }
+default = 0
+options = [{ zh = "点阵：随浪起伏的网格小十字，远处变稀、融进夜色", en = "Marks: a grid of small crosses riding the swells, thinning far off into the dark" }, { zh = "低多边形：有光照的三角面", en = "Low-poly: lit triangles" }]
+
+[[param]]
+id = "mark_size"
+group = { zh = "海", en = "Sea" }
+label = { zh = "点阵：十字的大小", en = "Marks: how big the crosses are" }
+unit = "m"
+default = 0.06
+min = 0.02
+max = 0.2
+step = 0.005
+
+[[param]]
+id = "mark_glow"
+group = { zh = "海", en = "Sea" }
+label = { zh = "点阵：十字的亮度", en = "Marks: how bright the crosses are" }
+default = 1.0
+min = 0.0
+max = 3.0
+step = 0.05
+
+# ---- 颜色 ----
+
+[[param]]
+id = "player_colour"
+type = "bool"
+group = { zh = "颜色", en = "Colour" }
+label = { zh = "光灵和海跟随播放器的主题色（系统强调色、自选颜色或封面主色）；鸟居保持本色", en = "The spirits and the sea follow the player's theme colour (the system's accent, the chosen colour or the cover's); the torii keep theirs" }
+default = true
+
+[[param]]
+id = "theme"
+type = "color"
+group = { zh = "颜色", en = "Colour" }
+label = { zh = "不跟随播放器时用的主题色；只取它的色相", en = "The theme colour when not following the player; only its hue is taken" }
+default = "#007aff"
+
+[[param]]
+id = "colourful"
+group = { zh = "颜色", en = "Colour" }
+label = { zh = "光灵和海的色彩浓淡（0 为白）", en = "How colourful the spirits and the sea are (0 white)" }
+default = 1.0
+min = 0.0
+max = 2.0
+step = 0.05

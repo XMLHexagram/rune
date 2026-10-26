@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use ::database::connection::{MainDbConnection, RecommendationDbConnection};
 use ::fsio::FsIo;
 use ::playback::player::Playable;
-use ::visualizer::{PcmInput, Transport};
+use ::visualizer::{Location, PcmInput, Transport};
 
 use crate::{
     Session, Signal, flutter_bridge,
@@ -73,7 +73,7 @@ impl Signal for StartVisualizerRequest {
             channels: tap.channels(),
             sample_rate: tap.sample_rate(),
         };
-        flutter_bridge::prepare_visualizer().await;
+        flutter_bridge::prepare_visualizer(dart_signal.width, dart_signal.height).await;
         let result = VISUALIZER.start(
             input,
             dart_signal.width,
@@ -132,7 +132,7 @@ impl Signal for ResizeVisualizerRequest {
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        report(VISUALIZER.resize(dart_signal.width, dart_signal.height))
+        report(flutter_bridge::resize_visualizer(dart_signal.width, dart_signal.height).await)
     }
 }
 
@@ -215,7 +215,7 @@ impl Signal for LoadVisualizerPresetRequest {
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        report(VISUALIZER.load_preset_path(Path::new(&dart_signal.path)))
+        report(VISUALIZER.load_preset(Location::parse(&dart_signal.path)))
     }
 }
 
@@ -331,6 +331,7 @@ impl Signal for VisualizerStatusRequest {
                 Some(Transport::Readback) => "readback",
                 Some(Transport::DxgiShared) => "dxgi-shared",
                 Some(Transport::VulkanShared) => "vulkan-shared",
+                Some(Transport::Surface) => "surface",
                 None => "",
             }
             .to_string(),
@@ -381,8 +382,9 @@ impl Signal for ListVisualizerPresetsRequest {
             .into_iter()
             .map(|info| VisualizerPresetEntry {
                 name: info.name,
-                path: info.path.to_string_lossy().into_owned(),
+                path: info.location.to_string(),
                 group: info.group,
+                builtin: matches!(info.location, Location::Builtin(_)),
             })
             .collect();
         Ok(Some(ListVisualizerPresetsResponse { presets }))
