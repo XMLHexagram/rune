@@ -29,8 +29,9 @@ pub fn get_recommendation_by_file_id(
     item_id: i32,
     n: usize,
 ) -> Result<Vec<(u32, f32)>> {
-    let env = main_db.env.clone();
-    let db = main_db.db;
+    let Some((env, db)) = main_db.store.clone() else {
+        return Ok(vec![]);
+    };
     let rtxn = env.read_txn()?;
     let reader = Reader::<Euclidean>::open(&rtxn, 0, db)?;
     let search_k = NonZeroUsize::new(n * reader.n_trees() * 15)
@@ -63,8 +64,9 @@ pub fn get_recommendation_by_parameter(
     feature_vector: [f32; 61],
     n: usize,
 ) -> Result<Vec<(u32, f32)>> {
-    let env = recommend_db.env.clone();
-    let db = recommend_db.db;
+    let Some((env, db)) = recommend_db.store.clone() else {
+        return Ok(vec![]);
+    };
     let rtxn = env.read_txn()?;
     let reader = Reader::<Euclidean>::open(&rtxn, 0, db)?;
     let search_k = NonZeroUsize::new(n * reader.n_trees() * 15)
@@ -103,8 +105,9 @@ pub async fn sync_recommendation(
     main_db: &MainDbConnection,
     recommend_db: &RecommendationDbConnection,
 ) -> Result<()> {
-    let env = recommend_db.env.clone();
-    let arroy_db = recommend_db.db;
+    let Some((env, arroy_db)) = recommend_db.store.clone() else {
+        return Ok(());
+    };
 
     // Fetch all analysis data
     let analyzes = media_analysis::Entity::find().all(main_db).await?;

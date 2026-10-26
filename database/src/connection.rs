@@ -7,7 +7,7 @@ use arroy::{
     internals::{KeyCodec, NodeCodec},
 };
 use heed::{Env, EnvFlags, EnvOpenOptions};
-use log::info;
+use log::{info, warn};
 use sea_orm::{
     Database, SqlxSqliteConnector,
     sqlx::{SqlitePool, sqlite::SqliteConnectOptions},
@@ -238,8 +238,9 @@ const DB_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RecommendationDbConnection {
-    pub env: Env,
-    pub db: ArroyDatabase<Euclidean>,
+    /// The LMDB environment and the Arroy database, or none when the database could not be
+    /// opened (LMDB does not work under Wine); recommendations are then empty.
+    pub store: Option<(Env, ArroyDatabase<Euclidean>)>,
 }
 
 pub async fn connect_recommendation_db(
@@ -267,23 +268,33 @@ pub async fn connect_recommendation_db(
 
     info!("Initializing recommendation database: {path_str}");
 
-    let env = unsafe {
-        EnvOpenOptions::new()
-            .map_size(DB_SIZE)
-            .flags(EnvFlags::NO_LOCK)
-            .flags(EnvFlags::NO_SUB_DIR)
-            .open(path_str)
+    let open = || -> Result<(Env, ArroyDatabase<Euclidean>)> {
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .map_size(DB_SIZE)
+                .flags(EnvFlags::NO_LOCK)
+                .flags(EnvFlags::NO_SUB_DIR)
+                .open(path_str)
+        }
+        .with_context(|| "Failed to open the recommendation database")?;
+
+        let mut wtxn = env.write_txn()?;
+        let db: ArroyDatabase<Euclidean> = env
+            .database_options()
+            .types::<KeyCodec, NodeCodec<Euclidean>>()
+            .create(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok((env, db))
+    };
+
+    // A library without recommendations still opens.
+    match open() {
+        Ok(store) => Ok(RecommendationDbConnection { store: Some(store) }),
+        Err(e) => {
+            warn!("Recommendations are off: {e:#}");
+            Ok(RecommendationDbConnection { store: None })
+        }
     }
-    .with_context(|| "Failed to open the recommendation database")?;
-
-    let mut wtxn = env.write_txn()?;
-    let db: ArroyDatabase<Euclidean> = env
-        .database_options()
-        .types::<KeyCodec, NodeCodec<Euclidean>>()
-        .create(&mut wtxn)?;
-    wtxn.commit()?;
-
-    Ok(RecommendationDbConnection { env, db })
 }
 
 pub fn connect_fake_recommendation_db() -> Result<RecommendationDbConnection> {
@@ -304,5 +315,7 @@ pub fn connect_fake_recommendation_db() -> Result<RecommendationDbConnection> {
         .create(&mut wtxn)?;
     wtxn.commit()?;
 
-    Ok(RecommendationDbConnection { env, db })
+    Ok(RecommendationDbConnection {
+        store: Some((env, db)),
+    })
 }
