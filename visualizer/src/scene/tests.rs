@@ -1072,3 +1072,78 @@ fn a_scene_without_inputs_or_binds_is_as_it_was() {
     let scene = Scene::load(&device, &queue, &dir, FORMAT, SIZE, 48_000).unwrap();
     assert!(scene.bindings().is_empty());
 }
+
+/// Each entry point of `text` through naga's SPIR-V writer, as wgpu's Vulkan backend takes it.
+fn spirv(name: &str, text: &str, entries: &[(naga::ShaderStage, &str)]) {
+    let module = naga::front::wgsl::parse_str(text).unwrap();
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&module)
+    .unwrap();
+    for &(stage, entry) in entries {
+        let (module, info) = naga::back::pipeline_constants::process_overrides(
+            &module,
+            &info,
+            Some((stage, entry)),
+            &Default::default(),
+        )
+        .unwrap();
+        let pipeline = naga::back::spv::PipelineOptions {
+            shader_stage: stage,
+            entry_point: entry.to_string(),
+        };
+        // naga panics on some modules it cannot write (rather than returning an error).
+        match std::panic::catch_unwind(|| {
+            naga::back::spv::write_vec(
+                &module,
+                &info,
+                &naga::back::spv::Options::default(),
+                Some(&pipeline),
+            )
+        }) {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("{name} {entry}: {e}"),
+            Err(_) => panic!("{name} {entry}: naga panicked (above)"),
+        }
+    }
+}
+
+// Vulkan (Linux, Android) takes shaders in SPIR-V, which no other platform writes, so a scene
+// that runs everywhere else can fail there alone (CRT Wall did: naga could not pass a pointer to
+// a struct's field).
+#[test]
+fn every_built_in_scene_writes_spirv() {
+    for scene in crate::builtin::scenes() {
+        let files = Files::read(&scene.source).unwrap();
+        let manifest = &files.manifest;
+        let state = files.state();
+        if let Some((name, text)) = &files.update {
+            let source = wgsl::update_source(manifest, state, (name, text));
+            spirv(
+                &format!("{}/{name}", scene.name),
+                &source.text,
+                &[(naga::ShaderStage::Compute, "rv_update")],
+            );
+        }
+        for (pass, (name, text)) in manifest.passes.iter().zip(&files.shaders) {
+            let source = wgsl::pass_source(
+                manifest,
+                state,
+                &files.common,
+                &pass.inputs,
+                (name, text),
+                1.0,
+            );
+            spirv(
+                &format!("{}/{name}", scene.name),
+                &source.text,
+                &[
+                    (naga::ShaderStage::Vertex, "rv_vertex"),
+                    (naga::ShaderStage::Fragment, "rv_fragment"),
+                ],
+            );
+        }
+    }
+}
