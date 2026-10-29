@@ -24,6 +24,7 @@ import 'utils/query_list.dart';
 import 'utils/tray_manager.dart';
 import 'utils/close_manager.dart';
 import 'utils/settings_manager.dart';
+import 'utils/frame_log.dart';
 import 'utils/update_color_mode.dart';
 import 'utils/theme_color_manager.dart';
 import 'utils/storage_key_manager.dart';
@@ -76,6 +77,7 @@ late bool cafeMode;
 
 void main(List<String> arguments) async {
   WidgetsFlutterBinding.ensureInitialized();
+  startFrameLog();
   await initializeRust(assignRustSignal);
 
   String? profile = arguments.contains('--profile')

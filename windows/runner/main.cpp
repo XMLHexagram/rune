@@ -43,6 +43,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
   flutter::DartProject project(L"data");
+  // Experiment: RUNE_UI_THREAD=separate runs Dart off the platform thread.
+  {
+    wchar_t policy[16] = {};
+    if (GetEnvironmentVariableW(L"RUNE_UI_THREAD", policy, 16) > 0 && wcscmp(policy, L"separate") == 0) {
+      project.set_ui_thread_policy(flutter::UIThreadPolicy::RunOnSeparateThread);
+    }
+  }
 
   std::vector<std::string> command_line_arguments =
       GetCommandLineArguments();

@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:math';
 import 'dart:async';
 import 'dart:ui' as ui;
@@ -71,6 +72,9 @@ double tanh(double angle) {
   return (e1 - e2) / (e1 + e2);
 }
 
+// Experiment: RUNE_FFT=off|noblur|boundary|fps30.
+final String _fftMode = Platform.environment['RUNE_FFT'] ?? '';
+
 class FFTVisualizeState extends State<FFTVisualize>
     with TickerProviderStateMixin {
   final radius = 12.0;
@@ -88,6 +92,7 @@ class FFTVisualizeState extends State<FFTVisualize>
   void initState() {
     super.initState();
 
+    if (_fftMode == 'off') return;
     _registry.register(this);
 
     SettingsManager().getValue<String>(kMildSpectrumKey).then((x) {
@@ -126,7 +131,12 @@ class FFTVisualizeState extends State<FFTVisualize>
       });
     });
 
+    var odd = false;
     _ticker = createTicker((Duration elapsed) {
+      if (_fftMode == 'fps30') {
+        odd = !odd;
+        if (odd) return;
+      }
       final now = DateTime.now().millisecondsSinceEpoch;
       if (now - _lastUpdateTime > 168) {
         if (mounted) {
@@ -161,7 +171,9 @@ class FFTVisualizeState extends State<FFTVisualize>
 
   @override
   Widget build(BuildContext context) {
+    if (_fftMode == 'off') return const SizedBox.shrink();
     final color = FluentTheme.of(context).accentColor;
+    final painted = CustomPaint(painter: FFTPainter(_currentFftValues, color));
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -172,21 +184,24 @@ class FFTVisualizeState extends State<FFTVisualize>
           alignment: Alignment.topCenter,
           child: SizedBox(
             height: parentHeight * 2,
-            child: Opacity(
+            child: _wrap(Opacity(
               opacity: 0.87,
-              child: ImageFiltered(
-                imageFilter:
-                    ui.ImageFilter.blur(sigmaX: radius, sigmaY: radius),
-                child: CustomPaint(
-                  painter: FFTPainter(_currentFftValues, color),
-                ),
-              ),
-            ),
+              child: _fftMode == 'noblur'
+                  ? painted
+                  : ImageFiltered(
+                      imageFilter:
+                          ui.ImageFilter.blur(sigmaX: radius, sigmaY: radius),
+                      child: painted,
+                    ),
+            )),
           ),
         );
       },
     );
   }
+
+  Widget _wrap(Widget child) =>
+      _fftMode == 'boundary' ? RepaintBoundary(child: child) : child;
 
   void _lerpedFftValues() {
     if (_targetFftValues.isEmpty) return;

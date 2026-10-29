@@ -86,6 +86,10 @@ static void my_application_activate(GApplication* application) {
   gtk_widget_show(GTK_WIDGET(window));
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
+  // Experiment: RUNE_UI_THREAD=separate runs Dart off the GTK main thread.
+  if (g_strcmp0(g_getenv("RUNE_UI_THREAD"), "separate") == 0) {
+    fl_dart_project_set_ui_thread_policy(project, FL_UI_THREAD_POLICY_RUN_ON_SEPARATE_THREAD);
+  }
   fl_dart_project_set_dart_entrypoint_arguments(project, self->dart_entrypoint_arguments);
 
   FlView* view = fl_view_new(project);
