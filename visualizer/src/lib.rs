@@ -678,15 +678,18 @@ impl Visualizer {
         self.load_entry(&Preset::from_path(path))
     }
 
-    /// Show the scene at `location`: a folder (watched for changes) or a built-in scene. Built
-    /// in the background like [`Visualizer::load_preset_path`]; a newer request replaces one that
-    /// is still being built.
+    /// Show the scene at `location`: a folder (watched for changes) or a built-in scene, which
+    /// becomes the newest of the history (what a visualizer that starts resumes). Built in the
+    /// background like [`Visualizer::load_preset_path`]; a newer request replaces one that is
+    /// still being built.
     pub fn load_preset(&self, location: Location) -> Result<()> {
+        lock(&self.library).folder.remember_at(&location);
         self.send(Command::LoadScene(location))
     }
 
+    /// Show a scene the history already has.
     fn load_entry(&self, preset: &Preset) -> Result<()> {
-        self.load_preset(preset.location.clone())
+        self.send(Command::LoadScene(preset.location.clone()))
     }
 
     /// Scan the folders `dirs` and their subfolders for scenes (folders with a `scene.toml`) for
@@ -727,6 +730,12 @@ impl Visualizer {
         library.folder.set_order(order);
         library.folder.set_disabled(disabled);
         library.folder.set_shuffle(shuffle);
+    }
+
+    /// The scene on screen when the app last ran, which a visualizer that starts resumes unless
+    /// another scene was shown since the app started.
+    pub fn resume_from(&self, location: Location) {
+        lock(&self.library).folder.resume_from(&location);
     }
 
     /// Every scene, by group and name, for choosing one.
@@ -969,19 +978,16 @@ fn run(
     let mut bench = bench::seconds_from_env().map(bench::Bench::new);
     // Whether nothing is drawn: the cover wall is on, or the scene to begin with is being built.
     let mut hidden = false;
-    // The pipeline comes with the default scene. In order, the visualizer begins with the scene
-    // shown last (or the first one); shuffled, with the default scene, or a random one if that is
-    // off. Another scene is shown at once when it is built.
+    // The pipeline comes with the default scene. The visualizer begins with the scene shown last;
+    // without one, in order with the first scene, shuffled with the default scene, or a random
+    // one if that is off. Another scene is shown at once when it is built.
     let begin = Location::Builtin(pipeline.preset_name().to_string());
     if bench.is_none() {
         let mut library = lock(library);
-        let first = if library.folder.shuffles() {
-            match library.folder.is_enabled(&begin) {
-                true => None,
-                false => library.folder.random(&mut rng).ok(),
-            }
-        } else {
-            library.folder.resume()
+        let first = match library.folder.resume() {
+            Some(preset) => Some(preset),
+            None if library.folder.is_enabled(&begin) => None,
+            None => library.folder.random(&mut rng).ok(),
         };
         drop(library);
         if let Some(preset) = first.filter(|preset| preset.location != begin) {

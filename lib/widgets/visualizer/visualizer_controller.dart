@@ -37,10 +37,11 @@ class VisualizerController {
   /// The user stopped the automatic scene switching.
   bool get locked => _locked;
 
-  /// A new surface starts with a new render thread, so the old state is gone.
-  void attach() {
+  /// A new surface starts with a new render thread, so the old state is gone;
+  /// only the lock carries over ([locked], as the user left it).
+  void attach({bool locked = false}) {
     _attached = true;
-    _locked = false;
+    _locked = locked;
     _menuOpen = false;
     _autoSwitchPaused = false;
     status = null;
@@ -82,12 +83,16 @@ class VisualizerController {
     _syncAutoSwitchPaused();
   }
 
+  /// Tells a render thread that just started whether the scene is locked: it
+  /// starts unlocked.
+  void sendLock() => _syncAutoSwitchPaused(force: true);
+
   // Rust does not switch scenes by itself while the scene is locked or the
   // menu is open, and takes the song that plays afterwards as the scene's own.
-  void _syncAutoSwitchPaused() {
+  void _syncAutoSwitchPaused({bool force = false}) {
     if (!_attached) return;
     final paused = _locked || _menuOpen;
-    if (paused == _autoSwitchPaused) return;
+    if (paused == _autoSwitchPaused && !force) return;
     _autoSwitchPaused = paused;
     SetVisualizerAutoSwitchPausedRequest(paused: paused).sendSignalToRust();
   }

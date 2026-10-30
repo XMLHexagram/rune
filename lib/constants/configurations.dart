@@ -173,3 +173,12 @@ const kVisualizerShuffleScenesKey = 'visualizer_shuffle_scenes';
 /// are written to the Log page, for debugging; its errors always are. This
 /// defaults to false.
 const kVisualizerLogKey = 'visualizer_log';
+
+/// The path of the visualizer scene on screen (in the form of the scene list's
+/// paths), which the visualizer resumes after a restart.
+const kVisualizerLastSceneKey = 'visualizer_last_scene';
+
+/// Whether the user locked the visualizer's scene, so that it does not change
+/// with the songs; it stays locked across visits and restarts. This defaults
+/// to false.
+const kVisualizerLockedKey = 'visualizer_scene_locked';

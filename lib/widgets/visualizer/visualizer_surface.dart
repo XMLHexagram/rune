@@ -68,7 +68,7 @@ class _VisualizerSurfaceState extends State<VisualizerSurface>
   void initState() {
     super.initState();
     _scenes = context.read<VisualizerScenesProvider>();
-    _controller.attach();
+    _controller.attach(locked: _scenes.locked);
     WidgetsBinding.instance.addObserver(this);
     _syncVisible(WidgetsBinding.instance.lifecycleState);
     _statusTimer = Timer.periodic(
@@ -231,12 +231,18 @@ class _VisualizerSurfaceState extends State<VisualizerSurface>
       if (_disposed || !mounted) return;
       final status = signal.message;
 
+      final started = status.running && _controller.status?.running != true;
       _controller.status = status;
       _updateLabel(status);
       _controller.scenePath.value = status.running ? status.presetPath : null;
       if (status.running) {
         _controller.hasPresets = status.presetCount > 0;
+        // The scene to resume next time, also after a restart.
+        if (status.presetPath.isNotEmpty) {
+          _scenes.setLastScene(status.presetPath);
+        }
       }
+      if (started) _controller.sendLock();
       // Scenes draw on black; the page darkens for them.
       _scenes.sceneShowing =
           status.running && status.presetPath != kCoverWallScenePath;

@@ -282,21 +282,21 @@ impl PresetList {
             .map(|entry| entry.preset.clone())
     }
 
-    /// The scene a visualizer that starts begins with, in order: the one shown last if it is
-    /// still picked, else the one after it, else the first. None when the list shuffles, or is
-    /// empty.
+    /// The scene a visualizer that starts begins with: the one shown last if it is still listed
+    /// and picked; in order, else the one after it, else the first. None when the list shuffles
+    /// and has nothing to resume, or is empty.
     pub fn resume(&mut self) -> Option<Preset> {
+        let last = self.history.get(self.cursor).map(|p| p.location.clone());
+        if let Some(last) = &last
+            && self.is_enabled(last)
+            && self.contains(last)
+        {
+            return Some(self.history[self.cursor].clone());
+        }
         if self.shuffle {
             return None;
         }
-        let last = self.history.get(self.cursor).map(|p| p.location.clone());
         let preset = match last {
-            Some(last)
-                if self.is_enabled(&last)
-                    && self.entries.iter().any(|e| e.preset.location == last) =>
-            {
-                return Some(self.history[self.cursor].clone());
-            }
             Some(last) => self.after(&last)?,
             None => self
                 .ordered()
@@ -331,6 +331,27 @@ impl PresetList {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Make the scene at `location`, which was loaded by name, the newest of the history (forward
+    /// history is dropped). Nothing happens if it is not in the list.
+    pub fn remember_at(&mut self, location: &Location) {
+        let preset = self
+            .entries
+            .iter()
+            .find(|e| e.preset.location == *location)
+            .map(|e| e.preset.clone());
+        if let Some(preset) = preset {
+            let _ = self.remember(preset);
+        }
+    }
+
+    /// The scene shown last before the app started, for [`Self::resume`]: taken only while the
+    /// history is empty, so the scenes of this run come first.
+    pub fn resume_from(&mut self, location: &Location) {
+        if self.history.is_empty() {
+            self.remember_at(location);
+        }
     }
 
     /// Whether the scene at `location` is in the list.
@@ -518,8 +539,29 @@ mod tests {
         // Turned off since: the one after it.
         list.set_disabled(vec![at("c")]);
         assert_eq!(list.resume().unwrap().location, at("a"));
+        // Shuffled, the scene shown last is resumed too, and nothing when there is none.
+        list.set_disabled(vec![]);
         list.set_shuffle(true);
-        assert!(list.resume().is_none());
+        assert_eq!(list.resume().unwrap().location, at("a"));
+        let mut fresh = listed(&["a", "b"]);
+        assert!(fresh.resume().is_none());
+    }
+
+    #[test]
+    fn a_scene_loaded_by_name_or_from_the_last_run_is_resumed() {
+        let mut list = listed(&["a", "b", "c"]);
+        list.set_shuffle(false);
+        let at = |name: &str| Preset::from_path(Path::new(name)).location;
+        // The last run's scene counts only while nothing was shown in this run.
+        list.resume_from(&at("b"));
+        assert_eq!(list.resume().unwrap().location, at("b"));
+        list.resume_from(&at("c"));
+        assert_eq!(list.resume().unwrap().location, at("b"));
+        list.remember_at(&at("c"));
+        assert_eq!(list.resume().unwrap().location, at("c"));
+        // A scene that is not listed (gone since) is not remembered.
+        list.remember_at(&at("gone"));
+        assert_eq!(list.resume().unwrap().location, at("c"));
     }
 
     /// A scene folder `name` under `root`: an empty `scene.toml` is enough to be found.

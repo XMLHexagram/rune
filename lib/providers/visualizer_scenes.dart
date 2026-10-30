@@ -54,6 +54,8 @@ class VisualizerScenesProvider extends ChangeNotifier {
   List<VisualizerScene> _scenes = const [];
   bool _shuffle = false;
   bool _log = false;
+  bool _locked = false;
+  String? _lastScene;
   bool? _gpu;
   String? _gpuProblem;
   bool _loaded = false;
@@ -93,6 +95,24 @@ class VisualizerScenesProvider extends ChangeNotifier {
   /// always do).
   bool get log => _log;
 
+  /// Whether the user locked the scene, which stays on until they unlock it,
+  /// also after leaving the cover wall or restarting the app.
+  bool get locked => _locked;
+
+  void setLocked(bool locked) {
+    if (locked == _locked) return;
+    _locked = locked;
+    $settingsManager.setValue(kVisualizerLockedKey, locked);
+  }
+
+  /// The path of the scene on screen, kept so that the visualizer resumes it
+  /// after a restart (within a run, Rust remembers it).
+  void setLastScene(String path) {
+    if (path == _lastScene) return;
+    _lastScene = path;
+    $settingsManager.setValue(kVisualizerLastSceneKey, path);
+  }
+
   void setLog(bool log) {
     if (log == _log) return;
     _log = log;
@@ -123,6 +143,11 @@ class VisualizerScenesProvider extends ChangeNotifier {
     try {
       final dir = await sceneDir();
       _log = await $settingsManager.getValue<bool>(kVisualizerLogKey) ?? false;
+      _locked =
+          await $settingsManager.getValue<bool>(kVisualizerLockedKey) ?? false;
+      _lastScene = await $settingsManager.getValue<String>(
+        kVisualizerLastSceneKey,
+      );
       // Rust answers once the library is open, which can take a while (or
       // wait for the user to pick one); until then the cover wall page shows
       // the plain wall. Signals sent before that are lost, so they are sent
@@ -312,6 +337,7 @@ class VisualizerScenesProvider extends ChangeNotifier {
       order: _scenes.map((scene) => scene.path).toList(),
       disabled: _disabledPaths(),
       shuffle: _shuffle,
+      last: _lastScene,
     ).sendSignalToRust();
   }
 

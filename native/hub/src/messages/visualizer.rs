@@ -70,6 +70,9 @@ pub struct SetVisualizerScenesRequest {
     pub order: Vec<String>,
     pub disabled: Vec<String>,
     pub shuffle: bool,
+    /// The scene on screen when the app last ran, which a visualizer that starts resumes unless
+    /// another scene was shown since the app started.
+    pub last: Option<String>,
 }
 
 /// Unpack the scene file `file` (a `.runescene`, see `visualizer::package`) into a folder of its

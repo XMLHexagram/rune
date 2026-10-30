@@ -428,6 +428,9 @@ impl Signal for SetVisualizerScenesRequest {
             parse(&dart_signal.disabled),
             dart_signal.shuffle,
         );
+        if let Some(last) = &dart_signal.last {
+            VISUALIZER.resume_from(Location::parse(last));
+        }
         Ok(Some(()))
     }
 }

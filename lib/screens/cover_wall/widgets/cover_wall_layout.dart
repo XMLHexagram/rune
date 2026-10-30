@@ -122,7 +122,10 @@ class CoverWallLayoutState extends State<CoverWallLayout> {
                   leading:
                       _visualizer.locked ? const Icon(Symbols.check) : null,
                   text: Text(s.visualizerLockPreset),
-                  onPressed: _visualizer.toggleLock,
+                  onPressed: () {
+                    _visualizer.toggleLock();
+                    provider.setLocked(_visualizer.locked);
+                  },
                 ),
                 const MenuFlyoutSeparator(),
               ],
