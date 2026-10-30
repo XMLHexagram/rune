@@ -122,6 +122,7 @@ final Map<String, WidgetBuilder> routes = {
   '/settings/server': (context) => const settings.SettingsServerPage(),
   '/settings/system': (context) => const settings.SettingsAnalysis(),
   '/settings/theme': (context) => const settings.SettingsTheme(),
+  '/settings/visualizer': (context) => const settings.SettingsVisualizerPage(),
   '/settings/language': (context) => const settings.SettingsLanguage(),
   '/settings/playback': (context) => const settings.SettingsPlayback(),
   '/settings/log': (context) => const settings.SettingsLogPage(),

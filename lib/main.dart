@@ -51,7 +51,7 @@ import 'bindings/bindings.dart';
 import 'constants/configurations.dart';
 
 import 'providers/crash.dart';
-import 'providers/cover_wall_display.dart';
+import 'providers/visualizer_scenes.dart';
 import 'providers/volume.dart';
 import 'providers/status.dart';
 import 'providers/license.dart';
@@ -302,7 +302,7 @@ void mainLoop(LicenseProvider licenseProvider, bool linuxCustomWindowControls) {
         ChangeNotifierProvider(create: (_) => licenseProvider),
         ChangeNotifierProvider(create: (_) => BroadcastProvider()),
         ChangeNotifierProvider(create: (_) => FullScreenProvider()),
-        ChangeNotifierProvider(create: (_) => CoverWallDisplayProvider()),
+        ChangeNotifierProvider(create: (_) => VisualizerScenesProvider()),
         ChangeNotifierProvider(create: (_) => LibraryHomeProvider()),
         ChangeNotifierProvider(create: (_) => LibraryManagerProvider()),
         ChangeNotifierProvider(create: (_) => PlaybackControllerProvider()),

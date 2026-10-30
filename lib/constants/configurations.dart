@@ -165,9 +165,17 @@ const kVisualizerPresetDirsKey = 'visualizer_preset_dirs';
 /// moves it into [kVisualizerPresetDirsKey].
 const kVisualizerPresetDirKey = 'visualizer_preset_dir';
 
-/// 'covers' or 'visualizer': what the cover wall page shows behind the
-/// playing track, the wall of cover art or the visualizer. This
-/// defaults to 'covers' when the setting is missing.
+/// The paths of the visualizer scenes in the order the user arranged them, a
+/// list of strings. Scenes that are not in it yet are appended when they
+/// first show up.
+const kVisualizerScenesKey = 'visualizer_scenes';
+
+/// The paths of the visualizer scenes that are unchecked, a list of strings.
+/// The visualizer leaves them out when it picks a scene.
+const kVisualizerDisabledScenesKey = 'visualizer_disabled_scenes';
+
+/// 'covers' or 'visualizer': what the cover wall page showed in earlier
+/// versions. It is read once to set up the scenes and then removed.
 const kCoverWallDisplayKey = 'cover_wall_display';
 
 /// 'default' or 'more': how often the visualizer plays effects at the music's

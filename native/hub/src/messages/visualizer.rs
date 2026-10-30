@@ -66,6 +66,15 @@ pub struct SetVisualizerEffectLevelRequest {
     pub level: String,
 }
 
+/// The scenes next, random and the automatic switch leave out (in the form of
+/// `VisualizerPresetEntry::path`), replacing the earlier ones; every other scene, also one of a
+/// folder scanned later, is picked. They can still be loaded by path. Turning every scene off
+/// counts as turning none off.
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct SetVisualizerDisabledScenesRequest {
+    pub paths: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct VisualizerStatusRequest {}
 
@@ -77,7 +86,8 @@ pub struct VisualizerStatusResponse {
     pub target_fps: u32,
     pub measured_fps: f32,
     pub preset_name: String,
-    /// Where the scene on screen is, in the form of `VisualizerPresetEntry::path`.
+    /// Where the scene on screen is, in the form of `VisualizerPresetEntry::path`;
+    /// `app:cover-wall` while the cover wall is on and nothing is drawn.
     pub preset_path: String,
     pub preset_count: u32,
     pub adapter: String,
@@ -133,7 +143,8 @@ pub struct VisualizerPresetEntry {
     pub builtin: bool,
 }
 
-/// Every scene, the built-in ones and those of the scene folders, by group and name.
+/// Every scene, the built-in ones, the cover wall (path `app:cover-wall`, which the app draws and
+/// the visualizer leaves blank) and those of the scene folders, by group and name.
 #[derive(Serialize, Deserialize, RustSignal)]
 pub struct ListVisualizerPresetsResponse {
     pub presets: Vec<VisualizerPresetEntry>,

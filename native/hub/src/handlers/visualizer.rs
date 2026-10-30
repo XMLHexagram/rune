@@ -423,6 +423,32 @@ impl Signal for ListVisualizerCreditsRequest {
     }
 }
 
+impl ParamsExtractor for SetVisualizerDisabledScenesRequest {
+    type Params = ();
+
+    fn extract_params(&self, _all_params: &GlobalParams) -> Self::Params {}
+}
+
+impl Signal for SetVisualizerDisabledScenesRequest {
+    type Params = ();
+    type Response = ();
+
+    async fn handle(
+        &self,
+        _: Self::Params,
+        _session: Option<Session>,
+        dart_signal: &Self,
+    ) -> Result<Option<Self::Response>> {
+        let locations = dart_signal
+            .paths
+            .iter()
+            .map(|path| Location::parse(path))
+            .collect();
+        VISUALIZER.set_disabled_scenes(locations);
+        Ok(Some(()))
+    }
+}
+
 impl ParamsExtractor for ListVisualizerPresetsRequest {
     type Params = ();
 

@@ -1357,29 +1357,25 @@
   "@linuxCustomWindowControlsSubtitle": {
     "description": "Subtitle explaining what the Linux custom window controls setting does."
   },
-  "visualizerPrevious": "Previous scene",
-  "@visualizerPrevious": {
-    "description": "Context menu item of the visualizer that switches to the previous scene."
-  },
   "visualizerNext": "Next scene",
   "@visualizerNext": {
     "description": "Context menu item of the visualizer that switches to the next scene."
   },
-  "visualizerRandom": "Random scene",
-  "@visualizerRandom": {
-    "description": "Context menu item of the visualizer that switches to a random scene."
+  "visualizerScenes": "Scenes",
+  "@visualizerScenes": {
+    "description": "Title of the setting that lists the visualizer scenes to check, uncheck and reorder."
   },
-  "visualizerChoosePreset": "Choose scene",
-  "@visualizerChoosePreset": {
-    "description": "Context menu item of the visualizer that opens a submenu to pick one scene by name."
+  "visualizerScenesSubtitle": "One scene for each song, picked from the checked ones. Drag to reorder.",
+  "@visualizerScenesSubtitle": {
+    "description": "Subtitle of the visualizer scenes setting."
+  },
+  "visualizerSettings": "Visualizer settings",
+  "@visualizerSettings": {
+    "description": "Context menu item of the cover wall page that opens the visualizer settings page."
   },
   "visualizerLockPreset": "Lock scene",
   "@visualizerLockPreset": {
-    "description": "Context menu item of the visualizer that stops it from switching to other scenes by itself, so the current scene stays."
-  },
-  "visualizerUnlockPreset": "Unlock scene",
-  "@visualizerUnlockPreset": {
-    "description": "Context menu item of the visualizer that lets it switch to other scenes by itself again."
+    "description": "Context menu item of the visualizer, a toggle with a check mark while on: stops it from switching to other scenes by itself, so the current scene stays."
   },
   "visualizerAddPresetFolder": "Add scene folder",
   "@visualizerAddPresetFolder": {
@@ -1409,21 +1405,9 @@
   "@visualizerEffectsMore": {
     "description": "Option of the visualizer effects setting: effects play more often."
   },
-  "coverWallDisplay": "Cover wall display",
-  "@coverWallDisplay": {
-    "description": "Title of the setting that chooses what the cover wall page shows."
-  },
-  "coverWallDisplaySubtitle": "Show cover art or the visualizer on the cover wall page",
-  "@coverWallDisplaySubtitle": {
-    "description": "Subtitle of the cover wall display setting."
-  },
-  "coverWallDisplayCovers": "Cover art wall",
-  "@coverWallDisplayCovers": {
-    "description": "Option of the cover wall display setting, also a context menu item of the cover wall page, that shows the wall of album covers."
-  },
-  "coverWallDisplayVisualizer": "Visualizer",
-  "@coverWallDisplayVisualizer": {
-    "description": "Option of the cover wall display setting, also a context menu item of the cover wall page, that shows the music visualizer."
+  "visualizer": "Visualizer",
+  "@visualizer": {
+    "description": "Title of the visualizer settings page and the navigation entries that open it, also the name of the cover wall button while the visualizer is available."
   },
   "coverWallVisualizerSubtitle": "Visuals that follow the music",
   "@coverWallVisualizerSubtitle": {

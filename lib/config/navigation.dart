@@ -145,6 +145,10 @@ final List<NavigationItem> navigationItems = [
             '/settings/theme',
           ),
           NavigationItem(
+            (context) => S.of(context).visualizer,
+            '/settings/visualizer',
+          ),
+          NavigationItem(
             (context) => S.of(context).language,
             '/settings/language',
           ),

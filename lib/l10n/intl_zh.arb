@@ -1339,29 +1339,25 @@
   "@deduplicating": {
     "description": "表示當前正在執行去重過程的標籤。向用戶展示系統正在移除音樂庫或播放列表中的重複曲目。也可使用“正在移除重複項”或“去重進行中”等表達。"
   },
-  "visualizerPrevious": "上一個場景",
-  "@visualizerPrevious": {
-    "description": "視覺化中切換到上一個場景的右鍵選單項。"
-  },
   "visualizerNext": "下一個場景",
   "@visualizerNext": {
     "description": "視覺化中切換到下一個場景的右鍵選單項。"
   },
-  "visualizerRandom": "隨機場景",
-  "@visualizerRandom": {
-    "description": "視覺化中切換到隨機場景的右鍵選單項。"
+  "visualizerScenes": "場景",
+  "@visualizerScenes": {
+    "description": "列出視覺化場景、可勾選並排序的設置項標題。"
   },
-  "visualizerChoosePreset": "選擇場景",
-  "@visualizerChoosePreset": {
-    "description": "視覺化右鍵選單項，開啟子選單依名稱選擇某個場景。"
+  "visualizerScenesSubtitle": "每首歌從勾選的場景中挑一個，拖動可排序",
+  "@visualizerScenesSubtitle": {
+    "description": "視覺化場景設置項的副標題。"
+  },
+  "visualizerSettings": "視覺化設定",
+  "@visualizerSettings": {
+    "description": "封面牆頁面右鍵選單項，開啟視覺化設定頁。"
   },
   "visualizerLockPreset": "鎖定場景",
   "@visualizerLockPreset": {
-    "description": "視覺化右鍵選單項，使其不再自動切換場景，保持目前的場景。"
-  },
-  "visualizerUnlockPreset": "解除鎖定場景",
-  "@visualizerUnlockPreset": {
-    "description": "視覺化右鍵選單項，使其重新自動切換場景。"
+    "description": "視覺化右鍵選單項，為開關，開啟時顯示勾選標記：使其不再自動切換場景，保持目前的場景。"
   },
   "visualizerAddPresetFolder": "新增場景資料夾",
   "@visualizerAddPresetFolder": {
@@ -1391,21 +1387,9 @@
   "@visualizerEffectsMore": {
     "description": "視覺化特效頻率設置項的選項：更頻繁地播放特效。"
   },
-  "coverWallDisplay": "封面牆顯示內容",
-  "@coverWallDisplay": {
-    "description": "選擇封面牆頁面顯示內容的設置項標題。"
-  },
-  "coverWallDisplaySubtitle": "在封面牆頁面顯示封面或視覺化",
-  "@coverWallDisplaySubtitle": {
-    "description": "封面牆顯示內容設置項的副標題。"
-  },
-  "coverWallDisplayCovers": "封面牆",
-  "@coverWallDisplayCovers": {
-    "description": "封面牆顯示內容設置項的選項，也是封面牆頁面右鍵選單項，顯示專輯封面牆。"
-  },
-  "coverWallDisplayVisualizer": "視覺化",
-  "@coverWallDisplayVisualizer": {
-    "description": "封面牆顯示內容設置項的選項，也是封面牆頁面右鍵選單項，顯示音樂視覺化。"
+  "visualizer": "視覺化",
+  "@visualizer": {
+    "description": "視覺化設定頁與開啟它的導航項的標題，也是視覺化可用時封面牆按鈕的名稱。"
   },
   "coverWallVisualizerSubtitle": "隨音樂變化的畫面",
   "@coverWallVisualizerSubtitle": {

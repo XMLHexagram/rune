@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:fluent_ui/fluent_ui.dart';
 import 'package:material_symbols_icons/symbols.dart';
+import 'package:provider/provider.dart';
 
 import '../../../utils/l10n.dart';
 import '../../../utils/rune_log.dart';
@@ -11,6 +12,7 @@ import '../../../utils/visualizer_preset_dirs.dart';
 import '../../../utils/file_storage/mac_secure_manager.dart';
 import '../../../widgets/settings/settings_button.dart';
 import '../../../widgets/settings/settings_tile_title.dart';
+import '../../../providers/visualizer_scenes.dart';
 import '../../../bindings/bindings.dart';
 
 /// The scene folders of the visualizer, managed like the library folders.
@@ -60,6 +62,8 @@ class _VisualizerPresetSettingState extends State<VisualizerPresetSetting> {
   }
 
   Future<void> _update(List<String> dirs) async {
+    final scenes = context.read<VisualizerScenesProvider>();
+    final added = dirs.length > _presetDirs.length;
     await saveVisualizerPresetDirs(dirs);
     if (!mounted) return;
     setState(() => _presetDirs = dirs);
@@ -67,6 +71,7 @@ class _VisualizerPresetSettingState extends State<VisualizerPresetSetting> {
     // A visualizer that is open follows now; one that is not open reads the
     // setting when it starts.
     SetVisualizerPresetDirsRequest(paths: dirs).sendSignalToRust();
+    unawaited(scenes.refresh(enableNew: added));
     final response = VisualizerStatusResponse.rustSignalStream.first.timeout(
       const Duration(seconds: 2),
     );
@@ -108,10 +113,9 @@ class _VisualizerPresetSettingState extends State<VisualizerPresetSetting> {
             itemBuilder: (context, index) {
               final itemPath = _presetDirs[index];
               final isSelected = itemPath == selectedItem;
-              final name = itemPath.split(RegExp(r'[/\\]')).lastWhere(
-                    (x) => x.isNotEmpty,
-                    orElse: () => itemPath,
-                  );
+              final name = itemPath
+                  .split(RegExp(r'[/\\]'))
+                  .lastWhere((x) => x.isNotEmpty, orElse: () => itemPath);
 
               return ListTile.selectable(
                 title: SettingsTileTitle(

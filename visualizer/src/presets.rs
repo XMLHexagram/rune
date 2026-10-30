@@ -6,20 +6,28 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use rand::Rng;
 
-/// Where a scene is: a folder, or the program (a built-in scene, by name).
+/// Where a scene is: a folder, or the program (a built-in scene, by name). The app's cover wall
+/// takes part in the choice like a scene, but the app draws it: the visualizer draws nothing while
+/// it is on.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Location {
     Folder(PathBuf),
     Builtin(String),
+    CoverWall,
 }
 
 impl Location {
     /// What the path of a built-in scene starts with where a folder's path is expected (the
     /// app's messages). A folder's path is absolute, so the two cannot be mixed up.
     const BUILTIN_PREFIX: &'static str = "builtin:";
+    /// The path of the cover wall in the app's messages.
+    const COVER_WALL: &'static str = "app:cover-wall";
 
     /// The location a path of [`Self::to_string`] names.
     pub fn parse(text: &str) -> Self {
+        if text == Self::COVER_WALL {
+            return Self::CoverWall;
+        }
         match text.strip_prefix(Self::BUILTIN_PREFIX) {
             Some(name) => Self::Builtin(name.to_string()),
             None => Self::Folder(PathBuf::from(text)),
@@ -32,6 +40,7 @@ impl std::fmt::Display for Location {
         match self {
             Self::Folder(path) => path.display().fmt(f),
             Self::Builtin(name) => write!(f, "{}{name}", Self::BUILTIN_PREFIX),
+            Self::CoverWall => f.write_str(Self::COVER_WALL),
         }
     }
 }
@@ -58,6 +67,13 @@ impl Preset {
         Self {
             name: name.to_string(),
             location: Location::Builtin(name.to_string()),
+        }
+    }
+
+    pub fn cover_wall() -> Self {
+        Self {
+            name: "Cover Wall".to_string(),
+            location: Location::CoverWall,
         }
     }
 }
@@ -128,15 +144,20 @@ fn collect(dir: &Path, entries: &mut Vec<Entry>) -> Result<()> {
     Ok(())
 }
 
-/// The scenes that take part in rotation (the built-in ones and those of the scene folders),
-/// with the history of what was loaded. The rules are
+/// The scenes that take part in rotation (the built-in ones, those of the scene folders and the
+/// app's cover wall if it has one), with the history of what was loaded. Scenes the user turned
+/// off are listed but not picked at random. The rules are
 /// those of MilkDrop 2 (Nullsoft, BSD-3): "previous" walks back through the last
 /// [`HISTORY_LEN`] scenes and "next" walks forward again before it picks a new random one.
 #[derive(Default)]
 pub struct PresetList {
     /// The names of the built-in scenes.
     builtins: Vec<String>,
+    /// Whether the app's cover wall is one of the scenes.
+    cover_wall: bool,
     entries: Vec<Entry>,
+    /// The scenes random picks leave out, unless every scene is off.
+    disabled: Vec<Location>,
     /// The presets loaded through this list, oldest first.
     history: VecDeque<Preset>,
     /// Index into `history` of the preset that is loaded. Meaningless while it is empty.
@@ -170,10 +191,59 @@ impl PresetList {
         (self.replace(entries), errors)
     }
 
+    /// Make the app's cover wall one of the scenes, or none of them. The history is emptied when
+    /// that changes.
+    pub fn set_cover_wall(&mut self, cover_wall: bool) {
+        if cover_wall == self.cover_wall {
+            return;
+        }
+        self.cover_wall = cover_wall;
+        let folders = std::mem::take(&mut self.entries)
+            .into_iter()
+            .filter(|e| matches!(e.preset.location, Location::Folder(_)))
+            .collect();
+        self.replace(folders);
+    }
+
+    /// Leave the scenes at `locations` out of random picks, replacing the earlier ones; those not
+    /// in the list (also scenes of folders scanned later) are picked. Turning every scene off
+    /// counts as turning none off.
+    pub fn set_disabled(&mut self, locations: Vec<Location>) {
+        self.disabled = locations;
+    }
+
+    /// Whether random picks may choose the scene at `location`.
+    pub fn is_enabled(&self, location: &Location) -> bool {
+        !self.disabled.contains(location) || self.enabled().next().is_none()
+    }
+
+    /// The scenes random picks choose from: those not turned off.
+    fn enabled(&self) -> impl Iterator<Item = &Entry> {
+        self.entries
+            .iter()
+            .filter(|e| !self.disabled.contains(&e.preset.location))
+    }
+
+    /// The scenes random picks choose from, or every scene when all are off.
+    fn choices(&self) -> Vec<&Entry> {
+        let enabled: Vec<&Entry> = self.enabled().collect();
+        if enabled.is_empty() {
+            self.entries.iter().collect()
+        } else {
+            enabled
+        }
+    }
+
     fn replace(&mut self, mut entries: Vec<Entry>) -> usize {
         for name in &self.builtins {
             entries.push(Entry {
                 preset: Preset::builtin(name),
+                group: String::new(),
+            });
+        }
+        if self.cover_wall {
+            entries.push(Entry {
+                preset: Preset::cover_wall(),
                 group: String::new(),
             });
         }
@@ -239,11 +309,13 @@ impl PresetList {
     }
 
     /// The scene for an automatic switch, while `current` is on screen: forward in the history if
-    /// the way back was taken (and that scene is another one), else a new random scene other than
-    /// `current`, so that a switch always shows something new unless there is only one scene.
+    /// the way back was taken (and that scene is another one that is not off), else a new random
+    /// scene other than `current`, so that a switch always shows something new unless there is
+    /// only one scene to pick.
     pub fn next_other(&mut self, rng: &mut impl Rng, current: &Location) -> Result<Preset> {
         if self.cursor + 1 < self.history.len()
             && self.history[self.cursor + 1].location != *current
+            && self.is_enabled(&self.history[self.cursor + 1].location)
         {
             self.cursor += 1;
             return Ok(self.history[self.cursor].clone());
@@ -251,19 +323,18 @@ impl PresetList {
         self.random_other(rng, current)
     }
 
-    /// A new random scene other than `current`, or any when `current` is the only one. Forward
-    /// history is dropped.
+    /// A new random scene other than `current`, or any when `current` is the only one to pick.
+    /// Forward history is dropped.
     pub fn random_other(&mut self, rng: &mut impl Rng, current: &Location) -> Result<Preset> {
         self.check_not_empty()?;
-        let others: Vec<&Entry> = self
-            .entries
+        let choices = self.choices();
+        let others: Vec<&Entry> = choices
             .iter()
+            .copied()
             .filter(|entry| entry.preset.location != *current)
             .collect();
         let preset = if others.is_empty() {
-            self.entries[rng.gen_range(0..self.entries.len())]
-                .preset
-                .clone()
+            choices[rng.gen_range(0..choices.len())].preset.clone()
         } else {
             others[rng.gen_range(0..others.len())].preset.clone()
         };
@@ -273,9 +344,8 @@ impl PresetList {
     /// A new random scene. Forward history is dropped.
     pub fn random(&mut self, rng: &mut impl Rng) -> Result<Preset> {
         self.check_not_empty()?;
-        let preset = self.entries[rng.gen_range(0..self.entries.len())]
-            .preset
-            .clone();
+        let choices = self.choices();
+        let preset = choices[rng.gen_range(0..choices.len())].preset.clone();
         self.remember(preset)
     }
 
@@ -466,6 +536,7 @@ mod tests {
         for location in [
             Location::Folder(PathBuf::from("/music/Scenes/a b")),
             Location::Builtin("CRT Wall".into()),
+            Location::CoverWall,
         ] {
             assert_eq!(Location::parse(&location.to_string()), location);
         }
@@ -473,6 +544,70 @@ mod tests {
             Location::Builtin("Growth".into()).to_string(),
             "builtin:Growth"
         );
+    }
+
+    #[test]
+    fn random_picks_leave_out_the_scenes_that_are_off_unless_all_are() {
+        let mut list = listed(&["a", "b", "c"]);
+        let at = |name: &str| Preset::from_path(Path::new(name)).location;
+        list.set_disabled(vec![at("a"), at("c")]);
+        let mut rng = rng();
+        for _ in 0..50 {
+            assert_eq!(list.random(&mut rng).unwrap().location, at("b"));
+            // The only scene to pick comes again rather than one that is off.
+            assert_eq!(
+                list.next_other(&mut rng, &at("b")).unwrap().location,
+                at("b")
+            );
+        }
+        // Off is not gone: the scene is still listed and can be loaded by hand.
+        assert_eq!(list.infos().len(), 3);
+        list.set_disabled(vec![at("a"), at("b"), at("c")]);
+        let mut seen: Vec<Location> = (0..50)
+            .map(|_| list.random(&mut rng).unwrap().location)
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn going_forward_in_the_history_skips_a_scene_turned_off_meanwhile() {
+        let mut list = listed(&["a", "b"]);
+        let at = |name: &str| Preset::from_path(Path::new(name)).location;
+        let mut rng = rng();
+        let first = list.random_other(&mut rng, &at("b")).unwrap();
+        assert_eq!(first.location, at("a"));
+        list.random_other(&mut rng, &at("a")).unwrap();
+        list.previous().unwrap();
+        list.set_disabled(vec![at("b")]);
+        assert_eq!(
+            list.next_other(&mut rng, &at("a")).unwrap().location,
+            at("a")
+        );
+    }
+
+    #[test]
+    fn the_cover_wall_is_a_scene_only_when_the_app_has_one() {
+        let names = ["Alpha"].map(String::from).to_vec();
+        let mut list = PresetList::with_builtins(names);
+        assert_eq!(list.len(), 1);
+        list.set_cover_wall(true);
+        assert_eq!((list.len(), list.folder_len()), (2, 0));
+        assert!(list.infos().contains(&PresetInfo {
+            name: "Cover Wall".into(),
+            location: Location::CoverWall,
+            group: String::new(),
+        }));
+        // A scan keeps it.
+        assert_eq!(list.scan_all(&[]).0, 2);
+        list.set_disabled(vec![Location::Builtin("Alpha".into())]);
+        assert_eq!(
+            list.random(&mut rng()).unwrap().location,
+            Location::CoverWall
+        );
+        list.set_cover_wall(false);
+        assert_eq!(list.len(), 1);
     }
 
     #[test]

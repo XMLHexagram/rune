@@ -15,7 +15,12 @@ use anyhow::Result;
 use log::warn;
 use visualizer::Visualizer;
 
-pub static VISUALIZER: LazyLock<Visualizer> = LazyLock::new(Visualizer::new);
+/// The app's cover wall is one of its scenes.
+pub static VISUALIZER: LazyLock<Visualizer> = LazyLock::new(|| {
+    let visualizer = Visualizer::new();
+    visualizer.offer_cover_wall();
+    visualizer
+});
 
 /// How many random covers a scene that reads covers gets besides the one of the track playing.
 const RANDOM_COVERS: usize = 63;

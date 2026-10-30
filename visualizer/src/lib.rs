@@ -74,7 +74,7 @@ use pipeline::{Pipeline, Rendered, SceneBuild};
 pub use presets::{Location, PresetInfo};
 use presets::{Preset, PresetList};
 pub use rhythm::{BeatTracker, Rhythm};
-use scene::Scene;
+use scene::{MusicValues, Scene};
 #[cfg(target_os = "linux")]
 pub use shared_vulkan::SharedFrame;
 use switching::{Decision, SceneSwitch};
@@ -217,8 +217,9 @@ pub struct Status {
     pub target_fps: u32,
     pub measured_fps: f32,
     pub preset_name: String,
-    /// Where the scene on screen is, as [`Location`]'s text (`builtin:<name>` or a folder's
-    /// path): the name alone does not tell a built-in scene from a folder scene of that name.
+    /// Where the scene on screen is, as [`Location`]'s text (`builtin:<name>`, a folder's path or
+    /// `app:cover-wall`): the name alone does not tell a built-in scene from a folder scene of that
+    /// name.
     pub preset_path: String,
     /// Scenes to choose from: the built-in ones and those of the chosen folders.
     pub preset_count: usize,
@@ -695,6 +696,20 @@ impl Visualizer {
         Ok(count)
     }
 
+    /// Make the app's cover wall one of the scenes (see [`Location::CoverWall`]): picked like a
+    /// scene, it stops the drawing until another scene comes.
+    pub fn offer_cover_wall(&self) {
+        let mut library = lock(&self.library);
+        library.folder.set_cover_wall(true);
+        self.shared.status().preset_count = library.folder.len();
+    }
+
+    /// Leave the scenes at `locations` out of random picks and the automatic switch, replacing
+    /// the earlier ones. They are still listed and can be loaded by name.
+    pub fn set_disabled_scenes(&self, locations: Vec<Location>) {
+        lock(&self.library).folder.set_disabled(locations);
+    }
+
     /// Every scene, by group and name, for choosing one.
     pub fn list_presets(&self) -> Vec<PresetInfo> {
         lock(&self.library).folder.infos()
@@ -920,6 +935,21 @@ fn run(
     let mut playing_cover_seen: Option<u64> = None;
     // Benchmark mode (see [`bench`]) shows every built-in scene in turn, whatever is asked for.
     let mut bench = bench::seconds_from_env().map(bench::Bench::new);
+    // Whether nothing is drawn: the cover wall is on, or the scene to begin with is being built.
+    let mut hidden = false;
+    // The visualizer begins with the default scene; if that is off, with a random one that is
+    // on, shown at once when it is built.
+    let begin = Location::Builtin(pipeline.preset_name().to_string());
+    if bench.is_none() {
+        let mut library = lock(library);
+        if !library.folder.is_enabled(&begin)
+            && let Ok(preset) = library.folder.random(&mut rng)
+        {
+            drop(library);
+            hidden = true;
+            start_scene_load(shared, &pipeline, &mut loads, preset.location, AT_ONCE);
+        }
+    }
 
     loop {
         loop {
@@ -954,7 +984,7 @@ fn run(
 
         // A scene that finished building replaces the one on screen, also while paused.
         if let Some(loaded) = loads.take() {
-            install(shared, &mut pipeline, &mut watched, loaded);
+            install(shared, &mut pipeline, &mut watched, &mut hidden, loaded);
             still_drawn = false;
         }
 
@@ -962,12 +992,15 @@ fn run(
         // now and the wait starts again.
         if let Some(loaded) = auto.loads.take() {
             if let Ok(scene) = &loaded.scene {
-                // The scene coming decides how the switch to it looks.
-                auto.decider
-                    .allow(switching::Allowed::of(scene.switch_transitions()));
+                // The scene coming decides how the switch to it looks; the cover wall comes at
+                // once, whatever is chosen.
+                if let Some(scene) = scene {
+                    auto.decider
+                        .allow(switching::Allowed::of(scene.switch_transitions()));
+                }
                 auto.held = Some(loaded);
             } else {
-                install(shared, &mut pipeline, &mut watched, loaded);
+                install(shared, &mut pipeline, &mut watched, &mut hidden, loaded);
                 auto.restart();
             }
         }
@@ -1027,7 +1060,7 @@ fn run(
             continue;
         }
         still_drawn = paused;
-        if !pcm.is_empty() {
+        if !pcm.is_empty() && !hidden {
             pipeline.push_pcm(&pcm, channels);
         }
 
@@ -1045,10 +1078,13 @@ fn run(
         // only happens with the next scene built and no scene loaded by hand still on its way.
         let ready = auto.held.is_some() && !loads.is_pending();
         let song = lock(&shared.playback).path.clone();
+        // Behind the cover wall the music is not followed: it counts as quiet, so the next scene
+        // comes as soon as it is built.
+        let quiet = MusicValues::default();
         let decision = auto.decider.tick(
             time,
             song.as_deref(),
-            pipeline.music(),
+            if hidden { &quiet } else { pipeline.music() },
             switch_paused,
             ready,
         );
@@ -1094,11 +1130,34 @@ fn run(
                         pipeline.music(),
                     );
                     loaded.switch = Switch(transition, durations);
-                    install(shared, &mut pipeline, &mut watched, loaded);
+                    install(shared, &mut pipeline, &mut watched, &mut hidden, loaded);
                     still_drawn = false;
                 }
                 auto.restart();
             }
+        }
+
+        if hidden {
+            // Nothing to draw: wait for commands and the next song with the clock standing
+            // still, as while the music is paused.
+            let since = Instant::now();
+            match commands.recv_timeout(PAUSED_POLL) {
+                Ok(Command::Stop) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                Ok(command) => apply(
+                    shared,
+                    library,
+                    &mut pipeline,
+                    &mut auto,
+                    &mut loads,
+                    command,
+                ),
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            frozen += since.elapsed();
+            deadline = Instant::now();
+            window_start = deadline;
+            window_frames = 0;
+            continue;
         }
 
         // A chart knows the beats of the whole song, or that it has none: it replaces the
@@ -1214,7 +1273,10 @@ const MANUAL_SWITCH: Switch = Switch(
 
 /// How a scene built ahead for the automatic switch is shown until the switch picks the real
 /// one (see [`switching`]), when the scene is held and nothing is shown.
-const PREPARED_SWITCH: Switch = Switch(
+const PREPARED_SWITCH: Switch = AT_ONCE;
+
+/// A cut: how a scene replaces the cover wall, or nothing at the start.
+const AT_ONCE: Switch = Switch(
     Transition::Cut,
     Durations {
         out: 0.0,
@@ -1254,7 +1316,8 @@ struct Loaded {
     switch: Switch,
     /// Where the scene is from; a folder is watched for changes.
     location: Location,
-    scene: Result<Scene>,
+    /// None for the cover wall, which has nothing to build.
+    scene: Result<Option<Scene>>,
 }
 
 /// Start building the scene `build` makes, which replaces any load still running. The scene on
@@ -1271,7 +1334,7 @@ fn start_load(
             .start(move || Loaded {
                 switch,
                 location,
-                scene: build.run(),
+                scene: build.run().map(Some),
             })
             .context("Failed to start a thread to build the scene")
     });
@@ -1280,21 +1343,37 @@ fn start_load(
     }
 }
 
-/// Show a scene that finished building, or its error (the scene on screen stays then).
+/// Show a scene that finished building, or its error (the scene on screen stays then). The cover
+/// wall hides the scene on screen; the scene after it shows at once.
 fn install(
     shared: &Shared,
     pipeline: &mut Pipeline,
     watched: &mut Option<Watched>,
+    hidden: &mut bool,
     loaded: Loaded,
 ) {
-    match loaded.scene.and_then(|scene| {
-        let Switch(transition, durations) = loaded.switch;
-        pipeline.switch_to(scene, transition, durations)
-    }) {
+    let switched = loaded.scene.and_then(|scene| {
+        let Some(scene) = scene else {
+            *hidden = true;
+            return Ok(());
+        };
+        let Switch(transition, durations) = if *hidden { AT_ONCE } else { loaded.switch };
+        pipeline.switch_to(scene, transition, durations)?;
+        *hidden = false;
+        Ok(())
+    });
+    match switched {
+        Ok(()) if loaded.location == Location::CoverWall => {
+            *watched = None;
+            let mut status = shared.status();
+            status.preset_name = Preset::cover_wall().name;
+            status.preset_path = loaded.location.to_string();
+            status.last_error = None;
+        }
         Ok(()) => {
             *watched = match &loaded.location {
                 Location::Folder(dir) => Some(Watched::new(dir.clone())),
-                Location::Builtin(_) => None,
+                Location::Builtin(_) | Location::CoverWall => None,
             };
             {
                 let mut status = shared.status();
@@ -1310,7 +1389,14 @@ fn install(
             }
             shared.status().last_error = None;
         }
-        Err(e) => shared.set_error(format!("{e:#}")),
+        Err(e) => {
+            // A scene that was to replace the one the visualizer began with failed: show that one
+            // instead of nothing. The cover wall stays up.
+            if shared.status().preset_path != Location::CoverWall.to_string() {
+                *hidden = false;
+            }
+            shared.set_error(format!("{e:#}"));
+        }
     }
 }
 
@@ -1335,6 +1421,16 @@ fn start_scene_load(
                 switch,
                 pipeline.scene_build_builtin(&name),
             );
+        }
+        Location::CoverWall => {
+            let started = loads.start(move || Loaded {
+                switch,
+                location: Location::CoverWall,
+                scene: Ok(None),
+            });
+            if let Err(e) = started {
+                shared.set_error(format!("Failed to start a thread for the cover wall: {e}"));
+            }
         }
     }
 }
