@@ -15,10 +15,13 @@ use anyhow::Result;
 use log::warn;
 use visualizer::Visualizer;
 
-/// The app's cover wall is one of its scenes.
+/// The app's cover wall is one of its scenes, and its errors go to the Log page.
 pub static VISUALIZER: LazyLock<Visualizer> = LazyLock::new(|| {
     let visualizer = Visualizer::new();
     visualizer.offer_cover_wall();
+    visualizer.set_error_listener(Some(Arc::new(|operation, message| {
+        crate::visualizer_log::error(operation, message.to_string())
+    })));
     visualizer
 });
 

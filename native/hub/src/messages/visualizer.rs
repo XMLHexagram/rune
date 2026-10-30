@@ -103,8 +103,9 @@ pub struct RemoveVisualizerSceneResponse {
     pub error: Option<String>,
 }
 
-/// Whether the visualizer's messages (info, warnings and errors) go to the Log page. The app sends
-/// its setting once the library is open and whenever it changes.
+/// Whether the visualizer's diagnostics (the GPU it runs on, how frames reach the screen) go to the
+/// Log page; its errors always do. The app sends its setting at start and whenever it changes,
+/// and the Log page's entries are written from the first one on.
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetVisualizerLogRequest {
     pub enabled: bool,

@@ -1371,13 +1371,13 @@
   "@visualizerNoGpu": {
     "description": "裝置沒有可用顯示卡（沒有，或只有軟體算繪器）時，視覺化場景設定中顯示的警告標題；其他場景會變灰。下方附視覺化給出的原因（英文）。"
   },
-  "visualizerLog": "視覺化日誌",
+  "visualizerLog": "視覺化診斷資訊",
   "@visualizerLog": {
-    "description": "把視覺化的執行資訊寫入日誌頁、便於排查問題的設定項標題。"
+    "description": "把視覺化的診斷資訊（顯示卡、畫面傳輸方式）寫入日誌頁、便於排查問題的設定項標題；錯誤資訊無論開關都會寫入。"
   },
-  "visualizerLogSubtitle": "把視覺化的執行資訊寫入「日誌」頁，便於排查問題",
+  "visualizerLogSubtitle": "額外把視覺化使用的顯示卡、畫面的傳輸方式寫入「日誌」頁；錯誤資訊始終會寫入",
   "@visualizerLogSubtitle": {
-    "description": "視覺化日誌設定項的副標題。"
+    "description": "視覺化診斷資訊設定項的副標題。"
   },
   "visualizerImportScene": "匯入場景",
   "@visualizerImportScene": {

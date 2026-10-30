@@ -89,7 +89,8 @@ class VisualizerScenesProvider extends ChangeNotifier {
   /// Why there is no GPU for the scenes, as Rust says it (in English).
   String? get gpuProblem => _gpuProblem;
 
-  /// Whether the visualizer's messages go to the Log page.
+  /// Whether the visualizer's diagnostics go to the Log page (its errors
+  /// always do).
   bool get log => _log;
 
   void setLog(bool log) {

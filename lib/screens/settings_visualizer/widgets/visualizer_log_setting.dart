@@ -6,8 +6,9 @@ import '../../../utils/visualizer_supported.dart';
 import '../../../widgets/settings/settings_box_toggle.dart';
 import '../../../providers/visualizer_scenes.dart';
 
-/// Whether the visualizer's messages (which GPU it runs on, how frames reach
-/// the screen, problems) are written to the Log page, for debugging.
+/// Whether the visualizer's diagnostics (which GPU it runs on, how frames reach
+/// the screen) are written to the Log page, for debugging. Its errors are
+/// written there in any case.
 class VisualizerLogSetting extends StatelessWidget {
   const VisualizerLogSetting({super.key});
 

@@ -169,6 +169,7 @@ const kVisualizerDisabledScenesKey = 'visualizer_disabled_scenes';
 /// the order of [kVisualizerScenesKey]. This defaults to false (in order).
 const kVisualizerShuffleScenesKey = 'visualizer_shuffle_scenes';
 
-/// Whether the visualizer's messages are written to the Log page, for
-/// debugging. This defaults to false.
+/// Whether the visualizer's diagnostics (its GPU, how frames reach the screen)
+/// are written to the Log page, for debugging; its errors always are. This
+/// defaults to false.
 const kVisualizerLogKey = 'visualizer_log';

@@ -1381,13 +1381,13 @@
   "@visualizerNoGpu": {
     "description": "设备没有可用显卡（没有，或只有软件渲染器）时，可视化场景设置中显示的警告标题；其他场景会变灰。下方附可视化给出的原因（英文）。"
   },
-  "visualizerLog": "可视化日志",
+  "visualizerLog": "可视化诊断信息",
   "@visualizerLog": {
-    "description": "把可视化的运行信息写入日志页、便于排查问题的设置项标题。"
+    "description": "把可视化的诊断信息（显卡、画面传输方式）写入日志页、便于排查问题的设置项标题；出错信息无论开关都会写入。"
   },
-  "visualizerLogSubtitle": "把可视化的运行信息写入“日志”页，便于排查问题",
+  "visualizerLogSubtitle": "额外把可视化使用的显卡、画面的传输方式写入“日志”页；出错信息始终会写入",
   "@visualizerLogSubtitle": {
-    "description": "可视化日志设置项的副标题。"
+    "description": "可视化诊断信息设置项的副标题。"
   },
   "visualizerImportScene": "导入场景",
   "@visualizerImportScene": {

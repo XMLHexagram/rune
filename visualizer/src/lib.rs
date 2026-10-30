@@ -92,6 +92,10 @@ pub type FrameListener = Arc<dyn Fn(u64) + Send + Sync>;
 /// Told how frames leave the GPU (see [`Visualizer::set_transport_listener`]).
 pub type TransportListener = Arc<dyn Fn(Transport) + Send + Sync>;
 
+/// Told every error (see [`Visualizer::set_error_listener`]): what was being done, in a word or
+/// two such as `load_scene`, and the error.
+pub type ErrorListener = Arc<dyn Fn(&'static str, &str) + Send + Sync>;
+
 /// Sample rate assumed until the first track tells the real one.
 const FALLBACK_SAMPLE_RATE: u32 = 44_100;
 
@@ -316,6 +320,8 @@ struct Shared {
     frame_listener: Mutex<Option<FrameListener>>,
     /// Told how frames leave the GPU, when the render thread knows and when that changes.
     transport_listener: Mutex<Option<TransportListener>>,
+    /// Told every error.
+    error_listener: Mutex<Option<ErrorListener>>,
     /// The LUID of the adapter Flutter renders on (see [`adapter_luid`]), 0 while unknown.
     adapter_luid: AtomicU64,
     /// The UUIDs of the GPU Flutter renders on, while known.
@@ -359,8 +365,14 @@ impl Shared {
         self.status.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn set_error(&self, message: String) {
-        error!("Visualizer: {message}");
+    /// Record an error of `operation` (see [`ErrorListener`]) for [`Status::last_error`] and the
+    /// error listener.
+    fn set_error(&self, operation: &'static str, message: String) {
+        error!("Visualizer ({operation}): {message}");
+        let listener = lock(&self.error_listener).clone();
+        if let Some(listener) = listener {
+            listener(operation, &message);
+        }
         self.status().last_error = Some(message);
     }
 }
@@ -419,6 +431,7 @@ impl Visualizer {
                 covers_requester: Mutex::new(None),
                 frame_listener: Mutex::new(None),
                 transport_listener: Mutex::new(None),
+                error_listener: Mutex::new(None),
                 adapter_luid: AtomicU64::new(0),
                 device_uuids: Mutex::new(None),
                 fall_back: AtomicBool::new(false),
@@ -688,7 +701,7 @@ impl Visualizer {
         self.shared.status().preset_count = count;
         if !errors.is_empty() {
             let message: Vec<String> = errors.iter().map(|e| format!("{e:#}")).collect();
-            self.shared.set_error(message.join("; "));
+            self.shared.set_error("scan_scenes", message.join("; "));
         }
         // Not running: `start` begins with the built-in scene anyway.
         let current = Location::parse(&self.shared.status().preset_path);
@@ -776,9 +789,10 @@ impl Visualizer {
             .store(paused, Ordering::Relaxed);
     }
 
-    /// Record an error that happened outside the render thread, for [`Status::last_error`].
-    pub fn report_error(&self, message: String) {
-        self.shared.set_error(message);
+    /// Record an error of `operation` that happened outside the render thread, for
+    /// [`Status::last_error`] and the error listener.
+    pub fn report_error(&self, operation: &'static str, message: String) {
+        self.shared.set_error(operation, message);
     }
 
     pub fn status(&self) -> Status {
@@ -827,6 +841,11 @@ impl Visualizer {
         *lock(&self.shared.transport_listener) = listener;
     }
 
+    /// Tell `listener` every error from now on, with what was being done (see [`ErrorListener`]).
+    pub fn set_error_listener(&self, listener: Option<ErrorListener>) {
+        *lock(&self.shared.error_listener) = listener;
+    }
+
     fn send(&self, command: Command) -> Result<()> {
         let worker = lock(&self.worker);
         let worker = worker.as_ref().context("The visualizer is not running")?;
@@ -869,7 +888,7 @@ fn worker_main(
         Err(_) => Some("The visualizer thread panicked".to_string()),
     };
     if let Some(message) = failure {
-        shared.set_error(message);
+        shared.set_error("run", message);
     }
     shared.status().running = false;
     input
@@ -888,7 +907,7 @@ fn run(
     };
     let on_gpu_error = {
         let shared = Arc::clone(shared);
-        Arc::new(move |message: String| shared.set_error(message))
+        Arc::new(move |message: String| shared.set_error("gpu", message))
     };
     let readback = shared.prefer_readback.load(Ordering::Relaxed);
     let adapter_luid = match shared.adapter_luid.load(Ordering::Relaxed) {
@@ -1131,7 +1150,7 @@ fn run(
                             auto.decider.prepare_started();
                         }
                         Some(Err(e)) => {
-                            shared.set_error(format!("{e:#}"));
+                            shared.set_error("switch_scene", format!("{e:#}"));
                             auto.restart();
                         }
                         None => auto.restart(),
@@ -1359,7 +1378,7 @@ fn start_load(
             .context("Failed to start a thread to build the scene")
     });
     if let Err(e) = started {
-        shared.set_error(format!("{e:#}"));
+        shared.set_error("load_scene", format!("{e:#}"));
     }
 }
 
@@ -1415,7 +1434,7 @@ fn install(
             if shared.status().preset_path != Location::CoverWall.to_string() {
                 *hidden = false;
             }
-            shared.set_error(format!("{e:#}"));
+            shared.set_error("load_scene", format!("{e:#}"));
         }
     }
 }
@@ -1449,7 +1468,10 @@ fn start_scene_load(
                 scene: Ok(None),
             });
             if let Err(e) = started {
-                shared.set_error(format!("Failed to start a thread for the cover wall: {e}"));
+                shared.set_error(
+                    "load_scene",
+                    format!("Failed to start a thread for the cover wall: {e}"),
+                );
             }
         }
     }
@@ -1508,7 +1530,7 @@ fn apply(
     };
     match result {
         Ok(()) => shared.status().last_error = None,
-        Err(e) => shared.set_error(format!("{e:#}")),
+        Err(e) => shared.set_error("resize", format!("{e:#}")),
     }
 }
 
@@ -1560,11 +1582,11 @@ fn lab(
                 pipeline.set_runtime(Arc::new(runtime));
                 shared.status().last_error = None;
             }
-            Err(e) => shared.set_error(format!("{e:#}")),
+            Err(e) => shared.set_error("lab", format!("{e:#}")),
         },
         LabCommand::SceneBindings(text) => match pipeline.set_scene_bindings(&text) {
             Ok(()) => shared.status().last_error = None,
-            Err(e) => shared.set_error(format!("{e:#}")),
+            Err(e) => shared.set_error("lab", format!("{e:#}")),
         },
         LabCommand::NextScene(transition) => {
             let current = Location::parse(&shared.status().preset_path);
@@ -1579,7 +1601,7 @@ fn lab(
                     let switch = Switch(transition, durations);
                     start_scene_load(shared, pipeline, loads, preset.location, switch);
                 }
-                Some(Err(e)) => shared.set_error(format!("{e:#}")),
+                Some(Err(e)) => shared.set_error("lab", format!("{e:#}")),
                 None => info!("There is no scene to switch to"),
             }
         }
@@ -1673,7 +1695,7 @@ impl Watched {
             Err(e) => {
                 let message = format!("{e:#}");
                 if shared.status().last_error.as_deref() != Some(message.as_str()) {
-                    shared.set_error(message);
+                    shared.set_error("reload_scene", message);
                 }
                 false
             }

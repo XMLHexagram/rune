@@ -16,11 +16,12 @@ use crate::{
     visualizer::{VISUALIZER, provide_covers},
 };
 
-/// Errors of the visualizer controls go to the status (`last_error`) instead of crashing the
-/// request loop, since a missing preset directory or GPU is an ordinary condition.
-fn report(result: Result<()>) -> Result<Option<()>> {
+/// Errors of the visualizer controls go to the status (`last_error`) and the Log page, under
+/// `operation`, instead of crashing the request loop, since a missing scene or GPU is an ordinary
+/// condition.
+fn report(operation: &'static str, result: Result<()>) -> Result<Option<()>> {
     if let Err(e) = result {
-        VISUALIZER.report_error(format!("{e:#}"));
+        VISUALIZER.report_error(operation, format!("{e:#}"));
     }
     Ok(Some(()))
 }
@@ -65,6 +66,7 @@ impl Signal for StartVisualizerRequest {
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let _turn = STARTING_OR_STOPPING.lock().await;
+        crate::visualizer_log::write_to(Arc::clone(&main_db));
         provide_covers(fsio, main_db, recommend_db);
         let tap = player.lock().await.pcm_tap();
         // A restart: take the audio back from the running visualizer first.
@@ -72,7 +74,7 @@ impl Signal for StartVisualizerRequest {
             tap.restore_consumer(input.consumer);
         }
         let Some(consumer) = tap.take_consumer() else {
-            return report(Err(anyhow::anyhow!("The PCM tap is in use")));
+            return report("start", Err(anyhow::anyhow!("The PCM tap is in use")));
         };
         tap.set_enabled(true);
         let input = PcmInput {
@@ -89,7 +91,7 @@ impl Signal for StartVisualizerRequest {
         );
         if result.is_err() {
             tap.set_enabled(false);
-            return report(result);
+            return report("start", result);
         }
         flutter_bridge::visualizer_started().await;
         Ok(Some(()))
@@ -141,7 +143,10 @@ impl Signal for ResizeVisualizerRequest {
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let _turn = STARTING_OR_STOPPING.lock().await;
-        report(flutter_bridge::resize_visualizer(dart_signal.width, dart_signal.height).await)
+        report(
+            "resize",
+            flutter_bridge::resize_visualizer(dart_signal.width, dart_signal.height).await,
+        )
     }
 }
 
@@ -162,7 +167,7 @@ impl Signal for SetVisualizerPresetDirsRequest {
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let dirs: Vec<PathBuf> = dart_signal.paths.iter().map(PathBuf::from).collect();
-        report(VISUALIZER.set_preset_dirs(&dirs).map(|_| ()))
+        report("scan_scenes", VISUALIZER.set_preset_dirs(&dirs).map(|_| ()))
     }
 }
 
@@ -224,7 +229,10 @@ impl Signal for LoadVisualizerPresetRequest {
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        report(VISUALIZER.load_preset(Location::parse(&dart_signal.path)))
+        report(
+            "load_scene",
+            VISUALIZER.load_preset(Location::parse(&dart_signal.path)),
+        )
     }
 }
 
@@ -244,7 +252,7 @@ impl Signal for NextVisualizerPresetRequest {
         _session: Option<Session>,
         _dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        report(VISUALIZER.next_preset())
+        report("switch_scene", VISUALIZER.next_preset())
     }
 }
 
@@ -264,7 +272,7 @@ impl Signal for PreviousVisualizerPresetRequest {
         _session: Option<Session>,
         _dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        report(VISUALIZER.previous_preset())
+        report("switch_scene", VISUALIZER.previous_preset())
     }
 }
 
@@ -284,7 +292,7 @@ impl Signal for RandomVisualizerPresetRequest {
         _session: Option<Session>,
         _dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        report(VISUALIZER.random_preset())
+        report("switch_scene", VISUALIZER.random_preset())
     }
 }
 
@@ -448,16 +456,15 @@ impl Signal for ImportVisualizerSceneRequest {
         };
         let (path, error) = match imported {
             Ok(path) => {
-                log::info!(
-                    "Imported the scene {} into {}",
-                    file.display(),
-                    path.display()
-                );
+                let imported = format!("Imported {} into {}", file.display(), path.display());
+                log::info!("{imported}");
+                crate::visualizer_log::diagnostic("import_scene", imported);
                 rescan(&dir);
                 (Some(path.to_string_lossy().into_owned()), None)
             }
             Err(e) => {
-                log::warn!("Failed to import the scene {}: {e:#}", file.display());
+                log::error!("Failed to import the scene {}: {e:#}", file.display());
+                crate::visualizer_log::error("import_scene", format!("{}: {e:#}", file.display()));
                 (None, Some(format!("{e:#}")))
             }
         };
@@ -497,7 +504,11 @@ impl Signal for RemoveVisualizerSceneRequest {
                 rescan(&dir);
                 None
             }
-            Err(e) => Some(format!("{e:#}")),
+            Err(e) => {
+                log::error!("Failed to delete the scene {}: {e:#}", path.display());
+                crate::visualizer_log::error("remove_scene", format!("{}: {e:#}", path.display()));
+                Some(format!("{e:#}"))
+            }
         };
         Ok(Some(RemoveVisualizerSceneResponse {
             path: dart_signal.path.clone(),
@@ -509,7 +520,7 @@ impl Signal for RemoveVisualizerSceneRequest {
 /// List the scenes of `dir` again after a scene came or went.
 fn rescan(dir: &std::path::Path) {
     if let Err(e) = VISUALIZER.set_preset_dirs(&[dir.to_path_buf()]) {
-        VISUALIZER.report_error(format!("{e:#}"));
+        VISUALIZER.report_error("scan_scenes", format!("{e:#}"));
     }
 }
 
@@ -531,7 +542,8 @@ impl Signal for SetVisualizerLogRequest {
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        crate::visualizer_log::set_enabled(dart_signal.enabled, main_db);
+        crate::visualizer_log::set_diagnostics(dart_signal.enabled);
+        crate::visualizer_log::write_to(main_db);
         Ok(Some(()))
     }
 }
@@ -565,8 +577,17 @@ impl Signal for VisualizerSupportRequest {
                     Err(e) => Err(format!("The GPU probe failed: {e}")),
                 };
                 match &gpu {
-                    Ok(adapter) => log::info!("The visualizer can run on {adapter}"),
-                    Err(problem) => log::warn!("The visualizer cannot run: {problem}"),
+                    Ok(adapter) => {
+                        log::info!("The visualizer can run on {adapter}");
+                        crate::visualizer_log::diagnostic(
+                            "probe_gpu",
+                            format!("The visualizer can run on {adapter}"),
+                        );
+                    }
+                    Err(problem) => {
+                        log::error!("The visualizer cannot run: {problem}");
+                        crate::visualizer_log::error("probe_gpu", problem.clone());
+                    }
                 }
                 gpu
             })

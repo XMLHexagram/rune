@@ -1389,13 +1389,13 @@
   "@visualizerNoGpu": {
     "description": "Title of a warning in the visualizer scenes setting when the device has no usable GPU (none, or only a software renderer); the other scenes are greyed out. The reason from the visualizer follows below it, in English."
   },
-  "visualizerLog": "Visualizer log",
+  "visualizerLog": "Visualizer diagnostics",
   "@visualizerLog": {
-    "description": "Title of the setting that writes the visualizer's messages to the Log page, for debugging."
+    "description": "Title of the setting that writes the visualizer's diagnostics (its GPU, how frames reach the screen) to the Log page, for debugging; its errors are written there in any case."
   },
-  "visualizerLogSubtitle": "Write the visualizer's messages to the Log page, for finding problems",
+  "visualizerLogSubtitle": "Also write which GPU the visualizer runs on and how its frames reach the screen to the Log page. Its errors are always there.",
   "@visualizerLogSubtitle": {
-    "description": "Subtitle of the visualizer log setting."
+    "description": "Subtitle of the visualizer diagnostics setting."
   },
   "visualizerImportScene": "Import scene",
   "@visualizerImportScene": {

@@ -48,7 +48,6 @@ use tracing_logcat::{LogcatMakeWriter, LogcatTag};
 use tracing_subscriber::EnvFilter;
 #[cfg(target_os = "android")]
 use tracing_subscriber::fmt::format::Format;
-use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 pub struct DatabaseConnections {
     pub main_db: Arc<MainDbConnection>,
@@ -594,9 +593,8 @@ pub fn init_logging() {
         "symphonia_format_ogg=off,symphonia_core=off,symphonia_bundle_mp3::demuxer=off,sea_orm_migration::migrator=off,info",
     );
 
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(stdout_filter))
-        .with(crate::visualizer_log::layer())
+    tracing_subscriber::fmt()
+        .with_env_filter(stdout_filter)
         .init();
 }
 
@@ -613,14 +611,9 @@ pub fn init_logging() {
 
     // JNI_OnLoad (playback::android_utils) may have already installed a global
     // subscriber; a second .init() would panic and kill the Rust main thread.
-    let _ = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .event_format(Format::default().with_level(false).without_time())
-                .with_writer(writer)
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        )
-        .with(crate::visualizer_log::layer())
+    let _ = tracing_subscriber::fmt()
+        .event_format(Format::default().with_level(false).without_time())
+        .with_writer(writer)
+        .with_ansi(false)
         .try_init();
 }
