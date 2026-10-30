@@ -69,7 +69,7 @@ pub use inspect::{
 };
 use loading::Loads;
 pub use moments::{Chances, EffectLevel};
-pub use pipeline::{DEFAULT_PRESET_NAME, Transport};
+pub use pipeline::{DEFAULT_PRESET_NAME, Transport, probe_gpu};
 use pipeline::{Pipeline, Rendered, SceneBuild};
 pub use presets::{Location, PresetInfo};
 use presets::{Preset, PresetList};

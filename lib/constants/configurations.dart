@@ -178,6 +178,10 @@ const kVisualizerDisabledScenesKey = 'visualizer_disabled_scenes';
 /// the order of [kVisualizerScenesKey]. This defaults to false (in order).
 const kVisualizerShuffleScenesKey = 'visualizer_shuffle_scenes';
 
+/// Whether the visualizer's messages are written to the Log page, for
+/// debugging. This defaults to false.
+const kVisualizerLogKey = 'visualizer_log';
+
 /// 'default' or 'more': how often the visualizer plays effects at the music's
 /// moments. This defaults to 'default' when the setting is missing.
 const kVisualizerEffectLevelKey = 'visualizer_effect_level';

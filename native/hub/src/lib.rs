@@ -10,6 +10,7 @@ pub mod messages;
 pub mod server;
 pub mod utils;
 pub mod visualizer;
+mod visualizer_log;
 
 use std::{future::Future, sync::Arc, time::Duration};
 
@@ -17,7 +18,9 @@ use anyhow::Result;
 use log::{error, info};
 use rustls::crypto::ring::default_provider;
 use tokio::sync::Mutex;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{
+    EnvFilter, Layer as _, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _,
+};
 
 pub use tokio;
 
@@ -64,10 +67,14 @@ async fn main() {
         let file_appender = tracing_appender::rolling::never(".", file_name);
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-        tracing_subscriber::fmt()
-            .with_env_filter(file_filter)
-            .with_writer(non_blocking)
-            .with_timer(fmt::time::ChronoLocal::rfc_3339())
+        tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_timer(fmt::time::ChronoLocal::rfc_3339())
+                    .with_filter(file_filter),
+            )
+            .with(visualizer_log::layer())
             .init();
 
         info!("Logging is enabled");

@@ -1385,6 +1385,18 @@
   "@visualizerSceneOrderShuffle": {
     "description": "Option of the visualizer scene order setting: each song gets a random checked scene."
   },
+  "visualizerNoGpu": "This device has no GPU for the visualizer, so only the cover wall can be shown",
+  "@visualizerNoGpu": {
+    "description": "Title of a warning in the visualizer scenes setting when the device has no usable GPU (none, or only a software renderer); the other scenes are greyed out. The reason from the visualizer follows below it, in English."
+  },
+  "visualizerLog": "Visualizer log",
+  "@visualizerLog": {
+    "description": "Title of the setting that writes the visualizer's messages to the Log page, for debugging."
+  },
+  "visualizerLogSubtitle": "Write the visualizer's messages to the Log page, for finding problems",
+  "@visualizerLogSubtitle": {
+    "description": "Subtitle of the visualizer log setting."
+  },
   "visualizerSettings": "Visualizer settings",
   "@visualizerSettings": {
     "description": "Context menu item of the cover wall page that opens the visualizer settings page."

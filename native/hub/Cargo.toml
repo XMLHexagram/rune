@@ -36,6 +36,8 @@ metadata = { path = "../../metadata" }
 discovery = { path = "../../discovery" }
 lazy_static = "1.5.0"
 log = "0.4.22"
+tracing = "0.1"
+tracing-log = "0.2"
 tracing-subscriber = { version = "0.3.20", features = ["chrono", "registry"] }
 paste = "1.0.15"
 tokio-util = "0.7.11"

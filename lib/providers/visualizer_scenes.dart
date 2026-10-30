@@ -48,6 +48,9 @@ class VisualizerScene {
 class VisualizerScenesProvider extends ChangeNotifier {
   List<VisualizerScene> _scenes = const [];
   bool _shuffle = false;
+  bool _log = false;
+  bool? _gpu;
+  String? _gpuProblem;
   bool _loaded = false;
   bool _sceneShowing = false;
   Future<void>? _refreshing;
@@ -70,7 +73,27 @@ class VisualizerScenesProvider extends ChangeNotifier {
   bool get showVisualizer =>
       isVisualizerSupported &&
       _loaded &&
+      _gpu == true &&
       _scenes.any((scene) => scene.enabled && !scene.isCoverWall);
+
+  /// Whether this machine has a GPU for the scenes: null until Rust has
+  /// looked. Without one (no GPU, or only a software renderer that would draw
+  /// on the CPU) only the cover wall can be shown.
+  bool? get gpu => _gpu;
+
+  /// Why there is no GPU for the scenes, as Rust says it (in English).
+  String? get gpuProblem => _gpuProblem;
+
+  /// Whether the visualizer's messages go to the Log page.
+  bool get log => _log;
+
+  void setLog(bool log) {
+    if (log == _log) return;
+    _log = log;
+    $settingsManager.setValue(kVisualizerLogKey, log);
+    notifyListeners();
+    SetVisualizerLogRequest(enabled: log).sendSignalToRust();
+  }
 
   /// Whether a scene other than the cover wall is on screen. Set by the
   /// visualizer surface; scenes draw on black.
@@ -89,17 +112,40 @@ class VisualizerScenesProvider extends ChangeNotifier {
         await MacSecureManager().completed;
       }
       final dirs = await loadVisualizerPresetDirs();
-      if (dirs.isNotEmpty) {
-        SetVisualizerPresetDirsRequest(paths: dirs).sendSignalToRust();
-      }
-      // Rust may not answer yet while the app starts; until it does, the
-      // cover wall page shows the plain wall.
-      for (var attempt = 0; attempt < 5 && !_loaded; attempt++) {
+      _log = await $settingsManager.getValue<bool>(kVisualizerLogKey) ?? false;
+      // Rust answers once the library is open, which can take a while (or
+      // wait for the user to pick one); until then the cover wall page shows
+      // the plain wall. Signals sent before that are lost, so they are sent
+      // again with every attempt.
+      while (!_loaded) {
+        SetVisualizerLogRequest(enabled: _log).sendSignalToRust();
+        if (dirs.isNotEmpty) {
+          SetVisualizerPresetDirsRequest(paths: dirs).sendSignalToRust();
+        }
         await refresh();
+        if (!_loaded) await Future.delayed(const Duration(seconds: 3));
       }
+      await _probeGpu();
     } catch (e) {
       error$('Failed to load the visualizer scenes: $e');
     }
+  }
+
+  Future<void> _probeGpu() async {
+    // Looking for a GPU can take a few seconds the first time.
+    final response = VisualizerSupportResponse.rustSignalStream.first.timeout(
+      const Duration(seconds: 20),
+    );
+    VisualizerSupportRequest().sendSignalToRust();
+    try {
+      final support = (await response).message;
+      _gpu = support.supported;
+      _gpuProblem = support.problem;
+    } on TimeoutException {
+      _gpu = false;
+      _gpuProblem = 'No answer from the GPU probe';
+    }
+    notifyListeners();
   }
 
   /// Asks Rust for the scenes and reconciles them with the saved order and

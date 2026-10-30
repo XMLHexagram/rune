@@ -5,6 +5,7 @@ import '../../widgets/unavailable_page_on_band.dart';
 import '../../widgets/navigation_bar/page_content_frame.dart';
 
 import 'widgets/visualizer_effect_level_setting.dart';
+import 'widgets/visualizer_log_setting.dart';
 import 'widgets/visualizer_preset_setting.dart';
 import 'widgets/visualizer_scene_order_setting.dart';
 import 'widgets/visualizer_scenes_setting.dart';
@@ -25,6 +26,7 @@ class SettingsVisualizerPage extends StatelessWidget {
                 VisualizerSceneOrderSetting(),
                 VisualizerPresetSetting(),
                 VisualizerEffectLevelSetting(),
+                VisualizerLogSetting(),
               ],
             ),
           ),

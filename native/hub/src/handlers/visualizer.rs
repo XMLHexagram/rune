@@ -449,6 +449,79 @@ impl Signal for SetVisualizerScenesRequest {
     }
 }
 
+impl ParamsExtractor for SetVisualizerLogRequest {
+    type Params = (Arc<MainDbConnection>,);
+
+    fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
+        (Arc::clone(&all_params.main_db),)
+    }
+}
+
+impl Signal for SetVisualizerLogRequest {
+    type Params = (Arc<MainDbConnection>,);
+    type Response = ();
+
+    async fn handle(
+        &self,
+        (main_db,): Self::Params,
+        _session: Option<Session>,
+        dart_signal: &Self,
+    ) -> Result<Option<Self::Response>> {
+        crate::visualizer_log::set_enabled(dart_signal.enabled, main_db);
+        Ok(Some(()))
+    }
+}
+
+/// What [`visualizer::probe_gpu`] found, once: the GPU does not change while the app runs.
+static GPU: tokio::sync::OnceCell<std::result::Result<String, String>> =
+    tokio::sync::OnceCell::const_new();
+
+impl ParamsExtractor for VisualizerSupportRequest {
+    type Params = ();
+
+    fn extract_params(&self, _all_params: &GlobalParams) -> Self::Params {}
+}
+
+impl Signal for VisualizerSupportRequest {
+    type Params = ();
+    type Response = VisualizerSupportResponse;
+
+    async fn handle(
+        &self,
+        _: Self::Params,
+        _session: Option<Session>,
+        _dart_signal: &Self,
+    ) -> Result<Option<Self::Response>> {
+        let gpu = GPU
+            .get_or_init(|| async {
+                let probed = tokio::task::spawn_blocking(::visualizer::probe_gpu).await;
+                let gpu = match probed {
+                    Ok(Ok(adapter)) => Ok(adapter),
+                    Ok(Err(e)) => Err(format!("{e:#}")),
+                    Err(e) => Err(format!("The GPU probe failed: {e}")),
+                };
+                match &gpu {
+                    Ok(adapter) => log::info!("The visualizer can run on {adapter}"),
+                    Err(problem) => log::warn!("The visualizer cannot run: {problem}"),
+                }
+                gpu
+            })
+            .await;
+        Ok(Some(match gpu {
+            Ok(adapter) => VisualizerSupportResponse {
+                supported: true,
+                adapter: adapter.clone(),
+                problem: None,
+            },
+            Err(problem) => VisualizerSupportResponse {
+                supported: false,
+                adapter: String::new(),
+                problem: Some(problem.clone()),
+            },
+        }))
+    }
+}
+
 impl ParamsExtractor for ListVisualizerPresetsRequest {
     type Params = ();
 

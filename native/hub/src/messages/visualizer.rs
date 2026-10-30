@@ -78,6 +78,27 @@ pub struct SetVisualizerScenesRequest {
     pub shuffle: bool,
 }
 
+/// Whether the visualizer's messages (info, warnings and errors) go to the Log page. The app sends
+/// its setting once the library is open and whenever it changes.
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct SetVisualizerLogRequest {
+    pub enabled: bool,
+}
+
+/// Whether this machine can run the visualizer, asked before starting it.
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct VisualizerSupportRequest {}
+
+/// `supported`: there is a GPU (`adapter` names it). Otherwise `problem` says why not: no GPU
+/// adapter, or only a software renderer, which would draw the scenes on the CPU; then only the
+/// cover wall can be shown.
+#[derive(Serialize, Deserialize, RustSignal)]
+pub struct VisualizerSupportResponse {
+    pub supported: bool,
+    pub adapter: String,
+    pub problem: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct VisualizerStatusRequest {}
 
