@@ -66,13 +66,16 @@ pub struct SetVisualizerEffectLevelRequest {
     pub level: String,
 }
 
-/// The scenes next, random and the automatic switch leave out (in the form of
-/// `VisualizerPresetEntry::path`), replacing the earlier ones; every other scene, also one of a
-/// folder scanned later, is picked. They can still be loaded by path. Turning every scene off
-/// counts as turning none off.
+/// How the scenes are picked (paths in the form of `VisualizerPresetEntry::path`), replacing what
+/// was set before. Next and the switch at every song go through the scenes in `order`, or pick at
+/// random if `shuffle`; scenes not in `order`, such as those of a folder scanned later, come after
+/// it. `disabled` are left out, but can still be loaded by path; turning every scene off counts as
+/// turning none off.
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct SetVisualizerDisabledScenesRequest {
-    pub paths: Vec<String>,
+pub struct SetVisualizerScenesRequest {
+    pub order: Vec<String>,
+    pub disabled: Vec<String>,
+    pub shuffle: bool,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]

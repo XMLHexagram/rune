@@ -1347,9 +1347,25 @@
   "@visualizerScenes": {
     "description": "列出視覺化場景、可勾選並排序的設置項標題。"
   },
-  "visualizerScenesSubtitle": "每首歌從勾選的場景中挑一個，拖動可排序",
+  "visualizerScenesSubtitle": "每首歌一個場景，從勾選的場景中挑選，拖動可排序",
   "@visualizerScenesSubtitle": {
     "description": "視覺化場景設置項的副標題。"
+  },
+  "visualizerSceneOrder": "場景順序",
+  "@visualizerSceneOrder": {
+    "description": "選擇視覺化按順序還是隨機為每首歌挑選場景的設置項標題。"
+  },
+  "visualizerSceneOrderSubtitle": "下一首歌的場景如何挑選",
+  "@visualizerSceneOrderSubtitle": {
+    "description": "視覺化場景順序設置項的副標題。"
+  },
+  "visualizerSceneOrderInOrder": "按順序",
+  "@visualizerSceneOrderInOrder": {
+    "description": "視覺化場景順序設置項的選項：每首歌按場景列表的順序換到下一個勾選的場景。"
+  },
+  "visualizerSceneOrderShuffle": "隨機",
+  "@visualizerSceneOrderShuffle": {
+    "description": "視覺化場景順序設置項的選項：每首歌隨機挑一個勾選的場景。"
   },
   "visualizerSettings": "視覺化設定",
   "@visualizerSettings": {

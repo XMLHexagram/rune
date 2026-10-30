@@ -63,7 +63,6 @@ class _VisualizerPresetSettingState extends State<VisualizerPresetSetting> {
 
   Future<void> _update(List<String> dirs) async {
     final scenes = context.read<VisualizerScenesProvider>();
-    final added = dirs.length > _presetDirs.length;
     await saveVisualizerPresetDirs(dirs);
     if (!mounted) return;
     setState(() => _presetDirs = dirs);
@@ -71,7 +70,7 @@ class _VisualizerPresetSettingState extends State<VisualizerPresetSetting> {
     // A visualizer that is open follows now; one that is not open reads the
     // setting when it starts.
     SetVisualizerPresetDirsRequest(paths: dirs).sendSignalToRust();
-    unawaited(scenes.refresh(enableNew: added));
+    unawaited(scenes.refresh());
     final response = VisualizerStatusResponse.rustSignalStream.first.timeout(
       const Duration(seconds: 2),
     );

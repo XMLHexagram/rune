@@ -1365,9 +1365,25 @@
   "@visualizerScenes": {
     "description": "Title of the setting that lists the visualizer scenes to check, uncheck and reorder."
   },
-  "visualizerScenesSubtitle": "One scene for each song, picked from the checked ones. Drag to reorder.",
+  "visualizerScenesSubtitle": "One scene for each song, from the checked ones. Drag to reorder.",
   "@visualizerScenesSubtitle": {
     "description": "Subtitle of the visualizer scenes setting."
+  },
+  "visualizerSceneOrder": "Scene order",
+  "@visualizerSceneOrder": {
+    "description": "Title of the setting that chooses whether the visualizer goes through its scenes in order or at random, one for each song."
+  },
+  "visualizerSceneOrderSubtitle": "How the scene for the next song is picked",
+  "@visualizerSceneOrderSubtitle": {
+    "description": "Subtitle of the visualizer scene order setting."
+  },
+  "visualizerSceneOrderInOrder": "In order",
+  "@visualizerSceneOrderInOrder": {
+    "description": "Option of the visualizer scene order setting: each song gets the next checked scene, in the order of the scenes setting."
+  },
+  "visualizerSceneOrderShuffle": "Shuffle",
+  "@visualizerSceneOrderShuffle": {
+    "description": "Option of the visualizer scene order setting: each song gets a random checked scene."
   },
   "visualizerSettings": "Visualizer settings",
   "@visualizerSettings": {

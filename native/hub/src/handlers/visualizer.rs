@@ -423,13 +423,13 @@ impl Signal for ListVisualizerCreditsRequest {
     }
 }
 
-impl ParamsExtractor for SetVisualizerDisabledScenesRequest {
+impl ParamsExtractor for SetVisualizerScenesRequest {
     type Params = ();
 
     fn extract_params(&self, _all_params: &GlobalParams) -> Self::Params {}
 }
 
-impl Signal for SetVisualizerDisabledScenesRequest {
+impl Signal for SetVisualizerScenesRequest {
     type Params = ();
     type Response = ();
 
@@ -439,12 +439,12 @@ impl Signal for SetVisualizerDisabledScenesRequest {
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        let locations = dart_signal
-            .paths
-            .iter()
-            .map(|path| Location::parse(path))
-            .collect();
-        VISUALIZER.set_disabled_scenes(locations);
+        let parse = |paths: &[String]| paths.iter().map(|path| Location::parse(path)).collect();
+        VISUALIZER.set_scene_choice(
+            parse(&dart_signal.order),
+            parse(&dart_signal.disabled),
+            dart_signal.shuffle,
+        );
         Ok(Some(()))
     }
 }

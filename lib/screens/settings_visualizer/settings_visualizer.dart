@@ -6,6 +6,7 @@ import '../../widgets/navigation_bar/page_content_frame.dart';
 
 import 'widgets/visualizer_effect_level_setting.dart';
 import 'widgets/visualizer_preset_setting.dart';
+import 'widgets/visualizer_scene_order_setting.dart';
 import 'widgets/visualizer_scenes_setting.dart';
 
 class SettingsVisualizerPage extends StatelessWidget {
@@ -21,6 +22,7 @@ class SettingsVisualizerPage extends StatelessWidget {
             child: Column(
               children: [
                 VisualizerScenesSetting(),
+                VisualizerSceneOrderSetting(),
                 VisualizerPresetSetting(),
                 VisualizerEffectLevelSetting(),
               ],

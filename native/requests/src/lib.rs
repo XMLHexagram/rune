@@ -169,7 +169,7 @@ pub fn define_request_types(_input: TokenStream) -> TokenStream {
             local_only: true,
         },
         RequestResponse {
-            request: "SetVisualizerDisabledScenesRequest".to_string(),
+            request: "SetVisualizerScenesRequest".to_string(),
             response: None,
             local_only: true,
         },

@@ -42,22 +42,26 @@ class VisualizerScene {
   );
 }
 
-/// The scenes of the visualizer in the order the user arranged them, and
-/// which of them are checked. The scenes come from Rust; the order and the
-/// unchecked ones are saved in the settings.
+/// The scenes of the visualizer in the order the user arranged them, which of
+/// them are checked, and whether they play in that order or shuffled. The
+/// scenes come from Rust; the rest is saved in the settings.
 class VisualizerScenesProvider extends ChangeNotifier {
   List<VisualizerScene> _scenes = const [];
+  bool _shuffle = false;
   bool _loaded = false;
   bool _sceneShowing = false;
   Future<void>? _refreshing;
   bool _refreshAgain = false;
-  bool _enableNewAgain = false;
 
   VisualizerScenesProvider() {
     if (isVisualizerSupported) _load();
   }
 
   List<VisualizerScene> get scenes => _scenes;
+
+  /// Whether each song gets a random scene instead of the next one in the
+  /// order.
+  bool get shuffle => _shuffle;
 
   /// Whether the cover wall page runs the visualizer: some checked scene is
   /// not the cover wall. With only the cover wall checked the page shows the
@@ -99,34 +103,32 @@ class VisualizerScenesProvider extends ChangeNotifier {
   }
 
   /// Asks Rust for the scenes and reconciles them with the saved order and
-  /// unchecked scenes. New scenes are checked if [enableNew] is set or if the
-  /// user already uses scenes other than the cover wall. Calls that overlap
-  /// share one run after the current one.
-  Future<void> refresh({bool enableNew = false}) {
+  /// unchecked scenes. Scenes seen for the first time (all of them on the
+  /// first run, then new built-in scenes and those of a new folder) are
+  /// checked, at the end of the order; on the first run the cover wall comes
+  /// first. Calls that overlap share one run after the current one.
+  Future<void> refresh() {
     final running = _refreshing;
     if (running != null) {
       _refreshAgain = true;
-      _enableNewAgain = _enableNewAgain || enableNew;
       return running;
     }
-    return _refreshing = _runRefresh(enableNew);
+    return _refreshing = _runRefresh();
   }
 
-  Future<void> _runRefresh(bool enableNew) async {
+  Future<void> _runRefresh() async {
     try {
       while (true) {
-        await _refreshOnce(enableNew);
+        await _refreshOnce();
         if (!_refreshAgain) break;
         _refreshAgain = false;
-        enableNew = _enableNewAgain;
-        _enableNewAgain = false;
       }
     } finally {
       _refreshing = null;
     }
   }
 
-  Future<void> _refreshOnce(bool enableNew) async {
+  Future<void> _refreshOnce() async {
     final response = ListVisualizerPresetsResponse.rustSignalStream.first
         .timeout(const Duration(seconds: 2));
     ListVisualizerPresetsRequest().sendSignalToRust();
@@ -137,40 +139,22 @@ class VisualizerScenesProvider extends ChangeNotifier {
       return;
     }
 
+    _shuffle =
+        await $settingsManager.getValue<bool>(kVisualizerShuffleScenesKey) ??
+        false;
     final storedOrder = await _loadPaths(kVisualizerScenesKey);
     final storedDisabled = await _loadPaths(kVisualizerDisabledScenesKey);
     final byPath = {for (final entry in listed) entry.path: entry};
 
     final order = <String>[];
-    final disabled = <String>{};
-    if (storedOrder == null) {
-      // First run: earlier versions chose between the wall and the visualizer.
-      final old = await $settingsManager.getValue<String>(kCoverWallDisplayKey);
-      final all = old == 'visualizer';
-      if (byPath.containsKey(kCoverWallScenePath)) {
-        order.add(kCoverWallScenePath);
-      }
-      order.addAll(
-        listed.map((e) => e.path).where((p) => p != kCoverWallScenePath),
-      );
-      if (!all) {
-        disabled.addAll(order.where((p) => p != kCoverWallScenePath));
-      }
-      await $settingsManager.removeValue(kCoverWallDisplayKey);
-    } else {
-      final known = storedOrder.where(byPath.containsKey).toList();
-      final knownDisabled = storedDisabled?.toSet() ?? <String>{};
-      final usesScenes = known.any(
-        (p) => p != kCoverWallScenePath && !knownDisabled.contains(p),
-      );
-      order.addAll(known);
-      disabled.addAll(known.where(knownDisabled.contains));
-      for (final entry in listed) {
-        if (order.contains(entry.path)) continue;
-        order.add(entry.path);
-        if (!enableNew && !usesScenes) disabled.add(entry.path);
-      }
+    if (storedOrder == null && byPath.containsKey(kCoverWallScenePath)) {
+      order.add(kCoverWallScenePath);
     }
+    order.addAll((storedOrder ?? const []).where(byPath.containsKey));
+    for (final entry in listed) {
+      if (!order.contains(entry.path)) order.add(entry.path);
+    }
+    final disabled = (storedDisabled ?? const []).toSet();
 
     _scenes = [
       for (final path in order)
@@ -185,7 +169,7 @@ class VisualizerScenesProvider extends ChangeNotifier {
     _loaded = true;
     await _save();
     notifyListeners();
-    _sendDisabled();
+    _sendChoice();
   }
 
   Future<List<String>?> _loadPaths(String key) async {
@@ -213,10 +197,20 @@ class VisualizerScenesProvider extends ChangeNotifier {
       if (!scene.enabled) scene.path,
   ];
 
-  void _sendDisabled() {
-    SetVisualizerDisabledScenesRequest(
-      paths: _disabledPaths(),
+  void _sendChoice() {
+    SetVisualizerScenesRequest(
+      order: _scenes.map((scene) => scene.path).toList(),
+      disabled: _disabledPaths(),
+      shuffle: _shuffle,
     ).sendSignalToRust();
+  }
+
+  void setShuffle(bool shuffle) {
+    if (shuffle == _shuffle) return;
+    _shuffle = shuffle;
+    $settingsManager.setValue(kVisualizerShuffleScenesKey, shuffle);
+    notifyListeners();
+    _sendChoice();
   }
 
   /// Moves a scene, with the semantics of `ReorderableColumn.onReorder`.
@@ -232,6 +226,7 @@ class VisualizerScenesProvider extends ChangeNotifier {
     _scenes = scenes;
     _save();
     notifyListeners();
+    _sendChoice();
   }
 
   /// Checks or unchecks a scene. The last checked scene cannot be unchecked.
@@ -246,6 +241,6 @@ class VisualizerScenesProvider extends ChangeNotifier {
     _scenes = scenes;
     _save();
     notifyListeners();
-    _sendDisabled();
+    _sendChoice();
   }
 }

@@ -704,10 +704,14 @@ impl Visualizer {
         self.shared.status().preset_count = library.folder.len();
     }
 
-    /// Leave the scenes at `locations` out of random picks and the automatic switch, replacing
-    /// the earlier ones. They are still listed and can be loaded by name.
-    pub fn set_disabled_scenes(&self, locations: Vec<Location>) {
-        lock(&self.library).folder.set_disabled(locations);
+    /// How the scenes are picked, replacing what was set before: switches go through them in
+    /// `order` (or at random, if `shuffle`), leaving out those at `disabled`, which are still
+    /// listed and can be loaded by name. Scenes not in `order` come after those that are.
+    pub fn set_scene_choice(&self, order: Vec<Location>, disabled: Vec<Location>, shuffle: bool) {
+        let mut library = lock(&self.library);
+        library.folder.set_order(order);
+        library.folder.set_disabled(disabled);
+        library.folder.set_shuffle(shuffle);
     }
 
     /// Every scene, by group and name, for choosing one.
@@ -715,14 +719,21 @@ impl Visualizer {
         lock(&self.library).folder.infos()
     }
 
-    /// Forward in the history if [`Self::previous_preset`] went back, else a new random scene.
-    /// Nothing happens without scenes.
+    /// The next scene in the order after the one on screen, or, when the scenes shuffle, forward
+    /// in the history if [`Self::previous_preset`] went back, else a new random scene. Nothing
+    /// happens without scenes.
     pub fn next_preset(&self) -> Result<()> {
         let mut library = lock(&self.library);
         if library.folder.len() == 0 {
             return Ok(());
         }
-        let preset = library.folder.next(&mut rand::thread_rng())?;
+        let mut rng = rand::thread_rng();
+        let preset = if library.folder.shuffles() {
+            library.folder.next(&mut rng)?
+        } else {
+            let current = Location::parse(&self.shared.status().preset_path);
+            library.folder.next_other(&mut rng, &current)?
+        };
         drop(library);
         self.load_entry(&preset)
     }
@@ -937,15 +948,22 @@ fn run(
     let mut bench = bench::seconds_from_env().map(bench::Bench::new);
     // Whether nothing is drawn: the cover wall is on, or the scene to begin with is being built.
     let mut hidden = false;
-    // The visualizer begins with the default scene; if that is off, with a random one that is
-    // on, shown at once when it is built.
+    // The pipeline comes with the default scene. In order, the visualizer begins with the scene
+    // shown last (or the first one); shuffled, with the default scene, or a random one if that is
+    // off. Another scene is shown at once when it is built.
     let begin = Location::Builtin(pipeline.preset_name().to_string());
     if bench.is_none() {
         let mut library = lock(library);
-        if !library.folder.is_enabled(&begin)
-            && let Ok(preset) = library.folder.random(&mut rng)
-        {
-            drop(library);
+        let first = if library.folder.shuffles() {
+            match library.folder.is_enabled(&begin) {
+                true => None,
+                false => library.folder.random(&mut rng).ok(),
+            }
+        } else {
+            library.folder.resume()
+        };
+        drop(library);
+        if let Some(preset) = first.filter(|preset| preset.location != begin) {
             hidden = true;
             start_scene_load(shared, &pipeline, &mut loads, preset.location, AT_ONCE);
         }

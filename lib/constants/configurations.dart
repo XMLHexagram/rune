@@ -174,9 +174,9 @@ const kVisualizerScenesKey = 'visualizer_scenes';
 /// The visualizer leaves them out when it picks a scene.
 const kVisualizerDisabledScenesKey = 'visualizer_disabled_scenes';
 
-/// 'covers' or 'visualizer': what the cover wall page showed in earlier
-/// versions. It is read once to set up the scenes and then removed.
-const kCoverWallDisplayKey = 'cover_wall_display';
+/// Whether each song gets a random visualizer scene instead of the next one in
+/// the order of [kVisualizerScenesKey]. This defaults to false (in order).
+const kVisualizerShuffleScenesKey = 'visualizer_shuffle_scenes';
 
 /// 'default' or 'more': how often the visualizer plays effects at the music's
 /// moments. This defaults to 'default' when the setting is missing.

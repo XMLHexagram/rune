@@ -1357,9 +1357,25 @@
   "@visualizerScenes": {
     "description": "列出可视化场景、可勾选并排序的设置项标题。"
   },
-  "visualizerScenesSubtitle": "每首歌从勾选的场景中挑一个，拖动可排序",
+  "visualizerScenesSubtitle": "每首歌一个场景，从勾选的场景中挑选，拖动可排序",
   "@visualizerScenesSubtitle": {
     "description": "可视化场景设置项的副标题。"
+  },
+  "visualizerSceneOrder": "场景顺序",
+  "@visualizerSceneOrder": {
+    "description": "选择可视化按顺序还是随机为每首歌挑选场景的设置项标题。"
+  },
+  "visualizerSceneOrderSubtitle": "下一首歌的场景如何挑选",
+  "@visualizerSceneOrderSubtitle": {
+    "description": "可视化场景顺序设置项的副标题。"
+  },
+  "visualizerSceneOrderInOrder": "按顺序",
+  "@visualizerSceneOrderInOrder": {
+    "description": "可视化场景顺序设置项的选项：每首歌按场景列表的顺序换到下一个勾选的场景。"
+  },
+  "visualizerSceneOrderShuffle": "随机",
+  "@visualizerSceneOrderShuffle": {
+    "description": "可视化场景顺序设置项的选项：每首歌随机挑一个勾选的场景。"
   },
   "visualizerSettings": "可视化设置",
   "@visualizerSettings": {

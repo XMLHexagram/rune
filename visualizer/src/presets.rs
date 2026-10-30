@@ -146,9 +146,10 @@ fn collect(dir: &Path, entries: &mut Vec<Entry>) -> Result<()> {
 
 /// The scenes that take part in rotation (the built-in ones, those of the scene folders and the
 /// app's cover wall if it has one), with the history of what was loaded. Scenes the user turned
-/// off are listed but not picked at random. The rules are
-/// those of MilkDrop 2 (Nullsoft, BSD-3): "previous" walks back through the last
-/// [`HISTORY_LEN`] scenes and "next" walks forward again before it picks a new random one.
+/// off are listed but not picked. A switch takes the next scene in the user's order, or, when the
+/// list shuffles, a random one by the rules of MilkDrop 2 (Nullsoft, BSD-3): "previous" walks back
+/// through the last [`HISTORY_LEN`] scenes and "next" walks forward again before it picks a new
+/// random one.
 #[derive(Default)]
 pub struct PresetList {
     /// The names of the built-in scenes.
@@ -156,8 +157,13 @@ pub struct PresetList {
     /// Whether the app's cover wall is one of the scenes.
     cover_wall: bool,
     entries: Vec<Entry>,
-    /// The scenes random picks leave out, unless every scene is off.
+    /// The scenes picks leave out, unless every scene is off.
     disabled: Vec<Location>,
+    /// The user's order of the scenes; scenes not in it come after those that are, in the order
+    /// of `entries`.
+    order: Vec<Location>,
+    /// Whether a switch picks a random scene instead of the next one in the order.
+    shuffle: bool,
     /// The presets loaded through this list, oldest first.
     history: VecDeque<Preset>,
     /// Index into `history` of the preset that is loaded. Meaningless while it is empty.
@@ -205,14 +211,28 @@ impl PresetList {
         self.replace(folders);
     }
 
-    /// Leave the scenes at `locations` out of random picks, replacing the earlier ones; those not
-    /// in the list (also scenes of folders scanned later) are picked. Turning every scene off
-    /// counts as turning none off.
+    /// Leave the scenes at `locations` out of picks, replacing the earlier ones; those not in the
+    /// list (also scenes of folders scanned later) are picked. Turning every scene off counts as
+    /// turning none off.
     pub fn set_disabled(&mut self, locations: Vec<Location>) {
         self.disabled = locations;
     }
 
-    /// Whether random picks may choose the scene at `location`.
+    /// The order switches go through the scenes in, replacing the earlier one.
+    pub fn set_order(&mut self, locations: Vec<Location>) {
+        self.order = locations;
+    }
+
+    /// Whether a switch picks a random scene instead of the next one in the order.
+    pub fn set_shuffle(&mut self, shuffle: bool) {
+        self.shuffle = shuffle;
+    }
+
+    pub fn shuffles(&self) -> bool {
+        self.shuffle
+    }
+
+    /// Whether picks may choose the scene at `location`.
     pub fn is_enabled(&self, location: &Location) -> bool {
         !self.disabled.contains(location) || self.enabled().next().is_none()
     }
@@ -224,7 +244,7 @@ impl PresetList {
             .filter(|e| !self.disabled.contains(&e.preset.location))
     }
 
-    /// The scenes random picks choose from, or every scene when all are off.
+    /// The scenes picks choose from (every scene when all are off).
     fn choices(&self) -> Vec<&Entry> {
         let enabled: Vec<&Entry> = self.enabled().collect();
         if enabled.is_empty() {
@@ -232,6 +252,60 @@ impl PresetList {
         } else {
             enabled
         }
+    }
+
+    /// Every scene in the user's order.
+    fn ordered(&self) -> Vec<&Entry> {
+        let mut entries: Vec<&Entry> = self.entries.iter().collect();
+        entries.sort_by_key(|entry| {
+            self.order
+                .iter()
+                .position(|l| *l == entry.preset.location)
+                .unwrap_or(self.order.len())
+        });
+        entries
+    }
+
+    /// The first scene to pick after `current` in the user's order, going from the last scene to
+    /// the first; `current` itself only when it is the only one. From the start of the order when
+    /// `current` is not in the list.
+    fn after(&self, current: &Location) -> Option<Preset> {
+        let ordered = self.ordered();
+        let choices = self.choices();
+        let start = ordered
+            .iter()
+            .position(|e| e.preset.location == *current)
+            .map_or(0, |index| index + 1);
+        (0..ordered.len())
+            .map(|step| ordered[(start + step) % ordered.len()])
+            .find(|entry| choices.iter().any(|c| std::ptr::eq(*c, *entry)))
+            .map(|entry| entry.preset.clone())
+    }
+
+    /// The scene a visualizer that starts begins with, in order: the one shown last if it is
+    /// still picked, else the one after it, else the first. None when the list shuffles, or is
+    /// empty.
+    pub fn resume(&mut self) -> Option<Preset> {
+        if self.shuffle {
+            return None;
+        }
+        let last = self.history.get(self.cursor).map(|p| p.location.clone());
+        let preset = match last {
+            Some(last)
+                if self.is_enabled(&last)
+                    && self.entries.iter().any(|e| e.preset.location == last) =>
+            {
+                return Some(self.history[self.cursor].clone());
+            }
+            Some(last) => self.after(&last)?,
+            None => self
+                .ordered()
+                .into_iter()
+                .find(|e| self.is_enabled(&e.preset.location))?
+                .preset
+                .clone(),
+        };
+        self.remember(preset).ok()
     }
 
     fn replace(&mut self, mut entries: Vec<Entry>) -> usize {
@@ -308,11 +382,16 @@ impl PresetList {
         Ok(Some(self.history[self.cursor].clone()))
     }
 
-    /// The scene for an automatic switch, while `current` is on screen: forward in the history if
-    /// the way back was taken (and that scene is another one that is not off), else a new random
-    /// scene other than `current`, so that a switch always shows something new unless there is
-    /// only one scene to pick.
+    /// The scene for an automatic switch, while `current` is on screen: the next one in the order,
+    /// or, when the list shuffles, forward in the history if the way back was taken (and that
+    /// scene is another one that is not off), else a new random scene other than `current`. A
+    /// switch shows something new unless there is only one scene to pick.
     pub fn next_other(&mut self, rng: &mut impl Rng, current: &Location) -> Result<Preset> {
+        if !self.shuffle {
+            self.check_not_empty()?;
+            let preset = self.after(current).context("No scene to switch to")?;
+            return self.remember(preset);
+        }
         if self.cursor + 1 < self.history.len()
             && self.history[self.cursor + 1].location != *current
             && self.is_enabled(&self.history[self.cursor + 1].location)
@@ -381,6 +460,7 @@ mod tests {
         StdRng::seed_from_u64(7)
     }
 
+    /// A list of folder scenes `names` that shuffles, the rules most tests are about.
     fn listed(names: &[&str]) -> PresetList {
         let entries = names
             .iter()
@@ -389,9 +469,51 @@ mod tests {
                 group: String::new(),
             })
             .collect();
-        let mut list = PresetList::default();
+        let mut list = PresetList {
+            shuffle: true,
+            ..PresetList::default()
+        };
         list.replace(entries);
         list
+    }
+
+    #[test]
+    fn in_order_a_switch_takes_the_next_scene_that_is_on_and_wraps_around() {
+        let mut list = listed(&["a", "b", "c", "d"]);
+        list.set_shuffle(false);
+        let at = |name: &str| Preset::from_path(Path::new(name)).location;
+        list.set_order(vec![at("c"), at("a"), at("d"), at("b")]);
+        list.set_disabled(vec![at("d")]);
+        let mut rng = rng();
+        let mut current = at("c");
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            current = list.next_other(&mut rng, &current).unwrap().location;
+            seen.push(current.clone());
+        }
+        assert_eq!(seen, [at("a"), at("b"), at("c"), at("a")]);
+        // A scene that was turned off while on screen is followed by the one after it.
+        assert_eq!(
+            list.next_other(&mut rng, &at("d")).unwrap().location,
+            at("b")
+        );
+    }
+
+    #[test]
+    fn in_order_a_new_start_resumes_the_scene_shown_last() {
+        let mut list = listed(&["a", "b", "c"]);
+        list.set_shuffle(false);
+        let at = |name: &str| Preset::from_path(Path::new(name)).location;
+        list.set_order(vec![at("b"), at("c"), at("a")]);
+        // Nothing shown yet: the first in the order.
+        assert_eq!(list.resume().unwrap().location, at("b"));
+        list.next_other(&mut rng(), &at("b")).unwrap();
+        assert_eq!(list.resume().unwrap().location, at("c"));
+        // Turned off since: the one after it.
+        list.set_disabled(vec![at("c")]);
+        assert_eq!(list.resume().unwrap().location, at("a"));
+        list.set_shuffle(true);
+        assert!(list.resume().is_none());
     }
 
     /// A scene folder `name` under `root`: an empty `scene.toml` is enough to be found.
