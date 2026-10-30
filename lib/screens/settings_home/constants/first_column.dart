@@ -31,6 +31,12 @@ final List<(String Function(BuildContext), String, IconData, bool)>
     false
   ),
   (
+    (context) => S.of(context).visualizer,
+    '/settings/visualizer',
+    Symbols.graphic_eq,
+    false
+  ),
+  (
     (context) => S.of(context).language,
     '/settings/language',
     Symbols.language,

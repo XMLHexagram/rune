@@ -141,14 +141,20 @@ async fn prepare_window(width: u32, height: u32) {
         match flutter_texture::register_surface(width, height).await {
             Ok(texture) => install(&mut textures, Kind::Surface, texture),
             Err(e) => {
-                VISUALIZER.report_error(format!("Failed to register the visualizer texture: {e}"));
+                VISUALIZER.report_error(
+                    "texture",
+                    format!("Failed to register the visualizer texture: {e}"),
+                );
                 return;
             }
         }
     } else if let Some((_, texture)) = &textures.current
         && let Err(e) = texture.set_size(width, height).await
     {
-        VISUALIZER.report_error(format!("Failed to resize the visualizer texture: {e}"));
+        VISUALIZER.report_error(
+            "texture",
+            format!("Failed to resize the visualizer texture: {e}"),
+        );
         return;
     }
     let Some((_, texture)) = &textures.current else {
@@ -156,7 +162,10 @@ async fn prepare_window(width: u32, height: u32) {
     };
     match texture.window().await {
         Ok(window) => VISUALIZER.set_window(Some(Box::new(window))),
-        Err(e) => VISUALIZER.report_error(format!("The visualizer texture has no window: {e}")),
+        Err(e) => VISUALIZER.report_error(
+            "texture",
+            format!("The visualizer texture has no window: {e}"),
+        ),
     }
 }
 
@@ -242,9 +251,13 @@ impl FrameSource for VisualizerFrames {
             // read-back frames.
             TextureError::SharedFrame(_) => {
                 warn!("{error}; the visualizer reads frames back");
+                crate::visualizer_log::diagnostic(
+                    "transport",
+                    format!("{error}; the visualizer reads frames back"),
+                );
                 VISUALIZER.fall_back_to_readback();
             }
-            error => VISUALIZER.report_error(error.to_string()),
+            error => VISUALIZER.report_error("texture", error.to_string()),
         }
     }
 }
@@ -332,6 +345,13 @@ pub async fn visualizer_started() {
     // The render thread tells how its frames leave the GPU once it is up, and when that changes.
     let runtime = tokio::runtime::Handle::current();
     VISUALIZER.set_transport_listener(Some(Arc::new(move |transport| {
+        crate::visualizer_log::diagnostic(
+            "transport",
+            format!(
+                "Frames leave {} by {transport:?}",
+                VISUALIZER.status().adapter
+            ),
+        );
         if let Some(kind) = wanted_kind(Some(transport)) {
             runtime.spawn(show(kind));
         }
@@ -364,7 +384,10 @@ async fn show(kind: Kind) {
                 return;
             }
             Err(e) => {
-                VISUALIZER.report_error(format!("Failed to register the visualizer texture: {e}"));
+                VISUALIZER.report_error(
+                    "texture",
+                    format!("Failed to register the visualizer texture: {e}"),
+                );
                 return;
             }
         }

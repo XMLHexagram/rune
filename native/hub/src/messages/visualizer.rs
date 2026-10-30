@@ -17,8 +17,9 @@ pub struct ResizeVisualizerRequest {
     pub height: u32,
 }
 
-/// Directories with scenes (folders with a `scene.toml`) used by next, previous and random. An
-/// empty list stops using scene folders: a running visualizer changes to the built-in scene.
+/// Directories with scenes (folders with a `scene.toml`) listed beside the built-in ones: the
+/// app's folder of imported scenes. A running visualizer whose scene is gone changes to the
+/// built-in scene.
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetVisualizerPresetDirsRequest {
     pub paths: Vec<String>,
@@ -59,11 +60,72 @@ pub struct SetVisualizerAutoSwitchPausedRequest {
     pub paused: bool,
 }
 
-/// How often effects play at the music's moments: "default" or "more" (anything else counts as
-/// "default"). The setting is saved by the app and sent when a visualizer starts.
+/// How the scenes are picked (paths in the form of `VisualizerPresetEntry::path`), replacing what
+/// was set before. Next and the switch at every song go through the scenes in `order`, or pick at
+/// random if `shuffle`; scenes not in `order`, such as those of a folder scanned later, come after
+/// it. `disabled` are left out, but can still be loaded by path; turning every scene off counts as
+/// turning none off.
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct SetVisualizerEffectLevelRequest {
-    pub level: String,
+pub struct SetVisualizerScenesRequest {
+    pub order: Vec<String>,
+    pub disabled: Vec<String>,
+    pub shuffle: bool,
+    /// The scene on screen when the app last ran, which a visualizer that starts resumes unless
+    /// another scene was shown since the app started.
+    pub last: Option<String>,
+}
+
+/// Unpack the scene file `file` (a `.runescene`, see `visualizer::package`) into a folder of its
+/// own in `dir`, the app's folder of imported scenes, replacing a scene of that name. The scenes
+/// of `dir` are listed again.
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct ImportVisualizerSceneRequest {
+    pub file: String,
+    pub dir: String,
+}
+
+/// `path` is the folder of the imported scene, or `error` says why the file is not one.
+#[derive(Serialize, Deserialize, RustSignal)]
+pub struct ImportVisualizerSceneResponse {
+    pub file: String,
+    pub path: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Delete the imported scene at `path`, which must be a folder directly in `dir`. The scenes of
+/// `dir` are listed again.
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct RemoveVisualizerSceneRequest {
+    pub path: String,
+    pub dir: String,
+}
+
+#[derive(Serialize, Deserialize, RustSignal)]
+pub struct RemoveVisualizerSceneResponse {
+    pub path: String,
+    pub error: Option<String>,
+}
+
+/// Whether the visualizer's diagnostics (the GPU it runs on, how frames reach the screen) go to the
+/// Log page; its errors always do. The app sends its setting at start and whenever it changes,
+/// and the Log page's entries are written from the first one on.
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct SetVisualizerLogRequest {
+    pub enabled: bool,
+}
+
+/// Whether this machine can run the visualizer, asked before starting it.
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct VisualizerSupportRequest {}
+
+/// `supported`: there is a GPU (`adapter` names it). Otherwise `problem` says why not: no GPU
+/// adapter, or only a software renderer, which would draw the scenes on the CPU; then only the
+/// cover wall can be shown.
+#[derive(Serialize, Deserialize, RustSignal)]
+pub struct VisualizerSupportResponse {
+    pub supported: bool,
+    pub adapter: String,
+    pub problem: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
@@ -77,7 +139,8 @@ pub struct VisualizerStatusResponse {
     pub target_fps: u32,
     pub measured_fps: f32,
     pub preset_name: String,
-    /// Where the scene on screen is, in the form of `VisualizerPresetEntry::path`.
+    /// Where the scene on screen is, in the form of `VisualizerPresetEntry::path`;
+    /// `app:cover-wall` while the cover wall is on and nothing is drawn.
     pub preset_path: String,
     pub preset_count: u32,
     pub adapter: String,
@@ -133,7 +196,8 @@ pub struct VisualizerPresetEntry {
     pub builtin: bool,
 }
 
-/// Every scene, the built-in ones and those of the scene folders, by group and name.
+/// Every scene, the built-in ones, the cover wall (path `app:cover-wall`, which the app draws and
+/// the visualizer leaves blank) and those of the scene folders, by group and name.
 #[derive(Serialize, Deserialize, RustSignal)]
 pub struct ListVisualizerPresetsResponse {
     pub presets: Vec<VisualizerPresetEntry>,

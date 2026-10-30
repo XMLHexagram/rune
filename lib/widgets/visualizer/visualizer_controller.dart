@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/foundation.dart';
 
 import '../../bindings/bindings.dart';
@@ -27,27 +25,30 @@ class VisualizerController {
   // Why the texture could not be set up.
   String? startError;
   bool hasPresets = false;
-  // The scenes of the folders, as of the last time the menu opened.
-  List<VisualizerPresetEntry> presets = const [];
 
   /// Set by the surface whenever a scene from a folder starts or a problem
   /// comes up; null while the built-in scene shows.
   final ValueNotifier<VisualizerLabel?> label = ValueNotifier(null);
 
+  /// The path of the scene on screen, from the status; null before the
+  /// visualizer runs.
+  final ValueNotifier<String?> scenePath = ValueNotifier(null);
+
   /// The user stopped the automatic scene switching.
   bool get locked => _locked;
 
-  /// A new surface starts with a new render thread, so the old state is gone.
-  void attach() {
+  /// A new surface starts with a new render thread, so the old state is gone;
+  /// only the lock carries over ([locked], as the user left it).
+  void attach({bool locked = false}) {
     _attached = true;
-    _locked = false;
+    _locked = locked;
     _menuOpen = false;
     _autoSwitchPaused = false;
     status = null;
     startError = null;
     hasPresets = false;
-    presets = const [];
     label.value = null;
+    scenePath.value = null;
   }
 
   void detach() => _attached = false;
@@ -72,20 +73,6 @@ class VisualizerController {
     LoadVisualizerPresetRequest(path: path).sendSignalToRust();
   }
 
-  /// Asks Rust for the scenes of the folders, which a menu lists. Keeps the
-  /// earlier list if Rust does not answer.
-  Future<void> refreshPresets() async {
-    if (!_attached) return;
-    final response = ListVisualizerPresetsResponse.rustSignalStream.first
-        .timeout(const Duration(seconds: 1));
-    ListVisualizerPresetsRequest().sendSignalToRust();
-    try {
-      presets = (await response).message.presets;
-    } on TimeoutException {
-      // The menu shows the list it has.
-    }
-  }
-
   void toggleLock() {
     _locked = !_locked;
     _syncAutoSwitchPaused();
@@ -96,12 +83,16 @@ class VisualizerController {
     _syncAutoSwitchPaused();
   }
 
+  /// Tells a render thread that just started whether the scene is locked: it
+  /// starts unlocked.
+  void sendLock() => _syncAutoSwitchPaused(force: true);
+
   // Rust does not switch scenes by itself while the scene is locked or the
   // menu is open, and takes the song that plays afterwards as the scene's own.
-  void _syncAutoSwitchPaused() {
+  void _syncAutoSwitchPaused({bool force = false}) {
     if (!_attached) return;
     final paused = _locked || _menuOpen;
-    if (paused == _autoSwitchPaused) return;
+    if (paused == _autoSwitchPaused && !force) return;
     _autoSwitchPaused = paused;
     SetVisualizerAutoSwitchPausedRequest(paused: paused).sendSignalToRust();
   }
