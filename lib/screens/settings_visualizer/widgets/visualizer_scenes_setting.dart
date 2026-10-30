@@ -8,6 +8,7 @@ import 'package:reorderables/reorderables.dart';
 import '../../../providers/visualizer_scenes.dart';
 import '../../../utils/build_draggable_feedback.dart';
 import '../../../utils/l10n.dart';
+import '../../../utils/rune_log.dart';
 import '../../../utils/visualizer_supported.dart';
 import '../../../widgets/pointer_type.dart';
 import '../../../widgets/settings/settings_block_title.dart';
@@ -81,15 +82,6 @@ class VisualizerScenesSetting extends StatelessWidget {
                                                 ? s.coverWall
                                                 : scene.name,
                                           ),
-                                          if (scene.group.isNotEmpty)
-                                            TextSpan(
-                                              text: '  ${scene.group}',
-                                              style: TextStyle(
-                                                color: theme
-                                                    .resources
-                                                    .textFillColorSecondary,
-                                              ),
-                                            ),
                                         ],
                                       ),
                                     ),
@@ -109,6 +101,18 @@ class VisualizerScenesSetting extends StatelessWidget {
                                   ),
                                 ),
                               ),
+                              if (scene.imported)
+                                Tooltip(
+                                  message: s.visualizerDeleteScene,
+                                  child: IconButton(
+                                    icon: const Icon(Symbols.delete),
+                                    onPressed: () => _confirmDelete(
+                                      context,
+                                      provider,
+                                      scene,
+                                    ),
+                                  ),
+                                ),
                               Icon(
                                 Symbols.drag_indicator,
                                 color: theme.resources.textFillColorSecondary,
@@ -125,5 +129,36 @@ class VisualizerScenesSetting extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  // An imported scene is gone once deleted, until its file is imported again.
+  Future<void> _confirmDelete(
+    BuildContext context,
+    VisualizerScenesProvider provider,
+    VisualizerScene scene,
+  ) async {
+    final s = S.of(context);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => ContentDialog(
+        title: Text(s.visualizerDeleteScene),
+        content: Text(s.visualizerDeleteSceneConfirm(scene.name)),
+        actions: [
+          FilledButton(
+            child: Text(s.delete),
+            onPressed: () => Navigator.pop(context, true),
+          ),
+          Button(
+            child: Text(s.cancel),
+            onPressed: () => Navigator.pop(context, false),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    final error = await provider.removeScene(scene);
+    if (error != null) {
+      error$('Failed to delete the scene ${scene.name}: $error');
+    }
   }
 }

@@ -156,15 +156,6 @@ const kLinuxCustomWindowControlsKey = 'linux_custom_window_controls';
 /// "light" (always use light icon), and "dark" (always use dark icon).
 const kTrayIconColorModeKey = 'tray_icon_color_mode';
 
-/// The folders with scenes (folders with a `scene.toml`) that the visualizer
-/// cycles through, a list of paths. On macOS their security-scoped bookmarks are
-/// kept by `MacSecureManager` so the folders stay readable after a restart.
-const kVisualizerPresetDirsKey = 'visualizer_preset_dirs';
-
-/// The single preset folder of earlier versions; `loadVisualizerPresetDirs`
-/// moves it into [kVisualizerPresetDirsKey].
-const kVisualizerPresetDirKey = 'visualizer_preset_dir';
-
 /// The paths of the visualizer scenes in the order the user arranged them, a
 /// list of strings. Scenes that are not in it yet are appended when they
 /// first show up.
@@ -181,7 +172,3 @@ const kVisualizerShuffleScenesKey = 'visualizer_shuffle_scenes';
 /// Whether the visualizer's messages are written to the Log page, for
 /// debugging. This defaults to false.
 const kVisualizerLogKey = 'visualizer_log';
-
-/// 'default' or 'more': how often the visualizer plays effects at the music's
-/// moments. This defaults to 'default' when the setting is missing.
-const kVisualizerEffectLevelKey = 'visualizer_effect_level';

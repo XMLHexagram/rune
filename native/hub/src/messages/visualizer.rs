@@ -17,8 +17,9 @@ pub struct ResizeVisualizerRequest {
     pub height: u32,
 }
 
-/// Directories with scenes (folders with a `scene.toml`) used by next, previous and random. An
-/// empty list stops using scene folders: a running visualizer changes to the built-in scene.
+/// Directories with scenes (folders with a `scene.toml`) listed beside the built-in ones: the
+/// app's folder of imported scenes. A running visualizer whose scene is gone changes to the
+/// built-in scene.
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetVisualizerPresetDirsRequest {
     pub paths: Vec<String>,
@@ -59,13 +60,6 @@ pub struct SetVisualizerAutoSwitchPausedRequest {
     pub paused: bool,
 }
 
-/// How often effects play at the music's moments: "default" or "more" (anything else counts as
-/// "default"). The setting is saved by the app and sent when a visualizer starts.
-#[derive(Serialize, Deserialize, DartSignal)]
-pub struct SetVisualizerEffectLevelRequest {
-    pub level: String,
-}
-
 /// How the scenes are picked (paths in the form of `VisualizerPresetEntry::path`), replacing what
 /// was set before. Next and the switch at every song go through the scenes in `order`, or pick at
 /// random if `shuffle`; scenes not in `order`, such as those of a folder scanned later, come after
@@ -76,6 +70,37 @@ pub struct SetVisualizerScenesRequest {
     pub order: Vec<String>,
     pub disabled: Vec<String>,
     pub shuffle: bool,
+}
+
+/// Unpack the scene file `file` (a `.runescene`, see `visualizer::package`) into a folder of its
+/// own in `dir`, the app's folder of imported scenes, replacing a scene of that name. The scenes
+/// of `dir` are listed again.
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct ImportVisualizerSceneRequest {
+    pub file: String,
+    pub dir: String,
+}
+
+/// `path` is the folder of the imported scene, or `error` says why the file is not one.
+#[derive(Serialize, Deserialize, RustSignal)]
+pub struct ImportVisualizerSceneResponse {
+    pub file: String,
+    pub path: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Delete the imported scene at `path`, which must be a folder directly in `dir`. The scenes of
+/// `dir` are listed again.
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct RemoveVisualizerSceneRequest {
+    pub path: String,
+    pub dir: String,
+}
+
+#[derive(Serialize, Deserialize, RustSignal)]
+pub struct RemoveVisualizerSceneResponse {
+    pub path: String,
+    pub error: Option<String>,
 }
 
 /// Whether the visualizer's messages (info, warnings and errors) go to the Log page. The app sends

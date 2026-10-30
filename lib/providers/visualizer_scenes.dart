@@ -1,13 +1,15 @@
+import 'dart:io';
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 
 import '../bindings/bindings.dart';
 import '../constants/configurations.dart';
 import '../constants/settings_manager.dart';
-import '../utils/file_storage/mac_secure_manager.dart';
 import '../utils/rune_log.dart';
-import '../utils/visualizer_preset_dirs.dart';
+import '../utils/scene_files.dart';
 import '../utils/visualizer_supported.dart';
 
 /// The cover art wall as a scene. Rust lists it with the others and draws
@@ -32,6 +34,9 @@ class VisualizerScene {
   final bool enabled;
 
   bool get isCoverWall => path == kCoverWallScenePath;
+
+  /// A scene the user imported from a scene file, which can be deleted.
+  bool get imported => !builtin && !isCoverWall;
 
   VisualizerScene copyWith({bool? enabled}) => VisualizerScene(
     path: path,
@@ -104,14 +109,18 @@ class VisualizerScenesProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// The folder imported scenes are unpacked into, one folder each, made if
+  /// missing.
+  static Future<String> sceneDir() async {
+    final support = await getApplicationSupportDirectory();
+    final dir = Directory(p.join(support.path, 'visualizer-scenes'));
+    await dir.create(recursive: true);
+    return dir.path;
+  }
+
   Future<void> _load() async {
     try {
-      // Bookmarks are resolved when the manager is created; wait for them
-      // before Rust reads the saved folders.
-      if (MacSecureManager.isApplePlatform()) {
-        await MacSecureManager().completed;
-      }
-      final dirs = await loadVisualizerPresetDirs();
+      final dir = await sceneDir();
       _log = await $settingsManager.getValue<bool>(kVisualizerLogKey) ?? false;
       // Rust answers once the library is open, which can take a while (or
       // wait for the user to pick one); until then the cover wall page shows
@@ -119,16 +128,70 @@ class VisualizerScenesProvider extends ChangeNotifier {
       // again with every attempt.
       while (!_loaded) {
         SetVisualizerLogRequest(enabled: _log).sendSignalToRust();
-        if (dirs.isNotEmpty) {
-          SetVisualizerPresetDirsRequest(paths: dirs).sendSignalToRust();
-        }
+        SetVisualizerPresetDirsRequest(paths: [dir]).sendSignalToRust();
         await refresh();
         if (!_loaded) await Future.delayed(const Duration(seconds: 3));
       }
+      // Scene files the system asked Rune to open; Rust is listening now.
+      SceneFiles.opened.listen((file) async {
+        final result = await importScene(file);
+        _imports.add(result);
+      });
       await _probeGpu();
     } catch (e) {
       error$('Failed to load the visualizer scenes: $e');
     }
+  }
+
+  final _imports = StreamController<VisualizerImport>.broadcast();
+
+  /// The outcome of every import of a scene file the system asked Rune to
+  /// open, for a notification.
+  Stream<VisualizerImport> get imports => _imports.stream;
+
+  /// Unpacks the scene file [file] into [sceneDir] (a scene of the same name
+  /// is replaced) and lists it, checked, at the end of the order.
+  Future<VisualizerImport> importScene(String file) async {
+    final name = p.basenameWithoutExtension(file);
+    final response = ImportVisualizerSceneResponse.rustSignalStream
+        .where((signal) => signal.message.file == file)
+        .first
+        .timeout(const Duration(seconds: 30));
+    ImportVisualizerSceneRequest(
+      file: file,
+      dir: await sceneDir(),
+    ).sendSignalToRust();
+    try {
+      final message = (await response).message;
+      if (message.error != null) {
+        return VisualizerImport(name, error: message.error);
+      }
+    } on TimeoutException {
+      return VisualizerImport(name, error: 'No answer from the visualizer');
+    }
+    await refresh();
+    return VisualizerImport(name);
+  }
+
+  /// Deletes an imported scene.
+  Future<String?> removeScene(VisualizerScene scene) async {
+    if (!scene.imported) return null;
+    final response = RemoveVisualizerSceneResponse.rustSignalStream
+        .where((signal) => signal.message.path == scene.path)
+        .first
+        .timeout(const Duration(seconds: 10));
+    RemoveVisualizerSceneRequest(
+      path: scene.path,
+      dir: await sceneDir(),
+    ).sendSignalToRust();
+    try {
+      final error = (await response).message.error;
+      if (error != null) return error;
+    } on TimeoutException {
+      return 'No answer from the visualizer';
+    }
+    await refresh();
+    return null;
   }
 
   Future<void> _probeGpu() async {
@@ -289,4 +352,14 @@ class VisualizerScenesProvider extends ChangeNotifier {
     notifyListeners();
     _sendChoice();
   }
+}
+
+/// How importing a scene file went: [error] says why it is not a scene.
+@immutable
+class VisualizerImport {
+  const VisualizerImport(this.name, {this.error});
+
+  /// The scene's name, from the file's.
+  final String name;
+  final String? error;
 }

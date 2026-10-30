@@ -164,8 +164,13 @@ pub fn define_request_types(_input: TokenStream) -> TokenStream {
             local_only: true,
         },
         RequestResponse {
-            request: "SetVisualizerEffectLevelRequest".to_string(),
-            response: None,
+            request: "ImportVisualizerSceneRequest".to_string(),
+            response: Some("ImportVisualizerSceneResponse".to_string()),
+            local_only: true,
+        },
+        RequestResponse {
+            request: "RemoveVisualizerSceneRequest".to_string(),
+            response: Some("RemoveVisualizerSceneResponse".to_string()),
             local_only: true,
         },
         RequestResponse {

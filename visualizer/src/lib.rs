@@ -23,6 +23,7 @@ mod in_flight;
 mod inspect;
 mod loading;
 mod moments;
+pub mod package;
 mod pipeline;
 mod presets;
 mod published;
@@ -679,8 +680,8 @@ impl Visualizer {
     /// next/previous/random, replacing the earlier folders and emptying the history. A scene
     /// folder named like a built-in scene is listed beside it. Returns the number of scenes to
     /// choose from, the built-in ones included. A folder that cannot be read is skipped and shows
-    /// up in [`Status::last_error`]. Without scenes in the folders a running visualizer changes to
-    /// the first built-in scene; otherwise the caller loads one.
+    /// up in [`Status::last_error`]. A running visualizer whose scene is no longer in the folders
+    /// changes to the first built-in scene.
     pub fn set_preset_dirs(&self, dirs: &[PathBuf]) -> Result<usize> {
         let mut library = lock(&self.library);
         let (count, errors) = library.folder.scan_all(dirs);
@@ -690,7 +691,8 @@ impl Visualizer {
             self.shared.set_error(message.join("; "));
         }
         // Not running: `start` begins with the built-in scene anyway.
-        if library.folder.folder_len() == 0 {
+        let current = Location::parse(&self.shared.status().preset_path);
+        if matches!(current, Location::Folder(_)) && !library.folder.contains(&current) {
             let _ = self.send(Command::LoadDefaultScene);
         }
         Ok(count)

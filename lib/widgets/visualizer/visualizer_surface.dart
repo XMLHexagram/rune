@@ -8,9 +8,6 @@ import '../../bindings/bindings.dart';
 import '../../providers/visualizer_scenes.dart';
 import '../../utils/color_brightness.dart';
 import '../../utils/rune_log.dart';
-import '../../utils/visualizer_effect_level.dart';
-import '../../utils/visualizer_preset_dirs.dart';
-import '../../utils/file_storage/mac_secure_manager.dart';
 
 import 'visualizer_controller.dart';
 
@@ -172,21 +169,9 @@ class _VisualizerSurfaceState extends State<VisualizerSurface>
       _textureSubscription ??= VisualizerTextureResponse.rustSignalStream
           .listen((signal) => _showTexture(signal.message.textureId));
 
-      // Bookmarks are resolved when the manager is created; wait for them
-      // before Rust reads the saved folders.
-      if (MacSecureManager.isApplePlatform()) {
-        await MacSecureManager().completed;
-      }
-      final dirs = await loadVisualizerPresetDirs();
-      if (_disposed) return;
-
-      if (dirs.isNotEmpty) {
-        SetVisualizerPresetDirsRequest(paths: dirs).sendSignalToRust();
-      }
-      // Reconcile the scenes (also new ones in the folders) and tell Rust
-      // which are unchecked before it picks the first one.
+      // Tell Rust the order and the unchecked scenes before it picks the
+      // first one.
       await _scenes.refresh();
-      sendVisualizerEffectLevel(await loadVisualizerEffectLevel());
       if (_disposed) return;
       StartVisualizerRequest(
         width: size.$1,

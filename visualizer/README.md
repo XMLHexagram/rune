@@ -1,12 +1,12 @@
 # Visualizer scenes
 
-The visualizer draws scenes in Rune's own format and nothing else. Rune ships seven (Armillary, CRT Wall, Emoji Tunnel, Growth, Neon Street, Paperclip, Torii Sea), compiled into the binary on every platform. More come from folders the user picks.
+The visualizer draws scenes in Rune's own format and nothing else. Rune ships seven (Armillary, CRT Wall, Emoji Tunnel, Growth, Neon Street, Paperclip, Torii Sea), compiled into the binary on every platform. More come from scene files the user imports.
 
 ## Where scenes come from
 
-- The built-in scenes are the folders of `visualizer/scenes/` (MPL-2.0 like the rest of Rune). `build.rs` walks them, sorted and without hidden files, and embeds every file with `include_bytes!`, images included (`scene::Source::Embedded`). A scene is added by putting a folder with a `scene.toml` there. Armillary is shown first and when the user removes the last scene folder. An embedded scene is read from memory and never reloads. They are used for the light and the dark appearance alike.
-- Scene folders are added and removed in Settings > Theme, any number of them. A folder inside them with a `scene.toml` is one scene; the folders in between, also subfolders, are searched, and a scene's own contents are not. The built-in scenes and the folder scenes all take part in next, previous, random and the automatic switching, once per scene even if folders overlap. A folder scene with the same name as a built-in scene (the folder's name, as the menu shows it) does not replace it: both are listed and both take part, so a built-in scene can be copied to a folder and edited there with hot reload. Hidden folders (names starting with `.`) and symlinked folders are skipped. A folder that cannot be read is skipped and reported in the status error. In the preset list a built-in scene has the path `builtin:<name>` and no group; the cover wall's menu lists them first, directly in the scene submenu.
-- Setting the folders (`Visualizer::set_preset_dirs`) empties the list and the history. With no scene left in the folders, a running visualizer changes to Armillary; otherwise the app asks for a random scene.
+- The built-in scenes are the folders of `visualizer/scenes/` (MPL-2.0 like the rest of Rune). `build.rs` walks them, sorted and without hidden files, and embeds every file with `include_bytes!`, images included (`scene::Source::Embedded`). A scene is added by putting a folder with a `scene.toml` there. Armillary is shown first, and when the scene on screen is deleted. An embedded scene is read from memory and never reloads. They are used for the light and the dark appearance alike.
+- Other scenes are scene files (`.runescene`, a zipped scene folder, see `docs/scenes.md`) that the app unpacks into a folder of its own with `package::import`, one folder per scene, and deletes with `package::remove`. The visualizer scans that folder (`Visualizer::set_preset_dirs`, which takes any number of folders): a folder inside it with a `scene.toml` is one scene; the folders in between, also subfolders, are searched, and a scene's own contents are not. Hidden folders (names starting with `.`) and symlinked folders are skipped, and a folder that cannot be read is reported in the status error. A scene with the same name as a built-in scene does not replace it: both are listed. In the preset list a built-in scene has the path `builtin:<name>`, the app's cover wall `app:cover-wall`, and a scene of a folder its folder's path.
+- The app sets the scenes' order, the ones turned off and whether they shuffle (`Visualizer::set_scene_choice`). The switch at every song and "next" take the next scene in the order that is on, or a random one when they shuffle; a visualizer that starts again resumes the scene shown last. While the cover wall is the scene, nothing is drawn. Scanning the folders again empties the history; a running visualizer whose scene is gone changes to Armillary.
 
 ## Scene switching
 
@@ -17,7 +17,7 @@ The rules follow MilkDrop 2's defaults (Nullsoft, BSD-3), without the ratings:
 
 ## Writing scenes
 
-The scene on screen is reloaded whenever its files change, so a scene can be written in any editor while it plays. Put it in a folder of its own, add that folder in Settings > Theme, and lock the scene from the cover wall's context menu so the automatic switching leaves it alone. A save that does not load shows the problem in the visualizer's corner until the next save fixes it.
+A scene of a folder is reloaded whenever its files change, and a save that does not load shows the problem in the visualizer's corner until the next save fixes it. The snapshot example below renders a scene folder to images; to try a scene in Rune, zip its folder into a `.runescene` file and import it.
 
 ## Scenes in Rune's own format
 

@@ -333,7 +333,13 @@ impl PresetList {
         self.entries.len()
     }
 
+    /// Whether the scene at `location` is in the list.
+    pub fn contains(&self, location: &Location) -> bool {
+        self.entries.iter().any(|e| e.preset.location == *location)
+    }
+
     /// The number of scenes that come from folders.
+    #[cfg(test)]
     pub fn folder_len(&self) -> usize {
         self.entries
             .iter()

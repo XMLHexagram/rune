@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use ::database::connection::{MainDbConnection, RecommendationDbConnection};
 use ::fsio::FsIo;
 use ::playback::player::Playable;
-use ::visualizer::{EffectLevel, Location, PcmInput, Transport};
+use ::visualizer::{Location, PcmInput, Transport};
 
 use crate::{
     Session, Signal, flutter_bridge,
@@ -309,31 +309,6 @@ impl Signal for SetVisualizerAutoSwitchPausedRequest {
     }
 }
 
-impl ParamsExtractor for SetVisualizerEffectLevelRequest {
-    type Params = ();
-
-    fn extract_params(&self, _all_params: &GlobalParams) -> Self::Params {}
-}
-
-impl Signal for SetVisualizerEffectLevelRequest {
-    type Params = ();
-    type Response = ();
-
-    async fn handle(
-        &self,
-        _: Self::Params,
-        _session: Option<Session>,
-        dart_signal: &Self,
-    ) -> Result<Option<Self::Response>> {
-        let level = match dart_signal.level.as_str() {
-            "more" => EffectLevel::More,
-            _ => EffectLevel::Default,
-        };
-        VISUALIZER.set_effect_level(level);
-        Ok(Some(()))
-    }
-}
-
 impl ParamsExtractor for VisualizerStatusRequest {
     type Params = ();
 
@@ -446,6 +421,95 @@ impl Signal for SetVisualizerScenesRequest {
             dart_signal.shuffle,
         );
         Ok(Some(()))
+    }
+}
+
+impl ParamsExtractor for ImportVisualizerSceneRequest {
+    type Params = ();
+
+    fn extract_params(&self, _all_params: &GlobalParams) -> Self::Params {}
+}
+
+impl Signal for ImportVisualizerSceneRequest {
+    type Params = ();
+    type Response = ImportVisualizerSceneResponse;
+
+    async fn handle(
+        &self,
+        _: Self::Params,
+        _session: Option<Session>,
+        dart_signal: &Self,
+    ) -> Result<Option<Self::Response>> {
+        let file = PathBuf::from(&dart_signal.file);
+        let dir = PathBuf::from(&dart_signal.dir);
+        let imported = {
+            let (file, dir) = (file.clone(), dir.clone());
+            tokio::task::spawn_blocking(move || ::visualizer::package::import(&file, &dir)).await?
+        };
+        let (path, error) = match imported {
+            Ok(path) => {
+                log::info!(
+                    "Imported the scene {} into {}",
+                    file.display(),
+                    path.display()
+                );
+                rescan(&dir);
+                (Some(path.to_string_lossy().into_owned()), None)
+            }
+            Err(e) => {
+                log::warn!("Failed to import the scene {}: {e:#}", file.display());
+                (None, Some(format!("{e:#}")))
+            }
+        };
+        Ok(Some(ImportVisualizerSceneResponse {
+            file: dart_signal.file.clone(),
+            path,
+            error,
+        }))
+    }
+}
+
+impl ParamsExtractor for RemoveVisualizerSceneRequest {
+    type Params = ();
+
+    fn extract_params(&self, _all_params: &GlobalParams) -> Self::Params {}
+}
+
+impl Signal for RemoveVisualizerSceneRequest {
+    type Params = ();
+    type Response = RemoveVisualizerSceneResponse;
+
+    async fn handle(
+        &self,
+        _: Self::Params,
+        _session: Option<Session>,
+        dart_signal: &Self,
+    ) -> Result<Option<Self::Response>> {
+        let path = PathBuf::from(&dart_signal.path);
+        let dir = PathBuf::from(&dart_signal.dir);
+        let removed = {
+            let (path, dir) = (path.clone(), dir.clone());
+            tokio::task::spawn_blocking(move || ::visualizer::package::remove(&path, &dir)).await?
+        };
+        let error = match removed {
+            Ok(()) => {
+                log::info!("Deleted the scene {}", path.display());
+                rescan(&dir);
+                None
+            }
+            Err(e) => Some(format!("{e:#}")),
+        };
+        Ok(Some(RemoveVisualizerSceneResponse {
+            path: dart_signal.path.clone(),
+            error,
+        }))
+    }
+}
+
+/// List the scenes of `dir` again after a scene came or went.
+fn rescan(dir: &std::path::Path) {
+    if let Err(e) = VISUALIZER.set_preset_dirs(&[dir.to_path_buf()]) {
+        VISUALIZER.report_error(format!("{e:#}"));
     }
 }
 

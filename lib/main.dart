@@ -19,6 +19,7 @@ import 'l10n/app_localizations.dart';
 import 'utils/l10n.dart';
 import 'utils/locale.dart';
 import 'utils/rune_log.dart';
+import 'utils/scene_files.dart';
 import 'utils/platform.dart';
 import 'utils/query_list.dart';
 import 'utils/tray_manager.dart';
@@ -77,6 +78,8 @@ late bool cafeMode;
 void main(List<String> arguments) async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeRust(assignRustSignal);
+  // Scene files the app was opened with, or is asked to open later.
+  SceneFiles.start(arguments);
 
   String? profile = arguments.contains('--profile')
       ? arguments[arguments.indexOf('--profile') + 1]
