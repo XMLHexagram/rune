@@ -7,10 +7,7 @@ import '../utils/animation_unit.dart';
 class RevealEffectContext extends StatefulWidget {
   final Widget child;
 
-  const RevealEffectContext({
-    super.key,
-    required this.child,
-  });
+  const RevealEffectContext({super.key, required this.child});
 
   @override
   RevealEffectContextState createState() => RevealEffectContextState();
@@ -33,16 +30,13 @@ class RevealEffectContextState extends State<RevealEffectContext>
     _currentFrame++;
     _updateAnimations(_currentFrame);
 
-    for (final unit in _units) {
+    // Only press animations need continuous updates. Hover positions are
+    // refreshed once after layout, when pointer or geometry changes arrive.
+    for (final unit in List<AnimationUnit>.of(_animationQueue)) {
       if (unit.cleanedUpForAnimation) {
         stopAnimation(unit);
-        unit.cleanedUpForAnimation = false;
-      } else {
-        final isPlayingAnimation = unit.mousePressed || unit.mouseReleased;
-        if (_mouseInBoundary || isPlayingAnimation) {
-          unit.controller.notify();
-        }
       }
+      unit.controller.notify();
     }
 
     _paintedPosition = _currentPosition;
@@ -69,6 +63,15 @@ class RevealEffectContextState extends State<RevealEffectContext>
     super.initState();
 
     _ticker = createTicker(_handleTick);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Geometry changes (including application scale) require the last global
+    // pointer position to be projected into each target's new local space.
+    MediaQuery.maybeOf(context);
+    _scheduleUpdate();
   }
 
   final List<AnimationUnit> _animationQueue = [];
@@ -120,9 +123,10 @@ class RevealEffectContextState extends State<RevealEffectContext>
     if (!_isUpdateScheduled) {
       _isUpdateScheduled = true;
       SchedulerBinding.instance.addPostFrameCallback((_) {
-        _executeUpdate();
         _isUpdateScheduled = false;
+        if (mounted) _executeUpdate();
       });
+      SchedulerBinding.instance.ensureVisualUpdate();
     }
   }
 
@@ -131,7 +135,8 @@ class RevealEffectContextState extends State<RevealEffectContext>
       unit.controller.updateMousePosition(_currentPosition);
     }
 
-    if (_mouseInBoundary || hasActiveAnimations) {
+    _paintedPosition = _currentPosition;
+    if (hasActiveAnimations) {
       _ensureTickerStarted();
     }
   }
@@ -144,7 +149,24 @@ class RevealEffectContextState extends State<RevealEffectContext>
     _currentPosition = position;
     _mouseInBoundary = position != null;
 
-    _scheduleUpdate();
+    final scheduler = SchedulerBinding.instance;
+    final stableGeometry =
+        scheduler.schedulerPhase == SchedulerPhase.idle ||
+        scheduler.schedulerPhase == SchedulerPhase.postFrameCallbacks;
+    final hasActiveLight = _units.any(
+      (unit) => unit.controller.localPosition != null,
+    );
+    if (!_isUpdateScheduled &&
+        !scheduler.hasScheduledFrame &&
+        stableGeometry &&
+        !hasActiveLight) {
+      // Check an inactive pointer without requesting a frame first. Changed
+      // controllers notify their listeners and schedule the necessary paint.
+      _executeUpdate();
+    } else {
+      // Coalesce active lights and geometry changes into one post-layout update.
+      _scheduleUpdate();
+    }
   }
 
   void _updateAnimations(int frame) {
@@ -162,7 +184,8 @@ class RevealEffectContextState extends State<RevealEffectContext>
 
       double unitLogicFrame = relativeFrame.toDouble();
       if (unit.mouseReleased && unit.mouseDownAnimateReleasedFrame != null) {
-        unitLogicFrame += (frame - unit.mouseDownAnimateReleasedFrame!) *
+        unitLogicFrame +=
+            (frame - unit.mouseDownAnimateReleasedFrame!) *
             unit.releaseAnimationAccelerateRate;
       }
       unit.mouseDownAnimateLogicFrame =
@@ -192,10 +215,7 @@ class RevealEffectContextState extends State<RevealEffectContext>
             updateMousePosition(event.position);
           }
         },
-        child: Container(
-          key: _containerKey,
-          child: widget.child,
-        ),
+        child: Container(key: _containerKey, child: widget.child),
       ),
     );
   }

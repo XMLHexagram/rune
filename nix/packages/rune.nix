@@ -37,8 +37,9 @@ let
   pubspecLockFile = ../../pubspec.lock;
 
   gitHashes = {
+    bitsdojo_window_linux = "sha256-irPQE+PP2mfTNW5PMSVr6al2iE6kBu3ujCXiiQL71m0=";
+    fluent_ui = "sha256-HmiEdY/2nvDNItnDH44fyUdUiN2dJhK8eqIP6JLExJ0=";
     macos_secure_bookmarks = "sha256-f6TDL1JfWc8zGE8H3+YLNmRW3/KJSgjQiwhk44bMp5g=";
-    fluent_ui = "sha256-r40uN7mwr6MCNg41AKdk2Z9Zd4pUCxV0xwLXKgNauqo=";
     scrollable_positioned_list = "sha256-tkRlxnmyG5r5yZwEvj9KDfEf4OuSM0HEwPOYm7T7LnQ=";
     system_tray = "sha256-yx4Tc+HDx9LdVWJZKniQr6H3BsifPlNwVGxHj3jpvlE=";
   };
