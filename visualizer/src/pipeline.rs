@@ -28,7 +28,8 @@ use crate::moments::Chances;
 use crate::readback::{MappedFrame, Target};
 use crate::rhythm::Rhythm;
 use crate::scene::{
-    Decider, DeciderSettings, DirectorView, FrameInput, LooksView, MusicValues, Scene, Source,
+    Decider, DeciderSettings, DirectorView, FrameInput, LooksView, MusicValues, Scene, SongChart,
+    Source,
 };
 #[cfg(target_os = "windows")]
 use crate::shared_dx12::{SharedTargets, SharedTexture};
@@ -65,6 +66,8 @@ pub struct Pipeline {
     rhythm: Rhythm,
     chart: Option<ChartState>,
     song: (f64, bool),
+    /// The song's whole chart and seed, while it has one (see [`Pipeline::set_song_chart`]).
+    song_chart: Option<SongChart>,
     /// The app's accent colour (linear), once the app has told it.
     accent: Option<[f32; 3]>,
     /// The chances the music's moments play an effect with (see [`crate::moments`]).
@@ -498,6 +501,7 @@ impl Pipeline {
             rhythm: Rhythm::default(),
             chart: None,
             song: (0.0, false),
+            song_chart: None,
             accent: None,
             chances: Chances::default(),
             runtime: RuntimeBindings::embedded(),
@@ -948,6 +952,13 @@ impl Pipeline {
     /// The song time and whether it plays, for scenes.
     pub fn set_song(&mut self, time: f64, playing: bool) {
         self.song = (time, playing);
+    }
+
+    /// The song's whole chart and the seed its decisions are made with, while it has a chart and
+    /// no lab holds the music without one: scenes then decide by song time (see
+    /// [`crate::scene::SongChart`]).
+    pub fn set_song_chart(&mut self, song_chart: Option<SongChart>) {
+        self.song_chart = song_chart;
     }
 
     /// The chances the music's moments play an effect with, in the scene on screen, the one
@@ -1492,7 +1503,13 @@ impl Pipeline {
         if let Output::Surface(surface) = &mut self.output {
             let scene = &mut self.scene;
             let (device, queue) = (&self.device, &self.queue);
-            let heard = (&self.rhythm, self.chart.as_ref(), self.song, self.accent);
+            let heard = (
+                &self.rhythm,
+                self.chart.as_ref(),
+                self.song,
+                self.song_chart.as_ref(),
+                self.accent,
+            );
             let timer = &mut self.timer;
             let fx = (&mut self.transitions, plan);
             let presented = surface.present(device, queue, |encoder, view| {
@@ -1518,7 +1535,13 @@ impl Pipeline {
             match surfaces.next(&self.device) {
                 Ok(Some((buffer, view))) => {
                     let scene = &mut self.scene;
-                    let heard = (&self.rhythm, self.chart.as_ref(), self.song, self.accent);
+                    let heard = (
+                        &self.rhythm,
+                        self.chart.as_ref(),
+                        self.song,
+                        self.song_chart.as_ref(),
+                        self.accent,
+                    );
                     let timer = &mut self.timer;
                     let fx = (&mut self.transitions, plan);
                     render_and_submit(&self.device, &self.queue, |encoder| {
@@ -1553,7 +1576,13 @@ impl Pipeline {
             match targets.next(&self.device) {
                 Ok(Some((texture, view))) => {
                     let scene = &mut self.scene;
-                    let heard = (&self.rhythm, self.chart.as_ref(), self.song, self.accent);
+                    let heard = (
+                        &self.rhythm,
+                        self.chart.as_ref(),
+                        self.song,
+                        self.song_chart.as_ref(),
+                        self.accent,
+                    );
                     let timer = &mut self.timer;
                     let fx = (&mut self.transitions, plan);
                     render_and_submit(&self.device, &self.queue, |encoder| {
@@ -1589,7 +1618,13 @@ impl Pipeline {
                 Ok(Some(next)) => {
                     let scene = &mut self.scene;
                     let (device, queue) = (&self.device, &self.queue);
-                    let heard = (&self.rhythm, self.chart.as_ref(), self.song, self.accent);
+                    let heard = (
+                        &self.rhythm,
+                        self.chart.as_ref(),
+                        self.song,
+                        self.song_chart.as_ref(),
+                        self.accent,
+                    );
                     let timer = &mut self.timer;
                     let fx = (&mut self.transitions, plan);
                     let frame = targets.render(device, queue, next, |encoder, view| {
@@ -1625,7 +1660,13 @@ impl Pipeline {
         };
         let scene = &mut self.scene;
         let (device, queue) = (&self.device, &self.queue);
-        let heard = (&self.rhythm, self.chart.as_ref(), self.song, self.accent);
+        let heard = (
+            &self.rhythm,
+            self.chart.as_ref(),
+            self.song,
+            self.song_chart.as_ref(),
+            self.accent,
+        );
         let timer = &mut self.timer;
         let fx = (&mut self.transitions, plan);
         let frame = target.render(device, queue, |encoder, view| {
@@ -1651,11 +1692,12 @@ impl Drop for Pipeline {
 }
 
 /// What a scene hears and sees of the player: the rhythm, the chart, the song time and whether
-/// it plays, and the app's accent colour.
+/// it plays, the song's whole chart and seed, and the app's accent colour.
 type Heard<'a> = (
     &'a Rhythm,
     Option<&'a ChartState>,
     (f64, bool),
+    Option<&'a SongChart>,
     Option<[f32; 3]>,
 );
 
@@ -1671,7 +1713,7 @@ fn draw(
     encoder: &mut wgpu::CommandEncoder,
     view: &wgpu::TextureView,
     time: f64,
-    (rhythm, chart, song, accent): Heard,
+    (rhythm, chart, song, song_chart, accent): Heard,
 ) {
     let timestamps = timer.begin();
     scene.render_timed(
@@ -1684,6 +1726,7 @@ fn draw(
             rhythm,
             chart,
             song,
+            song_chart,
             accent,
         },
         timestamps,

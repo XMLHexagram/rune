@@ -420,7 +420,9 @@ pub struct LabEvent {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum LabEventKind {
-    /// The camera cut to a shot. `first` is the scene's first shot, begun with its first frame.
+    /// The camera cut to a shot. `first` is the scene's first shot, begun with its first frame, or
+    /// the shot on where the decisions were put at a song time without playing up to it (see
+    /// `scene::stepper`): a jump rather than a cut.
     Cut {
         shot: String,
         /// "wide", "medium", "close", "detail" or "top".

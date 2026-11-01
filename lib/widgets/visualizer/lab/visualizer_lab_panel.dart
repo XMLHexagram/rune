@@ -204,7 +204,7 @@ class _TimelineSection extends StatelessWidget {
     final status = context.read<PlaybackStatusProvider>().playbackStatus;
     final (matched, passed) = songTime == null
         ? (0, 0)
-        : labCutMatch(plan, lab.observed, songTime);
+        : labCutMatch(plan, lab.observed, lab.watched);
 
     // The first section that starts more than 4 s after a position that is
     // 4 s before it already.

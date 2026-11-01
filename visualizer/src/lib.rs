@@ -309,6 +309,8 @@ struct Shared {
     playback: Mutex<Playback>,
     /// Where the player's files are opened from, set once; without it files are not analysed.
     fsio: OnceLock<Arc<FsIo>>,
+    /// The chart of the song while the visualizer is stopped, for when it starts again.
+    kept_chart: chart::KeptChart,
     /// Whether the scene on screen reads the atlas of album covers.
     wants_covers: AtomicBool,
     /// The latest atlas of covers and its version, which the render thread uploads.
@@ -476,6 +478,7 @@ impl Visualizer {
                 lab_chance: AtomicU8::new(NO_LAB_CHANCE),
                 playback: Mutex::new(Playback::default()),
                 fsio: OnceLock::new(),
+                kept_chart: chart::KeptChart::default(),
                 wants_covers: AtomicBool::new(false),
                 covers: Mutex::new(CoverAtlas::default()),
                 covers_job: AtomicU64::new(0),
@@ -1023,7 +1026,7 @@ fn run(
     // The folder of the scene on screen, reloaded when it is saved (live editing).
     let mut watched: Option<Watched> = None;
     let mut tracker = BeatTracker::new(sample_rate);
-    let mut charts = ChartFollower::new(shared.fsio.get().cloned());
+    let mut charts = ChartFollower::new(shared.fsio.get().cloned(), Arc::clone(&shared.kept_chart));
     let mut planner = Planner::default();
     // The version of the atlas of covers the pipeline has.
     let mut covers_seen: Option<u64> = None;
@@ -1157,6 +1160,16 @@ fn run(
         let rhythm = chart::trusted_rhythm(tracker.rhythm(), chart.as_ref());
         pipeline.set_rhythm(&rhythm);
         pipeline.set_chart(chart.as_ref());
+        // With the song's chart (and no lab holding the music at a level), scenes decide by song
+        // time, with the seed the song is planned with.
+        let song_chart = charts
+            .chart()
+            .filter(|_| pipeline.lab().level.is_none())
+            .map(|(_, chart, path)| scene::SongChart {
+                chart,
+                seed: plan::seed_of(&path.display().to_string()),
+            });
+        pipeline.set_song_chart(song_chart);
         pipeline.set_song(charts.song_time(), shared.playing.load(Ordering::Relaxed));
         pipeline.set_accent(match shared.accent.load(Ordering::Relaxed) {
             0 => None,
