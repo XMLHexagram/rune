@@ -25,6 +25,7 @@ mod loading;
 mod moments;
 pub mod package;
 mod pipeline;
+mod plan;
 mod presets;
 mod published;
 mod readback;
@@ -41,6 +42,7 @@ mod transition;
 #[cfg(target_os = "android")]
 mod window;
 
+use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -51,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use fsio::FsIo;
-use log::{error, info};
+use log::{debug, error, info, warn};
 use rtrb::Consumer;
 
 pub use bind::{Level, RuntimeBindings, Used};
@@ -65,12 +67,14 @@ use chart::{ChartFollower, Playback};
 pub use inspect::{
     Inspect, InspectBinding, InspectDirector, InspectEffects, InspectInput, InspectLens,
     InspectLooks, InspectMusic, InspectSection, InspectShot, InspectSignal, InspectSwitching,
-    InspectTransition, LabCommand, LabLens, LabOverrides, LabPace, LabTransition,
+    InspectTransition, LabCommand, LabEvent, LabEventKind, LabLens, LabOverrides, LabPace,
+    LabTransition,
 };
 use loading::Loads;
 pub use moments::{Chances, EffectLevel};
 pub use pipeline::{DEFAULT_PRESET_NAME, Transport, probe_gpu};
 use pipeline::{Pipeline, Rendered, SceneBuild};
+pub use plan::{PlanCut, PlanLook, PlanMoment, PlanSection, SongPlan};
 pub use presets::{Location, PresetInfo};
 use presets::{Preset, PresetList};
 pub use rhythm::{BeatTracker, Rhythm};
@@ -294,6 +298,13 @@ struct Shared {
     inspecting: AtomicBool,
     /// What the render thread saw in its last frame, while inspecting.
     inspect: Mutex<Option<Inspect>>,
+    /// The song on screen played through ahead of time, while inspecting and it has a chart.
+    plan: Mutex<PlanSlot>,
+    /// The number of the latest plan job; an older job drops its result.
+    plan_job: AtomicU64,
+    /// What the visualizer decided and was told in the last moments, while inspecting, oldest
+    /// first (see [`Visualizer::drain_lab_events`]).
+    lab_events: Mutex<VecDeque<LabEvent>>,
     /// The file that plays and where, for analysing it into a chart and the time in it.
     playback: Mutex<Playback>,
     /// Where the player's files are opened from, set once; without it files are not analysed.
@@ -329,6 +340,16 @@ struct Shared {
     window: Mutex<Option<Window>>,
 }
 
+/// The most events the lab's log keeps: when it is not read, the oldest go.
+const LAB_EVENTS: usize = 512;
+
+/// The plan of the song made last (none: there is no chart) and how often it was replaced.
+#[derive(Default)]
+struct PlanSlot {
+    plan: Option<Arc<SongPlan>>,
+    version: u64,
+}
+
 /// The atlas of covers made last (none: there are no covers) and how often it was replaced.
 #[derive(Default)]
 struct CoverAtlas {
@@ -353,6 +374,41 @@ impl Shared {
             }
             .chances(),
             percent => Chances::every(f32::from(percent) / 100.0),
+        }
+    }
+
+    /// Put `events` in the lab's log, if a lab is inspecting; the log keeps the newest
+    /// [`LAB_EVENTS`].
+    fn log_events(&self, events: impl IntoIterator<Item = LabEvent>) {
+        if !self.inspecting.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut log = lock(&self.lab_events);
+        for event in events {
+            if log.len() == LAB_EVENTS {
+                log.pop_front();
+            }
+            log.push_back(event);
+        }
+    }
+
+    /// Keep `plan`, made by job `job`, unless a later job was started since.
+    fn store_plan(&self, job: u64, mut plan: SongPlan) {
+        let mut slot = lock(&self.plan);
+        if self.plan_job.load(Ordering::Relaxed) != job {
+            return;
+        }
+        slot.version += 1;
+        plan.version = slot.version;
+        slot.plan = Some(Arc::new(plan));
+    }
+
+    /// Drop the plan, and the result of a job still running.
+    fn clear_plan(&self) {
+        let mut slot = lock(&self.plan);
+        self.plan_job.fetch_add(1, Ordering::Relaxed);
+        if slot.plan.take().is_some() {
+            slot.version += 1;
         }
     }
 
@@ -411,6 +467,9 @@ impl Visualizer {
                 playing: AtomicBool::new(true),
                 inspecting: AtomicBool::new(false),
                 inspect: Mutex::new(None),
+                plan: Mutex::default(),
+                plan_job: AtomicU64::new(0),
+                lab_events: Mutex::default(),
                 visible: AtomicBool::new(true),
                 accent: AtomicU32::new(0),
                 effect_level: AtomicU8::new(0),
@@ -443,6 +502,7 @@ impl Visualizer {
         self.shared.inspecting.store(inspecting, Ordering::Relaxed);
         if !inspecting {
             *lock(&self.shared.inspect) = None;
+            lock(&self.shared.lab_events).clear();
         }
     }
 
@@ -450,6 +510,25 @@ impl Visualizer {
     /// [`Self::set_inspecting`]) and once a frame was drawn; else none.
     pub fn inspect(&self) -> Option<Inspect> {
         lock(&self.shared.inspect).clone()
+    }
+
+    /// The song on screen played through ahead of time with the scene's decisions, while
+    /// inspecting (see [`Self::set_inspecting`]) and the song has a chart; else none. Made in the
+    /// background after the song, the scene or what a lab set changes.
+    pub fn plan(&self) -> Option<Arc<SongPlan>> {
+        lock(&self.shared.plan).plan.clone()
+    }
+
+    /// How often the plan was replaced or dropped: a reader that has seen a version needs to
+    /// fetch the plan again only when this changes.
+    pub fn plan_version(&self) -> u64 {
+        lock(&self.shared.plan).version
+    }
+
+    /// What the visualizer decided (a cut, a look, a moment's effect) and what a lab told it
+    /// since the last call, oldest first; at most the last 512. Empty while not inspecting.
+    pub fn drain_lab_events(&self) -> Vec<LabEvent> {
+        lock(&self.shared.lab_events).drain(..).collect()
     }
 
     /// Tell the render thread to do something now (see [`LabCommand`]), for a scene lab.
@@ -940,6 +1019,7 @@ fn run(
     let mut watched: Option<Watched> = None;
     let mut tracker = BeatTracker::new(sample_rate);
     let mut charts = ChartFollower::new(shared.fsio.get().cloned());
+    let mut planner = Planner::default();
     // The version of the atlas of covers the pipeline has.
     let mut covers_seen: Option<u64> = None;
     // The same for the cell of the track playing.
@@ -1098,6 +1178,9 @@ fn run(
             bench.frame(&mut pipeline, Instant::now(), taken, age);
         }
         show(shared, &pipeline, rendered);
+        let events = pipeline.take_events();
+        shared.log_events(events);
+        planner.update(shared, &pipeline, &charts);
         if shared.inspecting.load(Ordering::Relaxed) {
             let seen = inspection(shared, &pipeline, &charts, time);
             *lock(&shared.inspect) = Some(seen);
@@ -1374,6 +1457,12 @@ fn lab(
     loads: &mut Loads<Loaded>,
     command: LabCommand,
 ) {
+    shared.log_events([LabEvent {
+        time: pipeline.song_time(),
+        kind: LabEventKind::Lab {
+            command: describe(&command),
+        },
+    }]);
     match command {
         LabCommand::Cut => pipeline.cut_now(),
         LabCommand::EffectChance(percent) => {
@@ -1431,6 +1520,91 @@ fn lab(
                 Some(Err(e)) => shared.set_error("lab", format!("{e:#}")),
                 None => info!("There is no scene to switch to"),
             }
+        }
+    }
+}
+
+/// A lab command in a few words for the event log: the texts of the bindings are left out.
+fn describe(command: &LabCommand) -> String {
+    match command {
+        LabCommand::RuntimeBindings(_) => "RuntimeBindings".to_string(),
+        LabCommand::SceneBindings(_) => "SceneBindings".to_string(),
+        command => format!("{command:?}"),
+    }
+}
+
+/// What a plan of the song depends on: when it changes, the song is played through again.
+#[derive(Clone, PartialEq)]
+struct PlanKey {
+    /// Which chart of the file (see [`ChartFollower::chart`]).
+    chart: u64,
+    /// The scene on screen, and how often the runtime's decisions were replaced.
+    scene: u64,
+    runtime: u64,
+    /// The level a lab holds the music at.
+    level: Option<Level>,
+    /// The chances, and what a lab holds or overrides in the scene's decisions.
+    settings: scene::DeciderSettings,
+}
+
+/// Keeps the plan of the song current (see [`plan`]): while a lab inspects and the song has a
+/// chart, a change of what the plan depends on starts playing the song through on a thread of
+/// its own, and the result is kept unless a newer change came meanwhile.
+#[derive(Default)]
+struct Planner {
+    /// What the plan kept (or being made) is of.
+    key: Option<PlanKey>,
+}
+
+impl Planner {
+    fn update(&mut self, shared: &Arc<Shared>, pipeline: &Pipeline, charts: &ChartFollower) {
+        let chart = charts
+            .chart()
+            .filter(|_| shared.inspecting.load(Ordering::Relaxed));
+        let Some((arrival, chart, path)) = chart else {
+            if self.key.take().is_some() {
+                shared.clear_plan();
+            }
+            return;
+        };
+        let (scene, runtime, settings) = pipeline.plan_parts();
+        let key = PlanKey {
+            chart: arrival,
+            scene,
+            runtime,
+            level: pipeline.lab().level,
+            settings,
+        };
+        if self.key.as_ref() == Some(&key) {
+            return;
+        }
+        self.key = Some(key);
+        let job = shared.plan_job.fetch_add(1, Ordering::Relaxed) + 1;
+        let decider = pipeline.plan_decider();
+        let path = path.display().to_string();
+        let scene = match shared.status().preset_path.as_str() {
+            "" => pipeline.preset_name().to_string(),
+            location => location.to_string(),
+        };
+        let shared = Arc::clone(shared);
+        let spawned = thread::Builder::new()
+            .name("song plan".into())
+            .spawn(move || {
+                let start = Instant::now();
+                let mut plan = plan::plan_song(&chart, decider, plan::seed_of(&path));
+                debug!(
+                    "Planned {path} in {:.2?}: {} cuts, {} looks, {} moments",
+                    start.elapsed(),
+                    plan.cuts.len(),
+                    plan.looks.len(),
+                    plan.moments.len()
+                );
+                plan.path = path;
+                plan.scene = scene;
+                shared.store_plan(job, plan);
+            });
+        if let Err(e) = spawned {
+            warn!("Failed to start the song plan: {e}");
         }
     }
 }
@@ -1599,5 +1773,63 @@ fn publish(shared: &Shared, width: u32, height: u32, data: FrameData) {
     let listener = lock(&shared.frame_listener).clone();
     if let Some(listener) = listener {
         listener(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(i: u32) -> LabEvent {
+        LabEvent {
+            time: f64::from(i),
+            kind: LabEventKind::Look {
+                look: i.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_event_log_keeps_the_newest_and_is_read_once() {
+        let visualizer = Visualizer::new();
+        visualizer.set_inspecting(true);
+        let over = LAB_EVENTS as u32 + 10;
+        visualizer.shared.log_events((0..over).map(event));
+        let events = visualizer.drain_lab_events();
+        assert_eq!(events.len(), LAB_EVENTS);
+        assert_eq!(events[0], event(10));
+        assert_eq!(events[LAB_EVENTS - 1], event(over - 1));
+        assert!(visualizer.drain_lab_events().is_empty());
+    }
+
+    #[test]
+    fn nothing_is_logged_while_not_inspecting() {
+        let visualizer = Visualizer::new();
+        visualizer.shared.log_events([event(1)]);
+        assert!(visualizer.drain_lab_events().is_empty());
+        visualizer.set_inspecting(true);
+        visualizer.shared.log_events([event(2)]);
+        visualizer.set_inspecting(false);
+        assert!(visualizer.drain_lab_events().is_empty());
+    }
+
+    #[test]
+    fn a_plan_of_an_older_job_is_dropped_and_each_kept_one_has_a_new_version() {
+        let visualizer = Visualizer::new();
+        let shared = &visualizer.shared;
+        assert_eq!((visualizer.plan_version(), visualizer.plan()), (0, None));
+        shared.plan_job.store(2, Ordering::Relaxed);
+        shared.store_plan(1, SongPlan::default());
+        assert!(visualizer.plan().is_none());
+        shared.store_plan(2, SongPlan::default());
+        assert_eq!(visualizer.plan().unwrap().version, 1);
+        shared.plan_job.store(3, Ordering::Relaxed);
+        shared.store_plan(3, SongPlan::default());
+        assert_eq!(visualizer.plan().unwrap().version, 2);
+        // A song without a chart has no plan, and a job still running for the one before does not
+        // bring it back.
+        shared.clear_plan();
+        shared.store_plan(3, SongPlan::default());
+        assert_eq!((visualizer.plan_version(), visualizer.plan()), (3, None));
     }
 }

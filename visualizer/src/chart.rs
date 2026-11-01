@@ -6,7 +6,7 @@
 //! ([`ChartFollower`]); until the chart is ready the live beat tracker drives the scenes. With a
 //! chart the scenes know what is coming: the next section, the next downbeat.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -267,6 +267,13 @@ impl Chart {
             .collect()
     }
 
+    /// How long the song is as the chart knows it, in seconds: where its last section ends, else
+    /// its last beat; 0 for a chart with neither.
+    pub fn length(&self) -> f64 {
+        let beat = self.beats.last().map_or(0.0, |b| b.t);
+        self.sections.last().map_or(beat, |s| s.end)
+    }
+
     /// The chart at song time `t` (seconds).
     pub fn at(&self, t: f64) -> ChartState {
         let mut state = ChartState {
@@ -521,7 +528,9 @@ pub struct ChartFollower {
     /// Where files are opened from; without it nothing is analysed.
     fsio: Option<Arc<FsIo>>,
     path: Option<PathBuf>,
-    chart: Option<Chart>,
+    chart: Option<Arc<Chart>>,
+    /// How many charts have arrived: which one `chart` is, for what is made from it.
+    arrivals: u64,
     loading: Option<Receiver<Option<Chart>>>,
     /// Stops the running analysis, if any.
     cancel: Option<Arc<AtomicBool>>,
@@ -536,6 +545,7 @@ impl ChartFollower {
             fsio,
             path: None,
             chart: None,
+            arrivals: 0,
             loading: None,
             cancel: None,
             clock: SongClock::default(),
@@ -561,7 +571,8 @@ impl ChartFollower {
             match receiver.try_recv() {
                 Ok(chart) => {
                     arrived = chart.is_some();
-                    self.chart = chart;
+                    self.arrivals += u64::from(arrived);
+                    self.chart = chart.map(Arc::new);
                     self.loading = None;
                 }
                 Err(TryRecvError::Disconnected) => self.loading = None,
@@ -579,7 +590,17 @@ impl ChartFollower {
 
     /// The sections of the chart, once there is one (else none).
     pub fn sections(&self) -> Vec<crate::InspectSection> {
-        self.chart.as_ref().map(Chart::sections).unwrap_or_default()
+        self.chart
+            .as_ref()
+            .map(|chart| chart.sections())
+            .unwrap_or_default()
+    }
+
+    /// The chart of the file that plays, once there is one, with the number of its arrival, and
+    /// where the file is.
+    pub fn chart(&self) -> Option<(u64, Arc<Chart>, &Path)> {
+        let chart = self.chart.as_ref()?;
+        Some((self.arrivals, Arc::clone(chart), self.path.as_deref()?))
     }
 
     /// The song time of the last [`Self::tick`], with or without a chart.

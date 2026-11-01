@@ -622,7 +622,7 @@ fn a_scene_cut_is_reported_for_the_frame_it_happens_in() {
     let mut scene = Scene::load(&device, &queue, &dir, FORMAT, SIZE, 48_000).unwrap();
     // The section start cuts to the other shot that opens one. Cuts come from the music's values, which a test cannot choose here, so tick the
     // director the way the frame does and see that what it said reaches the scene's report.
-    let director = scene.director.as_mut().unwrap();
+    let director = scene.decider.director_mut().unwrap();
     let music = MusicValues {
         cues: 1,
         cue: 1.0,

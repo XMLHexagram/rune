@@ -27,7 +27,9 @@ use crate::inspect::{LabLens, LabOverrides, LabPace, LabTransition};
 use crate::moments::Chances;
 use crate::readback::{MappedFrame, Target};
 use crate::rhythm::Rhythm;
-use crate::scene::{DirectorView, FrameInput, LooksView, MusicValues, Scene, Source};
+use crate::scene::{
+    Decider, DeciderSettings, DirectorView, FrameInput, LooksView, MusicValues, Scene, Source,
+};
 #[cfg(target_os = "windows")]
 use crate::shared_dx12::{SharedTargets, SharedTexture};
 #[cfg(target_os = "linux")]
@@ -69,6 +71,8 @@ pub struct Pipeline {
     chances: Chances,
     /// The runtime's decisions (`runtime.toml`), which every scene reads.
     runtime: Arc<RuntimeBindings>,
+    /// How often they were replaced, for what is made from them (a plan of the song).
+    runtime_version: u64,
     /// The atlas of covers for scenes that read one.
     covers: Option<Arc<Atlas>>,
     /// The cell of the track playing, which stays over cell 0 of the atlas.
@@ -497,6 +501,7 @@ impl Pipeline {
             accent: None,
             chances: Chances::default(),
             runtime: RuntimeBindings::embedded(),
+            runtime_version: 0,
             covers: None,
             playing_cover: None,
             output,
@@ -964,6 +969,7 @@ impl Pipeline {
     /// transition and every scene that comes (a scene lab replaced `runtime.toml`).
     pub fn set_runtime(&mut self, runtime: Arc<RuntimeBindings>) {
         self.runtime = runtime;
+        self.runtime_version += 1;
         self.scene.set_runtime(&self.runtime);
         if let Some(pending) = self
             .transitions
@@ -973,6 +979,31 @@ impl Pipeline {
         {
             pending.set_runtime(&self.runtime);
         }
+    }
+
+    /// What a plan of the song depends on besides the chart: the scene on screen, the runtime's
+    /// decisions and what a lab or the user set on the scene's decisions (see [`crate::plan`]).
+    pub fn plan_parts(&self) -> (u64, u64, DeciderSettings) {
+        (
+            self.scene.id(),
+            self.runtime_version,
+            self.scene.decider_settings(),
+        )
+    }
+
+    /// The decisions of the scene on screen, set as it is and from the start of a song.
+    pub fn plan_decider(&self) -> Decider {
+        self.scene.plan_decider()
+    }
+
+    /// What the last frame of the scene on screen decided, once (see [`Scene::take_events`]).
+    pub fn take_events(&mut self) -> Vec<crate::inspect::LabEvent> {
+        self.scene.take_events()
+    }
+
+    /// The song time of the last frame.
+    pub fn song_time(&self) -> f64 {
+        self.song.0
     }
 
     /// The runtime's decisions in use.
@@ -3041,7 +3072,7 @@ mod tests {
 /// Every probe draws at the phone's size on the same timeline: 60 frames a second, a steady
 /// 120 bpm in bars of four (so a scene grows, changes its view and its colours as it would with
 /// music), and each frame's seed fixed, so a scene draws the same frames on every run.
-/// The music's signals move on by wall time, not by the timeline's (`EventCounter::wall_dt`), and
+/// The music's signals move on by wall time, not by the timeline's (`inputs::WallClock`), and
 /// a scene takes the music over from the one before it (`Scene::take_music_from`). Left alone,
 /// that made the first frames differ between runs, and between two draws of the same scene in one
 /// run (the second started from where the first ended): a mean difference of 1 to 3.5 in the first

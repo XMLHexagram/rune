@@ -85,6 +85,7 @@ fn ease(t: f32) -> f32 {
 }
 
 /// Decides the look changes of one scene from the music.
+#[derive(Clone)]
 pub struct Looks {
     /// The `name` of each `[[look]]`, in order.
     names: Vec<String>,
