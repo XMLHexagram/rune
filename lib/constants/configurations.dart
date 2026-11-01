@@ -170,6 +170,11 @@ const kVisualizerDisabledScenesKey = 'visualizer_disabled_scenes';
 /// defaults to false.
 const kVisualizerLogKey = 'visualizer_log';
 
+/// Whether the visualizer lab is on: the cover wall page can show a panel with
+/// the song's planned cuts, live readouts and effect buttons. This defaults to
+/// false.
+const kVisualizerLabKey = 'visualizer_lab';
+
 /// The path of the visualizer scene on screen (in the form of the scene list's
 /// paths), which the visualizer resumes after a restart.
 const kVisualizerLastSceneKey = 'visualizer_last_scene';

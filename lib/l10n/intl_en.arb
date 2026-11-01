@@ -1407,6 +1407,14 @@
   "@coverWallVisualizerSubtitle": {
     "description": "Subtitle of the playback controller entry that opens the cover wall while it is set to show the visualizer."
   },
+  "visualizerLab": "Visualizer Lab",
+  "@visualizerLab": {
+    "description": "Name of the playback controller entry that opens the visualizer lab panel on the cover wall page."
+  },
+  "visualizerLabSubtitle": "Show the lab panel over the visualizer.",
+  "@visualizerLabSubtitle": {
+    "description": "Subtitle of the playback controller entry that opens the visualizer lab panel."
+  },
   "interfaceScale": "Interface Scale",
   "interfaceScaleSubtitle": "Changes text and app content immediately relative to the system scale. Window size and display resolution do not change. 100% follows the system scale.",
   "interfaceScaleSaveError": "Could not save interface scale",

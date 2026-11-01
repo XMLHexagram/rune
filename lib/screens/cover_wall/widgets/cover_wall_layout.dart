@@ -1,3 +1,6 @@
+import 'dart:io';
+import 'dart:math' as math;
+
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:fluent_ui/fluent_ui.dart';
@@ -11,12 +14,14 @@ import '../../../widgets/context_menu_wrapper.dart';
 import '../../../widgets/visualizer/visualizer_controller.dart';
 import '../../../widgets/visualizer/visualizer_surface.dart';
 import '../../../widgets/visualizer/visualizer_problem.dart';
+import '../../../widgets/visualizer/lab/visualizer_lab_panel.dart';
 import '../../../widgets/cover_wall_background/gradient_container.dart';
 import '../../../widgets/cover_wall_background/cover_wall_background.dart';
 import '../../../widgets/cover_wall_background/utils/calculate_cover_wall_size.dart';
 import '../../../widgets/playback_controller/constants/playback_controller_height.dart';
 import '../../../providers/responsive_providers.dart';
 import '../../../providers/visualizer_scenes.dart';
+import '../../../providers/visualizer_lab.dart';
 
 import 'back_button.dart';
 import 'playing_track.dart';
@@ -46,9 +51,20 @@ class CoverWallLayoutState extends State<CoverWallLayout> {
   final _visualizer = VisualizerController();
   final _contextController = RouterAwareFlyoutController();
   final _contextAttachKey = GlobalKey();
+  late final VisualizerLabProvider _lab;
+
+  @override
+  void initState() {
+    super.initState();
+    _lab = context.read<VisualizerLabProvider>();
+  }
 
   @override
   void dispose() {
+    // The panel belongs to this page; it is closed once the page is gone.
+    final lab = _lab;
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) => lab.setPanelOpen(false));
     _contextController.dispose();
     _focusNode.dispose();
     super.dispose();
@@ -112,12 +128,21 @@ class CoverWallLayoutState extends State<CoverWallLayout> {
     final isMini = r.smallerOrEqualTo(DeviceType.car, false);
     final showVisualizer = context
         .select<VisualizerScenesProvider, bool>((p) => p.showVisualizer);
+    final labOpen =
+        context.select<VisualizerLabProvider, bool>((p) => p.panelOpen);
+    // The lab's panel starts under the back button of small layouts, or under
+    // the macOS window buttons the others stack on the left.
+    final small = r.smallerOrEqualTo(DeviceType.mobile, false);
+    final labTop = MediaQuery.viewPaddingOf(context).top +
+        (small ? 48 : (Platform.isMacOS ? 72 : 0));
 
     return LayoutBuilder(
       builder: (context, constraints) {
         final gridSize = calculateCoverWallGridSize(constraints);
         final crossAxisCount = (constraints.maxWidth / gridSize).ceil();
         final mainAxisCount = (constraints.maxHeight / gridSize).ceil();
+        final labWidth =
+            math.min(visualizerLabPanelWidth, constraints.maxWidth);
 
         final coverArtWall = ClipRect(
           child: OverflowBox(
@@ -178,7 +203,10 @@ class CoverWallLayoutState extends State<CoverWallLayout> {
               ),
               height: (mainAxisCount * gridSize).toDouble(),
             ),
-            const PlayingTrack(),
+            Padding(
+              padding: EdgeInsets.only(left: labOpen ? labWidth : 0),
+              child: const PlayingTrack(),
+            ),
             if (!isMini)
               Container(
                 decoration: BoxDecoration(
@@ -202,6 +230,14 @@ class CoverWallLayoutState extends State<CoverWallLayout> {
             ),
             // A problem of the visualizer, in the corner.
             if (showVisualizer) VisualizerProblem(controller: _visualizer),
+            if (labOpen)
+              Positioned(
+                top: labTop,
+                left: 0,
+                bottom: playbackControllerHeight,
+                width: labWidth,
+                child: const VisualizerLabPanel(),
+              ),
           ],
         );
 

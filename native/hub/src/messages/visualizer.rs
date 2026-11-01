@@ -446,7 +446,7 @@ pub struct VisualizerLabOverrides {
     /// The pace in place of the scene's own, when a lab set one and the scene has a director.
     pub pace: Option<String>,
     /// What every scene switch takes, and what dresses every camera cut.
-    pub switch: Option<VisualizerLabTransition>,
+    pub switches: Option<VisualizerLabTransition>,
     pub cuts: Option<VisualizerLabTransition>,
     /// The lens effects on at every moment.
     pub lens: VisualizerLabLens,

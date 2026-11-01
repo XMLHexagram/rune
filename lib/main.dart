@@ -56,6 +56,7 @@ import 'constants/configurations.dart';
 import 'providers/app_scale.dart';
 import 'providers/crash.dart';
 import 'providers/visualizer_scenes.dart';
+import 'providers/visualizer_lab.dart';
 import 'providers/volume.dart';
 import 'providers/status.dart';
 import 'providers/license.dart';
@@ -328,6 +329,12 @@ void mainLoop(
         ChangeNotifierProvider(create: (_) => BroadcastProvider()),
         ChangeNotifierProvider(create: (_) => FullScreenProvider()),
         ChangeNotifierProvider(create: (_) => VisualizerScenesProvider()),
+        ChangeNotifierProxyProvider<PlaybackStatusProvider,
+            VisualizerLabProvider>(
+          lazy: false,
+          create: (_) => VisualizerLabProvider(),
+          update: (_, status, previous) => previous!..attachStatus(status),
+        ),
         ChangeNotifierProvider(create: (_) => LibraryHomeProvider()),
         ChangeNotifierProvider(create: (_) => LibraryManagerProvider()),
         ChangeNotifierProvider(create: (_) => PlaybackControllerProvider()),

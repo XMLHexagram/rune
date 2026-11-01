@@ -917,7 +917,7 @@ fn lab_now(inspect: Inspect) -> VisualizerLabNow {
             bursts: overrides.bursts,
             level: overrides.level.map(Into::into),
             pace,
-            switch: overrides.switch.map(Into::into),
+            switches: overrides.switch.map(Into::into),
             cuts: overrides.cuts.map(Into::into),
             lens: overrides.lens.into(),
         },
