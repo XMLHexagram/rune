@@ -477,7 +477,10 @@ fn update() {
   let dt = rv_dt();
   let t = frame.time;
   if (frame.first == 1u) {
-    state.s = 0.0;
+    // Opening at the same moment of the song gives the same place: the distance a nominal flight
+    // has covered by then, and the scene time that much of the song has run.
+    state.s = input.flight * frame.song;
+    state.phase = frame.song;
     state.speed = input.flight;
     // No hit has been counted yet.
     state.step_age = 1000.0;

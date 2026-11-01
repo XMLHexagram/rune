@@ -620,6 +620,11 @@ impl ChartFollower {
         Some((self.arrivals, Arc::clone(chart), self.path.as_deref()?))
     }
 
+    /// The file followed, once there is one (it may be empty: a song that is not a file).
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// The song time of the last [`Self::tick`], with or without a chart.
     pub fn song_time(&self) -> f64 {
         self.time

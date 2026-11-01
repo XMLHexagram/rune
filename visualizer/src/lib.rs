@@ -1162,14 +1162,17 @@ fn run(
         pipeline.set_chart(chart.as_ref());
         // With the song's chart (and no lab holding the music at a level), scenes decide by song
         // time, with the seed the song is planned with.
+        let song_seed = charts
+            .path()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| plan::seed_of(&path.display().to_string()));
         let song_chart = charts
             .chart()
             .filter(|_| pipeline.lab().level.is_none())
-            .map(|(_, chart, path)| scene::SongChart {
-                chart,
-                seed: plan::seed_of(&path.display().to_string()),
-            });
+            .zip(song_seed)
+            .map(|((_, chart, _), seed)| scene::SongChart { chart, seed });
         pipeline.set_song_chart(song_chart);
+        pipeline.set_song_seed(song_seed);
         pipeline.set_song(charts.song_time(), shared.playing.load(Ordering::Relaxed));
         pipeline.set_accent(match shared.accent.load(Ordering::Relaxed) {
             0 => None,

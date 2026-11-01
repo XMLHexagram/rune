@@ -68,6 +68,8 @@ pub struct Pipeline {
     song: (f64, bool),
     /// The song's whole chart and seed, while it has one (see [`Pipeline::set_song_chart`]).
     song_chart: Option<SongChart>,
+    /// The seed of the song that plays, while one does.
+    song_seed: Option<u32>,
     /// The app's accent colour (linear), once the app has told it.
     accent: Option<[f32; 3]>,
     /// The chances the music's moments play an effect with (see [`crate::moments`]).
@@ -502,6 +504,7 @@ impl Pipeline {
             chart: None,
             song: (0.0, false),
             song_chart: None,
+            song_seed: None,
             accent: None,
             chances: Chances::default(),
             runtime: RuntimeBindings::embedded(),
@@ -959,6 +962,12 @@ impl Pipeline {
     /// [`crate::scene::SongChart`]).
     pub fn set_song_chart(&mut self, song_chart: Option<SongChart>) {
         self.song_chart = song_chart;
+    }
+
+    /// The seed of the song that plays (see `crate::plan::seed_of`), none without a song: scenes
+    /// draw what they start with from it, and their `frame.seed` follows the song time with it.
+    pub fn set_song_seed(&mut self, seed: Option<u32>) {
+        self.song_seed = seed;
     }
 
     /// The chances the music's moments play an effect with, in the scene on screen, the one
@@ -1508,6 +1517,7 @@ impl Pipeline {
                 self.chart.as_ref(),
                 self.song,
                 self.song_chart.as_ref(),
+                self.song_seed,
                 self.accent,
             );
             let timer = &mut self.timer;
@@ -1540,6 +1550,7 @@ impl Pipeline {
                         self.chart.as_ref(),
                         self.song,
                         self.song_chart.as_ref(),
+                        self.song_seed,
                         self.accent,
                     );
                     let timer = &mut self.timer;
@@ -1581,6 +1592,7 @@ impl Pipeline {
                         self.chart.as_ref(),
                         self.song,
                         self.song_chart.as_ref(),
+                        self.song_seed,
                         self.accent,
                     );
                     let timer = &mut self.timer;
@@ -1623,6 +1635,7 @@ impl Pipeline {
                         self.chart.as_ref(),
                         self.song,
                         self.song_chart.as_ref(),
+                        self.song_seed,
                         self.accent,
                     );
                     let timer = &mut self.timer;
@@ -1665,6 +1678,7 @@ impl Pipeline {
             self.chart.as_ref(),
             self.song,
             self.song_chart.as_ref(),
+            self.song_seed,
             self.accent,
         );
         let timer = &mut self.timer;
@@ -1692,12 +1706,13 @@ impl Drop for Pipeline {
 }
 
 /// What a scene hears and sees of the player: the rhythm, the chart, the song time and whether
-/// it plays, the song's whole chart and seed, and the app's accent colour.
+/// it plays, the song's whole chart and seed, the song's seed, and the app's accent colour.
 type Heard<'a> = (
     &'a Rhythm,
     Option<&'a ChartState>,
     (f64, bool),
     Option<&'a SongChart>,
+    Option<u32>,
     Option<[f32; 3]>,
 );
 
@@ -1713,7 +1728,7 @@ fn draw(
     encoder: &mut wgpu::CommandEncoder,
     view: &wgpu::TextureView,
     time: f64,
-    (rhythm, chart, song, song_chart, accent): Heard,
+    (rhythm, chart, song, song_chart, song_seed, accent): Heard,
 ) {
     let timestamps = timer.begin();
     scene.render_timed(
@@ -1727,6 +1742,7 @@ fn draw(
             chart,
             song,
             song_chart,
+            song_seed,
             accent,
         },
         timestamps,

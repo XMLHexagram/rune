@@ -229,6 +229,9 @@ pub struct FrameInput<'a> {
     /// The song's whole chart and seed, with which the music's decisions are stepped by song time
     /// (see `stepper`); none without a chart, or while a lab holds the music without one.
     pub song_chart: Option<&'a SongChart>,
+    /// The seed of the song that plays, the same each time it plays (see `crate::plan::seed_of`);
+    /// none without a song.
+    pub song_seed: Option<u32>,
     /// The app's accent colour (linear), once the app has told it.
     pub accent: Option<[f32; 3]>,
 }
@@ -511,6 +514,11 @@ pub struct Scene {
     hard: bool,
     /// The next frame starts the stepping over as a first frame does (a rebuilt scene).
     restep: bool,
+    /// Whether the counters and signals of `heard` heard anything yet: before they did, the first
+    /// frame with a chart warms them up on the seconds of song before it.
+    warm: bool,
+    /// `frame.song_seed` without a song: a number fixed for the scene's run.
+    run_seed: u32,
     /// The cut the director made in the last frame.
     cut: Option<CutInfo>,
     /// A cut that [`Scene::cut_now`] made, to be reported with the next frame.
@@ -1357,6 +1365,8 @@ impl Scene {
             seen_cuts: 0,
             hard: false,
             restep: false,
+            warm: false,
+            run_seed: rand::random(),
             cut: None,
             forced_cut: None,
             overlay: None,
@@ -1397,6 +1407,7 @@ impl Scene {
         std::mem::swap(&mut self.analyzer, &mut previous.analyzer);
         std::mem::swap(&mut self.wall, &mut previous.wall);
         std::mem::swap(&mut self.heard, &mut previous.heard);
+        std::mem::swap(&mut self.warm, &mut previous.warm);
         self.music_values = previous.music_values;
         self.last_song = previous.last_song;
     }
@@ -2028,7 +2039,12 @@ impl Scene {
         frame.extend((w as f32).to_le_bytes());
         frame.extend((h as f32).to_le_bytes());
         frame.extend((w as f32 / h as f32).to_le_bytes());
-        let seed = rand::random::<u32>();
+        // With a song the seed follows the song time, a step of 1/60 s at a time, so that the same
+        // moment of the same song draws with the same numbers; without one it is random.
+        let seed = match input.song_seed {
+            Some(song) => mix_seed(song, (input.song.0.max(0.0) / STEP).floor() as u32),
+            None => rand::random::<u32>(),
+        };
         #[cfg(test)]
         let seed = self.fixed_seed.map_or(seed, |fixed| {
             fixed.wrapping_add(self.index.wrapping_mul(0x9e37_79b9))
@@ -2040,8 +2056,18 @@ impl Scene {
         }
         frame.extend(self.covers_count.to_le_bytes());
         frame.extend(self.level.quality.to_le_bytes());
+        frame.extend((input.song.0 as f32).to_le_bytes());
+        frame.extend(input.song_seed.unwrap_or(self.run_seed).to_le_bytes());
         frame.resize(wgsl::FRAME_SIZE as usize, 0);
         queue.write_buffer(&self.frame, 0, &frame);
+        // The signals start where they would be had the song been heard for a while (drive and
+        // the like take seconds to settle): from the chart, before the first frame.
+        if !self.warm
+            && let Some(song) = input.song_chart
+        {
+            warm_up(&mut self.heard, &song.chart, input.song.0);
+        }
+        self.warm = true;
         let music = inputs::music(
             input.rhythm,
             input.chart,
@@ -2236,6 +2262,38 @@ impl Scene {
         }
         self.index = self.index.wrapping_add(1);
         self.first = false;
+    }
+}
+
+/// A seed of `seed` and `n` together, spread over all the bits (the finaliser of MurmurHash3).
+fn mix_seed(seed: u32, n: u32) -> u32 {
+    let mut h = seed ^ n.wrapping_mul(0x9e37_79b9);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^ (h >> 16)
+}
+
+/// How many seconds of song the signals are warmed up on (see [`warm_up`]).
+const WARM_UP: f64 = 8.0;
+
+/// Lets `heard` hear the [`WARM_UP`] seconds of `chart` before song time `time`, a step at a
+/// time, as the chart says they go (the live audio is not known for them).
+fn warm_up(heard: &mut EventCounter, chart: &crate::chart::Chart, time: f64) {
+    let mut t = (time - WARM_UP).max(0.0);
+    while t < time {
+        let state = chart.at(t);
+        let rhythm = crate::chart::trusted_rhythm(Rhythm::default(), Some(&state));
+        inputs::music(
+            &rhythm,
+            Some(&state),
+            Levels::default(),
+            (t, true),
+            heard,
+            STEP,
+        );
+        t += STEP;
     }
 }
 
