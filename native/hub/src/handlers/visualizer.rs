@@ -7,7 +7,10 @@ use tokio::sync::Mutex;
 use ::database::connection::{MainDbConnection, RecommendationDbConnection};
 use ::fsio::FsIo;
 use ::playback::player::Playable;
-use ::visualizer::{Location, PcmInput, Transport};
+use ::visualizer::{
+    CutInStyle, Inspect, LabCommand, LabEvent, LabEventKind, LabLens, LabPace, LabTransition,
+    Level, Location, PcmInput, Transport,
+};
 
 use crate::{
     Session, Signal, flutter_bridge,
@@ -618,5 +621,417 @@ impl Signal for ListVisualizerPresetsRequest {
             })
             .collect();
         Ok(Some(ListVisualizerPresetsResponse { presets }))
+    }
+}
+
+impl ParamsExtractor for SetVisualizerLabRequest {
+    type Params = ();
+
+    fn extract_params(&self, _all_params: &GlobalParams) -> Self::Params {}
+}
+
+impl Signal for SetVisualizerLabRequest {
+    type Params = ();
+    type Response = ();
+
+    async fn handle(
+        &self,
+        _: Self::Params,
+        _session: Option<Session>,
+        dart_signal: &Self,
+    ) -> Result<Option<Self::Response>> {
+        VISUALIZER.set_inspecting(dart_signal.enabled);
+        Ok(Some(()))
+    }
+}
+
+impl From<VisualizerLabPace> for LabPace {
+    fn from(pace: VisualizerLabPace) -> Self {
+        match pace {
+            VisualizerLabPace::Sections => Self::Sections,
+            VisualizerLabPace::Calm => Self::Calm,
+            VisualizerLabPace::Normal => Self::Normal,
+            VisualizerLabPace::Busy => Self::Busy,
+        }
+    }
+}
+
+impl From<VisualizerLabLevel> for Level {
+    fn from(level: VisualizerLabLevel) -> Self {
+        match level {
+            VisualizerLabLevel::A => Self::A,
+            VisualizerLabLevel::B => Self::B,
+            VisualizerLabLevel::C => Self::C,
+        }
+    }
+}
+
+impl From<Level> for VisualizerLabLevel {
+    fn from(level: Level) -> Self {
+        match level {
+            Level::A => Self::A,
+            Level::B => Self::B,
+            Level::C => Self::C,
+        }
+    }
+}
+
+impl From<VisualizerLabCutIn> for CutInStyle {
+    fn from(style: VisualizerLabCutIn) -> Self {
+        match style {
+            VisualizerLabCutIn::Streaks => Self::Streaks,
+            VisualizerLabCutIn::Halftone => Self::Halftone,
+            VisualizerLabCutIn::Echo => Self::Echo,
+        }
+    }
+}
+
+impl From<CutInStyle> for VisualizerLabCutIn {
+    fn from(style: CutInStyle) -> Self {
+        match style {
+            CutInStyle::Streaks => Self::Streaks,
+            CutInStyle::Halftone => Self::Halftone,
+            CutInStyle::Echo => Self::Echo,
+        }
+    }
+}
+
+impl From<VisualizerLabTransition> for LabTransition {
+    fn from(transition: VisualizerLabTransition) -> Self {
+        match transition {
+            VisualizerLabTransition::Cut => Self::Cut,
+            VisualizerLabTransition::Fade => Self::Fade,
+            VisualizerLabTransition::Dissolve => Self::Dissolve,
+            VisualizerLabTransition::CutIn { style } => Self::CutIn(style.into()),
+            VisualizerLabTransition::Flash => Self::Flash,
+            VisualizerLabTransition::Glitch => Self::Glitch,
+            VisualizerLabTransition::Mosaic => Self::Mosaic,
+        }
+    }
+}
+
+impl From<LabTransition> for VisualizerLabTransition {
+    fn from(transition: LabTransition) -> Self {
+        match transition {
+            LabTransition::Cut => Self::Cut,
+            LabTransition::Fade => Self::Fade,
+            LabTransition::Dissolve => Self::Dissolve,
+            LabTransition::CutIn(style) => Self::CutIn {
+                style: style.into(),
+            },
+            LabTransition::Flash => Self::Flash,
+            LabTransition::Glitch => Self::Glitch,
+            LabTransition::Mosaic => Self::Mosaic,
+        }
+    }
+}
+
+impl From<VisualizerLabLens> for LabLens {
+    fn from(lens: VisualizerLabLens) -> Self {
+        Self {
+            flare: lens.flare,
+            leak: lens.leak,
+            glitch: lens.glitch,
+            mosaic: lens.mosaic,
+        }
+    }
+}
+
+impl From<LabLens> for VisualizerLabLens {
+    fn from(lens: LabLens) -> Self {
+        Self {
+            flare: lens.flare,
+            leak: lens.leak,
+            glitch: lens.glitch,
+            mosaic: lens.mosaic,
+        }
+    }
+}
+
+impl From<VisualizerLabCommand> for LabCommand {
+    fn from(command: VisualizerLabCommand) -> Self {
+        match command {
+            VisualizerLabCommand::Cut => Self::Cut,
+            VisualizerLabCommand::EffectChance { percent } => Self::EffectChance(percent),
+            VisualizerLabCommand::Shot { index } => Self::Shot(index),
+            VisualizerLabCommand::Look { index } => Self::Look(index),
+            VisualizerLabCommand::NextScene { transition } => Self::NextScene(transition.into()),
+            VisualizerLabCommand::CyclePace => Self::CyclePace,
+            VisualizerLabCommand::CutDressed { transition } => Self::CutDressed(transition.into()),
+            VisualizerLabCommand::Flare => Self::Flare,
+            VisualizerLabCommand::Leak => Self::Leak,
+            VisualizerLabCommand::LensGlitch => Self::LensGlitch,
+            VisualizerLabCommand::LensMosaic => Self::LensMosaic,
+            VisualizerLabCommand::SwitchWith { transition } => {
+                Self::SwitchWith(transition.map(Into::into))
+            }
+            VisualizerLabCommand::CutsWith { transition } => {
+                Self::CutsWith(transition.map(Into::into))
+            }
+            VisualizerLabCommand::BurstsWith { bursts } => Self::BurstsWith(bursts),
+            VisualizerLabCommand::LensWith { lens } => Self::LensWith(lens.into()),
+            VisualizerLabCommand::PaceWith { pace } => Self::PaceWith(pace.map(Into::into)),
+            VisualizerLabCommand::ForceLevel { level } => Self::ForceLevel(level.map(Into::into)),
+            VisualizerLabCommand::Burst => Self::Burst,
+        }
+    }
+}
+
+impl ParamsExtractor for VisualizerLabCommandRequest {
+    type Params = ();
+
+    fn extract_params(&self, _all_params: &GlobalParams) -> Self::Params {}
+}
+
+impl Signal for VisualizerLabCommandRequest {
+    type Params = ();
+    type Response = ();
+
+    async fn handle(
+        &self,
+        _: Self::Params,
+        _session: Option<Session>,
+        dart_signal: &Self,
+    ) -> Result<Option<Self::Response>> {
+        // A visualizer that is not running has nothing to tell.
+        if let Err(e) = VISUALIZER.lab(dart_signal.command.clone().into()) {
+            log::warn!("The visualizer lab command was dropped: {e:#}");
+        }
+        Ok(Some(()))
+    }
+}
+
+/// The lab's events as messages; an event of a kind this build does not know is left out.
+fn lab_event(event: LabEvent) -> Option<VisualizerLabEvent> {
+    let kind = match event.kind {
+        LabEventKind::Cut {
+            shot,
+            size,
+            fill,
+            strong,
+            hard,
+            dress,
+            first,
+        } => VisualizerLabEventKind::Cut {
+            shot,
+            size,
+            fill,
+            strong,
+            hard,
+            dress,
+            first,
+        },
+        LabEventKind::Look { look } => VisualizerLabEventKind::Look { look },
+        LabEventKind::Moment { strength, effect } => {
+            VisualizerLabEventKind::Moment { strength, effect }
+        }
+        LabEventKind::Lab { command } => VisualizerLabEventKind::Lab { command },
+        _ => return None,
+    };
+    Some(VisualizerLabEvent {
+        time: event.time,
+        kind,
+    })
+}
+
+/// The live readout of a frame the visualizer saw.
+fn lab_now(inspect: Inspect) -> VisualizerLabNow {
+    // `Inspect` does not carry the level: it is what the music's values say (see `Level::of`).
+    let level = if !inspect.music.has_chart {
+        Level::C
+    } else if inspect.music.locked {
+        Level::A
+    } else {
+        Level::B
+    };
+    let overrides = inspect.overrides;
+    let pace = inspect
+        .director
+        .as_ref()
+        .filter(|director| director.pace_overridden)
+        .map(|director| director.pace.clone());
+    let inputs = inspect
+        .inputs
+        .into_iter()
+        .map(|input| {
+            let value = inspect
+                .bindings
+                .iter()
+                .rev()
+                .find(|binding| binding.target == input.id)
+                .map_or(input.rest, |binding| binding.output);
+            VisualizerLabInput {
+                id: input.id,
+                label: input.label,
+                value,
+            }
+        })
+        .collect();
+    VisualizerLabNow {
+        level: level.name().to_string(),
+        director: inspect.director.map(|director| VisualizerLabDirector {
+            shot_index: director.shot_index,
+            shot_name: director.shot_name,
+            size: director.size,
+            tier: director.tier,
+            pace: director.pace,
+            own_pace: director.own_pace,
+            age: director.age,
+            length: director.length,
+            held: director.held,
+            shots: director
+                .shots
+                .into_iter()
+                .map(|shot| VisualizerLabShot {
+                    name: shot.name,
+                    size: shot.size,
+                    burst: shot.burst,
+                    owed: shot.owed,
+                })
+                .collect(),
+        }),
+        looks: inspect.looks.map(|looks| VisualizerLabLooks {
+            names: looks.names,
+            on: looks.on,
+            prev: looks.prev,
+            mix: looks.mix,
+            held: looks.held,
+        }),
+        signals: inspect
+            .signals
+            .into_iter()
+            .map(|signal| VisualizerLabSignal {
+                name: signal.name,
+                value: signal.value,
+                event: signal.event,
+                meaningful: signal.meaningful,
+            })
+            .collect(),
+        inputs,
+        effects: VisualizerLabEffects {
+            cut: inspect.effects.cut,
+            lens: inspect.effects.lens,
+        },
+        overrides: VisualizerLabOverrides {
+            chance: inspect.chance,
+            bursts: overrides.bursts,
+            level: overrides.level.map(Into::into),
+            pace,
+            switch: overrides.switch.map(Into::into),
+            cuts: overrides.cuts.map(Into::into),
+            lens: overrides.lens.into(),
+        },
+        sections: inspect
+            .sections
+            .into_iter()
+            .map(|section| VisualizerLabSection {
+                start: section.start,
+                end: section.end,
+                label: section.label,
+                energy: section.energy,
+            })
+            .collect(),
+    }
+}
+
+impl ParamsExtractor for VisualizerLabRequest {
+    type Params = ();
+
+    fn extract_params(&self, _all_params: &GlobalParams) -> Self::Params {}
+}
+
+impl Signal for VisualizerLabRequest {
+    type Params = ();
+    type Response = VisualizerLabResponse;
+
+    async fn handle(
+        &self,
+        _: Self::Params,
+        _session: Option<Session>,
+        _dart_signal: &Self,
+    ) -> Result<Option<Self::Response>> {
+        let inspect = VISUALIZER.inspect();
+        Ok(Some(VisualizerLabResponse {
+            inspecting: VISUALIZER.is_inspecting(),
+            song_time: inspect
+                .as_ref()
+                .map_or(0.0, |inspect| f64::from(inspect.music.time)),
+            plan_version: VISUALIZER.plan_version(),
+            events: VISUALIZER
+                .drain_lab_events()
+                .into_iter()
+                .filter_map(lab_event)
+                .collect(),
+            now: inspect.map(lab_now),
+        }))
+    }
+}
+
+impl ParamsExtractor for VisualizerPlanRequest {
+    type Params = ();
+
+    fn extract_params(&self, _all_params: &GlobalParams) -> Self::Params {}
+}
+
+impl Signal for VisualizerPlanRequest {
+    type Params = ();
+    type Response = VisualizerPlanResponse;
+
+    async fn handle(
+        &self,
+        _: Self::Params,
+        _session: Option<Session>,
+        _dart_signal: &Self,
+    ) -> Result<Option<Self::Response>> {
+        // The version first: a plan made in between is then fetched again for its own version.
+        let version = VISUALIZER.plan_version();
+        let plan = VISUALIZER.plan().map(|plan| VisualizerPlan {
+            path: plan.path.clone(),
+            scene: plan.scene.clone(),
+            length: plan.length,
+            sections: plan
+                .sections
+                .iter()
+                .map(|section| VisualizerPlanSection {
+                    start: section.start,
+                    end: section.end,
+                    label: section.label.clone(),
+                    energy: section.energy,
+                    tier: section.tier.clone(),
+                })
+                .collect(),
+            cuts: plan
+                .cuts
+                .iter()
+                .map(|cut| VisualizerPlanCut {
+                    time: cut.time,
+                    shot: cut.shot.clone(),
+                    size: cut.size.clone(),
+                    fill: cut.fill,
+                    strong: cut.strong,
+                    hard: cut.hard,
+                    dress: cut.dress.clone(),
+                    first: cut.first,
+                })
+                .collect(),
+            looks: plan
+                .looks
+                .iter()
+                .map(|look| VisualizerPlanLook {
+                    time: look.time,
+                    look: look.look.clone(),
+                })
+                .collect(),
+            moments: plan
+                .moments
+                .iter()
+                .map(|moment| VisualizerPlanMoment {
+                    time: moment.time,
+                    strength: moment.strength.clone(),
+                    effect: moment.effect.clone(),
+                })
+                .collect(),
+        });
+        Ok(Some(VisualizerPlanResponse { version, plan }))
     }
 }

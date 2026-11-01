@@ -512,6 +512,11 @@ impl Visualizer {
         lock(&self.shared.inspect).clone()
     }
 
+    /// Whether a lab inspects the render thread (see [`Self::set_inspecting`]).
+    pub fn is_inspecting(&self) -> bool {
+        self.shared.inspecting.load(Ordering::Relaxed)
+    }
+
     /// The song on screen played through ahead of time with the scene's decisions, while
     /// inspecting (see [`Self::set_inspecting`]) and the song has a chart; else none. Made in the
     /// background after the song, the scene or what a lab set changes.

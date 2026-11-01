@@ -179,6 +179,26 @@ pub fn define_request_types(_input: TokenStream) -> TokenStream {
             local_only: true,
         },
         RequestResponse {
+            request: "SetVisualizerLabRequest".to_string(),
+            response: None,
+            local_only: true,
+        },
+        RequestResponse {
+            request: "VisualizerLabCommandRequest".to_string(),
+            response: None,
+            local_only: true,
+        },
+        RequestResponse {
+            request: "VisualizerLabRequest".to_string(),
+            response: Some("VisualizerLabResponse".to_string()),
+            local_only: true,
+        },
+        RequestResponse {
+            request: "VisualizerPlanRequest".to_string(),
+            response: Some("VisualizerPlanResponse".to_string()),
+            local_only: true,
+        },
+        RequestResponse {
             request: "VisualizerSupportRequest".to_string(),
             response: Some("VisualizerSupportResponse".to_string()),
             local_only: true,
