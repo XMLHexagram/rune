@@ -24,6 +24,7 @@ const _hoverReach = 5.0;
 
 const _pink = Color(0xFFFF6FB5);
 const _manual = Color(0xFFFFB02E);
+const _jump = Color(0xFF9AA0A6);
 
 Color labTierColor(String tier) => switch (tier) {
   'quiet' => const Color(0xFF4A78C2),
@@ -123,6 +124,22 @@ class LabTimelinePainter extends CustomPainter {
           if (m.kind == LabMarkKind.moment) m,
       ],
     );
+
+    // A jump: a dashed grey line across the row, as it is not a cut.
+    final dash = Paint()
+      ..color = _jump
+      ..strokeWidth = 1.5;
+    for (final m in observed) {
+      if (m.kind != LabMarkKind.jump) continue;
+      final x = _x(m.time, size);
+      for (var y = top; y < top + _rowHeight; y += 5) {
+        canvas.drawLine(
+          Offset(x, y),
+          Offset(x, math.min(y + 3, top + _rowHeight)),
+          dash,
+        );
+      }
+    }
 
     final paint = Paint()
       ..color = _manual
@@ -517,6 +534,7 @@ List<String> _describe(
             fill: m.fill,
             strong: m.strong,
           ),
+          LabMarkKind.jump => 'Jump ${_clock(m.time)} · ${m.label} (${m.size})',
           LabMarkKind.look => 'Look ${_clock(m.time)} · ${m.label}',
           LabMarkKind.moment => _moment(
             m.time,
@@ -651,18 +669,21 @@ class _LabelLayout extends SingleChildLayoutDelegate {
       old.x != x || old.top != top || old.bottom != bottom;
 }
 
-/// How many of the planned cuts that are behind the song time have a cut that
-/// happened within [tolerance] seconds of them, and how many have passed.
+/// How many of the planned cuts in the stretches the visualizer was seen
+/// playing ([watched], see [VisualizerLabProvider.watched]) have a cut that
+/// happened within [tolerance] seconds of them, and how many there are. A cut
+/// at the start of a stretch is not counted: the stretch starts with a jump
+/// there, which goes straight to the shot on.
 (int, int) labCutMatch(
   VisualizerPlan plan,
   List<LabMark> observed,
-  double songTime, {
+  List<(double, double)> watched, {
   double tolerance = 0.1,
 }) {
   var passed = 0;
   var matched = 0;
   for (final c in plan.cuts) {
-    if (c.time > songTime) break;
+    if (!watched.any((w) => c.time > w.$1 && c.time <= w.$2)) continue;
     passed++;
     for (final m in observed) {
       if (m.kind == LabMarkKind.cut && (m.time - c.time).abs() <= tolerance) {

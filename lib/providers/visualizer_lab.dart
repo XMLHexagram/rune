@@ -9,8 +9,10 @@ import '../constants/settings_manager.dart';
 import '../utils/visualizer_supported.dart';
 import 'status.dart';
 
-/// What a mark on the lab's timeline is.
-enum LabMarkKind { cut, look, moment, manual }
+/// What a mark on the lab's timeline is. A jump is where the visualizer was put
+/// at a song time without playing up to it (it opened, or the song was sought),
+/// and went straight to the shot on.
+enum LabMarkKind { cut, jump, look, moment, manual }
 
 /// Something the visualizer did, or the user played by hand, at a song time.
 @immutable
@@ -63,6 +65,9 @@ class VisualizerLabProvider extends ChangeNotifier {
   double? _songTime;
   final List<LabMark> _observed = [];
   final List<LabMark> _temporary = [];
+  // The stretches of the song the visualizer was seen playing, as (from, to);
+  // a jump starts another.
+  final List<(double, double)> _watched = [];
 
   PlaybackStatusProvider? _status;
   String? _trackKey;
@@ -93,6 +98,10 @@ class VisualizerLabProvider extends ChangeNotifier {
   /// Marks of the effects the user played by hand.
   List<LabMark> get temporary => List.unmodifiable(_temporary);
 
+  /// The stretches of the song the visualizer was seen playing, as (from, to)
+  /// in song seconds, in the order they were played.
+  List<(double, double)> get watched => List.unmodifiable(_watched);
+
   Future<void> _load() async {
     final value = await $settingsManager.getValue<bool>(kVisualizerLabKey);
     if (_disposed) return;
@@ -111,6 +120,7 @@ class VisualizerLabProvider extends ChangeNotifier {
     _songTime = null;
     _observed.clear();
     _temporary.clear();
+    _watched.clear();
     if (_enabled) {
       SchedulerBinding.instance.addPostFrameCallback((_) {
         if (!_disposed) notifyListeners();
@@ -141,6 +151,7 @@ class VisualizerLabProvider extends ChangeNotifier {
       _songTime = null;
       _observed.clear();
       _temporary.clear();
+      _watched.clear();
     }
     notifyListeners();
   }
@@ -202,22 +213,55 @@ class VisualizerLabProvider extends ChangeNotifier {
       }
     }
 
+    var jumped = false;
+    for (final event in response.events) {
+      final mark = _markOf(event);
+      if (mark == null) continue;
+      if (mark.kind == LabMarkKind.jump) {
+        _jumpTo(mark.time);
+        jumped = true;
+      }
+      _observed.add(mark);
+    }
     final time = response.songTime;
     final last = _songTime;
-    if (last != null && time < last - _backwardsJump) {
-      _observed.removeWhere((m) => m.time > time);
-      _temporary.removeWhere((m) => m.time > time);
+    // A seek back that no jump told of (the visualizer was not drawing).
+    if (!jumped && last != null && time < last - _backwardsJump) {
+      _jumpTo(time);
     }
+    _watch(time);
     _songTime = time;
     _now = response.now;
 
-    for (final event in response.events) {
-      final mark = _markOf(event);
-      if (mark != null) _observed.add(mark);
-    }
     if (_observed.length > _maxMarks) {
       _observed.removeRange(0, _observed.length - _maxMarks);
     }
+  }
+
+  /// The visualizer went to song time [time] without playing up to it: what
+  /// was seen after it is of another playing, and a new stretch starts there.
+  void _jumpTo(double time) {
+    _observed.removeWhere((m) => m.time > time);
+    _temporary.removeWhere((m) => m.time > time);
+    for (var i = _watched.length - 1; i >= 0; i--) {
+      final (from, to) = _watched[i];
+      if (from > time) {
+        _watched.removeAt(i);
+      } else if (to > time) {
+        _watched[i] = (from, time);
+      }
+    }
+    _watched.add((time, time));
+  }
+
+  /// The visualizer was seen playing at song time [time].
+  void _watch(double time) {
+    if (_watched.isEmpty || time < _watched.last.$1) {
+      _watched.add((time, time));
+      return;
+    }
+    final (from, to) = _watched.last;
+    if (time > to) _watched[_watched.length - 1] = (from, time);
   }
 
   LabMark? _markOf(VisualizerLabEvent event) {
@@ -225,7 +269,7 @@ class VisualizerLabProvider extends ChangeNotifier {
     if (kind is VisualizerLabEventKindCut) {
       return LabMark(
         time: event.time,
-        kind: LabMarkKind.cut,
+        kind: kind.first ? LabMarkKind.jump : LabMarkKind.cut,
         size: kind.size,
         fill: kind.fill,
         strong: kind.strong,

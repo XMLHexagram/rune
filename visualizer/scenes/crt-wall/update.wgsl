@@ -283,6 +283,12 @@ fn update() {
     state.cuts = shot.cuts;
     choose_view();
     decide_wall();
+    // The camera has travelled along the wall at its cruise for as long as the song has played, so
+    // opening at the same moment puts it in the same place. (A burst's close-up does not cruise:
+    // it is framed on its set.)
+    if (state.view < 3.5) {
+      state.cam.x += state.dir * params.cruise * frame.song;
+    }
     state.vel = params.cruise;
     state.vtgt = params.cruise;
     // No change is rolling when the scene begins.

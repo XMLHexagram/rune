@@ -329,7 +329,8 @@ pub enum VisualizerLabEventKind {
         hard: bool,
         /// The transition that dresses the cut, by name.
         dress: Option<String>,
-        /// The scene's first shot, which it begins with.
+        /// The scene's first shot, which it begins with, or the shot on where the visualizer was
+        /// put at a song time without playing up to it (a seek): a jump rather than a cut.
         first: bool,
     },
     /// The look changed to `look`.

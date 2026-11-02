@@ -16,6 +16,7 @@ mod manifest;
 mod noise;
 mod post;
 mod signals;
+mod stepper;
 mod wgsl;
 
 use std::borrow::Cow;
@@ -30,13 +31,16 @@ use crate::covers::{self, Atlas, Cell};
 use crate::rhythm::Rhythm;
 use audio::{Analyzer, SPECTRUM_ROWS, SPECTRUM_WIDTH, WAVEFORM_WIDTH};
 pub(crate) use decider::Decider;
+pub use decider::STEP;
 pub use decider::Settings as DeciderSettings;
 pub use director::DirectorView;
-use inputs::WallClock;
+use inputs::{EventCounter, WallClock};
 pub use lens::LensView;
 pub use looks::LooksView;
 pub use manifest::{Bind, Effects, FallbackDecl, InputDecl, Pace, Param, ParamKind};
 use manifest::{Format, Manifest, OUT, PREV, ShotMove, ShotSize, Value};
+pub use stepper::SongChart;
+use stepper::{Stepped, Stepper};
 use wgsl::{InputLayout, ParamsLayout};
 
 pub use manifest::{MANIFEST, argb_to_linear};
@@ -222,6 +226,12 @@ pub struct FrameInput<'a> {
     pub chart: Option<&'a ChartState>,
     /// The song time and whether it plays.
     pub song: (f64, bool),
+    /// The song's whole chart and seed, with which the music's decisions are stepped by song time
+    /// (see `stepper`); none without a chart, or while a lab holds the music without one.
+    pub song_chart: Option<&'a SongChart>,
+    /// The seed of the song that plays, the same each time it plays (see `crate::plan::seed_of`);
+    /// none without a song.
+    pub song_seed: Option<u32>,
     /// The app's accent colour (linear), once the app has told it.
     pub accent: Option<[f32; 3]>,
 }
@@ -485,10 +495,30 @@ pub struct Scene {
     analyzer: Analyzer,
     /// The wall seconds between frames, which the music's signals move on by.
     wall: WallClock,
+    /// The counters and signals the music's values for the screen are made with, frame by frame.
+    heard: EventCounter,
     /// The values `struct Music` got for the last frame.
     music_values: inputs::MusicValues,
     /// What the music decides: the camera cuts, the looks, the moments and the lens effects.
     decider: Decider,
+    /// Steps the decider by song time while the song has a chart.
+    stepper: Stepper,
+    /// How often the runtime's decisions were given to the scene, for the stepper's snapshots.
+    runtime_version: u64,
+    /// The cuts the scene was told of (`shot.cuts`), which only grow: the decider's own count
+    /// starts over when it is replaced. The decider's count as last seen, to add what it adds.
+    cuts: u32,
+    seen_cuts: u32,
+    /// The screen jumped to the shot on (see `stepper`), so the scene is told to jump to it
+    /// (`shot.hard`) until the next cut.
+    hard: bool,
+    /// The next frame starts the stepping over as a first frame does (a rebuilt scene).
+    restep: bool,
+    /// Whether the counters and signals of `heard` heard anything yet: before they did, the first
+    /// frame with a chart warms them up on the seconds of song before it.
+    warm: bool,
+    /// `frame.song_seed` without a song: a number fixed for the scene's run.
+    run_seed: u32,
     /// The cut the director made in the last frame.
     cut: Option<CutInfo>,
     /// A cut that [`Scene::cut_now`] made, to be reported with the next frame.
@@ -1326,8 +1356,17 @@ impl Scene {
             level: Level::FULL,
             analyzer: Analyzer::new(sample_rate),
             wall: WallClock::default(),
+            heard: EventCounter::default(),
             music_values: inputs::MusicValues::default(),
             decider: Decider::new(manifest),
+            stepper: Stepper::default(),
+            runtime_version: 0,
+            cuts: 0,
+            seen_cuts: 0,
+            hard: false,
+            restep: false,
+            warm: false,
+            run_seed: rand::random(),
             cut: None,
             forced_cut: None,
             overlay: None,
@@ -1367,7 +1406,8 @@ impl Scene {
         }
         std::mem::swap(&mut self.analyzer, &mut previous.analyzer);
         std::mem::swap(&mut self.wall, &mut previous.wall);
-        self.decider.swap_music(&mut previous.decider);
+        std::mem::swap(&mut self.heard, &mut previous.heard);
+        std::mem::swap(&mut self.warm, &mut previous.warm);
         self.music_values = previous.music_values;
         self.last_song = previous.last_song;
     }
@@ -1506,28 +1546,34 @@ impl Scene {
 
     /// Start a lens flare now, at full strength (a scene lab).
     pub fn start_flare(&mut self) {
+        self.stepper.taint();
         self.decider.lens_mut().start_flare(1.0);
     }
 
     /// Start a light leak now, at full strength (a scene lab).
     pub fn start_leak(&mut self) {
+        self.stepper.taint();
         self.decider.lens_mut().start_leak(1.0);
     }
 
     /// Keep a flare at its full swell, called before each frame (a probe).
     #[cfg(test)]
     pub fn hold_flare(&mut self) {
+        self.stepper.taint();
         self.decider.lens_mut().hold_flare();
     }
 
     /// Play a glitch or a mosaic over the picture from the next frame (a scene lab).
     pub fn start_overlay(&mut self, kind: crate::transition::Overlay) {
+        self.stepper.taint();
         self.decider.lens_mut().start_overlay(kind);
     }
 
     /// The runtime's decisions this scene reads from now on: what a moment is, when the director
     /// cuts, how the effects' course reads the music (`runtime.toml`).
     pub fn set_runtime(&mut self, runtime: &crate::bind::RuntimeBindings) {
+        self.stepper.taint();
+        self.runtime_version += 1;
         self.decider.set_runtime(runtime);
     }
 
@@ -1538,13 +1584,18 @@ impl Scene {
 
     /// The chances the music's moments play an effect with (the user's setting, or a lab's).
     pub fn set_effect_chances(&mut self, chances: crate::moments::Chances) {
-        self.decider.set_chances(chances);
+        // Told every frame: only a change changes the decider.
+        if self.decider.settings().chances != chances {
+            self.stepper.taint();
+            self.decider.set_chances(chances);
+        }
     }
 
     /// Cut to the next shot now, by the director's rules for the size (see
     /// `Director::force_cut`); the scene hears of it with the next frame, which reports it as its
     /// cut ([`Scene::cut_this_frame`]). Nothing without shots.
     pub fn cut_now(&mut self) {
+        self.stepper.taint();
         if let Some(director) = self.decider.director_mut() {
             let cut = director.force_cut(&self.music_values);
             self.forced_cut = Some(CutInfo {
@@ -1561,6 +1612,7 @@ impl Scene {
     /// Start a burst of cuts now, as the one before a lift (see `Director::start_burst`); each
     /// cut is reported with its `fill` ([`Scene::cut_this_frame`]). Nothing without shots.
     pub fn start_burst(&mut self) {
+        self.stepper.taint();
         if let Some(director) = self.decider.director_mut() {
             director.start_burst();
         }
@@ -1569,6 +1621,7 @@ impl Scene {
     /// Cut to shot `index` and hold it, or with none let go of a held shot (see
     /// `Director::hold_shot`). Whether the scene has the shot.
     pub fn hold_shot(&mut self, index: Option<u32>) -> bool {
+        self.stepper.taint();
         if self.decider.director().is_none() {
             return false;
         }
@@ -1590,6 +1643,7 @@ impl Scene {
     /// the look no more, or with none hand the look back to the runtime (see `Looks::hold`).
     /// Whether the scene has the look.
     pub fn hold_look(&mut self, index: Option<u32>) -> bool {
+        self.stepper.taint();
         if self.decider.looks().is_none() {
             return false;
         }
@@ -1605,6 +1659,7 @@ impl Scene {
     /// Step the director's pace for a scene lab (see `Director::cycle_pace`). Nothing without
     /// shots.
     pub fn cycle_pace(&mut self) {
+        self.stepper.taint();
         if let Some(director) = self.decider.director_mut() {
             director.cycle_pace();
         }
@@ -1613,6 +1668,7 @@ impl Scene {
     /// Use `pace` for the director in place of the scene's own, or with none the scene's own
     /// again (a scene lab). Nothing without shots.
     pub fn set_pace(&mut self, pace: Option<Pace>) {
+        self.stepper.taint();
         if let Some(director) = self.decider.director_mut() {
             director.set_pace_override(pace);
         }
@@ -1621,6 +1677,7 @@ impl Scene {
     /// Make every lifting section start burst, or none, or with none leave it to the runtime's
     /// chance (a scene lab; see `Director::set_burst_override`). Nothing without shots.
     pub fn set_bursts(&mut self, bursts: Option<bool>) {
+        self.stepper.taint();
         if let Some(director) = self.decider.director_mut() {
             director.set_burst_override(bursts);
         }
@@ -1628,6 +1685,7 @@ impl Scene {
 
     /// Make the scene act as if it listed these lens effects too (a scene lab).
     pub fn set_lens_forced(&mut self, forced: crate::inspect::LabLens) {
+        self.stepper.taint();
         self.decider.lens_mut().set_forced(forced);
     }
 
@@ -1741,6 +1799,10 @@ impl Scene {
         next.started = self.started;
         next.last = self.last;
         next.index = self.index;
+        // The director is new: with a chart it is put where the song is, and the scene jumps to
+        // its shot; the count of cuts goes on.
+        next.cuts = self.cuts;
+        next.restep = true;
         *self = next;
         Ok(())
     }
@@ -1858,7 +1920,24 @@ impl Scene {
     #[cfg(test)]
     pub(crate) fn fix_wall_dt(&mut self, dt: f64) {
         self.wall = WallClock::fixed(dt);
-        self.decider.forget_music();
+        self.heard = EventCounter::default();
+    }
+
+    /// What the director tells the scene now (`struct Shot`), zeros without a director: its
+    /// shot, with the count of cuts the scene was told, told to jump after a jump, and `since_step`
+    /// song seconds older than the decider's last step (the steps come at 60 a second, the frames
+    /// may come faster).
+    fn shot_bytes(&self, since_step: f64) -> [u8; wgsl::SHOT_SIZE as usize] {
+        let Some(director) = self.decider.director() else {
+            return [0; wgsl::SHOT_SIZE as usize];
+        };
+        let mut state = *director.state();
+        state.cuts = self.cuts;
+        if self.hard {
+            state.hard = 1;
+        }
+        state.age += since_step as f32;
+        state.bytes()
     }
 
     /// The internal resolution (that of `out`, `frame.resolution`).
@@ -1960,7 +2039,12 @@ impl Scene {
         frame.extend((w as f32).to_le_bytes());
         frame.extend((h as f32).to_le_bytes());
         frame.extend((w as f32 / h as f32).to_le_bytes());
-        let seed = rand::random::<u32>();
+        // With a song the seed follows the song time, a step of 1/60 s at a time, so that the same
+        // moment of the same song draws with the same numbers; without one it is random.
+        let seed = match input.song_seed {
+            Some(song) => mix_seed(song, (input.song.0.max(0.0) / STEP).floor() as u32),
+            None => rand::random::<u32>(),
+        };
         #[cfg(test)]
         let seed = self.fixed_seed.map_or(seed, |fixed| {
             fixed.wrapping_add(self.index.wrapping_mul(0x9e37_79b9))
@@ -1972,41 +2056,101 @@ impl Scene {
         }
         frame.extend(self.covers_count.to_le_bytes());
         frame.extend(self.level.quality.to_le_bytes());
+        frame.extend((input.song.0 as f32).to_le_bytes());
+        frame.extend(input.song_seed.unwrap_or(self.run_seed).to_le_bytes());
         frame.resize(wgsl::FRAME_SIZE as usize, 0);
         queue.write_buffer(&self.frame, 0, &frame);
-        let music = self.decider.hear(
+        // The signals start where they would be had the song been heard for a while (drive and
+        // the like take seconds to settle): from the chart, before the first frame.
+        if !self.warm
+            && let Some(song) = input.song_chart
+        {
+            warm_up(&mut self.heard, &song.chart, input.song.0);
+        }
+        self.warm = true;
+        let music = inputs::music(
             input.rhythm,
             input.chart,
             levels,
             input.song,
+            &mut self.heard,
             self.wall.tick(),
         );
         queue.write_buffer(&self.music, 0, &music.bytes());
         self.music_values = music;
         // The decisions come first: the bindings hear the cut and nothing else of them, and no
-        // decision reads a binding.
-        let forced_cut = self.forced_cut.take();
-        let decision = self.decider.step(
-            dt as f32,
-            &music,
-            input.chart,
-            seed,
-            forced_cut,
-            self.level.quality,
-        );
+        // decision reads a binding. With a chart they are stepped by song time; without one (or
+        // while a chart that came during the song waits for its first cut) frame by frame with
+        // the frame's music.
+        let stepped = match input.song_chart {
+            Some(song) => self.stepper.frame(
+                &mut self.decider,
+                &self.files.manifest,
+                song,
+                input.song.0,
+                &mut self.forced_cut,
+                self.level.quality,
+                self.first || self.restep,
+                self.runtime_version,
+            ),
+            None => {
+                self.stepper.off();
+                None
+            }
+        };
+        self.restep = false;
+        let (decision, jumped, replaced, since_step) = match stepped {
+            Some(Stepped {
+                decision,
+                events,
+                jumped,
+                replaced,
+                since_step,
+            }) => {
+                self.events = events;
+                (decision, jumped, replaced, since_step)
+            }
+            None => {
+                let forced_cut = self.forced_cut.take();
+                let decision = self.decider.step(
+                    dt as f32,
+                    &music,
+                    input.chart,
+                    seed,
+                    forced_cut,
+                    self.level.quality,
+                );
+                self.events = self.decider.events(input.song.0, &decision, self.first);
+                (decision, false, false, 0.0)
+            }
+        };
         self.cut = decision.cut;
+        // The scene hears of every shot the director enters (a hold enters one without a cut) and
+        // of a jump, by a count that only grows.
+        let entered = self.decider.director().map_or(0, |d| d.state().cuts);
+        if replaced {
+            if self.cut.is_some() || (jumped && !self.first) {
+                self.cuts = self.cuts.wrapping_add(1);
+            }
+            self.hard = jumped;
+        } else if entered != self.seen_cuts {
+            self.cuts = self.cuts.wrapping_add(entered.wrapping_sub(self.seen_cuts));
+            self.hard = false;
+        }
+        self.seen_cuts = entered;
         let params = self.files.param_numbers();
         // The scene's first frame begins its first shot, so it counts as a cut too (a drift that
-        // starts over with each shot starts there); a reload that keeps the state does not.
-        let cut = self.cut.is_some() || (self.first && self.decider.director().is_some());
+        // starts over with each shot starts there), and so does a jump; a reload that keeps the
+        // state does not.
+        let cut =
+            self.cut.is_some() || ((self.first || jumped) && self.decider.director().is_some());
         self.bound_cut = cut;
         let inputs = self
             .bindings
             .tick_cut(dt as f32, &music, &params, seed, cut);
         queue.write_buffer(&self.input_buffer, 0, &self.input_layout.pack(inputs));
-        queue.write_buffer(&self.shot, 0, &self.decider.shot_bytes());
+        queue.write_buffer(&self.shot, 0, &self.shot_bytes(since_step));
         queue.write_buffer(&self.look, 0, &self.decider.look_bytes());
-        self.events = self.decider.events(input.song.0, &decision, self.first);
         let lens = decision.lens;
         self.overlay = decision.overlay;
         self.sized.post.write_lens(queue, &lens);
@@ -2118,6 +2262,38 @@ impl Scene {
         }
         self.index = self.index.wrapping_add(1);
         self.first = false;
+    }
+}
+
+/// A seed of `seed` and `n` together, spread over all the bits (the finaliser of MurmurHash3).
+fn mix_seed(seed: u32, n: u32) -> u32 {
+    let mut h = seed ^ n.wrapping_mul(0x9e37_79b9);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^ (h >> 16)
+}
+
+/// How many seconds of song the signals are warmed up on (see [`warm_up`]).
+const WARM_UP: f64 = 8.0;
+
+/// Lets `heard` hear the [`WARM_UP`] seconds of `chart` before song time `time`, a step at a
+/// time, as the chart says they go (the live audio is not known for them).
+fn warm_up(heard: &mut EventCounter, chart: &crate::chart::Chart, time: f64) {
+    let mut t = (time - WARM_UP).max(0.0);
+    while t < time {
+        let state = chart.at(t);
+        let rhythm = crate::chart::trusted_rhythm(Rhythm::default(), Some(&state));
+        inputs::music(
+            &rhythm,
+            Some(&state),
+            Levels::default(),
+            (t, true),
+            heard,
+            STEP,
+        );
+        t += STEP;
     }
 }
 

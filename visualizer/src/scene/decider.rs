@@ -7,7 +7,10 @@
 //!
 //! One frame is [`Decider::hear`] (the music's values, by the wall time the caller says went by)
 //! and [`Decider::step`] (the decisions), in the order the scene's shaders have always seen them:
-//! the director, the looks, the moments, the lens.
+//! the director, the looks, the moments, the lens. A song with a chart is decided by
+//! [`Decider::step_at`] instead, in steps of [`STEP`] of song time heard from the chart alone, so
+//! that the same song decides the same things at the same times however it is drawn (see
+//! `scene::stepper`).
 
 use super::CutInfo;
 use super::director::Director;
@@ -16,11 +19,14 @@ use super::lens::{Lens, LensFrame};
 use super::looks::Looks;
 use super::manifest::{Manifest, Pace, ShotMove, ShotSize};
 use crate::bind::RuntimeBindings;
-use crate::chart::ChartState;
+use crate::chart::{Chart, ChartState, trusted_rhythm};
 use crate::inspect::{LabEvent, LabEventKind, LabLens};
 use crate::moments::{self, Chances, Played, Scheduler, Strength};
 use crate::rhythm::Rhythm;
 use crate::transition::{Overlay, Transition};
+
+/// The step a song with a chart is decided in, in seconds: a frame at 60 fps.
+pub const STEP: f64 = 1.0 / 60.0;
 
 /// What a moment that played did.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -230,13 +236,6 @@ impl Decider {
         self.held_look = None;
     }
 
-    /// Take over what `other` has heard of the music (the scene it replaces): the counters and
-    /// signals, so that a switch of scenes does not restart the music's clock, cue gaps and
-    /// drive.
-    pub fn swap_music(&mut self, other: &mut Self) {
-        std::mem::swap(&mut self.events, &mut other.events);
-    }
-
     /// Take over what is under way in `old`, the decider of the scene this one replaces when its
     /// files were saved: what a lab set (a hold of a shot is held again by the scene, which says
     /// what the music is), the look on with its fade, the chances.
@@ -254,12 +253,6 @@ impl Decider {
         self.look_on = old.look_on;
     }
 
-    /// Forget what was heard of the music: the counters and signals start from nothing.
-    #[cfg(test)]
-    pub fn forget_music(&mut self) {
-        self.events = EventCounter::default();
-    }
-
     /// The music's values for a frame, by the wall seconds `wall_dt` since the last one.
     pub fn hear(
         &mut self,
@@ -270,6 +263,26 @@ impl Decider {
         wall_dt: f64,
     ) -> MusicValues {
         inputs::music(rhythm, chart, levels, song, &mut self.events, wall_dt)
+    }
+
+    /// Decide step `step` of a song with this whole `chart`: the frame at `step` times [`STEP`]
+    /// of song time, with the music's values heard from the chart at that time and from the live
+    /// audio (`live`) only where the chart has no value, which decides nothing then (see
+    /// `crate::plan`'s tests). The same steps with the same `seed` decide the same things.
+    pub fn step_at(
+        &mut self,
+        chart: &Chart,
+        step: u32,
+        seed: u32,
+        (tracker, levels): (Rhythm, Levels),
+        forced: Option<CutInfo>,
+        quality: f32,
+    ) -> Decision {
+        let time = f64::from(step) * STEP;
+        let state = chart.at(time);
+        let rhythm = trusted_rhythm(tracker, Some(&state));
+        let music = self.hear(&rhythm, Some(&state), levels, (time, true), STEP);
+        self.step(STEP as f32, &music, Some(&state), seed, forced, quality)
     }
 
     /// Decide a frame of `dt` seconds with its music and the frame's `seed`. `forced` is a cut a
@@ -375,11 +388,14 @@ impl Decider {
         }
     }
 
-    /// What the director tells the scene now (`struct Shot`), zeros without a director.
-    pub fn shot_bytes(&self) -> [u8; super::wgsl::SHOT_SIZE as usize] {
-        self.director
-            .as_ref()
-            .map_or([0; super::wgsl::SHOT_SIZE as usize], |d| d.state().bytes())
+    /// The shot the director is on, 0 without a director.
+    pub fn shot_index(&self) -> u32 {
+        self.director.as_ref().map_or(0, |d| d.state().index)
+    }
+
+    /// The look the last step reported, none without looks or before the first step.
+    pub fn look_on(&self) -> Option<u32> {
+        self.look_on
     }
 
     /// What the looks tell the scene now (`struct Look`), zeros without looks.

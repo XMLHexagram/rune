@@ -551,7 +551,7 @@ fn update() {
   // 0.3) does a discrete move happen (a beat counted, a bar's nudge, a phrase's whole turn, a
   // section's three rings, the lighting, the planet's swell), so a stray onset in near silence
   // moves nothing; a push already given (a pendulum settling back, a push landing after its delay)
-  // is let finish. The stars' twinkle stays on the clock (it is light, not motion).
+  // is let finish. The stars' twinkle stays on the song's clock (it is light, not motion).
   state.phase += dt * input.audible;
   let heard = input.audible > 0.3;
 

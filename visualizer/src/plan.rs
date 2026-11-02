@@ -7,14 +7,14 @@
 //! settings plan the same thing each time; the live audio, which the chart replaces wherever it
 //! has a value, is left out.
 
-use crate::chart::{Chart, trusted_rhythm};
+use crate::chart::Chart;
 use crate::inspect::LabEventKind;
 use crate::rhythm::Rhythm;
 use crate::scene::Decider;
 use crate::scene::Levels;
 
-/// The step of the plan, in seconds: a frame at 60 fps.
-pub const STEP: f64 = 1.0 / 60.0;
+/// The step of the plan, in seconds: the step the scene on screen decides a song with a chart in.
+pub use crate::scene::STEP;
 
 /// The quality the plan's lens is stepped with: the flare gives way only to a low quality, and
 /// that changes what is drawn, not what is decided.
@@ -140,11 +140,7 @@ fn play(
     };
     for frame in 0..(length / STEP).ceil() as u32 {
         let time = f64::from(frame) * STEP;
-        let state = chart.at(time);
-        let (tracker, levels) = live(time);
-        let rhythm = trusted_rhythm(tracker, Some(&state));
-        let music = decider.hear(&rhythm, Some(&state), levels, (time, true), STEP);
-        let decision = decider.step(STEP as f32, &music, Some(&state), seed, None, QUALITY);
+        let decision = decider.step_at(chart, frame, seed, live(time), None, QUALITY);
         for event in decider.events(time, &decision, frame == 0) {
             match event.kind {
                 LabEventKind::Cut {
@@ -184,6 +180,7 @@ fn play(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chart::trusted_rhythm;
     use crate::scene::fixtures;
 
     /// A song of a quiet section and a high one, which the director leads to with a burst.
