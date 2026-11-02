@@ -211,9 +211,10 @@ fn decide_wall() {
   // high, as the director's tiers read it) takes the share from all off_always + off down to
   // off_always along (1 - level)^1.5, the curve the drive had.
   state.dark = params.off_always + params.off * pow(max(1.0 - input.section_level, 0.0), 1.5);
-  // The channels group anew at each cut, from the section's number and the cuts so far (so a
-  // section with several cuts, and a song with no sections to tell, group differently each time).
-  state.section = input.section + 101.0 * f32(shot.cuts);
+  // The channels group anew at each cut, from the section's number and the shot's seed (so a
+  // section with several cuts, and a song with no sections to tell, group differently each time,
+  // and the same moment of a song the same way however it was reached).
+  state.section = input.section + 101.0 * floor(shot.seed * 9973.0);
   // The way the screens change channel, by the kind of section (the `way` input picks it from the
   // section's label, so every chorus the same way). Read only here, so it never changes within a
   // shot; the parameter `change_way` may pin one, which the view reads at once.

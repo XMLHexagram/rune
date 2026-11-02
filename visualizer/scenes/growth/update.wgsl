@@ -187,10 +187,11 @@ fn update() {
     for (var i = 0; i < FILL_LAYERS / 4; i += 1) {
       state.fills[i] = vec4f(0.65);
     }
-    choose_view();
     // The camera starts round from a place drawn from the song's seed, plus what it has circled
-    // by this moment of the song (at the shot's nominal speed), so the same moment shows the same side.
-    state.azimuth = song_random(4u) * 6.283 + frame.song * state.spin * 0.8;
+    // by this moment of the song at a usual speed, so the same moment shows the same side. The
+    // view then takes it from there (a view from above turns to a corner).
+    state.azimuth = song_random(4u) * 6.283 + frame.song * 0.024;
+    choose_view();
     state.cam_top = state.top;
     state.cam_rise = 0.0;
     state.top_prev = state.top;

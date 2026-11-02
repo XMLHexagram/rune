@@ -431,9 +431,10 @@ fn project(i: u32) -> vec4f {
 // that the dutch angle (a turn about the camera's axis) cannot lose it; its size is measured on
 // the shorter side of the picture (`frame_unit`), so it also fits a portrait one.
 
-// A random number that differs from cut to cut (`random` is the same all through a run).
+// A random number that differs from cut to cut: from the shot's seed, so that the same moment of
+// a song frames the same however it was reached.
 fn random_cut(n: u32) -> f32 {
-  return rv_unit(frame.seed * 2654435761u + n * 40503u + shot.cuts * 7919u + 977u);
+  return rv_unit(u32(shot.seed * 16777215.0) * 2654435761u + n * 40503u + 977u);
 }
 
 // The shorter side of the picture, in units of its height.
