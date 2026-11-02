@@ -2082,6 +2082,9 @@ impl Scene {
         // decision reads a binding. With a chart they are stepped by song time; without one (or
         // while a chart that came during the song waits for its first cut) frame by frame with
         // the frame's music.
+        // A rebuilt scene has a new director: its stepping starts over as on a first frame, and
+        // without a chart the scene is told of the shot it begins on below.
+        let rebuilt = std::mem::take(&mut self.restep);
         let stepped = match input.song_chart {
             Some(song) => self.stepper.frame(
                 &mut self.decider,
@@ -2090,7 +2093,7 @@ impl Scene {
                 input.song.0,
                 &mut self.forced_cut,
                 self.level.quality,
-                self.first || self.restep,
+                self.first || rebuilt,
                 self.runtime_version,
             ),
             None => {
@@ -2098,7 +2101,6 @@ impl Scene {
                 None
             }
         };
-        self.restep = false;
         let (decision, jumped, replaced, since_step) = match stepped {
             Some(Stepped {
                 decision,
@@ -2133,6 +2135,11 @@ impl Scene {
                 self.cuts = self.cuts.wrapping_add(1);
             }
             self.hard = jumped;
+        } else if rebuilt && !self.first {
+            // The new director's first shot (which a hold may already have replaced): one more
+            // cut for the scene, which frames it.
+            self.cuts = self.cuts.wrapping_add(1);
+            self.hard = false;
         } else if entered != self.seen_cuts {
             self.cuts = self.cuts.wrapping_add(entered.wrapping_sub(self.seen_cuts));
             self.hard = false;

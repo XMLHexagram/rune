@@ -14,7 +14,8 @@
 //!
 //! A chart that comes while the scene plays (the analysis of the song finished) does not jump:
 //! the song's decider is stepped next to the one on screen until it cuts, and the screen takes it
-//! over on that cut.
+//! over on that cut. A scene without shots, or with a shot a lab holds, never cuts: there the
+//! song's decider takes over at once.
 
 use std::sync::Arc;
 
@@ -42,9 +43,10 @@ impl SongChart {
 
 /// A snapshot of the decider is kept every this many steps: ten seconds of song.
 const SNAPSHOT_EVERY: u32 = 600;
-/// A song time up to this many steps behind the steps taken is waited for rather than taken for a
-/// seek: the song clock closes a small gap to the player by pulling back a little.
-const BEHIND: u32 = 6;
+/// A song time up to this many steps behind the steps taken (a third of a second) is waited for
+/// rather than taken for a seek: the song clock closes a gap to the player of up to its seek
+/// threshold (0.3 s) by pulling back a little each frame, which adds up at a high frame rate.
+const BEHIND: u32 = 20;
 /// A song time up to this many steps ahead (a second) is stepped through, as after a slow frame;
 /// further ahead is a seek.
 const AHEAD: u32 = 60;
@@ -219,7 +221,8 @@ impl Stepper {
     }
 
     /// The song's own decider, stepped next to the one on screen until it cuts; then it is put on
-    /// screen and the frame reports its cut.
+    /// screen and the frame reports its cut. Where the decider on screen cannot cut (no shots, or a
+    /// held shot) it is put on screen at once.
     #[allow(clippy::too_many_arguments)]
     fn follow(
         &mut self,
@@ -243,6 +246,33 @@ impl Stepper {
                 target,
             ),
         };
+        let cuts = decider
+            .director()
+            .is_some_and(|_| decider.settings().shot.is_none());
+        if !cuts {
+            // No cut to wait for: the song's decider takes over now, with the look it is on.
+            while steps < target {
+                self.lens = shadow
+                    .step_at(&song.chart, steps, song.seed, unheard(), None, quality)
+                    .lens;
+                steps += 1;
+            }
+            *decider = shadow;
+            self.on = Some(song.clone());
+            self.steps = steps;
+            self.pure = true;
+            let decision = Decision {
+                look: decider.look_on(),
+                ..self.standing(decider)
+            };
+            return Some(Stepped {
+                events: decider.events(time, &decision, false),
+                decision,
+                jumped: false,
+                replaced: true,
+                since_step: self.since_step(time),
+            });
+        }
         while steps < target {
             let decision = shadow.step_at(&song.chart, steps, song.seed, unheard(), None, quality);
             let step = steps;
@@ -560,6 +590,8 @@ mod tests {
         let back = frame(10.45, false);
         assert!(!back.jumped && back.decision.cut.is_none() && back.events.is_empty());
         assert!(!frame(10.52, false).jumped);
+        // Up to a third of a second back is waited for too.
+        assert!(!frame(10.22, false).jumped);
         assert!(frame(10.0, false).jumped);
         assert!(frame(12.0, false).jumped);
     }
@@ -612,6 +644,43 @@ mod tests {
         let (keys, jumps) = play_on(&mut stepper, &mut decider, &song, &later);
         assert!(jumps.is_empty());
         assert_eq!(keys, plan_keys(&plan, at, *later.last().unwrap()));
+    }
+
+    #[test]
+    fn a_chart_that_comes_while_a_lab_holds_a_shot_takes_over_at_once() {
+        let song = song();
+        let manifest = fixtures::manifest();
+        let mut decider = fixtures::decider();
+        decider.hold_shot(1, &crate::scene::MusicValues::default());
+        let mut stepper = Stepper::default();
+        let stepped = stepper
+            .frame(
+                &mut decider,
+                &manifest,
+                &song,
+                12.0,
+                &mut None,
+                1.0,
+                false,
+                0,
+            )
+            .expect("taken over");
+        assert!(stepped.replaced && !stepped.jumped && stepped.decision.cut.is_none());
+        assert_eq!(decider.shot_index(), 1);
+        // The song's decider is on screen from then on.
+        let next = stepper
+            .frame(
+                &mut decider,
+                &manifest,
+                &song,
+                12.02,
+                &mut None,
+                1.0,
+                false,
+                0,
+            )
+            .expect("stepped");
+        assert!(!next.replaced);
     }
 
     /// [`play`] on a scene that already shows the song.
