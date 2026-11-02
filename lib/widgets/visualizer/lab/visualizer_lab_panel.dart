@@ -185,6 +185,30 @@ class _Row extends StatelessWidget {
 
 String _fixed(double value, [int digits = 1]) => value.toStringAsFixed(digits);
 
+// Signals that count on (beats, bars): their bar shows the phase, the fraction.
+const _phaseSignals = {'clock', 'flow', 'beat', 'bar'};
+// Signals that are a number, not a share of anything: no bar.
+const _numberSignals = {'tempo', 'meter', 'cue_in', 'section', 'section_label'};
+// Levels about 1 on average: their bar is full at 2.
+const _bandSignals = {'band_low', 'band_mid', 'band_high'};
+
+/// How full a signal's bar is, 0 to 1, or none for a signal that is only a
+/// number.
+double? _signalBar(String name, double value) {
+  if (_numberSignals.contains(name)) return null;
+  if (!value.isFinite) return 0;
+  if (_phaseSignals.contains(name)) return value - value.floorToDouble();
+  if (_bandSignals.contains(name)) return (value / 2).clamp(0.0, 1.0);
+  return value.clamp(0.0, 1.0);
+}
+
+/// A signal's value as the readout shows it: whole numbers for counts and
+/// indices, the tempo without decimals.
+String _signalText(String name, double value) => switch (name) {
+  'tempo' || 'meter' || 'section' || 'section_label' => _fixed(value, 0),
+  _ => _fixed(value, 2),
+};
+
 class _TimelineSection extends StatelessWidget {
   const _TimelineSection({required this.lab});
 
@@ -340,66 +364,11 @@ class _SignalsSection extends StatelessWidget {
       return Text('Nothing drawn yet.', style: _caption(context, dim: true));
     }
     final theme = FluentTheme.of(context);
-    final fg = theme.resources.textFillColorPrimary;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        for (final signal in now.signals)
-          Opacity(
-            opacity: signal.meaningful ? 1 : 0.4,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 2),
-              child: Row(
-                children: [
-                  SizedBox(
-                    width: 104,
-                    child: Text(
-                      signal.name,
-                      style: _caption(context),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  Expanded(
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(2),
-                      child: SizedBox(
-                        height: 4,
-                        child: Stack(
-                          children: [
-                            Positioned.fill(
-                              child: ColoredBox(color: fg.withAlpha(30)),
-                            ),
-                            FractionallySizedBox(
-                              widthFactor: signal.value.clamp(0.0, 1.0),
-                              child: ColoredBox(color: theme.accentColor),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                  SizedBox(
-                    width: 16,
-                    child: signal.event
-                        ? Center(
-                            child: Container(
-                              width: 8,
-                              height: 8,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: signal.value > 0.05
-                                    ? theme.accentColor
-                                    : fg.withAlpha(40),
-                              ),
-                            ),
-                          )
-                        : null,
-                  ),
-                ],
-              ),
-            ),
-          ),
+        for (final signal in now.signals) _signalRow(context, signal),
         if (now.inputs.isNotEmpty) ...[
           const SizedBox(height: 10),
           Text('Inputs', style: theme.typography.bodyStrong),
@@ -422,6 +391,82 @@ class _SignalsSection extends StatelessWidget {
             ),
         ],
       ],
+    );
+  }
+
+  Widget _signalRow(BuildContext context, VisualizerLabSignal signal) {
+    final theme = FluentTheme.of(context);
+    final fg = theme.resources.textFillColorPrimary;
+    final bar = _signalBar(signal.name, signal.value);
+    return Opacity(
+      opacity: signal.meaningful ? 1 : 0.4,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 104,
+              child: Text(
+                signal.name,
+                style: _caption(context),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            Expanded(
+              child: bar == null
+                  ? const SizedBox.shrink()
+                  : ClipRRect(
+                      borderRadius: BorderRadius.circular(2),
+                      child: SizedBox(
+                        height: 4,
+                        child: Stack(
+                          children: [
+                            Positioned.fill(
+                              child: ColoredBox(color: fg.withAlpha(30)),
+                            ),
+                            // The fill takes the bar's height: a
+                            // childless box is otherwise 0 high.
+                            Align(
+                              alignment: Alignment.centerLeft,
+                              child: FractionallySizedBox(
+                                widthFactor: bar,
+                                heightFactor: 1,
+                                child: ColoredBox(color: theme.accentColor),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+            ),
+            SizedBox(
+              width: 48,
+              child: Text(
+                _signalText(signal.name, signal.value),
+                style: _caption(context),
+                textAlign: TextAlign.right,
+              ),
+            ),
+            SizedBox(
+              width: 16,
+              child: signal.event
+                  ? Center(
+                      child: Container(
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: signal.value > 0.05
+                              ? theme.accentColor
+                              : fg.withAlpha(40),
+                        ),
+                      ),
+                    )
+                  : null,
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
