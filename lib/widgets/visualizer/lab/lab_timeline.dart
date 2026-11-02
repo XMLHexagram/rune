@@ -365,25 +365,29 @@ class _LabTimelineState extends State<LabTimeline> {
 }
 
 /// Puts the plan's section boundaries and cuts behind [slider], a progress
-/// bar's slider, while the lab is on and has a plan. Otherwise it is [slider]
-/// itself, so the tree is as it is without the lab.
+/// bar's slider, while the lab is on. The tree keeps its shape whether there is
+/// a plan or not, so that a plan coming or going does not cut a drag short.
+/// With the lab off it is [slider] itself, so the tree is as it is without the
+/// lab.
 Widget withLabMarkers(
   BuildContext context, {
   required Widget slider,
   required double duration,
 }) {
-  final plan = context.select<VisualizerLabProvider, VisualizerPlan?>(
-    (p) => p.enabled ? p.plan : null,
-  );
-  if (plan == null) return slider;
+  final (enabled, plan) = context
+      .select<VisualizerLabProvider, (bool, VisualizerPlan?)>(
+        (p) => (p.enabled, p.enabled ? p.plan : null),
+      );
+  if (!enabled) return slider;
 
   // The slider spans the player's duration, which the chart's length may miss
   // by a little.
-  final length = duration > 0 ? duration : plan.length;
+  final length = duration > 0 ? duration : (plan?.length ?? 0);
   final color = FluentTheme.of(context).resources.textFillColorPrimary;
 
   return _LabHover(
     describe: (local, size) {
+      if (plan == null) return const [];
       final width = math.max(1.0, size.width - 2 * _sliderInset);
       return _describe(
         _Row.compact,
@@ -397,15 +401,17 @@ Widget withLabMarkers(
       children: [
         Positioned.fill(
           child: IgnorePointer(
-            child: CustomPaint(
-              painter: LabTimelinePainter(
-                plan: plan,
-                duration: length,
-                compact: true,
-                inset: _sliderInset,
-                color: color,
-              ),
-            ),
+            child: plan == null
+                ? const SizedBox.shrink()
+                : CustomPaint(
+                    painter: LabTimelinePainter(
+                      plan: plan,
+                      duration: length,
+                      compact: true,
+                      inset: _sliderInset,
+                      color: color,
+                    ),
+                  ),
           ),
         ),
         slider,

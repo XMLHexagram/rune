@@ -195,9 +195,10 @@ pub struct ListVisualizerPresetsResponse {
 }
 
 /// Whether the visualizer copies what it sees in each frame for the in-app lab
-/// ([`VisualizerLabResponse`]). Off by default, and the lab sends it on when its panel opens and
-/// off when it closes: the app pays nothing for it otherwise. Turning it off drops what the lab
-/// had collected.
+/// ([`VisualizerLabResponse`]) and plans the song for it. Off by default: the lab sends it on while
+/// its setting is on (the progress bars show the plan even with the panel closed) and off when
+/// the setting is turned off, and the app pays nothing for it otherwise. Turning it off drops what
+/// the lab had collected, and the plan.
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetVisualizerLabRequest {
     pub enabled: bool,

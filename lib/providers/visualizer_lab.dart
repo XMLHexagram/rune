@@ -48,7 +48,8 @@ class VisualizerLabProvider extends ChangeNotifier {
   static const _openInterval = Duration(milliseconds: 100);
   static const _closedInterval = Duration(milliseconds: 500);
   // The lab asks the visualizer to collect again this often while it says it
-  // does not (it restarts with the cover wall page).
+  // does not (the native side started again without it, as after a hot
+  // restart).
   static const _reEnableEvery = Duration(seconds: 2);
   static const _maxMarks = 3000;
   // A song time this much behind the last one is a seek back.
@@ -63,6 +64,9 @@ class VisualizerLabProvider extends ChangeNotifier {
   double? _songTime;
   final List<LabMark> _observed = [];
   final List<LabMark> _temporary = [];
+  // The first readout after a change of track may still tell the last moments
+  // of the track before, at its times: its events are left out.
+  bool _skipEvents = false;
 
   PlaybackStatusProvider? _status;
   String? _trackKey;
@@ -111,6 +115,7 @@ class VisualizerLabProvider extends ChangeNotifier {
     _songTime = null;
     _observed.clear();
     _temporary.clear();
+    _skipEvents = true;
     if (_enabled) {
       SchedulerBinding.instance.addPostFrameCallback((_) {
         if (!_disposed) notifyListeners();
@@ -211,6 +216,10 @@ class VisualizerLabProvider extends ChangeNotifier {
     _songTime = time;
     _now = response.now;
 
+    if (_skipEvents) {
+      _skipEvents = false;
+      return;
+    }
     for (final event in response.events) {
       final mark = _markOf(event);
       if (mark != null) _observed.add(mark);

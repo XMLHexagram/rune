@@ -393,13 +393,12 @@ impl Shared {
     }
 
     /// Keep `plan`, made by job `job`, unless a later job was started since.
-    fn store_plan(&self, job: u64, mut plan: SongPlan) {
+    fn store_plan(&self, job: u64, plan: SongPlan) {
         let mut slot = lock(&self.plan);
         if self.plan_job.load(Ordering::Relaxed) != job {
             return;
         }
         slot.version += 1;
-        plan.version = slot.version;
         slot.plan = Some(Arc::new(plan));
     }
 
@@ -503,6 +502,7 @@ impl Visualizer {
         if !inspecting {
             *lock(&self.shared.inspect) = None;
             lock(&self.shared.lab_events).clear();
+            self.shared.clear_plan();
         }
     }
 
@@ -521,7 +521,14 @@ impl Visualizer {
     /// inspecting (see [`Self::set_inspecting`]) and the song has a chart; else none. Made in the
     /// background after the song, the scene or what a lab set changes.
     pub fn plan(&self) -> Option<Arc<SongPlan>> {
-        lock(&self.shared.plan).plan.clone()
+        let plan = lock(&self.shared.plan).plan.clone()?;
+        // The plan of a song that no longer plays (it changed while the visualizer was stopped or
+        // showed the cover wall, and planned nothing) is not this song's.
+        let playing = lock(&self.shared.playback)
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string());
+        (playing.as_deref() == Some(plan.path.as_str())).then_some(plan)
     }
 
     /// How often the plan was replaced or dropped: a reader that has seen a version needs to
@@ -1563,9 +1570,10 @@ struct Planner {
 
 impl Planner {
     fn update(&mut self, shared: &Arc<Shared>, pipeline: &Pipeline, charts: &ChartFollower) {
-        let chart = charts
-            .chart()
-            .filter(|_| shared.inspecting.load(Ordering::Relaxed));
+        // A lab holding the music at a level decides without the chart, which the plan cannot show.
+        let chart = charts.chart().filter(|_| {
+            shared.inspecting.load(Ordering::Relaxed) && pipeline.lab().level.is_none()
+        });
         let Some((arrival, chart, path)) = chart else {
             if self.key.take().is_some() {
                 shared.clear_plan();
@@ -1822,19 +1830,50 @@ mod tests {
     fn a_plan_of_an_older_job_is_dropped_and_each_kept_one_has_a_new_version() {
         let visualizer = Visualizer::new();
         let shared = &visualizer.shared;
+        visualizer.set_playback(Some(Path::new("/music/a.flac")), Duration::ZERO, true);
+        let plan = || SongPlan {
+            path: "/music/a.flac".to_string(),
+            ..SongPlan::default()
+        };
         assert_eq!((visualizer.plan_version(), visualizer.plan()), (0, None));
         shared.plan_job.store(2, Ordering::Relaxed);
-        shared.store_plan(1, SongPlan::default());
+        shared.store_plan(1, plan());
         assert!(visualizer.plan().is_none());
-        shared.store_plan(2, SongPlan::default());
-        assert_eq!(visualizer.plan().unwrap().version, 1);
+        shared.store_plan(2, plan());
+        assert!(visualizer.plan().is_some());
+        assert_eq!(visualizer.plan_version(), 1);
         shared.plan_job.store(3, Ordering::Relaxed);
-        shared.store_plan(3, SongPlan::default());
-        assert_eq!(visualizer.plan().unwrap().version, 2);
+        shared.store_plan(3, plan());
+        assert_eq!(visualizer.plan_version(), 2);
         // A song without a chart has no plan, and a job still running for the one before does not
         // bring it back.
         shared.clear_plan();
-        shared.store_plan(3, SongPlan::default());
+        shared.store_plan(3, plan());
         assert_eq!((visualizer.plan_version(), visualizer.plan()), (3, None));
+    }
+
+    #[test]
+    fn the_plan_is_of_the_song_that_plays_and_goes_with_the_lab() {
+        let visualizer = Visualizer::new();
+        let shared = &visualizer.shared;
+        visualizer.set_inspecting(true);
+        visualizer.set_playback(Some(Path::new("/music/a.flac")), Duration::ZERO, true);
+        let job = shared.plan_job.load(Ordering::Relaxed);
+        shared.store_plan(
+            job,
+            SongPlan {
+                path: "/music/a.flac".to_string(),
+                ..SongPlan::default()
+            },
+        );
+        assert!(visualizer.plan().is_some());
+        // Another song started while nothing planned it: the plan is not shown on it.
+        visualizer.set_playback(Some(Path::new("/music/b.flac")), Duration::ZERO, true);
+        assert!(visualizer.plan().is_none());
+        visualizer.set_playback(Some(Path::new("/music/a.flac")), Duration::ZERO, true);
+        assert!(visualizer.plan().is_some());
+        // Turning the lab off drops it.
+        visualizer.set_inspecting(false);
+        assert!(lock(&shared.plan).plan.is_none());
     }
 }

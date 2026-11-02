@@ -1,9 +1,9 @@
 //! What a scene's music decides, in one place: the camera director, the looks, the moments that
 //! play an effect and the lens effects they start, with the counters and signals the music's
 //! values are made with. It is stepped with an explicit time step and seed, and every part of it
-//! is plain data, so it can be cloned: a song played ahead of time through [`Decider::step`]
-//! (see `crate::plan`) decides what the song on screen does, and what the screen draws is only
-//! what the decisions say. The scene's own bindings are not in it; they hear the cut.
+//! is plain data, so it can be cloned: a song can be played through ahead of time with the same
+//! steps (see `crate::plan`), and what the screen draws is only what the decisions say. The
+//! scene's own bindings are not in it; they hear the cut.
 //!
 //! One frame is [`Decider::hear`] (the music's values, by the wall time the caller says went by)
 //! and [`Decider::step`] (the decisions), in the order the scene's shaders have always seen them:
@@ -245,13 +245,15 @@ impl Decider {
             new.set_pace_override(old.pace_override());
             new.set_burst_override(old.burst_override());
         }
-        if let (Some(old), Some(new)) = (&old.looks, &mut self.looks) {
-            new.inherit(old);
+        // The look on and a held one carry over only to the same looks.
+        if let (Some(old_looks), Some(new)) = (&old.looks, &mut self.looks)
+            && new.inherit(old_looks)
+        {
+            self.held_look = old.held_look;
+            self.look_on = old.look_on;
         }
         self.lens.set_forced(old.lens.forced());
         self.chances = old.chances;
-        self.held_look = old.held_look;
-        self.look_on = old.look_on;
     }
 
     /// Forget what was heard of the music: the counters and signals start from nothing.

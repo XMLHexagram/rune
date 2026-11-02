@@ -79,8 +79,6 @@ pub struct PlanMoment {
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct SongPlan {
-    /// Which plan this is among those made, so that a reader sees a new one.
-    pub version: u64,
     /// The song's file, and the scene (its name) the plan is of.
     pub path: String,
     pub scene: String,
@@ -279,10 +277,10 @@ mod tests {
         );
     }
 
-    /// The scene drawing frame by frame (the music's values by the step, then the decision) gives
-    /// the cuts, looks and moments the plan says, and so does the event log.
+    /// A decider stepped frame by frame at the plan's step (the music's values by the step, then
+    /// the decision) gives the cuts, looks and moments the plan says, and so does the event log.
     #[test]
-    fn the_scene_on_screen_decides_what_the_plan_says() {
+    fn a_decider_stepped_frame_by_frame_decides_what_the_plan_says() {
         let chart = fixtures::chart(&SECTIONS);
         let seed = seed_of("/music/a.flac");
         let plan = plan_song(&chart, fixtures::decider(), seed);

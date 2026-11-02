@@ -573,7 +573,7 @@ List<ControllerEntry> controllerItems = [
     },
     isAvailable: (context) =>
         isVisualizerSupported &&
-        Provider.of<VisualizerLabProvider>(context).enabled,
+        context.select<VisualizerLabProvider, bool>((p) => p.enabled),
     tooltipBuilder: (context) => S.of(context).visualizerLab,
     controllerButtonBuilder: (context, shadows) => VisualizerLabButton(
       shadows: shadows,

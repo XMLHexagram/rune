@@ -33,6 +33,10 @@ class CoverWallLayout extends StatefulWidget {
   CoverWallLayoutState createState() => CoverWallLayoutState();
 }
 
+// The width the playing track needs beside the lab's panel to move over for
+// it.
+const _playingTrackRoom = 320.0;
+
 const gradientParams = GradientParams(
   multX: 2.0,
   multY: 2.0,
@@ -203,8 +207,15 @@ class CoverWallLayoutState extends State<CoverWallLayout> {
               ),
               height: (mainAxisCount * gridSize).toDouble(),
             ),
+            // The playing track makes room for the lab's panel where the
+            // window leaves it enough; else the panel covers it.
             Padding(
-              padding: EdgeInsets.only(left: labOpen ? labWidth : 0),
+              padding: EdgeInsets.only(
+                left: labOpen &&
+                        constraints.maxWidth - labWidth >= _playingTrackRoom
+                    ? labWidth
+                    : 0,
+              ),
               child: const PlayingTrack(),
             ),
             if (!isMini)
