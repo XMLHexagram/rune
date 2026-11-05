@@ -2,6 +2,9 @@
 use crate::sync::model::BlobRef;
 use anyhow::{Context, Result, ensure};
 use fsio::FsIo;
+use sea_orm::sea_query::Expr;
+use std::collections::HashSet;
+use std::path::Component;
 use std::{
     io::Read,
     path::{Path, PathBuf},
@@ -12,6 +15,12 @@ use uuid::Uuid;
 pub const MAX_BLOB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Reserved application-managed content; ordinary library scans do not author it.
 pub const MANAGED_AUDIO_DIRECTORY: &str = "Rune Sync";
+
+pub fn is_managed_directory(directory: &str) -> bool {
+    directory == MANAGED_AUDIO_DIRECTORY
+        || directory.starts_with(&format!("{MANAGED_AUDIO_DIRECTORY}/"))
+        || directory.starts_with(&format!("{MANAGED_AUDIO_DIRECTORY}\\"))
+}
 
 /// Validate the full lowercase BLAKE3 digest used to identify audio.
 pub fn validate_digest(digest: &str) -> Result<()> {
@@ -64,9 +73,7 @@ pub fn blob_path(fsio: &FsIo, root: &Path, digest: &str, extension: &str) -> Res
     validate_digest(digest)?;
     validate_extension(extension)?;
     ensure!(
-        !root
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        !root.components().any(|c| matches!(c, Component::ParentDir)),
         "invalid library root"
     );
     let dir = root.join(MANAGED_AUDIO_DIRECTORY);
@@ -153,7 +160,7 @@ pub async fn remote_content_ids(
     db: &DatabaseConnection,
     ids: &[i32],
 ) -> Result<std::collections::HashSet<i32>> {
-    let mut found = std::collections::HashSet::new();
+    let mut found = HashSet::new();
     for chunk in ids.chunks(512) {
         let rows = media_files::Entity::find()
             .filter(media_files::Column::Id.is_in(chunk.iter().copied()))
@@ -173,6 +180,8 @@ pub async fn remote_content_ids(
     Ok(found)
 }
 
+// Managed copies are reverified by the verifier and user files by the scanner;
+// downloaders also verify the full digest before attaching received bytes.
 pub async fn local_audio_path(
     db: &DatabaseConnection,
     fsio: &FsIo,
@@ -196,7 +205,10 @@ pub async fn local_audio_path(
     let Some(path) = materialized_path(db, fsio, root, file.id).await? else {
         return Ok(None);
     };
-    if hash_file(fsio, &path).ok().as_ref() == Some(blob) {
+    if fsio
+        .canonicalize(&path)
+        .is_ok_and(|node| node.is_file && node.size == blob.size)
+    {
         Ok(Some(path))
     } else {
         Ok(None)
@@ -240,23 +252,24 @@ pub async fn attach_download(
     path: &Path,
 ) -> Result<()> {
     #[cfg(not(target_os = "android"))]
-    {
-        let canonical_root = fsio.canonicalize_path(root)?;
-        let canonical = fsio.canonicalize_path(path)?;
-        ensure!(
-            canonical.starts_with(&canonical_root),
-            "download escapes library root"
-        );
-    }
-    ensure!(
-        &hash_file(fsio, path)? == blob,
-        "download digest or size mismatch"
-    );
+    let (canonical_root, canonical) =
+        (fsio.canonicalize_path(root)?, fsio.canonicalize_path(path)?);
+    #[cfg(not(target_os = "android"))]
+    let relative = canonical
+        .strip_prefix(&canonical_root)
+        .context("download escapes library root")?;
+    #[cfg(target_os = "android")]
     let relative = path.strip_prefix(root)?;
+    let hash_fsio = fsio.clone();
+    let hash_path = path.to_owned();
+    let actual = tokio::task::spawn_blocking(move || hash_file(&hash_fsio, &hash_path))
+        .await
+        .context("download verification task failed")??;
+    ensure!(&actual == blob, "download digest or size mismatch");
     ensure!(
         relative
             .components()
-            .all(|c| matches!(c, std::path::Component::Normal(_))),
+            .all(|c| matches!(c, Component::Normal(_))),
         "invalid download path"
     );
     let directory = relative
@@ -302,18 +315,9 @@ pub async fn attach_download(
         "download job mismatch"
     );
     media_files::Entity::update_many()
-        .col_expr(
-            media_files::Column::Directory,
-            sea_orm::sea_query::Expr::value(directory),
-        )
-        .col_expr(
-            media_files::Column::FileName,
-            sea_orm::sea_query::Expr::value(name),
-        )
-        .col_expr(
-            media_files::Column::LocalAvailable,
-            sea_orm::sea_query::Expr::value(true),
-        )
+        .col_expr(media_files::Column::Directory, Expr::value(directory))
+        .col_expr(media_files::Column::FileName, Expr::value(name))
+        .col_expr(media_files::Column::LocalAvailable, Expr::value(true))
         .filter(media_files::Column::Id.eq(row.id))
         .exec(&tx)
         .await?;

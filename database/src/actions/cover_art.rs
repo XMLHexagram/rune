@@ -1,3 +1,9 @@
+use crate::actions::file::hash_file;
+use crate::error::ExpectedError;
+use crate::sync::SeaOrmSyncStore;
+use crate::sync::accepted as crate_sync_accepted;
+use crate::sync::model::{Artwork, BlobRef, Collection, ObjectKey, RuneModel, author_source_on};
+use http_request::reqwest;
 use std::{
     collections::HashMap,
     env, fs,
@@ -6,7 +12,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use chrono::Utc;
 use once_cell::sync::Lazy;
 use sea_orm::{
     ActiveValue, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
@@ -37,7 +42,6 @@ pub async fn get_magic_cover_art_id(main_db: &DatabaseConnection) -> Option<i32>
 
 pub async fn ensure_magic_cover_art(
     main_db: &DatabaseConnection,
-    node_id: &str,
 ) -> Result<media_cover_art::Model> {
     if let Some(magic_cover_art) = get_magic_cover_art(main_db).await? {
         Ok(magic_cover_art)
@@ -52,12 +56,6 @@ pub async fn ensure_magic_cover_art(
             content_size: ActiveValue::Set(None),
             local_available: ActiveValue::Set(false),
             hlc_uuid: ActiveValue::Set("00000000-0000-0000-0000-000000000000".to_owned()),
-            created_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
-            updated_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
-            created_at_hlc_ver: ActiveValue::Set(0),
-            updated_at_hlc_ver: ActiveValue::Set(0),
-            created_at_hlc_nid: ActiveValue::Set(node_id.to_owned()),
-            updated_at_hlc_nid: ActiveValue::Set(node_id.to_owned()),
         };
 
         let insert_result = media_cover_art::Entity::insert(new_magic_cover_art)
@@ -75,8 +73,8 @@ pub async fn ensure_magic_cover_art(
     }
 }
 
-pub async fn ensure_magic_cover_art_id(main_db: &DatabaseConnection, node_id: &str) -> Result<i32> {
-    let magic_cover_art = ensure_magic_cover_art(main_db, node_id).await?;
+pub async fn ensure_magic_cover_art_id(main_db: &DatabaseConnection) -> Result<i32> {
+    let magic_cover_art = ensure_magic_cover_art(main_db).await?;
     Ok(magic_cover_art.id)
 }
 
@@ -220,8 +218,10 @@ where
         .filter(media_files::Column::LocalAvailable.eq(true))
         .count(db)
         .await? as usize;
+    use futures::{StreamExt, stream};
     let mut cursor = 0;
     let mut processed = 0;
+    progress(0, total);
     loop {
         let rows = media_files::Entity::find()
             .filter(media_files::Column::Id.gt(cursor))
@@ -233,71 +233,109 @@ where
         if rows.is_empty() {
             break;
         }
-        for file in rows {
-            cursor = file.id;
+        cursor = rows.last().unwrap().id;
+        let mut work = stream::iter(rows.into_iter().map(|file| {
+            let fs = fsio.clone();
+            let root = root.to_path_buf();
+            let token = cancel.clone();
+            async move {
+                if token.as_ref().is_some_and(|c| c.is_cancelled()) {
+                    return Ok((file, None));
+                }
+                if artwork_inspection_is_current(&file) {
+                    return Ok((file, None));
+                }
+                let path = root.join(&file.directory).join(&file.file_name);
+                let expected = match (&file.content_hash, file.content_size) {
+                    (Some(hash), Some(size)) if size >= 0 => Some(BlobRef {
+                        digest: hash.clone(),
+                        size: size as u64,
+                    }),
+                    _ => None,
+                };
+                let inspected = tokio::task::spawn_blocking(move || {
+                    if let Some(expected) = &expected
+                        && hash_file(&fs, &path).ok().as_ref() != Some(expected)
+                    {
+                        return None;
+                    }
+                    let art = metadata::cover_art::extract_cover_art_binary_checked(
+                        &fs,
+                        Some(&root),
+                        &path,
+                    );
+                    if let Some(expected) = &expected
+                        && hash_file(&fs, &path).ok().as_ref() != Some(expected)
+                    {
+                        return None;
+                    }
+                    Some(art)
+                })
+                .await?;
+                Ok::<_, anyhow::Error>((file, inspected))
+            }
+        }))
+        .buffer_unordered(batch_size.min(4));
+        while let Some(result) = work.next().await {
+            let (file, inspection) = result?;
             if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
                 return Ok(processed);
             }
-            if let Some(checked) = &file.cover_art_checked_at
-                && let (Ok(modified), Ok(checked)) = (
-                    chrono::DateTime::parse_from_rfc3339(&file.last_modified),
-                    chrono::DateTime::parse_from_rfc3339(checked),
-                )
-                && modified <= checked
-            {
-                processed += 1;
-                progress(processed, total);
-                continue;
-            }
-            let path = root.join(&file.directory).join(&file.file_name);
-            let expected = match (&file.content_hash, file.content_size) {
-                (Some(hash), Some(size)) if size >= 0 => Some(crate::sync::model::BlobRef {
-                    digest: hash.clone(),
-                    size: size as u64,
-                }),
-                _ => None,
-            };
-            if let Some(expected) = &expected
-                && crate::actions::file::hash_file(&fsio, &path).ok().as_ref() != Some(expected)
-            {
-                log::warn!("artwork source changed before inspection: {}", file.id);
-                processed += 1;
-                progress(processed, total);
-                continue;
-            }
-            let recheck_path = path.clone();
-            let root = root.to_path_buf();
-            let fs = fsio.clone();
-            let inspection = tokio::task::spawn_blocking(move || {
-                metadata::cover_art::extract_cover_art_binary_checked(
-                    fs.as_ref(),
-                    Some(&root),
-                    &path,
-                )
-            })
-            .await?;
-            if let Some(expected) = &expected
-                && crate::actions::file::hash_file(&fsio, &recheck_path)
-                    .ok()
-                    .as_ref()
-                    != Some(expected)
-            {
-                log::warn!("artwork source changed during inspection: {}", file.id);
-                processed += 1;
-                progress(processed, total);
-                continue;
-            }
             match inspection {
-                Ok(art) => assign_inspected(db, store, &file, art).await?,
-                Err(error) => {
-                    log::warn!("artwork inspection for file {} failed: {error:#}", file.id)
+                Some(Ok(art)) => {
+                    if let Err(error) = assign_inspected(db, store, &file, art).await {
+                        if super::metadata::is_fatal_scan_error(&error) {
+                            return Err(error);
+                        }
+                        log::warn!("artwork assignment for {} failed: {error:#}", file.id);
+                    }
                 }
+                Some(Err(error)) => {
+                    log::warn!("artwork inspection for {} failed: {error:#}", file.id)
+                }
+                None => {}
             }
             processed += 1;
             progress(processed, total);
         }
     }
     Ok(processed)
+}
+
+fn artwork_inspection_is_current(file: &media_files::Model) -> bool {
+    inspection_timestamp_is_current(&file.last_modified, file.cover_art_checked_at.as_deref())
+}
+
+fn inspection_timestamp_is_current(modified: &str, checked: Option<&str>) -> bool {
+    let Some(checked) = checked.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) else {
+        return false;
+    };
+    let modified = modified
+        .parse::<i64>()
+        .ok()
+        .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(modified)
+                .ok()
+                .map(|v| v.to_utc())
+        });
+    modified.is_some_and(|modified| modified <= checked.to_utc())
+}
+
+#[cfg(test)]
+mod inspection_timestamp_tests {
+    use super::inspection_timestamp_is_current as current;
+    #[test]
+    fn accepts_current_unix_and_legacy_timestamps_only() {
+        let checked = Some("2024-01-01T00:00:00+00:00");
+        assert!(current("1704067200", checked));
+        assert!(current("2023-12-31T23:59:59Z", checked));
+        assert!(!current("1704067201", checked));
+        assert!(!current("invalid", checked));
+        assert!(!current("9223372036854775807", checked));
+        assert!(!current("1704067200", None));
+        assert!(!current("1704067200", Some("invalid")));
+    }
 }
 
 /// Returns a map of file_id -> (file_last_modified, cover_art_updated_at)
@@ -342,11 +380,11 @@ pub async fn remove_cover_art_by_file_id(
         active.cover_art_uuid = ActiveValue::Set(None);
         active.cover_art_checked_at = ActiveValue::Set(None);
         media_files::Entity::update(active).exec(&tx).await?;
-        crate::sync::model::author_source_on(
+        author_source_on(
             &tx,
             store,
-            crate::sync::model::ObjectKey {
-                collection: crate::sync::model::Collection::Tracks,
+            ObjectKey {
+                collection: Collection::Tracks,
                 id,
             },
         )
@@ -400,7 +438,7 @@ pub async fn get_primary_color_by_cover_art_id(
     let cover_art = media_cover_art::Entity::find_by_id(cover_art_id)
         .one(main_db)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("Cover art not found"))?;
+        .ok_or(ExpectedError::NotFound { what: "cover art" })?;
 
     // Step 2: Check if the primary color is null
     if let Some(primary_color) = cover_art.primary_color {
@@ -414,6 +452,7 @@ pub async fn get_primary_color_by_cover_art_id(
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+    use crate::sync::SeaOrmSyncStore;
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{Database, EntityTrait, Set};
 
@@ -443,8 +482,7 @@ mod identity_tests {
             .exec(&db)
             .await?;
         }
-        let store =
-            crate::sync::SeaOrmSyncStore::create_empty(db.clone(), Uuid::new_v4(), node).await?;
+        let store = SeaOrmSyncStore::create_empty(db.clone(), Uuid::new_v4(), node).await?;
         for (id, data) in [(1, vec![1, 2, 3]), (2, vec![4, 5, 6])] {
             let file = media_files::Entity::find_by_id(id).one(&db).await?.unwrap();
             assign_inspected(
@@ -609,7 +647,7 @@ async fn attach_body(
 pub async fn assign_inspected(
     db: &sea_orm::DatabaseConnection,
     store: &crate::sync::SeaOrmSyncStore,
-    observed: &crate::entities::media_files::Model,
+    observed: &media_files::Model,
     art: Option<metadata::cover_art::CoverArt>,
 ) -> Result<()> {
     use crate::entities::media_files;
@@ -675,7 +713,7 @@ pub async fn assign_inspected(
 pub async fn artwork_body_needed(
     db: &DatabaseConnection,
     id: Uuid,
-    expected: &crate::sync::model::Artwork,
+    expected: &Artwork,
 ) -> Result<bool> {
     let body = expected.body()?;
     let local = media_cover_art::Entity::find()
@@ -696,7 +734,7 @@ pub async fn attach_received_body(
     db: &DatabaseConnection,
     store: &crate::sync::SeaOrmSyncStore,
     id: Uuid,
-    expected: &crate::sync::model::Artwork,
+    expected: &Artwork,
     bytes: Vec<u8>,
 ) -> Result<()> {
     use crate::sync::{
@@ -738,12 +776,12 @@ pub async fn artwork_candidates(
     db: &DatabaseConnection,
     store: &crate::sync::SeaOrmSyncStore,
     cursor: Option<Uuid>,
-) -> Result<sync_orm::causal_store::ProjectedPage<crate::sync::model::RuneModel>> {
+) -> Result<sync_orm::causal_store::ProjectedPage<RuneModel>> {
     use sea_orm::TransactionTrait;
     let tx = db.begin().await?;
-    let page = crate::sync::accepted::AcceptedState::new(&tx, store)
+    let page = crate_sync_accepted::AcceptedState::new(&tx, store)
         .page(
-            crate::sync::model::Collection::Artworks,
+            Collection::Artworks,
             cursor,
             sync::PageLimits {
                 max_scanned: 128,
@@ -834,4 +872,83 @@ mod received_body_tests {
         assert!(media_cover_art::Entity::find().one(&db).await?.is_none());
         Ok(())
     }
+}
+
+/// Fetch missing verified artwork bodies with per-item failure isolation.
+pub async fn fetch_missing(
+    db: &DatabaseConnection,
+    store: &SeaOrmSyncStore,
+    server: &str,
+    client: &reqwest::Client,
+    cursor: &mut http_request::sync::PageCursor,
+    deadline: tokio::time::Instant,
+) -> Result<(usize, usize)> {
+    use crate::sync::model::Payload;
+    use std::ops::ControlFlow;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::time::Instant;
+    let attached = AtomicUsize::new(0);
+    let pending = AtomicUsize::new(0);
+    http_request::sync::visit_page(
+        cursor,
+        |cursor| async move {
+            let page = artwork_candidates(db, store, cursor).await?;
+            let records = page
+                .records
+                .into_iter()
+                .filter_map(|record| match record.value {
+                    Some(Payload::Artwork(artwork)) => Some((record.key.id, artwork)),
+                    _ => None,
+                })
+                .collect();
+            Ok((records, page.next, page.done))
+        },
+        |id, artwork| {
+            let attached = &attached;
+            let pending = &pending;
+            async move {
+                if Instant::now() >= deadline {
+                    pending.fetch_add(1, Ordering::Relaxed);
+                    return Ok(ControlFlow::Break(()));
+                }
+                if !artwork_body_needed(db, id, &artwork).await? {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let limit = deadline.min(Instant::now() + Duration::from_secs(1));
+                let result = tokio::time::timeout_at(limit, async {
+                    let body = artwork.body()?;
+                    let url = format!("{}/sync/artworks/{id}", server.trim_end_matches('/'));
+                    let bytes =
+                        http_request::sync::fetch_bounded(client, &url, body.size, limit).await?;
+                    attach_received_body(db, store, id, &artwork, bytes).await?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("artwork request timed out")));
+                match result {
+                    Ok(()) => {
+                        attached.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        if error.chain().any(|cause| {
+                            cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                                error.status() == Some(reqwest::StatusCode::UNAUTHORIZED)
+                            })
+                        }) {
+                            return Err(error);
+                        }
+                        pending.fetch_add(1, Ordering::Relaxed);
+                        log::warn!("artwork {id} remains pending: {error:#}");
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            }
+        },
+    )
+    .await?;
+    Ok((
+        attached.load(Ordering::Relaxed),
+        pending.load(Ordering::Relaxed),
+    ))
 }

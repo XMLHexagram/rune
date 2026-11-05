@@ -1,8 +1,13 @@
 //! Assign fingerprint and similarity values to their existing source rows.
+
 use crate::entities::{media_file_fingerprint, media_file_similarity, media_files};
-use crate::sync::model::{Collection, Payload};
+use crate::sync::bindings::apply;
+use crate::sync::model::{
+    Collection, Fingerprint, MAX_PORTABLE_FINGERPRINT_BYTES, Payload, ScoreValue, Similarity,
+};
 use anyhow::{Result, ensure};
-use sea_orm::{ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter};
+use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, Set};
+use tag_editor::music_brainz::fingerprint::Configuration;
 
 /// A computed fingerprint and the provenance used to derive its identity.
 pub struct ComputedFingerprint {
@@ -49,7 +54,49 @@ pub async fn assign_computed_fingerprint(
         Some(&configuration),
         Some(format_version),
     );
-    let value = Some(Payload::Fingerprint(crate::sync::model::Fingerprint {
+    if bytes.len() > MAX_PORTABLE_FINGERPRINT_BYTES {
+        let key = ObjectKey {
+            collection: Collection::Fingerprints,
+            id,
+        };
+        if store
+            .get_on(&tx, &key)
+            .await?
+            .is_some_and(|record| record.value.is_some())
+        {
+            store.author_on(&tx, key, None).await?;
+        }
+        let existing = media_file_fingerprint::Entity::find()
+            .filter(media_file_fingerprint::Column::HlcUuid.eq(id.to_string()))
+            .one(&tx)
+            .await?;
+        let mut row: media_file_fingerprint::ActiveModel =
+            existing.map(Into::into).unwrap_or_default();
+        row.hlc_uuid = Set(id.to_string());
+        row.track_uuid = Set(file_id.to_string());
+        row.fingerprint = Set(bytes);
+        row.is_duplicated = Set(is_duplicated);
+        row.source_hash = Set(file.content_hash);
+        row.source_size = Set(file.content_size);
+        row.algorithm = Set(Some(algorithm));
+        row.configuration = Set(Some(configuration));
+        row.format_version = Set(Some(format_version));
+        row.save(&tx).await?;
+        log::debug!("keeping oversized fingerprint local for {}", file.id);
+        tx.commit().await?;
+        return Ok(());
+    }
+    if let Some(existing) = media_file_fingerprint::Entity::find()
+        .filter(media_file_fingerprint::Column::HlcUuid.eq(id.to_string()))
+        .one(&tx)
+        .await?
+        && existing.fingerprint.len() > MAX_PORTABLE_FINGERPRINT_BYTES
+    {
+        let mut update: media_file_fingerprint::ActiveModel = existing.into();
+        update.fingerprint = Set(bytes.clone());
+        update.update(&tx).await?;
+    }
+    let value = Some(Payload::Fingerprint(Fingerprint {
         file_id,
         source_hash: file.content_hash,
         source_size: file.content_size,
@@ -67,7 +114,7 @@ pub async fn assign_computed_fingerprint(
         Some(record) if record.value == value => record,
         _ => store.author_on(&tx, key, value).await?,
     };
-    crate::sync::bindings::apply(&tx, &record.key, record.value.as_ref()).await?;
+    apply(&tx, &record.key, record.value.as_ref()).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -116,7 +163,7 @@ pub async fn assign_computed_similarity(
         Some(&configuration),
         Some(format_version),
     );
-    let value = Some(Payload::Similarity(crate::sync::model::Similarity {
+    let value = Some(Payload::Similarity(Similarity {
         first_file_id,
         second_file_id,
         first_source_hash: first.content_hash,
@@ -126,7 +173,7 @@ pub async fn assign_computed_similarity(
         algorithm: Some(algorithm),
         configuration: Some(configuration),
         format_version: Some(format_version),
-        score: crate::sync::model::ScoreValue(if score == 0.0 { 0 } else { score.to_bits() }),
+        score: ScoreValue(if score == 0.0 { 0 } else { score.to_bits() }),
     }));
     let key = ObjectKey {
         collection: Collection::Similarities,
@@ -136,7 +183,7 @@ pub async fn assign_computed_similarity(
         Some(record) if record.value == value => record,
         _ => store.author_on(&tx, key, value).await?,
     };
-    crate::sync::bindings::apply(&tx, &record.key, record.value.as_ref()).await?;
+    apply(&tx, &record.key, record.value.as_ref()).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -264,7 +311,15 @@ pub async fn assign_duplicate_mark(
         row.hlc_uuid == id.to_string(),
         "fingerprint source identity requires correction"
     );
-    let value = Some(Payload::Fingerprint(crate::sync::model::Fingerprint {
+    if row.fingerprint.len() > MAX_PORTABLE_FINGERPRINT_BYTES {
+        let mut update: media_file_fingerprint::ActiveModel = row.into();
+        update.is_duplicated = Set(mark);
+        update.update(&tx).await?;
+        log::debug!("keeping oversized fingerprint local for {file_id}");
+        tx.commit().await?;
+        return Ok(());
+    }
+    let value = Some(Payload::Fingerprint(Fingerprint {
         file_id: uuid,
         source_hash: row.source_hash,
         source_size: row.source_size,
@@ -282,7 +337,7 @@ pub async fn assign_duplicate_mark(
         Some(record) if record.value == value => record,
         _ => store.author_on(&tx, key, value).await?,
     };
-    crate::sync::bindings::apply(&tx, &record.key, record.value.as_ref()).await?;
+    apply(&tx, &record.key, record.value.as_ref()).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -310,7 +365,7 @@ pub async fn unavailable_fingerprints(
 }
 
 pub fn default_similarity_configuration() -> String {
-    let config = tag_editor::music_brainz::fingerprint::Configuration::default();
+    let config = Configuration::default();
     format!(
         "rusty-chromaprint-0.3.0/{}",
         blake3::hash(format!("{config:?}").as_bytes()).to_hex()

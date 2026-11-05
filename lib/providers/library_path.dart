@@ -1,9 +1,14 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:fluent_ui/fluent_ui.dart';
 
 import '../utils/query_list.dart';
+import '../utils/api/library_registry.dart';
+import '../utils/library_ui/library_ui_state.dart';
+import '../utils/rune_log.dart';
 import '../utils/api/load_request.dart';
+import '../utils/api/request_failure.dart';
 import '../utils/api/set_media_library_path.dart';
 import '../utils/api/operate_playback_with_mix_query.dart';
 import '../utils/settings_manager.dart';
@@ -102,10 +107,44 @@ Future<String?> getInitialPath() async {
 }
 
 class LibraryPathProvider with ChangeNotifier {
+  bool _openedLocalLibrary = false;
   String? _currentPath;
   final Set<LibraryPathEntry> _libraryHistory = {};
+  StreamSubscription<dynamic>? _contentSubscription;
+  bool _readOnly = false;
+  int _refreshVersion = 0;
+  bool _disposed = false;
+
+  bool get isReadOnlyReplica => _readOnly;
+
+  Future<void> _refreshAccess() async {
+    final version = ++_refreshVersion;
+    if (_currentPath == null || _currentPath!.startsWith('@RR|')) return;
+    try {
+      final libraries = await listLocalLibraries();
+      if (_disposed || version != _refreshVersion) return;
+      final readOnly =
+          currentLibraryIsReadOnly(_currentPath, libraries.libraries);
+      if (readOnly != _readOnly) {
+        _readOnly = readOnly;
+        notifyListeners();
+      }
+    } on RequestFailure catch (error) {
+      error$(error.toString());
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _contentSubscription?.cancel();
+    super.dispose();
+  }
 
   LibraryPathProvider(String? initialPath) {
+    _contentSubscription = LibraryContentChanged.rustSignalStream.listen((_) {
+      _refreshAccess();
+    });
     if (initialPath != null) {
       setLibraryPath(null, initialPath, null).then((result) {
         final success = result.$1;
@@ -128,7 +167,7 @@ class LibraryPathProvider with ChangeNotifier {
 
   Set<LibraryPathEntry> get libraryHistory => _libraryHistory;
 
-  void addLibraryPath(
+  Future<void> addLibraryPath(
       BuildContext? context, String filePath, String alias) async {
     final entry = LibraryPathEntry(filePath, alias: alias);
 
@@ -136,29 +175,57 @@ class LibraryPathProvider with ChangeNotifier {
       notifyListeners();
     }
 
-    _fileStorageService.storeFilePath(filePath, alias: alias);
+    await _fileStorageService.storeFilePath(filePath, alias: alias);
   }
 
-  Future<(bool, bool, String?)> setLibraryPath(
+  Future<(bool, bool, String?, LibraryOpenErrorKind?)> setLibraryPath(
     BuildContext? context,
     String filePath,
     LibraryInitializeMode? selectedMode,
   ) async {
     _currentPath = filePath;
+    _readOnly = false;
+    _refreshAccess();
     notifyListeners();
 
-    var (success, notReady, error) =
-        await setMediaLibraryPath(filePath, selectedMode);
+    var restoreLastIndex = false;
+    Future<(bool, bool, String?, LibraryOpenErrorKind?)> openLibrary() async {
+      final subscription = SetMediaLibraryPathResponse.rustSignalStream
+          .where(
+            (event) =>
+                event.message.path == LibraryPathEntry.removePrefix(filePath),
+          )
+          .listen((event) {
+            restoreLastIndex = event.message.restoreLastIndex;
+          });
+      try {
+        return await setMediaLibraryPath(filePath, selectedMode);
+      } finally {
+        await subscription.cancel();
+      }
+    }
+
+    (bool, bool, String?, LibraryOpenErrorKind?) result;
+    try {
+      result = await openLibrary();
+    } on RequestFailure {
+      removeCurrentPath();
+      rethrow;
+    }
+    var (success, notReady, error, errorKind) = result;
 
     if (!success) {
-      return (false, false, error);
+      if (error != null) error$(error);
+      removeCurrentPath();
+      return (false, false, error, errorKind);
     }
 
     if (notReady && context == null) {
-      return (false, true, null);
+      return (false, true, null, null);
     }
 
     if (notReady && context != null) {
+      if (!context.mounted) return (false, true, null, null);
       // Databases cannot live inside a SAF tree (SQLite WAL needs real
       // file paths), so Android is always redirected to app-local storage.
       if (Platform.isAndroid) {
@@ -170,14 +237,19 @@ class LibraryPathProvider with ChangeNotifier {
       }
 
       if (selectedMode == null) {
-        return (false, true, null);
+        return (false, true, null, null);
       }
 
-      (success, notReady, error) =
-          await setMediaLibraryPath(filePath, selectedMode);
+      try {
+        (success, notReady, error, errorKind) = await openLibrary();
+      } on RequestFailure {
+        removeCurrentPath();
+        rethrow;
+      }
     }
 
     if (success) {
+      await _refreshAccess();
       final entry = LibraryPathEntry(filePath);
       if (_libraryHistory.add(entry)) {
         notifyListeners();
@@ -185,25 +257,47 @@ class LibraryPathProvider with ChangeNotifier {
       CollectionCache().clearAll();
       _fileStorageService.storeFilePath(filePath);
 
-      await operatePlaybackWithMixQuery(
-        queries: const QueryList([("lib::queue", "true")]),
-        playbackMode:
-            await SettingsManager().getValue<int>(kPlaybackModeKey) ?? 99,
-        hintPosition: -1,
-        initialPlaybackId: 0,
-        instantlyPlay: false,
-        operateMode: PlaylistOperateMode.replace,
-        fallbackPlayingItems: [],
-      );
+      try {
+        if (filePath.startsWith('@RR|')) {
+          await operatePlaybackWithMixQuery(
+            queries: const QueryList([("lib::queue", "true")]),
+            playbackMode:
+                await SettingsManager().getValue<int>(kPlaybackModeKey) ?? 99,
+            hintPosition: -1,
+            initialPlaybackId: 0,
+            instantlyPlay: false,
+            operateMode: PlaylistOperateMode.replace,
+            fallbackPlayingItems: [],
+          );
 
-      final lastQueueIndex =
-          await (SettingsManager().getValue(kLastQueueIndexKey));
-      load(lastQueueIndex ?? 0);
+          final lastQueueIndex = await (SettingsManager().getValue(
+            kLastQueueIndexKey,
+          ));
+          load(lastQueueIndex ?? 0);
+        } else {
+          if (!_openedLocalLibrary && restoreLastIndex) {
+            final mode = await SettingsManager().getValue<int>(
+              kPlaybackModeKey,
+            );
+            if (mode != null && mode != 99) {
+              SetPlaybackModeRequest(mode: mode).sendSignalToRust();
+            }
+            final index = await SettingsManager().getValue<int>(
+              kLastQueueIndexKey,
+            );
+            load(index ?? 0);
+          }
+          _openedLocalLibrary = true;
+        }
+      } on RequestFailure {
+        // Opening the library does not depend on restoring its queue.
+      }
     } else {
       removeCurrentPath();
     }
 
-    return (success, false, error);
+    if (!success && error != null) error$(error);
+    return (success, false, error, errorKind);
   }
 
   List<LibraryPathEntry> _filterEntries({
@@ -236,6 +330,8 @@ class LibraryPathProvider with ChangeNotifier {
   Future<void> clearAllOpenedFiles() async {
     await _fileStorageService.clearAllOpenedFiles();
     _currentPath = null;
+    _readOnly = false;
+    _refreshVersion++;
     _libraryHistory.clear();
     notifyListeners();
   }
@@ -251,6 +347,8 @@ class LibraryPathProvider with ChangeNotifier {
 
     if (_currentPath == filePath) {
       _currentPath = null;
+      _readOnly = false;
+      _refreshVersion++;
       hasChanged = true;
     }
 
@@ -271,6 +369,8 @@ class LibraryPathProvider with ChangeNotifier {
 
   void removeCurrentPath() {
     _currentPath = null;
+    _readOnly = false;
+    _refreshVersion++;
     notifyListeners();
   }
 }

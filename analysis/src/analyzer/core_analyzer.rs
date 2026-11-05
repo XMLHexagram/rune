@@ -1,3 +1,4 @@
+use crate::utils::mixing::append_mixed;
 use std::sync::{Arc, Mutex};
 
 use log::debug;
@@ -179,7 +180,7 @@ impl Analyzer {
     {
         let frames = buf.frames();
         let mut samples = std::mem::take(&mut self.sample_buffer);
-        crate::utils::mixing::append_mixed(buf, &mut samples);
+        append_mixed(buf, &mut samples);
         self.consume_mixed_samples(samples, frames);
     }
 
@@ -381,6 +382,7 @@ impl Analyzer {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn final_window_does_not_retain_track_sized_buffer() {
@@ -396,7 +398,7 @@ mod regression_tests {
     fn cancelled_analysis_does_not_return_partial_results() {
         let mut analyzer = Analyzer::new(ComputingDevice::Cpu, 1024, 512, None, None);
         // Cancel after process() enters the decode loop, before its first packet.
-        let calls = std::cell::Cell::new(0);
+        let calls = Cell::new(0);
         analyzer.fn_is_cancelled = Box::new(move || {
             calls.set(calls.get() + 1);
             calls.get() > 1
@@ -408,7 +410,9 @@ mod regression_tests {
 
 #[cfg(test)]
 mod streaming_tests {
+
     use super::*;
+    use std::f32::consts::PI;
 
     fn run(samples: &[f32], rate: u32, packet: usize) -> Analyzer {
         let mut a = Analyzer::new(ComputingDevice::Cpu, 1024, 512, None, None);
@@ -453,7 +457,7 @@ mod streaming_tests {
     fn opposite_phase_frames_do_not_cancel_power() {
         let mut a = Analyzer::new(ComputingDevice::Cpu, 1024, 512, None, None);
         let frame: Vec<f32> = (0..1024)
-            .map(|i| (2.0 * std::f32::consts::PI * 21.0 * i as f32 / 1024.0).sin())
+            .map(|i| (2.0 * PI * 21.0 * i as f32 / 1024.0).sin())
             .collect();
         a.process_audio_chunk(&frame, false);
         let power = a.avg_spectrum[21].re;

@@ -1,7 +1,8 @@
 //! Headless GPU tests. They skip (and say so) when the machine has no GPU adapter.
 
-use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::f32::consts::TAU;
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard, atomic::AtomicU32};
 use std::time::{Duration, Instant};
 
 use rtrb::{Producer, RingBuffer};
@@ -12,7 +13,7 @@ const SAMPLE_RATE: u32 = 48_000;
 /// A copy of the built-in scene under the name `name`, in a folder of its own that the test
 /// removes afterwards.
 fn copied_scene(name: &str) -> std::path::PathBuf {
-    let from = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scenes/armillary");
+    let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("scenes/armillary");
     let dir = std::env::temp_dir()
         .join(format!("rune-visualizer-{name}-{}", std::process::id()))
         .join(name);
@@ -56,7 +57,7 @@ impl Feeder {
                 .wrapping_add(1_013_904_223);
             let noise = (self.noise >> 16) as f32 / 65_536.0 - 0.5;
             let beat = (-(t * 4.0).fract() * 6.0).exp();
-            let value = 0.8 * beat * (t * 110.0 * std::f32::consts::TAU).sin() + 0.05 * noise;
+            let value = 0.8 * beat * (t * 110.0 * TAU).sin() + 0.05 * noise;
             let _ = self.producer.push(value);
             let _ = self.producer.push(value);
             self.samples_sent += 1;
@@ -237,7 +238,7 @@ fn frame_listener_hears_every_frame() {
         return;
     };
     let visualizer = Arc::new(visualizer);
-    let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let heard = Arc::new(Mutex::new(Vec::new()));
     visualizer.set_frame_listener(Some(Arc::new({
         let heard = Arc::clone(&heard);
         let visualizer = Arc::downgrade(&visualizer);
@@ -268,7 +269,7 @@ fn transport_listener_hears_the_fall_back_to_readback() {
     let Some((visualizer, mut feeder)) = start(320, 180) else {
         return;
     };
-    let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let heard = Arc::new(Mutex::new(Vec::new()));
     visualizer.set_transport_listener(Some(Arc::new({
         let heard = Arc::clone(&heard);
         move |transport| heard.lock().unwrap().push(transport)
@@ -339,7 +340,7 @@ fn missing_scene_keeps_running_and_reports_the_error() {
         return;
     };
     visualizer
-        .load_preset_path(std::path::Path::new("/nonexistent/scene"))
+        .load_preset_path(Path::new("/nonexistent/scene"))
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while visualizer.status().last_error.is_none() {

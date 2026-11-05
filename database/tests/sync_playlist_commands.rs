@@ -1,12 +1,15 @@
+use support::fixtures;
+
 #[path = "support/causal_library.rs"]
 mod support;
 use anyhow::Result;
 use database::{
-    actions::playlists,
-    sync::{
-        LibrarySyncStore,
-        model::{Collection, Scope},
+    actions::{mixes::create_mix, playlists},
+    entities::{
+        media_file_playlists, media_files, mix_queries, mix_queries::Column,
+        playlists as playlist_rows, playlists::Column as PlaylistsColumn,
     },
+    sync::model::{Collection, Scope},
 };
 use migration::{Migrator, MigratorTrait};
 use sea_orm::{Database, EntityTrait, PaginatorTrait, QueryFilter, Set};
@@ -18,64 +21,36 @@ async fn commands_publish_playlist_and_occurrence_removals() -> Result<()> {
     let peer_db = Database::connect("sqlite::memory:").await?;
     let node = Uuid::new_v4();
     let ns = Uuid::new_v4();
-    let _ = migration::initialize_node_id(node.to_string());
-    Migrator::up(&db, None).await?;
+    fixtures::migrate(&db, node).await?;
     Migrator::up(&peer_db, None).await?;
-    let a = LibrarySyncStore::open(db.clone(), node, Some(ns)).await?;
-    let b = LibrarySyncStore::open(peer_db.clone(), Uuid::new_v4(), Some(ns)).await?;
+    let a = fixtures::open_library(db.clone(), node, Some(ns)).await?;
+    let b = fixtures::open_library(peer_db.clone(), Uuid::new_v4(), Some(ns)).await?;
     let file = Uuid::new_v4();
     for conn in [&db, &peer_db] {
-        database::entities::media_files::Entity::insert(
-            database::entities::media_files::ActiveModel {
-                file_name: Set("song".into()),
-                directory: Set(String::new()),
-                extension: Set("ogg".into()),
-                file_hash: Set(String::new()),
-                last_modified: Set(String::new()),
-                sample_rate: Set(1),
-                duration: Set(1.into()),
-                hlc_uuid: Set(file.to_string()),
-                ..Default::default()
-            },
-        )
+        media_files::Entity::insert(media_files::ActiveModel {
+            file_name: Set("song".into()),
+            directory: Set(String::new()),
+            extension: Set("ogg".into()),
+            file_hash: Set(String::new()),
+            last_modified: Set(String::new()),
+            sample_rate: Set(1),
+            duration: Set(1.into()),
+            hlc_uuid: Set(file.to_string()),
+            ..Default::default()
+        })
         .exec(conn)
         .await?;
     }
     a.import_basic().await?;
     let record_store = a.record_store();
-    let list =
-        playlists::create_playlist(&db, &record_store, node, "test".into(), "t".into()).await?;
-    playlists::update_playlist(
-        &db,
-        &record_store,
-        node,
-        list.id,
-        Some("renamed".into()),
-        None,
-    )
-    .await?;
-    let before = database::entities::playlists::Entity::find_by_id(list.id)
-        .one(&db)
-        .await?
-        .unwrap();
-    let first = playlists::add_item_to_playlist(&db, &record_store, node, list.id, 1, None).await?;
-    let after = database::entities::playlists::Entity::find_by_id(list.id)
-        .one(&db)
-        .await?
-        .unwrap();
-    assert_eq!(after.created_at_hlc_ts, before.created_at_hlc_ts);
-    assert_eq!(after.created_at_hlc_ver, before.created_at_hlc_ver);
-    assert_eq!(after.created_at_hlc_nid, before.created_at_hlc_nid);
-    assert_eq!(after.updated_at_hlc_ver, before.updated_at_hlc_ver + 1);
-    assert_eq!(after.updated_at_hlc_nid, node.to_string());
-
-    let second =
-        playlists::add_item_to_playlist(&db, &record_store, node, list.id, 1, None).await?;
+    let list = playlists::create_playlist(&db, &record_store, "test".into(), "t".into()).await?;
+    playlists::update_playlist(&db, &record_store, list.id, Some("renamed".into()), None).await?;
+    let first = playlists::add_item_to_playlist(&db, &record_store, list.id, 1, None).await?;
+    let second = playlists::add_item_to_playlist(&db, &record_store, list.id, 1, None).await?;
     assert_ne!(first.hlc_uuid, second.hlc_uuid);
     playlists::reorder_playlist_item_position(
         &db,
         &record_store,
-        node,
         list.id,
         second.hlc_uuid.parse()?,
         0,
@@ -97,28 +72,17 @@ async fn commands_publish_playlist_and_occurrence_removals() -> Result<()> {
     )
     .await?;
     assert_eq!(b.pending_references().await?.len(), 0);
-    let remote_playlist = database::entities::playlists::Entity::find()
-        .one(&peer_db)
-        .await?
-        .unwrap();
+    let remote_playlist = playlist_rows::Entity::find().one(&peer_db).await?.unwrap();
     assert_eq!(remote_playlist.name, "renamed");
-    let remote_entries = database::entities::media_file_playlists::Entity::find()
-        .all(&peer_db)
-        .await?;
+    let remote_entries = media_file_playlists::Entity::find().all(&peer_db).await?;
     assert_eq!(remote_entries.len(), 2);
     assert!(
         remote_entries
             .iter()
             .any(|entry| entry.hlc_uuid == second.hlc_uuid && entry.position == 0)
     );
-    playlists::remove_item_from_playlist(
-        &db,
-        &record_store,
-        node,
-        list.id,
-        first.hlc_uuid.parse()?,
-    )
-    .await?;
+    playlists::remove_item_from_playlist(&db, &record_store, list.id, first.hlc_uuid.parse()?)
+        .await?;
     support::exchange_scoped(
         &(Arc::new(a.endpoint()) as support::Peer),
         &(Arc::new(b.endpoint()) as support::Peer),
@@ -126,15 +90,12 @@ async fn commands_publish_playlist_and_occurrence_removals() -> Result<()> {
     )
     .await?;
     assert_eq!(
-        database::entities::media_file_playlists::Entity::find()
-            .count(&peer_db)
-            .await?,
+        media_file_playlists::Entity::find().count(&peer_db).await?,
         1
     );
-    let mix = database::actions::mixes::create_mix(
+    let mix = create_mix(
         &db,
         &record_store,
-        &node.to_string(),
         "dependent".into(),
         "d".into(),
         false,
@@ -150,22 +111,15 @@ async fn commands_publish_playlist_and_occurrence_removals() -> Result<()> {
         scope,
     )
     .await?;
+    assert_eq!(playlist_rows::Entity::find().count(&peer_db).await?, 0);
     assert_eq!(
-        database::entities::playlists::Entity::find()
-            .count(&peer_db)
-            .await?,
-        0
-    );
-    assert_eq!(
-        database::entities::media_file_playlists::Entity::find()
-            .count(&peer_db)
-            .await?,
+        media_file_playlists::Entity::find().count(&peer_db).await?,
         1
     );
     use sea_orm::ColumnTrait;
     assert!(
-        database::entities::mix_queries::Entity::find()
-            .filter(database::entities::mix_queries::Column::MixUuid.eq(mix.hlc_uuid.clone()))
+        mix_queries::Entity::find()
+            .filter(Column::MixUuid.eq(mix.hlc_uuid.clone()))
             .all(&db)
             .await?
             .len()
@@ -191,10 +145,9 @@ async fn occurrence_cursor_preserves_duplicates_and_commands_address_one_uuid() 
     use sea_orm::{ColumnTrait, QueryOrder, Set, sea_query::Expr};
     let db = Database::connect("sqlite::memory:").await?;
     let actor = Uuid::new_v4();
-    let _ = migration::initialize_node_id(actor.to_string());
-    Migrator::up(&db, None).await?;
+    fixtures::migrate(&db, actor).await?;
     let root = tempfile::tempdir()?;
-    let store = LibrarySyncStore::open(db.clone(), actor, Some(Uuid::new_v4())).await?;
+    let store = fixtures::open_library(db.clone(), actor, Some(Uuid::new_v4())).await?;
     let file = media_files::Entity::insert(media_files::ActiveModel {
         file_name: Set("remote.flac".into()),
         directory: Set(String::new()),
@@ -211,23 +164,14 @@ async fn occurrence_cursor_preserves_duplicates_and_commands_address_one_uuid() 
     .await?;
     let record_store = store.record_store();
     let playlist =
-        playlists::create_playlist(&db, &record_store, actor, "Occurrences".into(), "O".into())
-            .await?;
-    let other =
-        playlists::create_playlist(&db, &record_store, actor, "Other".into(), "O".into()).await?;
+        playlists::create_playlist(&db, &record_store, "Occurrences".into(), "O".into()).await?;
+    let other = playlists::create_playlist(&db, &record_store, "Other".into(), "O".into()).await?;
     let mut ids = Vec::new();
     for _ in 0..5 {
         ids.push(
-            playlists::add_item_to_playlist(
-                &db,
-                &record_store,
-                actor,
-                playlist.id,
-                file.id,
-                Some(7),
-            )
-            .await?
-            .hlc_uuid,
+            playlists::add_item_to_playlist(&db, &record_store, playlist.id, file.id, Some(7))
+                .await?
+                .hlc_uuid,
         );
     }
     ids.sort();
@@ -251,27 +195,26 @@ async fn occurrence_cursor_preserves_duplicates_and_commands_address_one_uuid() 
     assert_eq!(seen, ids);
     let selected: Uuid = ids[2].parse()?;
     let unchanged = store.head().await?;
-    playlists::reorder_playlist_item_position(&db, &record_store, actor, playlist.id, selected, 7)
-        .await?;
+    playlists::reorder_playlist_item_position(&db, &record_store, playlist.id, selected, 7).await?;
     assert_eq!(store.head().await?, unchanged);
     assert!(
-        playlists::remove_item_from_playlist(&db, &record_store, actor, other.id, selected)
+        playlists::remove_item_from_playlist(&db, &record_store, other.id, selected)
             .await
             .is_err()
     );
     assert!(
-        playlists::reorder_playlist_item_position(&db, &record_store, actor, other.id, selected, 0)
+        playlists::reorder_playlist_item_position(&db, &record_store, other.id, selected, 0)
             .await
             .is_err()
     );
     assert_eq!(store.head().await?, unchanged);
-    playlists::reorder_playlist_item_position(&db, &record_store, actor, playlist.id, selected, -4)
+    playlists::reorder_playlist_item_position(&db, &record_store, playlist.id, selected, -4)
         .await?;
     assert_eq!(
         list_occurrences(&db, playlist.id, None, 2).await?.entries[0].occurrence_id,
         ids[2]
     );
-    playlists::remove_item_from_playlist(&db, &record_store, actor, playlist.id, selected).await?;
+    playlists::remove_item_from_playlist(&db, &record_store, playlist.id, selected).await?;
     let remaining = entries::Entity::find()
         .filter(entries::Column::PlaylistUuid.eq(playlist.hlc_uuid.clone()))
         .order_by_asc(entries::Column::HlcUuid)
@@ -307,7 +250,6 @@ async fn occurrence_cursor_preserves_duplicates_and_commands_address_one_uuid() 
     let (imported, result) = playlists::create_m3u8_playlist(
         &db,
         &record_store,
-        actor,
         "Import".into(),
         "I".into(),
         &import_path,
@@ -325,7 +267,7 @@ async fn occurrence_cursor_preserves_duplicates_and_commands_address_one_uuid() 
 
     let peer_db = Database::connect("sqlite::memory:").await?;
     Migrator::up(&peer_db, None).await?;
-    let peer = LibrarySyncStore::open(
+    let peer = fixtures::open_library(
         peer_db.clone(),
         Uuid::new_v4(),
         Some(record_store.namespace()),
@@ -341,8 +283,8 @@ async fn occurrence_cursor_preserves_duplicates_and_commands_address_one_uuid() 
         },
     )
     .await?;
-    let remote_import = database::entities::playlists::Entity::find()
-        .filter(database::entities::playlists::Column::HlcUuid.eq(imported.hlc_uuid.clone()))
+    let remote_import = playlist_rows::Entity::find()
+        .filter(PlaylistsColumn::HlcUuid.eq(imported.hlc_uuid.clone()))
         .one(&peer_db)
         .await?
         .unwrap();
@@ -377,14 +319,11 @@ async fn occurrence_cursor_preserves_duplicates_and_commands_address_one_uuid() 
     )
     .await?;
     let history_before = store.head().await?;
-    let count_before = database::entities::playlists::Entity::find()
-        .count(&db)
-        .await?;
+    let count_before = playlist_rows::Entity::find().count(&db).await?;
     assert!(
         playlists::create_m3u8_playlist(
             &db,
             &record_store,
-            actor,
             "failed".into(),
             "I".into(),
             &import_path
@@ -393,22 +332,14 @@ async fn occurrence_cursor_preserves_duplicates_and_commands_address_one_uuid() 
         .is_err()
     );
     assert_eq!(
-        database::entities::playlists::Entity::find()
-            .count(&db)
-            .await?,
+        playlist_rows::Entity::find().count(&db).await?,
         count_before
     );
     assert_eq!(store.head().await?, history_before);
     assert!(
-        playlists::remove_item_from_playlist(
-            &db,
-            &record_store,
-            actor,
-            playlist.id,
-            ids[0].parse()?
-        )
-        .await
-        .is_err()
+        playlists::remove_item_from_playlist(&db, &record_store, playlist.id, ids[0].parse()?)
+            .await
+            .is_err()
     );
     assert!(
         entries::Entity::find()

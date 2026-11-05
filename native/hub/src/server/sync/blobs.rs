@@ -4,10 +4,12 @@ use database::{
     sync::model::BlobRef,
 };
 use fsio::FsIo;
+use std::time::Duration;
 use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+use tokio::runtime::Handle;
 use uuid::Uuid;
 struct TempFile {
     fsio: FsIo,
@@ -17,7 +19,7 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let fsio = self.fsio.clone();
         let path = self.path.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if let Ok(handle) = Handle::try_current() {
             handle.spawn(async move {
                 let _ = fsio.remove_file(&path).await;
             });
@@ -73,7 +75,13 @@ async fn download_to_path(
                 .is_symlink(),
             "invalid existing blob path"
         );
-        if hash_file(fsio, &final_path)? == *blob {
+        let hash_fsio = fsio.clone();
+        let hash_path = final_path.clone();
+        if tokio::task::spawn_blocking(move || hash_file(&hash_fsio, &hash_path))
+            .await
+            .context("existing blob verification task failed")??
+            == *blob
+        {
             return Ok(final_path);
         }
     }
@@ -83,7 +91,7 @@ async fn download_to_path(
     };
     let result = async {
         let mut response = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            Duration::from_secs(30),
             client
                 .get(format!(
                     "{}/sync/blobs/{}",
@@ -101,10 +109,9 @@ async fn download_to_path(
         let mut output = fsio.open(&temp.path, "wt")?;
         let mut size = 0u64;
         let mut hash = blake3::Hasher::new();
-        while let Some(chunk) =
-            tokio::time::timeout(std::time::Duration::from_secs(30), response.chunk())
-                .await
-                .context("blob transfer stalled")??
+        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(30), response.chunk())
+            .await
+            .context("blob transfer stalled")??
         {
             size = size
                 .checked_add(chunk.len() as u64)
@@ -119,6 +126,7 @@ async fn download_to_path(
             }
         }
         output.flush()?;
+        output.sync_all()?;
         drop(output);
         ensure!(
             size == blob.size && hash.finalize().to_hex().as_str() == blob.digest,

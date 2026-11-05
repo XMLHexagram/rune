@@ -1,22 +1,64 @@
+#[path = "support/fixtures.rs"]
+mod fixtures;
 use anyhow::Result;
-use database::entities::media_files;
+use database::connection::RecommendationDbConnection;
 use database::{
-    actions::file::AudioAvailability as LocalState,
     actions::{
-        file::{get_media_files, get_media_files_count},
+        downloads::prepare_download,
+        file::{
+            AudioAvailability as LocalState, audio_availability, get_media_files,
+            get_media_files_count, materialized_path, resolve_local_id,
+        },
         metadata::get_metadata_summary_by_files,
     },
+    entities::media_files,
+    library_registry::{DbPlacement, LibraryAuthority, LibraryDescriptor, LibraryStorage},
+    sync::LibrarySyncStore,
+    sync::model::BlobRef,
 };
 use fsio::FsIo;
 use hub::{
     Signal,
+    library_pool::{LibraryHandle, LibraryPool, LibraryResources},
     messages::{AudioAvailability, SearchMediaFileSummaryRequest},
     utils::{files_to_playback_request, parse_media_files},
 };
-use migration::{Migrator, MigratorTrait};
+use sea_orm::sea_query;
 use sea_orm::{ConnectionTrait, Database, EntityTrait, ExprTrait, Set};
 use std::sync::Arc;
 use uuid::Uuid;
+
+async fn request_library(
+    db: sea_orm::DatabaseConnection,
+    fsio: Arc<FsIo>,
+    media_root: String,
+    actor: Uuid,
+    config_path: &std::path::Path,
+) -> Result<LibraryHandle> {
+    let library_id = Uuid::new_v4();
+    let library_sync = LibrarySyncStore::open(db.clone(), actor, Some(library_id)).await?;
+    let pool = LibraryPool::new(config_path, config_path, &actor.to_string())?;
+    let descriptor = LibraryDescriptor {
+        library_id,
+        alias: "Test library".into(),
+        authority: LibraryAuthority::Owned,
+        storage: LibraryStorage::Local {
+            path: media_root.clone(),
+        },
+        db_placement: DbPlacement::Portable,
+        background_sync: false,
+        access_level: None,
+    };
+    pool.register_ui(LibraryResources {
+        main_db: Arc::new(db),
+        library_sync,
+        recommend_db: Arc::new(RecommendationDbConnection::new()),
+        fsio,
+        media_root,
+        descriptor,
+    })
+    .await
+}
 
 #[tokio::test]
 async fn pending_rows_are_returned_and_reported_without_becoming_playable() -> Result<()> {
@@ -25,8 +67,7 @@ async fn pending_rows_are_returned_and_reported_without_becoming_playable() -> R
     std::fs::write(dir.path().join("staged.ogg"), b"uncommitted")?;
     let db = Database::connect("sqlite::memory:").await?;
     let node = Uuid::new_v4();
-    let _ = migration::initialize_node_id(node.to_string());
-    Migrator::up(&db, None).await?;
+    fixtures::migrate(&db, node).await?;
     let track = Uuid::new_v4();
     for (id, name, available) in [
         (10, "local.ogg", true),
@@ -49,12 +90,12 @@ async fn pending_rows_are_returned_and_reported_without_becoming_playable() -> R
         .exec(&db)
         .await?;
     }
-    database::actions::downloads::prepare_download(
+    prepare_download(
         &db,
         &FsIo::new(),
         dir.path(),
         track,
-        &database::sync::model::BlobRef {
+        &BlobRef {
             digest: "a".repeat(64),
             size: 1,
         },
@@ -92,17 +133,26 @@ async fn pending_rows_are_returned_and_reported_without_becoming_playable() -> R
     assert!(states[1].2.is_empty());
     assert!(states[2].2.is_empty());
     let request = SearchMediaFileSummaryRequest { n: 50 };
+    let library = request_library(
+        db.clone(),
+        Arc::new(fsio.clone()),
+        root.to_string(),
+        node,
+        dir.path(),
+    )
+    .await?;
+    use sea_orm::sea_query::{Alias, Expr, Query};
+    let query = Query::select()
+        .expr_as(Expr::col(Alias::new("namespace")).count(), Alias::new("n"))
+        .from(Alias::new("sync_meta"))
+        .to_owned();
+    let sync_metadata_before = db
+        .query_one(&query)
+        .await?
+        .unwrap()
+        .try_get::<i64>("", "n")?;
     let summary = request
-        .handle(
-            (
-                Arc::new(db.clone()),
-                Arc::new(fsio.clone()),
-                root.clone(),
-                Arc::new(node.to_string()),
-            ),
-            None,
-            &request,
-        )
+        .handle((Some(library),), None, &request)
         .await?
         .unwrap();
     for (id, state, _) in &states {
@@ -116,34 +166,23 @@ async fn pending_rows_are_returned_and_reported_without_becoming_playable() -> R
             *state
         );
     }
-    use sea_orm::sea_query::{Alias, Expr, Query};
-    let query = Query::select()
-        .expr_as(Expr::col(Alias::new("namespace")).count(), Alias::new("n"))
-        .from(Alias::new("sync_meta"))
-        .to_owned();
     assert_eq!(
         db.query_one(&query)
             .await?
             .unwrap()
             .try_get::<i64>("", "n")?,
-        0,
-        "catalog reads must not initialize a replication store"
+        sync_metadata_before,
+        "catalog reads must not change replication metadata"
     );
-    let _store = database::sync::LibrarySyncStore::open(db.clone(), node, None).await?;
+    let _store = fixtures::open_library(db.clone(), node, None).await?;
     assert_eq!(
-        database::actions::file::audio_availability(&db, &fsio, dir.path(), &[20])
+        audio_availability(&db, &fsio, dir.path(), &[20])
             .await?
             .get(&20),
         Some(&LocalState::ImportPending)
     );
-    assert_eq!(
-        database::actions::file::materialized_path(&db, &fsio, dir.path(), 20).await?,
-        None
-    );
-    assert_eq!(
-        database::actions::file::resolve_local_id(&db, 20).await?,
-        Some(20)
-    );
+    assert_eq!(materialized_path(&db, &fsio, dir.path(), 20).await?, None);
+    assert_eq!(resolve_local_id(&db, 20).await?, Some(20));
     Ok(())
 }
 
@@ -158,7 +197,7 @@ async fn queued_downloads_with_content_remain_streamable() -> Result<()> {
     let actor = Uuid::new_v4();
     migration::up_with_actor(&db, Some(&actor.to_string()), None).await?;
     let track = Uuid::new_v4();
-    let blob = database::sync::model::BlobRef {
+    let blob = BlobRef {
         digest: "a".repeat(64),
         size: 128,
     };
@@ -182,24 +221,31 @@ async fn queued_downloads_with_content_remain_streamable() -> Result<()> {
     let id = inserted.last_insert_id;
     let row = media_files::Entity::find_by_id(id).one(&db).await?.unwrap();
     let handles = vec![row.into()];
+    let library = request_library(
+        db.clone(),
+        Arc::new(fsio.clone()),
+        root.path().to_string_lossy().into_owned(),
+        actor,
+        root.path(),
+    )
+    .await?;
     prepare_download(&db, &fsio, root.path(), track, &blob, "ogg").await?;
     for retrying in [false, true] {
         if retrying {
             sync_download_jobs::Entity::update_many()
                 .col_expr(
                     sync_download_jobs::Column::Attempts,
-                    sea_orm::sea_query::Expr::value(3),
+                    sea_query::Expr::value(3),
                 )
                 .col_expr(
                     sync_download_jobs::Column::RetryAt,
-                    sea_orm::sea_query::Expr::value("2999-01-01T00:00:00Z"),
+                    sea_query::Expr::value("2999-01-01T00:00:00Z"),
                 )
                 .filter(sync_download_jobs::Column::FileUuid.eq(track.to_string()))
                 .exec(&db)
                 .await?;
         }
-        let state =
-            database::actions::file::audio_availability(&db, &fsio, root.path(), &[id]).await?;
+        let state = audio_availability(&db, &fsio, root.path(), &[id]).await?;
         assert_eq!(state[&id], State::ImportPending);
         let summaries =
             get_metadata_summary_by_files(&db, get_media_files(&db, 0, 10).await?).await?;
@@ -218,16 +264,7 @@ async fn queued_downloads_with_content_remain_streamable() -> Result<()> {
         );
         let request = SearchMediaFileSummaryRequest { n: 10 };
         let response = request
-            .handle(
-                (
-                    Arc::new(db.clone()),
-                    Arc::new(fsio.clone()),
-                    Arc::new(root.path().to_string_lossy().into_owned()),
-                    Arc::new(actor.to_string()),
-                ),
-                None,
-                &request,
-            )
+            .handle((Some(library.clone()),), None, &request)
             .await?
             .unwrap();
         assert_eq!(
@@ -241,10 +278,48 @@ async fn queued_downloads_with_content_remain_streamable() -> Result<()> {
         assert_eq!(queue.len(), 1);
         assert!(matches!(queue[0].1, PlaybackSource::LibraryStream));
         assert!(
-            database::actions::file::materialized_path(&db, &fsio, root.path(), id)
+            materialized_path(&db, &fsio, root.path(), id)
                 .await?
                 .is_none()
         );
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scanned_symlinked_folder_is_playable() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    std::fs::copy(fixtures::audio_fixture(), outside.path().join("track.ogg"))?;
+    symlink(outside.path(), root.path().join("linked"))?;
+    let db = Database::connect("sqlite::memory:").await?;
+    let node = Uuid::new_v4();
+    let _ = migration::initialize_node_id(node.to_string());
+    migration::up_with_actor(&db, Some(&node.to_string()), None).await?;
+    let fs = Arc::new(FsIo::new());
+    let store = fixtures::open_library(db.clone(), node, None).await?;
+    fixtures::scan_library(
+        &fs,
+        &db,
+        &node.to_string(),
+        root.path(),
+        &store.record_store(),
+    )
+    .await?;
+    let rows = media_files::Entity::find().all(&db).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        materialized_path(&db, &fs, root.path(), rows[0].id).await?,
+        Some(root.path().join("linked/track.ogg"))
+    );
+    let handles = rows.into_iter().map(Into::into).collect::<Vec<_>>();
+    assert_eq!(
+        files_to_playback_request(&fs, &db, &node.to_string(), &root.path(), &handles)
+            .await?
+            .len(),
+        1
+    );
     Ok(())
 }

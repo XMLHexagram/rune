@@ -1,25 +1,29 @@
+#[path = "support/fixtures.rs"]
+mod fixtures;
 use anyhow::Result;
-use database::sync::model::{Collection, ObjectKey};
 use database::{
-    actions::metadata::sync_file_descriptions, entities::media_files, sync::SeaOrmSyncStore,
+    actions::{
+        index::{index_audio_library, index_media_files},
+        metadata::{author_indexed_track_row, sync_file_descriptions},
+    },
+    entities::{albums, media_file_albums, media_file_artists, media_file_genres, media_files},
+    sync::{
+        SeaOrmSyncStore,
+        model::{Collection, ObjectKey},
+    },
 };
 use fsio::FsIo;
 use metadata::describe::describe_file;
-use migration::{Migrator, MigratorTrait};
 use sea_orm::{ConnectionTrait, Database, EntityTrait, PaginatorTrait};
 use uuid::Uuid;
 
 #[tokio::test]
 async fn journal_failure_rolls_back_scanned_file() -> Result<()> {
     let node = Uuid::from_u128(1);
-    let _ = migration::initialize_node_id(node.to_string());
-    let db = Database::connect("sqlite::memory:").await?;
-    Migrator::up(&db, None).await?;
+    let db = fixtures::memory_database(node).await?;
     let store = SeaOrmSyncStore::create_empty(db.clone(), Uuid::from_u128(2), node).await?;
     let fs = FsIo::new();
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../assets")
-        .canonicalize()?;
+    let root = fixtures::asset_directory().canonicalize()?;
     let audio = fs.canonicalize(&root.join("startup_0.ogg"))?;
     let mut descriptions = vec![Some(describe_file(&fs, &audio, &Some(root))?)];
     db.execute_unprepared("CREATE TRIGGER reject_journal BEFORE INSERT ON sync_journal BEGIN SELECT RAISE(ABORT, 'test failure'); END").await?;
@@ -56,25 +60,15 @@ async fn journal_failure_rolls_back_scanned_file() -> Result<()> {
     let file = media_files::Entity::find().one(&db).await?.unwrap();
     db.execute_unprepared("CREATE TRIGGER reject_album_journal BEFORE INSERT ON sync_journal BEGIN SELECT RAISE(ABORT, 'test failure'); END").await?;
     assert!(
-        database::actions::index::index_audio_library(&db, &node.to_string(), 50, None, &store)
+        index_audio_library(&db, &node.to_string(), 50, None, &store)
             .await
             .is_err()
     );
-    assert_eq!(
-        database::entities::albums::Entity::find()
-            .count(&db)
-            .await?,
-        0
-    );
-    assert_eq!(
-        database::entities::media_file_albums::Entity::find()
-            .count(&db)
-            .await?,
-        0
-    );
+    assert_eq!(albums::Entity::find().count(&db).await?, 0);
+    assert_eq!(media_file_albums::Entity::find().count(&db).await?, 0);
     db.execute_unprepared("DROP TRIGGER reject_album_journal")
         .await?;
-    database::actions::index::index_audio_library(&db, &node.to_string(), 50, None, &store).await?;
+    index_audio_library(&db, &node.to_string(), 50, None, &store).await?;
     let indexed_count = sync_orm::causal_progress::head_on(&db, store.namespace())
         .await?
         .sequence;
@@ -91,31 +85,16 @@ async fn journal_failure_rolls_back_scanned_file() -> Result<()> {
             .await?
             .is_some()
     );
-    let artists_before = database::entities::media_file_artists::Entity::find()
-        .all(&db)
-        .await?;
-    let genres_before = database::entities::media_file_genres::Entity::find()
-        .all(&db)
-        .await?;
+    let artists_before = media_file_artists::Entity::find().all(&db).await?;
+    let genres_before = media_file_genres::Entity::find().all(&db).await?;
     sync_file_descriptions(&fs, &db, &node.to_string(), &mut descriptions, true, &store).await?;
-    database::actions::index::index_media_files(
-        &db,
-        &node.to_string(),
-        vec![file.id],
-        None,
-        &store,
-    )
-    .await?;
+    index_media_files(&db, &node.to_string(), vec![file.id], None, &store).await?;
     assert_eq!(
-        database::entities::media_file_artists::Entity::find()
-            .all(&db)
-            .await?,
+        media_file_artists::Entity::find().all(&db).await?,
         artists_before
     );
     assert_eq!(
-        database::entities::media_file_genres::Entity::find()
-            .all(&db)
-            .await?,
+        media_file_genres::Entity::find().all(&db).await?,
         genres_before
     );
     assert_eq!(
@@ -136,16 +115,14 @@ async fn index_reads_metadata_after_acquiring_replica_lock() -> Result<()> {
         albums, artists, genres, media_file_albums, media_file_artists, media_file_genres,
         media_metadata,
     };
-    use database::sync::{LibrarySyncStore, model::Payload};
+    use database::sync::model::Payload;
     use sea_orm::{ColumnTrait, QueryFilter, Set};
     let db = Database::connect("sqlite::memory:").await?;
     let actor = Uuid::new_v4();
     migration::up_with_actor(&db, Some(&actor.to_string()), None).await?;
-    let library = LibrarySyncStore::open(db.clone(), actor, None).await?;
+    let library = fixtures::open_library(db.clone(), actor, None).await?;
     let store = library.record_store();
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../assets")
-        .canonicalize()?;
+    let root = fixtures::asset_directory().canonicalize()?;
     let file_id = scan_audio_file(
         &FsIo::new(),
         &db,
@@ -275,5 +252,53 @@ async fn index_reads_metadata_after_acquiring_replica_lock() -> Result<()> {
                 .any(|tag| tag.key == key && tag.value == format!("new {key}"))
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn untitled_track_is_searchable_after_authoring() -> Result<()> {
+    use database::actions::collection::CollectionQueryType;
+    use database::{
+        actions::{metadata::scan_audio_file, search::search_for},
+        entities::media_metadata,
+    };
+    use sea_orm::{ColumnTrait, QueryFilter, TransactionTrait};
+    let node = Uuid::new_v4();
+    let db = fixtures::memory_database(node).await?;
+    let store = SeaOrmSyncStore::create_empty(db.clone(), Uuid::new_v4(), node).await?;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("unusualfallback.ogg");
+    std::fs::copy(fixtures::audio_fixture(), &path)?;
+    let id = scan_audio_file(
+        &FsIo::new(),
+        &db,
+        &node.to_string(),
+        dir.path(),
+        &path,
+        &store,
+    )
+    .await?;
+    let tx = db.begin().await?;
+    store.lock(&tx).await?;
+    media_metadata::Entity::delete_many()
+        .filter(media_metadata::Column::FileId.eq(id))
+        .filter(media_metadata::Column::MetaKey.eq("track_title"))
+        .exec(&tx)
+        .await?;
+    let file = media_files::Entity::find_by_id(id).one(&tx).await?.unwrap();
+    author_indexed_track_row(&tx, &store, file).await?;
+    tx.commit().await?;
+    let found = search_for(
+        &db,
+        "unusualfallback",
+        Some(vec![CollectionQueryType::Track]),
+        30,
+    )
+    .await?;
+    assert!(
+        found
+            .get(&CollectionQueryType::Track)
+            .is_some_and(|ids| ids.contains(&i64::from(id)))
+    );
     Ok(())
 }

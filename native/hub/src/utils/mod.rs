@@ -1,8 +1,15 @@
+use database::sync::LibrarySyncStore;
+use tokio::time::Duration;
+use uuid::Uuid;
 pub mod broadcastable;
 pub mod diagnostics;
 pub mod nid;
 pub mod player;
+pub mod sync_settings;
 
+use database::actions::file::{
+    AudioAvailability, audio_availability, audio_origin, remote_content_ids,
+};
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -10,10 +17,10 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use crate::node::{NodeContext, initialize_node};
 use anyhow::{Context, Result};
 use fsio::FsIo;
 use log::{error, info};
-use nid::get_or_create_node_id;
 use rinf::{DartSignal, DartSignalPack};
 use scrobbling::manager::ScrobblingServiceManager;
 use tokio::sync::{Mutex, RwLock};
@@ -26,9 +33,10 @@ use ::database::{
     },
     connection::{
         LibraryState, MainDbConnection, RecommendationDbConnection, check_library_state,
-        connect_main_db, connect_recommendation_db, create_redirect,
+        check_storage_mode, connect_main_db, connect_recommendation_db, create_redirect,
     },
     entities::media_files,
+    library_registry::{LibraryRegistry, resolve_library},
     playing_item::MediaFileHandle,
 };
 use ::discovery::{client::CertValidator, protocol::DiscoveryService, server::PermissionManager};
@@ -38,8 +46,13 @@ use ::playback::{
 };
 use ::scrobbling::manager::ScrobblingManager;
 
-use crate::backends::{local::local_player_loop, remote::server_player_loop};
+use crate::backends::{
+    local::local_player_loop,
+    remote::{RemoteConnectError, server_player_loop},
+};
+use crate::library_pool::{LibraryHandle, LibraryPool};
 use crate::messages::*;
+use crate::request_error::ExpectedRequestError;
 use crate::server::ServerManager;
 
 #[cfg(target_os = "android")]
@@ -79,6 +92,7 @@ pub async fn initialize_databases(
 #[derive(Debug, Default)]
 pub struct TaskTokens {
     pub scan_token: Option<CancellationToken>,
+    pub scan_id: Option<String>,
     pub analyze_token: Option<CancellationToken>,
     pub deduplicate_token: Option<CancellationToken>,
 }
@@ -89,14 +103,28 @@ pub enum RunningMode {
     Client,
 }
 
+/// The current UI library for a request, or the expected `Unavailable` error
+/// when this process has none open (for example in remote-control mode).
+pub fn require_library(library: Option<LibraryHandle>) -> Result<LibraryHandle> {
+    library.ok_or_else(|| {
+        ExpectedRequestError::Unavailable {
+            what: "no library is open on this device",
+        }
+        .into()
+    })
+}
+
 pub struct GlobalParams {
-    pub fsio: Arc<FsIo>,
-    pub lib_path: Arc<String>,
+    pub node: Arc<NodeContext>,
+    pub library_id: Option<Uuid>,
+    pub library_pool: Arc<LibraryPool>,
+    /// The library open in this UI, the one source of per-library state for
+    /// request handlers. `None` in remote-control mode.
+    pub library: Option<LibraryHandle>,
+    pub ui_library: Arc<Mutex<Option<LibraryHandle>>>,
     pub config_path: Arc<String>,
+    pub sync_settings: Arc<RwLock<sync_settings::SyncSettings>>,
     pub node_id: Arc<String>,
-    pub main_db: Arc<MainDbConnection>,
-    pub library_sync: Option<database::sync::LibrarySyncStore>,
-    pub recommend_db: Arc<RecommendationDbConnection>,
     pub main_token: Arc<CancellationToken>,
     pub task_tokens: Arc<Mutex<TaskTokens>>,
     pub player: Arc<Mutex<dyn Playable>>,
@@ -115,19 +143,29 @@ pub struct GlobalParams {
 pub async fn initialize_library_replica(
     db: &MainDbConnection,
     device_id: &str,
-) -> Result<database::sync::LibrarySyncStore> {
-    let device_id = uuid::Uuid::parse_str(device_id)?;
-    let namespace = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, b"https://rune.audio/catalog");
-    let library =
-        database::sync::LibrarySyncStore::open(db.clone(), device_id, Some(namespace)).await?;
+    library_id: Uuid,
+) -> Result<LibrarySyncStore> {
+    let device_id = Uuid::parse_str(device_id)?;
+    let library = LibrarySyncStore::open(db.clone(), device_id, Some(library_id)).await?;
     library.import_existing(device_id).await?;
     Ok(library)
+}
+
+#[cfg(test)]
+impl GlobalParams {
+    /// The library a test fixture opened. Fixtures that build `GlobalParams`
+    /// for a local library always set it, so a missing one is a broken fixture.
+    pub fn test_library(&self) -> &LibraryHandle {
+        self.library
+            .as_ref()
+            .expect("test fixture opened no library")
+    }
 }
 
 impl Debug for GlobalParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GlobalParams")
-            .field("lib_path", &self.lib_path)
+            .field("library_id", &self.library_id)
             .finish()
     }
 }
@@ -179,6 +217,8 @@ pub async fn receive_media_library_path(scrobbler: Arc<Mutex<ScrobblingManager>>
             if let Err(panic) = futures::FutureExt::catch_unwind(handling).await {
                 error!("Panicked while handling media library path {path}: {panic:?}");
                 broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                    restore_last_index: false,
+                    error_kind: None,
                     path,
                     success: false,
                     error: Some(
@@ -190,7 +230,7 @@ pub async fn receive_media_library_path(scrobbler: Arc<Mutex<ScrobblingManager>>
             }
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -215,6 +255,8 @@ async fn handle_media_library_path(
             Err(e) => {
                 error!("Failed to initialize Android SAF filesystem: {e:#?}");
                 broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                    restore_last_index: false,
+                    error_kind: None,
                     path: media_library_path.to_string(),
                     success: false,
                     error: Some(format!("Failed to access the selected directory: {e:#?}")),
@@ -223,14 +265,21 @@ async fn handle_media_library_path(
                 return;
             }
         };
-        let node_id = match get_or_create_node_id(config_path).await {
-            Ok(node_id) => node_id.to_string(),
-            Err(e) => {
-                error!("Failed to get or create node id: {e:#?}");
+        let node = match initialize_node(
+            config_path,
+            &dart_signal.message.db_path,
+            broadcaster.clone(),
+        )
+        .await
+        {
+            Ok(node) => node,
+            Err(error) => {
                 broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                    restore_last_index: false,
+                    error_kind: None,
                     path: media_library_path.to_string(),
                     success: false,
-                    error: Some(format!("Failed to initialize library config: {e:#?}")),
+                    error: Some(format!("Failed to initialize node: {error:#}")),
                     not_ready: false,
                 });
                 return;
@@ -239,7 +288,6 @@ async fn handle_media_library_path(
 
         match &dart_signal.message.hosted_on {
             OperationDestination::Local => {
-                let database_path = dart_signal.message.db_path;
                 let database_mode = dart_signal.message.mode;
                 info!("Received path: {media_library_path}");
 
@@ -248,6 +296,8 @@ async fn handle_media_library_path(
                     Err(e) => {
                         error!("Failed to check library state: {e:#?}");
                         broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                            restore_last_index: false,
+                            error_kind: None,
                             path: media_library_path.to_string(),
                             success: false,
                             error: Some(format!("{e:#?}")),
@@ -261,6 +311,8 @@ async fn handle_media_library_path(
                     match &library_test {
                         LibraryState::Uninitialized => {
                             broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                                restore_last_index: false,
+                                error_kind: None,
                                 path: media_library_path.to_string(),
                                 success: true,
                                 error: None,
@@ -277,6 +329,8 @@ async fn handle_media_library_path(
                     && let Err(e) = create_redirect(&fsio, media_library_path).await
                 {
                     broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                        restore_last_index: false,
+                        error_kind: None,
                         path: media_library_path.to_string(),
                         success: false,
                         error: Some(format!("{e:#?}")),
@@ -285,42 +339,37 @@ async fn handle_media_library_path(
                     return;
                 }
 
-                // Initialize databases
-                match initialize_databases(
-                    &fsio,
-                    media_library_path,
-                    Some(&database_path),
-                    &node_id,
-                )
-                .await
-                {
-                    Ok(db_connections) => {
-                        // Send success response to Dart
+                let opened = async {
+                    let mode = check_storage_mode(&fsio, media_library_path)?;
+                    let mut registry = LibraryRegistry::load(Path::new(config_path))?;
+                    let descriptor =
+                        resolve_library(&fsio, &mut registry, media_library_path, alias, mode)
+                            .await?;
+                    node.library_pool.acquire_ui(descriptor.library_id).await
+                }
+                .await;
+                match opened {
+                    Ok(library) => {
+                        info!("Resolved library id: {}", library.descriptor.library_id);
+                        let result =
+                            local_player_loop(library, node.clone(), Arc::clone(&scrobbler)).await;
                         broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                            restore_last_index: result.is_ok()
+                                && node
+                                    .session()
+                                    .is_ok_and(|session| session.take_legacy_restore()),
+                            error_kind: None,
                             path: media_library_path.to_string(),
-                            success: true,
-                            error: None,
+                            success: result.is_ok(),
+                            error: result.err().map(|error| format!("{error:#}")),
                             not_ready: false,
                         });
-
-                        // Clone the Arc for this iteration
-                        let scrobbler_clone = Arc::clone(&scrobbler);
-
-                        // Continue with main loop
-                        local_player_loop(
-                            fsio,
-                            media_library_path.to_string(),
-                            config_path.to_string(),
-                            db_connections,
-                            scrobbler_clone,
-                            broadcaster.clone(),
-                        )
-                        .await;
                     }
                     Err(e) => {
-                        error!("Database initialization failed: {e:#?}");
-                        // Send error response to Dart
+                        error!("Library initialization failed: {e:#?}");
                         broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                            restore_last_index: false,
+                            error_kind: None,
                             path: media_library_path.to_string(),
                             success: false,
                             error: Some(format!("{e:#?}")),
@@ -330,10 +379,11 @@ async fn handle_media_library_path(
                 }
             }
             OperationDestination::Remote => {
-                let config_path = &dart_signal.message.config_path;
-                match server_player_loop(fsio, media_library_path, config_path, alias).await {
+                match server_player_loop(fsio, media_library_path, node, alias).await {
                     Ok(_) => {
                         broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                            restore_last_index: false,
+                            error_kind: None,
                             path: media_library_path.to_string(),
                             success: true,
                             error: None,
@@ -343,6 +393,13 @@ async fn handle_media_library_path(
                     Err(e) => {
                         error!("Failed to server player loop: {e:#?}");
                         broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                            restore_last_index: false,
+                            error_kind: Some(
+                                e.downcast_ref::<RemoteConnectError>()
+                                    .map_or(LibraryOpenErrorKind::RemoteProtocol, |error| {
+                                        error.kind()
+                                    }),
+                            ),
                             path: media_library_path.to_string(),
                             success: false,
                             error: Some(format!("{e:#?}")),
@@ -355,14 +412,20 @@ async fn handle_media_library_path(
     }
 }
 
+pub struct CollectionCoverOptions<'a> {
+    pub bake: bool,
+    pub running_mode: &'a RunningMode,
+    pub remote_host: &'a Option<String>,
+    pub playback_queue: &'a [i32],
+}
+
 pub async fn inject_cover_art_map(
     fsio: &FsIo,
     main_db: &MainDbConnection,
     recommend_db: Arc<RecommendationDbConnection>,
     collection: Collection,
     n: Option<i32>,
-    running_mode: &RunningMode,
-    remote_host: &Option<String>,
+    options: CollectionCoverOptions<'_>,
 ) -> Result<Collection> {
     let files = query_cover_arts(
         main_db,
@@ -377,6 +440,7 @@ pub async fn inject_cover_art_map(
             collection.queries.clone()
         },
         n,
+        options.playback_queue,
     )
     .await?;
 
@@ -386,7 +450,12 @@ pub async fn inject_cover_art_map(
     // Process the cover art paths based on the running mode
     let cover_art_map: HashMap<i32, String> = raw_cover_art_map
         .into_iter()
-        .map(|(id, path)| (id, process_cover_art_path(&path, running_mode, remote_host)))
+        .map(|(id, path)| {
+            (
+                id,
+                process_cover_art_path(&path, options.running_mode, options.remote_host),
+            )
+        })
         .collect();
 
     Ok(Collection {
@@ -404,6 +473,7 @@ pub async fn query_cover_arts(
     recommend_db: Arc<RecommendationDbConnection>,
     queries: Vec<MixQuery>,
     n: Option<i32>,
+    queue: &[i32],
 ) -> Result<Vec<media_files::Model>> {
     query_mix_media_files(
         main_db,
@@ -424,6 +494,7 @@ pub async fn query_cover_arts(
             }
             None => 18,
         },
+        queue,
     )
     .await
 }
@@ -479,9 +550,8 @@ pub async fn parse_media_files(
     lib_path: Arc<String>,
 ) -> Result<Vec<MediaFile>> {
     let ids: Vec<_> = media_summaries.iter().map(|file| file.id).collect();
-    let availability =
-        database::actions::file::audio_availability(db, fsio, Path::new(&*lib_path), &ids).await?;
-    let remote_content = database::actions::file::remote_content_ids(db, &ids).await?;
+    let availability = audio_availability(db, fsio, Path::new(&*lib_path), &ids).await?;
+    let remote_content = remote_content_ids(db, &ids).await?;
     let mut media_files = Vec::with_capacity(media_summaries.len());
 
     for file in media_summaries {
@@ -516,6 +586,14 @@ pub async fn parse_media_files(
             let state = ApiState::from_local(state, remote_content.contains(&file.id));
             (PathBuf::new(), state)
         };
+        let origin = audio_origin(
+            if state == ApiState::Local {
+                LocalState::Local
+            } else {
+                LocalState::Unavailable
+            },
+            &file.directory,
+        );
         let media_file = MediaFile {
             id: file.id,
             path: media_path
@@ -541,6 +619,7 @@ pub async fn parse_media_files(
             cover_art_id: file.cover_art_id.unwrap_or(-1),
             track_number: file.track_number,
             audio_availability: state,
+            audio_origin: origin.into(),
         };
 
         media_files.push(media_file);
@@ -552,42 +631,38 @@ pub async fn parse_media_files(
 pub async fn files_to_playback_request<P: AsRef<Path>>(
     fsio: &FsIo,
     db: &MainDbConnection,
-    _node_id: &str,
+    library_id: &str,
     lib_path: &P,
     files: &[MediaFileHandle],
 ) -> Result<Vec<(PlayingItem, PlaybackSource)>> {
     let ids: Vec<i32> = files
         .iter()
         .filter_map(|file| match file.item {
-            PlayingItem::InLibrary(id) => Some(id),
+            PlayingItem::InLibrary(id, _) => Some(id),
             _ => None,
         })
         .collect();
-    let availability =
-        database::actions::file::audio_availability(db, fsio, lib_path.as_ref(), &ids).await?;
-    let remote_content = database::actions::file::remote_content_ids(db, &ids).await?;
+    let availability = audio_availability(db, fsio, lib_path.as_ref(), &ids).await?;
+    let remote_content = remote_content_ids(db, &ids).await?;
     Ok(files
         .iter()
         .filter_map(|file| {
             let source = match &file.item {
-                PlayingItem::InLibrary(id)
+                PlayingItem::InLibrary(id, _)
                     if matches!(
                         availability.get(id),
-                        Some(database::actions::file::AudioAvailability::RemoteOnly)
-                            | Some(database::actions::file::AudioAvailability::ImportPending)
+                        Some(AudioAvailability::RemoteOnly)
+                            | Some(AudioAvailability::ImportPending)
                     ) && remote_content.contains(id) =>
                 {
                     PlaybackSource::LibraryStream
                 }
-                PlayingItem::InLibrary(id)
-                    if !matches!(
-                        availability.get(id),
-                        Some(database::actions::file::AudioAvailability::Local)
-                    ) =>
+                PlayingItem::InLibrary(id, _)
+                    if !matches!(availability.get(id), Some(AudioAvailability::Local)) =>
                 {
                     return None;
                 }
-                PlayingItem::InLibrary(_) => match fsio.canonicalize_path(
+                PlayingItem::InLibrary(_, _) => match fsio.canonicalize_path(
                     &lib_path
                         .as_ref()
                         .join(&file.directory)
@@ -602,7 +677,11 @@ pub async fn files_to_playback_request<P: AsRef<Path>>(
                 PlayingItem::Online(_, _) => PlaybackSource::Local(PathBuf::new()),
                 PlayingItem::Unknown => return None,
             };
-            Some((file.item.clone(), source))
+            let mut item = file.item.clone();
+            if let PlayingItem::InLibrary(_, id) = &mut item {
+                *id = library_id.to_owned();
+            }
+            Some((item, source))
         })
         .collect())
 }

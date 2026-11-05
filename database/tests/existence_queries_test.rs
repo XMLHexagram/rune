@@ -1,3 +1,5 @@
+#[path = "support/fixtures.rs"]
+mod fixtures;
 use anyhow::Result;
 use database::{
     actions::{
@@ -15,13 +17,9 @@ async fn existence_queries_preserve_filters_duplicates_and_errors() -> Result<()
     let db = Database::connect("sqlite::memory:").await?;
     initialize_db(&db, "existence-test").await?;
     let fs = FsIo::new();
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../assets")
-        .canonicalize()?;
+    let root = fixtures::asset_directory().canonicalize()?;
     let actor = uuid::Uuid::new_v4();
-    let store =
-        database::sync::LibrarySyncStore::open(db.clone(), actor, Some(uuid::Uuid::new_v4()))
-            .await?;
+    let store = fixtures::open_library(db.clone(), actor, Some(uuid::Uuid::new_v4())).await?;
     let node = fs.canonicalize(&root.join("startup_0.ogg"))?;
     let mut descriptions = vec![Some(describe_file(&fs, &node, &Some(root))?)];
     sync_file_descriptions(
@@ -41,10 +39,10 @@ async fn existence_queries_preserve_filters_duplicates_and_errors() -> Result<()
 
     for n in 0..2 {
         db.execute_unprepared(&format!(
-            "INSERT INTO media_file_fingerprint (track_uuid,fingerprint,is_duplicated,hlc_uuid,created_at_hlc_ts,created_at_hlc_ver,created_at_hlc_nid,updated_at_hlc_ts,updated_at_hlc_ver,updated_at_hlc_nid) VALUES ('{track_uuid}',X'0102',0,'fingerprint-{n}','',0,'','',0,'')"
+            "INSERT INTO media_file_fingerprint (track_uuid,fingerprint,is_duplicated,hlc_uuid) VALUES ('{track_uuid}',X'0102',0,'fingerprint-{n}')"
         )).await?;
         db.execute_unprepared(&format!(
-            "INSERT INTO media_analysis (file_id,analysis_version,hlc_uuid,created_at_hlc_ts,created_at_hlc_ver,created_at_hlc_nid,updated_at_hlc_ts,updated_at_hlc_ver,updated_at_hlc_nid) VALUES ({id},1,'analysis-{n}','',0,'','',0,'')"
+            "INSERT INTO media_analysis (file_id,analysis_version,hlc_uuid) VALUES ({id},1,'analysis-{n}')"
         )).await?;
     }
     assert!(has_fingerprint(&db, id).await?);

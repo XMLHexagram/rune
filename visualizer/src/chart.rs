@@ -7,11 +7,16 @@
 //! chart the scenes know what is coming: the next section, the next downbeat.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+        mpsc::{Receiver, TryRecvError},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use chart_analyzer::chart::{Beat, Curves};
 use chart_analyzer::decode::Cancelled;
@@ -465,6 +470,7 @@ fn silent(values: &[f64], hop: f64, t: f64) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct Playback {
     pub path: Option<PathBuf>,
+    pub fsio: Option<Arc<FsIo>>,
     pub position: Duration,
     pub playing: bool,
     /// When the position was reported.
@@ -523,7 +529,6 @@ pub type KeptChart = Arc<Mutex<Option<(PathBuf, Arc<Chart>)>>>;
 /// file before, which stops at its next decoded packet; a burst of track changes thus leaves
 /// one analysis running for long. Without a chart the caller falls back on the live tracker.
 pub struct ChartFollower {
-    /// Where files are opened from; without it nothing is analysed.
     fsio: Option<Arc<FsIo>>,
     path: Option<PathBuf>,
     chart: Option<Arc<Chart>>,
@@ -538,9 +543,9 @@ pub struct ChartFollower {
 }
 
 impl ChartFollower {
-    pub fn new(fsio: Option<Arc<FsIo>>, kept: KeptChart) -> Self {
+    pub fn new(kept: KeptChart) -> Self {
         Self {
-            fsio,
+            fsio: None,
             path: None,
             chart: None,
             loading: None,
@@ -553,7 +558,13 @@ impl ChartFollower {
 
     /// The chart at the song time of `now`, if the playing file has one (and it has loaded).
     pub fn tick(&mut self, playback: &Playback, now: Instant) -> Option<ChartState> {
-        if playback.path != self.path {
+        let fsio_changed = match (&self.fsio, &playback.fsio) {
+            (Some(current), Some(next)) => !Arc::ptr_eq(current, next),
+            (None, None) => false,
+            _ => true,
+        };
+        if playback.path != self.path || fsio_changed {
+            self.fsio = playback.fsio.clone();
             self.path = playback.path.clone();
             self.chart = None;
             self.clock.reset();
@@ -672,7 +683,9 @@ impl Drop for ChartFollower {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use std::f64::consts::PI;
     use std::path::{Path, PathBuf};
 
     const CHART: &str = r#"{
@@ -848,6 +861,7 @@ mod tests {
         let mut clock = SongClock::default();
         let mut playback = Playback {
             path: None,
+            fsio: None,
             position: Duration::from_secs(10),
             playing: true,
             at: Some(start),
@@ -877,6 +891,7 @@ mod tests {
         let mut clock = SongClock::default();
         let mut playback = Playback {
             path: None,
+            fsio: None,
             position: Duration::from_secs(10),
             playing: false,
             at: Some(start),
@@ -909,7 +924,7 @@ mod tests {
         for start in (0..samples.len()).step_by(RATE as usize / 2) {
             for i in 0..2000.min(samples.len() - start) {
                 let t = i as f64 / f64::from(RATE);
-                let thump = (2.0 * std::f64::consts::PI * 60.0 * t).sin() * (-t * 30.0).exp();
+                let thump = (2.0 * PI * 60.0 * t).sin() * (-t * 30.0).exp();
                 let click = if i < 40 { 0.5 } else { 0.0 };
                 samples[start + i] = ((thump * 0.8 + click) * 30000.0) as i16;
             }
@@ -936,6 +951,7 @@ mod tests {
     fn playing(path: &Path, position: f64) -> Playback {
         Playback {
             path: Some(path.to_path_buf()),
+            fsio: Some(Arc::new(FsIo::new())),
             position: Duration::from_secs_f64(position),
             playing: false,
             at: Some(Instant::now()),
@@ -957,7 +973,7 @@ mod tests {
     #[test]
     fn the_follower_analyses_the_playing_file() {
         let path = write_clicks("follows", 20);
-        let mut follower = ChartFollower::new(Some(Arc::new(FsIo::new())), KeptChart::default());
+        let mut follower = ChartFollower::new(KeptChart::default());
         let playback = playing(&path, 10.0);
         // The live tracker has the say until the analysis is done.
         assert!(follower.tick(&playback, Instant::now()).is_none());
@@ -971,14 +987,12 @@ mod tests {
     #[test]
     fn no_file_system_or_no_path_means_no_analysis() {
         let path = write_clicks("none", 5);
-        let mut follower = ChartFollower::new(None, KeptChart::default());
-        assert!(
-            follower
-                .tick(&playing(&path, 1.0), Instant::now())
-                .is_none()
-        );
+        let mut follower = ChartFollower::new(KeptChart::default());
+        let mut without_source = playing(&path, 1.0);
+        without_source.fsio = None;
+        assert!(follower.tick(&without_source, Instant::now()).is_none());
         assert!(follower.loading.is_none());
-        let mut follower = ChartFollower::new(Some(Arc::new(FsIo::new())), KeptChart::default());
+        let mut follower = ChartFollower::new(KeptChart::default());
         let online = Playback {
             path: Some(PathBuf::new()),
             ..playing(&path, 1.0)
@@ -989,20 +1003,26 @@ mod tests {
     }
 
     #[test]
-    fn a_new_path_or_a_drop_cancels_the_analysis() {
+    fn a_new_path_source_or_a_drop_cancels_the_analysis() {
         // Ten minutes take several seconds to analyse.
         let long = write_clicks("long", 600);
         let short = write_clicks("short", 5);
-        let mut follower = ChartFollower::new(Some(Arc::new(FsIo::new())), KeptChart::default());
+        let mut follower = ChartFollower::new(KeptChart::default());
         follower.tick(&playing(&long, 0.0), Instant::now());
         let first = follower.cancel.clone().expect("analysing");
         assert!(!first.load(Ordering::Relaxed));
-        follower.tick(&playing(&short, 0.0), Instant::now());
+        let mut changed_source = playing(&long, 0.0);
+        changed_source.fsio = Some(Arc::new(FsIo::new()));
+        follower.tick(&changed_source, Instant::now());
         assert!(first.load(Ordering::Relaxed));
-        let second = follower.cancel.clone().expect("analysing");
+        let second = follower.cancel.clone().expect("analysing with new source");
         assert!(!second.load(Ordering::Relaxed));
-        drop(follower);
+        follower.tick(&playing(&short, 0.0), Instant::now());
         assert!(second.load(Ordering::Relaxed));
+        let third = follower.cancel.clone().expect("analysing");
+        assert!(!third.load(Ordering::Relaxed));
+        drop(follower);
+        assert!(third.load(Ordering::Relaxed));
         for path in [long, short] {
             std::fs::remove_dir_all(path.parent().unwrap()).ok();
         }
@@ -1012,17 +1032,17 @@ mod tests {
     fn a_chart_is_kept_for_the_next_follower_of_the_same_file() {
         let kept = KeptChart::default();
         let (a, b) = (Path::new("/music/a.flac"), Path::new("/music/b.flac"));
-        let mut follower = ChartFollower::new(None, Arc::clone(&kept));
+        let mut follower = ChartFollower::new(Arc::clone(&kept));
         follower.tick(&playing(a, 1.0), Instant::now());
         follower.chart = Some(Arc::new(chart()));
         drop(follower);
         // The visualizer starts again on the same song: the chart is there at once.
-        let mut follower = ChartFollower::new(None, Arc::clone(&kept));
+        let mut follower = ChartFollower::new(Arc::clone(&kept));
         assert!(follower.tick(&playing(a, 2.0), Instant::now()).is_some());
         assert!(follower.chart().is_some());
         drop(follower);
         // On another song it is not, and it is gone.
-        let mut follower = ChartFollower::new(None, Arc::clone(&kept));
+        let mut follower = ChartFollower::new(Arc::clone(&kept));
         assert!(follower.tick(&playing(b, 2.0), Instant::now()).is_none());
         assert!(kept.lock().unwrap().is_none());
     }

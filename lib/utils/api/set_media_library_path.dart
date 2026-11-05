@@ -1,3 +1,4 @@
+import 'request_failure.dart';
 import 'dart:async';
 
 import '../../constants/configurations.dart';
@@ -22,7 +23,7 @@ LibraryInitializeMode? stringToLibraryInitializeMode(String? x) {
   return LibraryInitializeMode.portable;
 }
 
-Future<(bool, bool, String?)> setMediaLibraryPath(
+Future<(bool, bool, String?, LibraryOpenErrorKind?)> setMediaLibraryPath(
   String path,
   LibraryInitializeMode? mode,
 ) async {
@@ -34,7 +35,7 @@ Future<(bool, bool, String?)> setMediaLibraryPath(
 
   final settingsManager = SettingsManager();
 
-  SetMediaLibraryPathRequest(
+  final request = SetMediaLibraryPathRequest(
     path: cleanPath,
     dbPath: await getSettingsPath(),
     configPath: await getSettingsPath(),
@@ -42,16 +43,26 @@ Future<(bool, bool, String?)> setMediaLibraryPath(
     mode: mode,
     playsOn: playsOn,
     hostedOn: hostedOn,
-  ).sendSignalToRust();
+  );
 
   try {
     while (true) {
-      final rustSignal = await SetMediaLibraryPathResponse.rustSignalStream.first
-          .timeout(const Duration(seconds: 30));
+      final rustSignal = await awaitResponse(
+        'SetMediaLibraryPathRequest',
+        SetMediaLibraryPathResponse.rustSignalStream.where(
+          (event) => event.message.path == cleanPath,
+        ),
+        send: () => request.sendSignalToRust(),
+      );
       final response = rustSignal.message;
 
       if (response.path == cleanPath) {
-        return (response.success, response.notReady, response.error);
+        return (
+          response.success,
+          response.notReady,
+          response.error,
+          response.errorKind,
+        );
       }
     }
   } on TimeoutException {
@@ -59,7 +70,8 @@ Future<(bool, bool, String?)> setMediaLibraryPath(
       false,
       false,
       'No response from the Rust backend within 30 seconds. '
-          'The Rust side may have failed to initialize; check logcat for details.'
+          'The Rust side may have failed to initialize; check logcat for details.',
+      null,
     );
   }
 }

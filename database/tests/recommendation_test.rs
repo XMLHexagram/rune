@@ -1,10 +1,3 @@
-use std::path::Path;
-use std::time::Instant;
-
-use anyhow::Result;
-use rand::{Rng, SeedableRng, rngs::StdRng};
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, EntityTrait, QueryOrder, Statement};
-
 use ::database::{
     actions::analysis::AggregatedAnalysisResult,
     actions::recommendation::{
@@ -18,6 +11,12 @@ use ::database::{
     entities::media_analysis,
 };
 use ::fsio::FsIo;
+use anyhow::Result;
+use rand::{Rng, SeedableRng, rngs::StdRng};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, EntityTrait, QueryOrder, Statement};
+use std::fs::Permissions;
+use std::path::Path;
+use std::time::Instant;
 
 async fn setup_db() -> Result<DatabaseConnection> {
     let db = Database::connect("sqlite::memory:").await?;
@@ -28,9 +27,8 @@ async fn setup_db() -> Result<DatabaseConnection> {
 async fn insert_file(db: &DatabaseConnection, id: i32) -> Result<()> {
     db.execute_unprepared(&format!(
         "INSERT INTO media_files (id, file_name, directory, extension, file_hash, last_modified, \
-         sample_rate, duration, hlc_uuid, created_at_hlc_ts, created_at_hlc_ver, created_at_hlc_nid, \
-         updated_at_hlc_ts, updated_at_hlc_ver, updated_at_hlc_nid) \
-         VALUES ({id}, 'f{id}.mp3', '.', 'mp3', 'hash{id}', '0', 44100, 1.0, 'file-{id}', '', 0, '', '', 0, '')"
+         sample_rate, duration, hlc_uuid) \
+         VALUES ({id}, 'f{id}.mp3', '.', 'mp3', 'hash{id}', '0', 44100, 1.0, 'file-{id}')"
     ))
     .await?;
     Ok(())
@@ -39,9 +37,8 @@ async fn insert_file(db: &DatabaseConnection, id: i32) -> Result<()> {
 /// A track whose analysis has `rms = x` and `zcr = y`, everything else NULL (0).
 async fn insert_analysis(db: &DatabaseConnection, file_id: i32, x: f64, y: f64) -> Result<()> {
     db.execute_unprepared(&format!(
-        "INSERT INTO media_analysis (analysis_version, file_id, rms, zcr, hlc_uuid, created_at_hlc_ts, \
-         created_at_hlc_ver, created_at_hlc_nid, updated_at_hlc_ts, updated_at_hlc_ver, updated_at_hlc_nid) \
-         VALUES (2, {file_id}, {x}, {y}, 'analysis-{file_id}', '', 0, '', '', 0, '')"
+        "INSERT INTO media_analysis (analysis_version, file_id, rms, zcr, hlc_uuid) \
+         VALUES (2, {file_id}, {x}, {y}, 'analysis-{file_id}')"
     ))
     .await?;
     Ok(())
@@ -151,10 +148,10 @@ async fn connect_does_not_fail_when_the_legacy_file_cannot_be_deleted() -> Resul
     std::fs::create_dir_all(&rune_dir)?;
     std::fs::write(rune_dir.join(".analysis.db"), b"lmdb")?;
     // A read-only directory does not allow deleting its entries.
-    std::fs::set_permissions(&rune_dir, std::fs::Permissions::from_mode(0o555))?;
+    std::fs::set_permissions(&rune_dir, Permissions::from_mode(0o555))?;
 
     let result = connect_recommendation_db(&FsIo::new(), lib_path, None, &db).await;
-    std::fs::set_permissions(&rune_dir, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::set_permissions(&rune_dir, Permissions::from_mode(0o755))?;
 
     let recommend_db = result?;
     assert_eq!(
@@ -306,21 +303,7 @@ async fn loaded_vectors_are_bit_identical_to_the_model_conversion() -> Result<()
         .await?
         .into_iter()
         .map(|r| r.try_get::<String>("", "name").unwrap())
-        .filter(|c| {
-            ![
-                "id",
-                "file_id",
-                "analysis_version",
-                "hlc_uuid",
-                "created_at_hlc_ts",
-                "created_at_hlc_ver",
-                "created_at_hlc_nid",
-                "updated_at_hlc_ts",
-                "updated_at_hlc_ver",
-                "updated_at_hlc_nid",
-            ]
-            .contains(&c.as_str())
-        })
+        .filter(|c| !["id", "file_id", "analysis_version", "hlc_uuid"].contains(&c.as_str()))
         .collect();
     assert_eq!(columns.len(), 61);
 
@@ -339,9 +322,8 @@ async fn loaded_vectors_are_bit_identical_to_the_model_conversion() -> Result<()
             })
             .collect();
         db.execute_unprepared(&format!(
-            "INSERT INTO media_analysis (analysis_version, file_id, {}, hlc_uuid, created_at_hlc_ts, created_at_hlc_ver, \
-             created_at_hlc_nid, updated_at_hlc_ts, updated_at_hlc_ver, updated_at_hlc_nid) \
-             VALUES (2, {id}, {}, 'a{id}', '', 0, '', '', 0, '')",
+            "INSERT INTO media_analysis (analysis_version, file_id, {}, hlc_uuid) \
+             VALUES (2, {id}, {}, 'a{id}')",
             columns.join(", "),
             values.join(", ")
         ))
@@ -437,9 +419,8 @@ async fn perf_load_100k_rows() -> Result<()> {
             .map(|i| format!("{}", (id as f64 * 0.37 + i as f64).sin()))
             .collect();
         db.execute_unprepared(&format!(
-            "INSERT INTO media_analysis (analysis_version, file_id, {}, hlc_uuid, created_at_hlc_ts, created_at_hlc_ver, \
-             created_at_hlc_nid, updated_at_hlc_ts, updated_at_hlc_ver, updated_at_hlc_nid) \
-             VALUES (2, {id}, {}, 'a{id}', '', 0, '', '', 0, '')",
+            "INSERT INTO media_analysis (analysis_version, file_id, {}, hlc_uuid) \
+             VALUES (2, {id}, {}, 'a{id}')",
             columns.join(", "),
             values.join(", ")
         ))

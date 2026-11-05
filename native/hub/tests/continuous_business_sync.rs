@@ -1,4 +1,7 @@
 //! Deterministic business commands interleaved with bounded metadata sessions.
+
+#[path = "support/fixtures.rs"]
+mod fixtures;
 use anyhow::{Context, Result, ensure};
 use axum::{
     body::{Body, to_bytes},
@@ -8,13 +11,14 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use database::{
-    actions::{mixes, playlists, stats},
+    actions::{file::get_media_files, mixes, playlists, stats},
     entities::{media_file_stats, media_files, playlists as playlist_rows},
     sync::{LibrarySyncStore, model::RuneModel},
 };
 use http_request::sync::{MetadataPeer, MetadataStore, router};
 use migration::{Migrator, MigratorTrait};
 use sea_orm::{ColumnTrait, Database, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use std::time::Duration;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -23,6 +27,9 @@ use std::{
     },
 };
 use sync::{Coordinator, SessionAdvance, SyncModel, SyncPeer};
+use tokio::net::TcpListener;
+use tokio::sync::Barrier;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 struct Replica {
@@ -105,14 +112,14 @@ impl Replica {
         let db = Database::connect(options).await?;
         Migrator::up(&db, None).await?;
         let actor = Uuid::from_u128(1000 + index);
-        let library = LibrarySyncStore::open(db.clone(), actor, Some(namespace)).await?;
+        let library = fixtures::open_library(db.clone(), actor, Some(namespace)).await?;
         let lose_reply = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(AtomicUsize::new(0));
         let retry = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(AtomicBool::new(false));
         let gate_head = Arc::new(AtomicBool::new(false));
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
         let peer: Arc<dyn MetadataStore<RuneModel>> = Arc::new(library.endpoint());
         let app = router(peer).layer(middleware::from_fn_with_state(
             Fault {
@@ -126,7 +133,7 @@ impl Replica {
             },
             lose_first_page,
         ));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}", listener.local_addr()?);
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -236,7 +243,7 @@ async fn check_reads(replica: &Replica) -> Result<()> {
             previous = Some(current);
         }
     }
-    for file in database::actions::file::get_media_files(&replica.db, 0, 128).await? {
+    for file in get_media_files(&replica.db, 0, 128).await? {
         let _ = stats::get_liked(&replica.db, file.id).await?;
     }
     for mix in mixes::get_all_mixes(&replica.db).await? {
@@ -260,7 +267,7 @@ async fn heads(replicas: &[Replica]) -> Result<Vec<sync::ReceiveProgress>> {
 
 #[tokio::test]
 async fn business_mutations_during_partitioned_http_sessions_converge() -> Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(600), business_scenario())
+    tokio::time::timeout(Duration::from_secs(600), business_scenario())
         .await
         .context("business scenario exceeded its deadline")?
 }
@@ -314,17 +321,10 @@ async fn business_scenario() -> Result<()> {
     let c_store = c.library.record_store();
     let d_store = d.library.record_store();
     let a1 = a.file(tracks[0]).await?;
-    let shared = playlists::create_playlist(
-        &a.db,
-        &a_store,
-        a.actor,
-        "shared original".into(),
-        "s".into(),
-    )
-    .await?;
+    let shared =
+        playlists::create_playlist(&a.db, &a_store, "shared original".into(), "s".into()).await?;
     let shared_uuid: Uuid = shared.hlc_uuid.parse()?;
-    let removed =
-        playlists::add_item_to_playlist(&a.db, &a_store, a.actor, shared.id, a1, None).await?;
+    let removed = playlists::add_item_to_playlist(&a.db, &a_store, shared.id, a1, None).await?;
     let mut in_flight = coordinator()?;
     assert!(
         !step(&mut in_flight, a, b).await?,
@@ -332,7 +332,7 @@ async fn business_scenario() -> Result<()> {
     );
     a.gate.store(true, Ordering::SeqCst);
     a.lose_reply.store(true, Ordering::SeqCst);
-    let kept = tokio::time::timeout(std::time::Duration::from_secs(90), async {
+    let kept = tokio::time::timeout(Duration::from_secs(90), async {
     let mut kept = None;
     for _ in 0..20000 {
         let mut request = Box::pin(step(&mut in_flight, a, b));
@@ -344,7 +344,7 @@ async fn business_scenario() -> Result<()> {
             _ = a.entered.notified() => {
                 // The HTTP request is waiting at the source while these commands commit.
                 let commands: Result<_> = async {
-                    let entry = playlists::add_item_to_playlist(&a.db, &a_store, a.actor, shared.id, a1, None).await?;
+                    let entry = playlists::add_item_to_playlist(&a.db, &a_store, shared.id, a1, None).await?;
                     assert_ne!(removed.hlc_uuid, entry.hlc_uuid);
                     stats::set_liked(&a.db, &a_store, a1, true).await?;
                     stats::increase_skipped(&a.db, &a_store, a1, a.actor).await?;
@@ -387,31 +387,22 @@ async fn business_scenario() -> Result<()> {
     playlists::update_playlist(
         &b.db,
         &b_store,
-        b.actor,
         shared_b.id,
         Some("shared final".into()),
         None,
     )
     .await?;
-    playlists::remove_item_from_playlist(
-        &b.db,
-        &b_store,
-        b.actor,
-        shared_b.id,
-        removed.hlc_uuid.parse()?,
-    )
-    .await?;
+    playlists::remove_item_from_playlist(&b.db, &b_store, shared_b.id, removed.hlc_uuid.parse()?)
+        .await?;
     playlists::reorder_playlist_item_position(
         &b.db,
         &b_store,
-        b.actor,
         shared_b.id,
         kept.hlc_uuid.parse()?,
         5,
     )
     .await?;
-    let extra =
-        playlists::add_item_to_playlist(&b.db, &b_store, b.actor, shared_b.id, b2, Some(2)).await?;
+    let extra = playlists::add_item_to_playlist(&b.db, &b_store, shared_b.id, b2, Some(2)).await?;
     stats::increase_played_through(&b.db, &b_store, b1, b.actor).await?;
     let local_entries = playlists::list_occurrences(&b.db, shared_b.id, None, 128)
         .await?
@@ -433,28 +424,24 @@ async fn business_scenario() -> Result<()> {
     let c2 = c.file(tracks[1]).await?;
     let d1 = d.file(tracks[0]).await?;
     let transient =
-        playlists::create_playlist(&c.db, &c_store, c.actor, "remove me".into(), "x".into())
-            .await?;
+        playlists::create_playlist(&c.db, &c_store, "remove me".into(), "x".into()).await?;
     let transient_uuid: Uuid = transient.hlc_uuid.parse()?;
     playlists::update_playlist(
         &c.db,
         &c_store,
-        c.actor,
         transient.id,
         Some("renamed then removed".into()),
         None,
     )
     .await?;
     let retained =
-        playlists::create_playlist(&d.db, &d_store, d.actor, "remote list".into(), "r".into())
-            .await?;
+        playlists::create_playlist(&d.db, &d_store, "remote list".into(), "r".into()).await?;
     let retained_uuid: Uuid = retained.hlc_uuid.parse()?;
     let retained_entry =
-        playlists::add_item_to_playlist(&d.db, &d_store, d.actor, retained.id, d1, None).await?;
+        playlists::add_item_to_playlist(&d.db, &d_store, retained.id, d1, None).await?;
     let mix = mixes::create_mix(
         &c.db,
         &c_store,
-        &c.actor.to_string(),
         "temporary mix".into(),
         "m".into(),
         false,
@@ -466,7 +453,6 @@ async fn business_scenario() -> Result<()> {
     mixes::update_mix(
         &c.db,
         &c_store,
-        &c.actor.to_string(),
         mix.id,
         Some("updated mix".into()),
         None,
@@ -479,7 +465,6 @@ async fn business_scenario() -> Result<()> {
     let dangling_mix = mixes::create_mix(
         &c.db,
         &c_store,
-        &c.actor.to_string(),
         "missing reference".into(),
         "m".into(),
         false,
@@ -627,7 +612,7 @@ async fn business_scenario() -> Result<()> {
 
 #[tokio::test]
 async fn repeated_partitioned_commands_preserve_unseen_edit_and_pagination() -> Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(600), repeated_scenario())
+    tokio::time::timeout(Duration::from_secs(600), repeated_scenario())
         .await
         .context("repeated scenario exceeded its deadline")?
 }
@@ -662,7 +647,6 @@ async fn repeated_scenario() -> Result<()> {
     let common = playlists::create_playlist(
         &a.db,
         &a.library.record_store(),
-        a.actor,
         "before partition".into(),
         "c".into(),
     )
@@ -689,7 +673,6 @@ async fn repeated_scenario() -> Result<()> {
     playlists::update_playlist(
         &b.db,
         &b.library.record_store(),
-        b.actor,
         b_common.id,
         Some("unseen edit survives".into()),
         None,
@@ -708,7 +691,6 @@ async fn repeated_scenario() -> Result<()> {
         let entry = playlists::add_item_to_playlist(
             &b.db,
             &b.library.record_store(),
-            b.actor,
             b_common.id,
             b_file,
             Some(position),
@@ -734,25 +716,12 @@ async fn repeated_scenario() -> Result<()> {
         for (index, replica) in replicas.iter().enumerate() {
             let store = replica.library.record_store();
             let name = format!("replica-{index}-round-{round}");
-            let row = playlists::create_playlist(
-                &replica.db,
-                &store,
-                replica.actor,
-                name.clone(),
-                "r".into(),
-            )
-            .await?;
+            let row =
+                playlists::create_playlist(&replica.db, &store, name.clone(), "r".into()).await?;
             let id: Uuid = row.hlc_uuid.parse()?;
             let final_name = format!("{name}-updated");
-            playlists::update_playlist(
-                &replica.db,
-                &store,
-                replica.actor,
-                row.id,
-                Some(final_name.clone()),
-                None,
-            )
-            .await?;
+            playlists::update_playlist(&replica.db, &store, row.id, Some(final_name.clone()), None)
+                .await?;
             if round % 2 == 0 {
                 playlists::remove_playlist(&replica.db, &store, row.id).await?;
             } else {
@@ -859,7 +828,7 @@ async fn repeated_scenario() -> Result<()> {
 
 #[tokio::test]
 async fn concurrent_actions_and_http_while_writer_is_held() -> Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(180), concurrent_scenario())
+    tokio::time::timeout(Duration::from_secs(180), concurrent_scenario())
         .await
         .context("concurrent scenario exceeded its deadline")?
 }
@@ -898,7 +867,7 @@ async fn concurrent_scenario() -> Result<()> {
     let store = a.library.record_store();
     a.library.import_existing(a.actor).await?;
     let playlist =
-        playlists::create_playlist(&a.db, &store, a.actor, "committed".into(), "c".into()).await?;
+        playlists::create_playlist(&a.db, &store, "committed".into(), "c".into()).await?;
     let playlist_uuid: Uuid = playlist.hlc_uuid.parse()?;
     exchange(&a, &b).await?;
     let mut session = coordinator()?;
@@ -914,20 +883,20 @@ async fn concurrent_scenario() -> Result<()> {
     a.gate_head.store(true, Ordering::SeqCst);
     let peer = a.peer();
     let head_request = tokio::spawn(async move { peer.head().await });
-    tokio::time::timeout(std::time::Duration::from_secs(10), a.entered.notified())
+    tokio::time::timeout(Duration::from_secs(10), a.entered.notified())
         .await
         .context("metadata request did not reach source")?;
     assert!(!head_request.is_finished());
 
-    let barrier = Arc::new(tokio::sync::Barrier::new(3));
-    let stats_started = Arc::new(tokio::sync::Notify::new());
-    let playlist_started = Arc::new(tokio::sync::Notify::new());
+    let barrier = Arc::new(Barrier::new(3));
+    let stats_started = Arc::new(Notify::new());
+    let playlist_started = Arc::new(Notify::new());
     let stats_action = {
+        let actor = a.actor;
         let db = a.db.clone();
         let store = store.clone();
         let barrier = barrier.clone();
         let started = stats_started.clone();
-        let actor = a.actor;
         tokio::spawn(async move {
             barrier.wait().await;
             started.notify_one();
@@ -939,19 +908,17 @@ async fn concurrent_scenario() -> Result<()> {
         let store = store.clone();
         let barrier = barrier.clone();
         let started = playlist_started.clone();
-        let actor = a.actor;
         let id = playlist.id;
         tokio::spawn(async move {
             barrier.wait().await;
             started.notify_one();
-            playlists::update_playlist(&db, &store, actor, id, Some("after lock".into()), None)
-                .await
+            playlists::update_playlist(&db, &store, id, Some("after lock".into()), None).await
         })
     };
-    tokio::time::timeout(std::time::Duration::from_secs(10), barrier.wait())
+    tokio::time::timeout(Duration::from_secs(10), barrier.wait())
         .await
         .context("business actions did not start")?;
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(stats_started.notified(), playlist_started.notified());
     })
     .await
@@ -978,13 +945,13 @@ async fn concurrent_scenario() -> Result<()> {
     );
     tx.rollback().await?;
     a.release.notify_one();
-    tokio::time::timeout(std::time::Duration::from_secs(20), head_request)
+    tokio::time::timeout(Duration::from_secs(20), head_request)
         .await
         .context("metadata request did not finish")???;
-    tokio::time::timeout(std::time::Duration::from_secs(20), stats_action)
+    tokio::time::timeout(Duration::from_secs(20), stats_action)
         .await
         .context("statistics action did not finish")???;
-    tokio::time::timeout(std::time::Duration::from_secs(20), playlist_action)
+    tokio::time::timeout(Duration::from_secs(20), playlist_action)
         .await
         .context("playlist action did not finish")???;
     assert_eq!(a.playlist(playlist_uuid).await?.unwrap().name, "after lock");

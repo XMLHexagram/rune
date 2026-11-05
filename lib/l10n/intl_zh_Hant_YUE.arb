@@ -1091,11 +1091,11 @@
   "@editDeviceInformationSubtitle": {
     "description": "強調更改會影響喺其他人掃描列表度嘅可見性。避免用技術術語，突出「掃描」呢個互動場景。"
   },
-  "enableBroadcast": "啟用廣播",
+  "enableBroadcast": "附近裝置可見",
   "@enableBroadcast": {
     "description": "「廣播」即係主動傳送裝置資訊。如果目標語言冇直接對應嘅詞，可以優先用「設定為可被發現」或「分享可用狀態」。"
   },
-  "enableBroadcastSubtitle": "展示你嘅裝置資訊，俾其他人發現。",
+  "enableBroadcastSubtitle": "畀附近裝置搵到此裝置。",
   "@enableBroadcastSubtitle": {
     "description": "避免歧義：呢度嘅「公開」只係指對本機網絡入面嘅用戶，而唔係成個互聯網。"
   },
@@ -1167,15 +1167,15 @@
       }
     }
   },
-  "server": "伺服器",
+  "server": "分享",
   "@server": {
     "description": "用嚟控制媒體播放器共享行為嘅設定頁面標題，包括管理授權用戶同廣播裝置狀態。"
   },
-  "serverControl": "伺服器控制",
+  "serverControl": "容許其他裝置連接",
   "@serverControl": {
     "description": "用嚟控制本機網絡伺服器嘅部分標題。「伺服器」指用嚟俾裝置發現嘅後台服務。"
   },
-  "serverControlSubtitle": "啟動伺服器，等其他裝置可以喺本機網絡搵到呢個裝置。",
+  "serverControlSubtitle": "畀其他裝置連接此裝置。",
   "@serverControlSubtitle": {
     "description": "明確伺服器只會喺本機網絡運行。強調啟動伺服器會令裝置對其他人可見。"
   },
@@ -1199,7 +1199,7 @@
   "@unknownStatus": {
     "description": "作為用戶/客戶端狀態徽章顯示，表示狀態無法識別或未定義。建議用「無法識別」或「未定義」，保持中性語氣，唔暗示錯誤。UI 中通常配灰色。"
   },
-  "review": "審查",
+  "review": "處理請求",
   "@review": {
     "description": "用嚟審查待處理嘅裝置連線請求嘅按鈕。會彈出一個對話框俾你允許或封鎖裝置。"
   },
@@ -1207,11 +1207,11 @@
   "@reviewRequestTitle": {
     "description": "審查裝置連線時對話框顯示嘅標題。保持簡潔，突出所需操作。"
   },
-  "blockDevice": "封鎖裝置",
+  "blockDevice": "封鎖",
   "@blockDevice": {
     "description": "永久拒絕存取嘅操作。根據文化習慣亦可用「禁用」，但避免負面情緒過重。"
   },
-  "allowAccess": "允許存取",
+  "allowAccess": "我嘅裝置",
   "@allowAccess": {
     "description": "授權連線權限嘅操作。可根據習慣用「批准」或「授權」。"
   },
@@ -1229,7 +1229,7 @@
       }
     }
   },
-  "allowAccessSubtitle": "授權呢個裝置控制播放同攞取歌曲。",
+  "allowAccessSubtitle": "此裝置可以瀏覽、播放同同步你嘅音樂庫。",
   "@allowAccessSubtitle": {
     "description": "說明允許存取時會授予嘅權限。「攞取」指獲取媒體內容。"
   },
@@ -1341,5 +1341,44 @@
   },
   "interfaceScale": "介面縮放",
   "interfaceScaleSubtitle": "相對於系統縮放立即調整文字與應用程式內容。視窗大小和螢幕解析度不會改變。100% 遵循系統縮放。",
-  "interfaceScaleSaveError": "無法儲存介面縮放"
+  "interfaceScaleSaveError": "無法儲存介面縮放",
+  "remoteOpenUntrusted": "呢部裝置仲未信任伺服器，請先配對。",
+  "remoteOpenNotAuthorized": "另一部裝置未允許呢部裝置，或者已經封鎖咗佢。",
+  "remoteOpenUnreachable": "連接唔到裝置，請檢查佢有冇開機同連接同一個網絡。",
+  "remoteOpenProtocol": "無法同裝置通訊，兩部裝置需要相同版本嘅 Rune。",
+  "remoteLossRevoked": "呢部裝置嘅存取權已被移除。",
+  "remoteLossServerStopped": "另一部裝置已停止分享。",
+  "remoteLossNetworkLost": "連線已中斷。",
+  "deviceLibraries": "音樂庫",
+  "addSharedLibrary": "加入",
+  "sharedLibraryAdded": "已加入",
+  "openSharedLibrary": "開啟",
+  "noSharedLibraries": "呢部裝置冇可以分享嘅音樂庫",
+  "libraryFromDevice": "來自 {device}",
+  "backgroundLibrarySync": "喺背景保持同步",
+  "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
+  "requestItemMissing": "呢個項目已經唔存在",
+  "requestInvalid": "要求無效",
+  "requestUnavailable": "而家用唔到",
+  "mixNoLongerExists": "呢個混音已經唔存在",
+  "devices": "裝置",
+  "thisDevice": "此裝置",
+  "devicesThatCanConnect": "可以連接此裝置嘅裝置",
+  "otherDevices": "其他裝置",
+  "myDevice": "我的裝置",
+  "waitingForApproval": "等候批准",
+  "guest": "訪客",
+  "myDeviceAccessDescription": "可以播放、瀏覽和同步你的音樂庫",
+  "guestAccessDescription": "可以控制播放並在控制時瀏覽",
+  "guestControlSummary": "訪客 · 可以控制播放",
+  "customDeviceAccess": "自訂",
+  "customizeDevice": "自訂",
+  "controlPlayback": "控制播放",
+  "controlPlaybackDescription": "控制時可以瀏覽並加入播放佇列",
+  "deviceAccessLibraries": "音樂庫",
+  "deviceNotShared": "不共享",
+  "deviceReadOnly": "唯讀",
+  "deviceReadWrite": "讀寫",
+  "requestPermissionDenied": "此裝置不允許執行此操作",
+  "readOnly": "只讀"
 }

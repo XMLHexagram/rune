@@ -5,8 +5,9 @@
 //! Without a folder it shows the first built-in scene (`scenes/armillary`). The seconds default to
 //! 2, 6 and 12.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::f32::consts::TAU;
+use std::path::Path;
+use std::sync::{Arc, atomic::AtomicU32};
 use std::time::{Duration, Instant};
 
 use rtrb::RingBuffer;
@@ -49,10 +50,10 @@ fn main() -> anyhow::Result<()> {
         60,
     )?;
     if let Some(path) = scene {
-        visualizer.load_preset_path(std::path::Path::new(path))?;
+        visualizer.load_preset_path(Path::new(path))?;
         // The scene is built in the background and the first scene shows meanwhile: wait for the
         // requested one (or its error) before the clock starts.
-        let name = std::fs::read_to_string(std::path::Path::new(path).join("scene.toml"))
+        let name = std::fs::read_to_string(Path::new(path).join("scene.toml"))
             .ok()
             .and_then(|text| text.parse::<toml::Table>().ok())
             .and_then(|table| table.get("name")?.as_str().map(str::to_string));
@@ -75,11 +76,10 @@ fn main() -> anyhow::Result<()> {
             let due = (started.elapsed().as_secs_f64() * f64::from(SAMPLE_RATE)) as u64;
             while sent < due {
                 let t = sent as f32 / SAMPLE_RATE as f32;
-                let kick =
-                    (-(t * 2.0).fract() * 10.0).exp() * (t * 55.0 * std::f32::consts::TAU).sin();
+                let kick = (-(t * 2.0).fract() * 10.0).exp() * (t * 55.0 * TAU).sin();
                 let chord = [220.0, 277.2, 329.6, 1760.0]
                     .iter()
-                    .map(|f| (t * f * std::f32::consts::TAU).sin())
+                    .map(|f| (t * f * TAU).sin())
                     .sum::<f32>()
                     * 0.08;
                 let value = 0.7 * kick + chord;

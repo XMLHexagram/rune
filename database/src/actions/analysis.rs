@@ -1,9 +1,7 @@
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
 use fsio::FsIo;
 use futures::future::join_all;
 use log::info;
@@ -44,7 +42,6 @@ pub async fn analysis_audio_library<F>(
     fsio: Arc<FsIo>,
     main_db: &DatabaseConnection,
     lib_path: &Path,
-    node_id: &str,
     batch_size: usize,
     computing_device: ComputingDevice,
     progress_callback: F,
@@ -73,14 +70,6 @@ where
         );
 
     let lib_path = Arc::new(lib_path.to_path_buf());
-    let node_id = Arc::new(node_id.to_owned());
-    // In analysis we don't strictly need HLC context yet, but macro requires it.
-    // Creating a dummy context or using real one if available.
-    // Ideally we should pass real node_id UUID to create proper context.
-    // For now, let's try to parse node_id string to UUID.
-    let node_uuid = Uuid::from_str(&node_id).unwrap_or_default();
-    let hlc_context = Arc::new(sync::hlc::SyncTaskContext::new(node_uuid));
-
     parallel_media_files_processing!(
         main_db,
         batch_size,
@@ -89,22 +78,16 @@ where
         cursor_query,
         lib_path,
         fsio,
-        node_id,
-        hlc_context,
         move |fsio, file, lib_path, cancel_token| {
             analysis_file(fsio, file, lib_path, computing_device, cancel_token)
         },
         |db,
          file: media_files::Model,
-         node_id: Arc<String>,
-         _hlc_context: Arc<sync::hlc::SyncTaskContext>,
          analysis_result: Result<Option<NormalizedAnalysisResult>>| async move {
             match analysis_result {
                 Ok(analysis_result) => {
                     if let Some(x) = analysis_result {
-                        match insert_analysis_result(db, &node_id, file.id, &file.file_hash, x)
-                            .await
-                        {
+                        match insert_analysis_result(db, file.id, &file.file_hash, x).await {
                             Ok(_) => debug!("Finished analysis: {}", file.id),
                             Err(e) => error!("Failed to insert analysis result: {e}"),
                         }
@@ -162,7 +145,6 @@ fn analysis_file(
 /// * `result` - The normalized analysis result.
 async fn insert_analysis_result(
     main_db: &DatabaseConnection,
-    node_id: &str,
     file_id: i32,
     file_hash: &str,
     result: NormalizedAnalysisResult,
@@ -193,12 +175,6 @@ async fn insert_analysis_result(
             )
             .to_string(),
         ),
-        created_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
-        updated_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
-        created_at_hlc_ver: ActiveValue::Set(0),
-        updated_at_hlc_ver: ActiveValue::Set(0),
-        created_at_hlc_nid: ActiveValue::Set(node_id.to_owned()),
-        updated_at_hlc_nid: ActiveValue::Set(node_id.to_owned()),
         ..Default::default()
     };
 

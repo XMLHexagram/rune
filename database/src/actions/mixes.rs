@@ -1,41 +1,34 @@
+use crate::actions::search::{add_term, remove_term};
+use crate::error::ExpectedError;
+use crate::sync::{
+    SeaOrmSyncStore,
+    bindings::apply,
+    model::{Collection, MixClauseMap, ObjectKey, author_source_on},
+};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
 use log::warn;
-use migration::ExprTrait;
-use migration::Func;
-use migration::IntoCondition;
-use migration::SimpleExpr;
+use migration::{ExprTrait, Func, IntoCondition, SimpleExpr};
 use sea_orm::entity::prelude::*;
-use sea_orm::sea_query::{Condition, Expr, Query};
 use sea_orm::{
-    ColumnTrait, EntityTrait, JoinType, Order, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
-    TransactionTrait,
+    ColumnTrait, DatabaseTransaction, EntityTrait, JoinType, Order, QueryFilter, QueryOrder,
+    QuerySelect, QueryTrait, Set, TransactionTrait,
+    sea_query::{Condition, Expr, Query},
 };
 
-use crate::actions::analysis::get_analyze_count;
-use crate::actions::analysis::get_percentile_analysis_result;
-use crate::actions::playback_queue::list_playback_queue;
+use crate::actions::analysis::{get_analyze_count, get_percentile_analysis_result};
 use crate::connection::{MainDbConnection, RecommendationDbConnection};
-use crate::entities::media_file_fingerprint;
-use crate::entities::media_file_genres;
 use crate::entities::{
     albums, artists, genres, media_analysis, media_file_albums, media_file_artists,
-    media_file_likes, media_file_playlists, media_file_stats, media_files, mix_queries, mixes,
-    playlists,
+    media_file_fingerprint, media_file_genres, media_file_likes, media_file_playlists,
+    media_file_stats, media_files, mix_queries, mixes, playlists,
 };
-use crate::sync::{
-    SeaOrmSyncStore,
-    model::{Collection, ObjectKey},
-};
-use sea_orm::{DatabaseTransaction, Set};
 
 use super::analysis::get_centralized_analysis_result;
-use super::collection::CollectionQuery;
-use super::collection::CollectionQueryListMode;
-use super::collection::CollectionQueryType;
+use super::collection::{CollectionQuery, CollectionQueryListMode, CollectionQueryType};
 use super::file::get_files_by_ids;
 use super::recommendation::get_recommendation_by_parameter;
 use super::utils::CollectionDefinition;
@@ -189,7 +182,7 @@ async fn author_mix(
     store: &SeaOrmSyncStore,
     mix: &mixes::Model,
 ) -> Result<()> {
-    crate::sync::model::author_source_on(
+    author_source_on(
         tx,
         store,
         ObjectKey {
@@ -204,7 +197,6 @@ async fn author_mix(
 pub async fn create_mix(
     db: &DatabaseConnection,
     store: &SeaOrmSyncStore,
-    node_id: &str,
     name: String,
     group: String,
     scriptlet_mode: bool,
@@ -214,7 +206,6 @@ pub async fn create_mix(
 ) -> Result<mixes::Model> {
     let tx = db.begin().await?;
     store.lock(&tx).await?;
-    let now = Utc::now().to_rfc3339();
     let row = mixes::ActiveModel {
         name: Set(name),
         group: Set(group),
@@ -222,17 +213,11 @@ pub async fn create_mix(
         mode: Set(Some(mode)),
         locked: Set(locked),
         hlc_uuid: Set(Uuid::new_v4().to_string()),
-        created_at_hlc_ts: Set(now.clone()),
-        updated_at_hlc_ts: Set(now),
-        created_at_hlc_ver: Set(0),
-        updated_at_hlc_ver: Set(0),
-        created_at_hlc_nid: Set(node_id.to_owned()),
-        updated_at_hlc_nid: Set(node_id.to_owned()),
         ..Default::default()
     }
     .insert(&tx)
     .await?;
-    crate::actions::search::add_term(&tx, CollectionQueryType::Mix, row.id, &row.name).await?;
+    add_term(&tx, CollectionQueryType::Mix, row.id, &row.name).await?;
     replace_queries_on(&tx, &row.hlc_uuid, queries, 0).await?;
     author_mix(&tx, store, &row).await?;
     tx.commit().await?;
@@ -246,14 +231,14 @@ pub async fn get_mix_by_id(db: &DatabaseConnection, id: i32) -> Result<mixes::Mo
     mixes::Entity::find_by_id(id)
         .one(db)
         .await?
-        .context("Mix not found")
+        .ok_or(ExpectedError::NotFound { what: "mix" })
+        .map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub async fn update_mix(
     db: &DatabaseConnection,
     store: &SeaOrmSyncStore,
-    node_id: &str,
     id: i32,
     name: Option<String>,
     group: Option<String>,
@@ -267,8 +252,7 @@ pub async fn update_mix(
     let row = mixes::Entity::find_by_id(id)
         .one(&tx)
         .await?
-        .context("Mix not found")?;
-    let ver = row.updated_at_hlc_ver;
+        .ok_or(ExpectedError::NotFound { what: "mix" })?;
     let mut model: mixes::ActiveModel = row.into();
     if let Some(v) = name {
         model.name = Set(v);
@@ -285,14 +269,11 @@ pub async fn update_mix(
     if let Some(v) = locked {
         model.locked = Set(v);
     }
-    model.updated_at_hlc_ts = Set(Utc::now().to_rfc3339());
-    model.updated_at_hlc_ver = Set(ver.checked_add(1).context("mix version exhausted")?);
-    model.updated_at_hlc_nid = Set(node_id.to_owned());
     let row = model.update(&tx).await?;
     if let Some(queries) = queries {
         replace_queries_on(&tx, &row.hlc_uuid, queries, 0).await?;
     }
-    crate::actions::search::add_term(&tx, CollectionQueryType::Mix, row.id, &row.name).await?;
+    add_term(&tx, CollectionQueryType::Mix, row.id, &row.name).await?;
     author_mix(&tx, store, &row).await?;
     tx.commit().await?;
     Ok(row)
@@ -304,13 +285,13 @@ pub async fn remove_mix(db: &DatabaseConnection, store: &SeaOrmSyncStore, id: i3
     let row = mixes::Entity::find_by_id(id)
         .one(&tx)
         .await?
-        .context("mix not found")?;
+        .ok_or(ExpectedError::NotFound { what: "mix" })?;
     let key = ObjectKey {
         collection: Collection::Mixes,
         id: row.hlc_uuid.parse()?,
     };
-    crate::actions::search::remove_term(&tx, CollectionQueryType::Mix, id).await?;
-    crate::sync::bindings::apply(&tx, &key, None).await?;
+    remove_term(&tx, CollectionQueryType::Mix, id).await?;
+    apply(&tx, &key, None).await?;
     store.author_on(&tx, key, None).await?;
     tx.commit().await?;
     Ok(())
@@ -329,7 +310,7 @@ pub async fn replace_mix_queries(
     let mix = mixes::Entity::find_by_id(mix_id)
         .one(&tx)
         .await?
-        .context("mix not found")?;
+        .ok_or(ExpectedError::NotFound { what: "mix" })?;
     anyhow::ensure!(mix.hlc_uuid == mix_hlc_uuid, "mix identity changed");
     replace_queries_on(&tx, &mix.hlc_uuid, queries, group.unwrap_or_default()).await?;
     author_mix(&tx, store, &mix).await?;
@@ -343,7 +324,7 @@ pub async fn get_mix_queries_by_mix_id(
     let mix = mixes::Entity::find_by_id(mix_id)
         .one(db)
         .await?
-        .context("mix not found")?;
+        .ok_or(ExpectedError::NotFound { what: "mix" })?;
     query_views_on(db, &mix.hlc_uuid).await
 }
 pub async fn executable_mix_queries(
@@ -353,7 +334,7 @@ pub async fn executable_mix_queries(
     let mix = mixes::Entity::find_by_id(mix_id)
         .one(db)
         .await?
-        .context("mix not found")?;
+        .ok_or(ExpectedError::NotFound { what: "mix" })?;
     executable_queries_on(db, &mix.hlc_uuid).await
 }
 pub async fn remove_mix_query(
@@ -362,18 +343,18 @@ pub async fn remove_mix_query(
     id: i32,
 ) -> Result<()> {
     use sync_orm::owned_list::{ListBudget, OwnedListPolicy};
-    type Clauses = OwnedListPolicy<mix_queries::Entity, crate::sync::model::MixClauseMap>;
+    type Clauses = OwnedListPolicy<mix_queries::Entity, MixClauseMap>;
     let tx = db.begin().await?;
     store.lock(&tx).await?;
     let row = mix_queries::Entity::find_by_id(id)
         .one(&tx)
         .await?
-        .context("mix clause not found")?;
+        .ok_or(ExpectedError::NotFound { what: "mix clause" })?;
     let mix = mixes::Entity::find()
         .filter(mixes::Column::HlcUuid.eq(&row.mix_uuid))
         .one(&tx)
         .await?
-        .context("mix not found")?;
+        .ok_or(ExpectedError::NotFound { what: "mix" })?;
     let owner = [row.mix_uuid.into()];
     let mut items = Clauses::read_on(&tx, &owner, Clauses::read_ceiling()).await?;
     items.retain(|item| item.id.to_string() != row.hlc_uuid);
@@ -448,7 +429,7 @@ pub async fn add_item_to_mix(
     let mix = mixes::Entity::find_by_id(mix_id)
         .one(&tx)
         .await?
-        .context("mix not found")?;
+        .ok_or(ExpectedError::NotFound { what: "mix" })?;
     let row = add_query_on(&tx, &mix.hlc_uuid, operator, parameter).await?;
     author_mix(&tx, store, &mix).await?;
     tx.commit().await?;
@@ -645,9 +626,9 @@ fn sort_media_files(
 
         match (a_index, b_index) {
             (Some(a_idx), Some(b_idx)) => a_idx.cmp(b_idx),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
         }
     });
 
@@ -660,6 +641,7 @@ pub async fn query_mix_media_files(
     queries: Vec<(String, String)>,
     cursor: usize,
     page_size: usize,
+    session_queue: &[i32],
 ) -> Result<Vec<media_files::Model>> {
     let mut all: bool = false;
 
@@ -893,11 +875,9 @@ pub async fn query_mix_media_files(
     if let Some(queue_enabled) = playback_queue
         && queue_enabled
     {
-        let queued_tracks = list_playback_queue(main_db).await?;
-
         let subquery = media_files::Entity::find()
             .select_only()
-            .filter(media_files::Column::Id.is_in(queued_tracks))
+            .filter(media_files::Column::Id.is_in(session_queue.to_vec()))
             .column(media_files::Column::Id)
             .into_query();
 
@@ -1245,7 +1225,7 @@ async fn replace_queries_on(
     let owner = [mix_uuid.to_owned().into()];
     let previous = Clauses::read_on(tx, &owner, Clauses::read_ceiling()).await?;
     let views = query_views_on(tx, mix_uuid).await?;
-    let mut used = std::collections::HashSet::new();
+    let mut used = HashSet::new();
     let mut incoming = Vec::with_capacity(queries.len());
     let mut directories = Vec::new();
     for (position, (operator, parameter)) in queries.into_iter().enumerate() {
@@ -1330,7 +1310,9 @@ async fn resolve_target_on(
     Ok(Some(
         RuneModel::source_uuid_on(tx, &collection, local)
             .await?
-            .context("mix reference not found")?,
+            .ok_or(ExpectedError::NotFound {
+                what: "mix reference",
+            })?,
     ))
 }
 async fn add_query_on(

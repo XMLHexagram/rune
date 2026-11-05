@@ -2,6 +2,7 @@ use sea_orm_migration::{
     prelude::*,
     sea_orm::{ConnectionTrait, FromQueryResult, TransactionTrait, prelude::Uuid},
 };
+use std::collections::HashSet;
 
 #[path = "source_uuid_conversion.rs"]
 mod source_uuid_conversion;
@@ -82,7 +83,7 @@ async fn correct_catalog_identities(
         let rows = ParentIdentityRow::find_by_statement(backend.build(&select))
             .all(tx)
             .await?;
-        let mut ids = std::collections::HashSet::new();
+        let mut ids = HashSet::new();
         for row in rows {
             let id = catalog_identity::parent(kind, &row.name).to_string();
             if !ids.insert(id.clone()) {
@@ -141,8 +142,8 @@ async fn correct_catalog_identities(
         let rows = MembershipIdentityRow::find_by_statement(backend.build(&select))
             .all(tx)
             .await?;
-        let mut pairs = std::collections::HashSet::new();
-        let mut ids = std::collections::HashSet::new();
+        let mut pairs = HashSet::new();
+        let mut ids = HashSet::new();
         for row in rows {
             if !pairs.insert((row.media_file_id, row.parent_id)) {
                 return Err(DbErr::Custom(format!(
@@ -178,7 +179,7 @@ async fn correct_catalog_identities(
         }
     }
     if schema.has_table("media_cover_art").await? {
-        let mut identities = std::collections::HashSet::new();
+        let mut identities = HashSet::new();
         let mut after = 0;
         loop {
             let query = Query::select()
@@ -201,7 +202,14 @@ async fn correct_catalog_identities(
             {
                 continue;
             }
-            if row.binary.is_empty() || row.binary.len() > 8 * 1024 * 1024 {
+            if row.binary.len() > 8 * 1024 * 1024 {
+                eprintln!(
+                    "Artwork row {} is too large and will be unavailable",
+                    row.id
+                );
+                continue;
+            }
+            if row.binary.is_empty() {
                 return Err(DbErr::Custom(format!(
                     "artwork row {} has unsupported body size {}",
                     row.id,
@@ -240,7 +248,7 @@ async fn correct_catalog_identities(
         let rows = FingerprintIdentityRow::find_by_statement(backend.build(&query))
             .all(tx)
             .await?;
-        let mut files = std::collections::HashSet::new();
+        let mut files = HashSet::new();
         for row in rows {
             if !files.insert(row.media_file_id) {
                 return Err(DbErr::Custom(format!(
@@ -299,7 +307,7 @@ async fn correct_catalog_identities(
         let rows = SimilarityIdentityRow::find_by_statement(backend.build(&query))
             .all(tx)
             .await?;
-        let mut pairs = std::collections::HashSet::new();
+        let mut pairs = HashSet::new();
         for row in rows {
             if !pairs.insert((row.file_id1, row.file_id2)) {
                 return Err(DbErr::Custom(format!(
@@ -402,29 +410,25 @@ async fn relax_similarity_pair_uniqueness(
                     .not_null()
                     .default(""),
             );
-        for name in ["created_at_hlc_ts", "updated_at_hlc_ts"] {
-            create.col(
-                ColumnDef::new(Alias::new(name))
-                    .timestamp()
-                    .not_null()
-                    .default("1970-01-01 00:00:00.000"),
-            );
-        }
-        for name in ["created_at_hlc_ver", "updated_at_hlc_ver"] {
-            create.col(
-                ColumnDef::new(Alias::new(name))
-                    .integer()
-                    .not_null()
-                    .default(0),
-            );
-        }
-        for name in ["created_at_hlc_nid", "updated_at_hlc_nid"] {
-            create.col(
-                ColumnDef::new(Alias::new(name))
-                    .text()
-                    .not_null()
-                    .default(""),
-            );
+        let mut legacy_columns = Vec::new();
+        for prefix in ["created_at", "updated_at"] {
+            for (suffix, kind, default) in [
+                ("ts", "text", "1970-01-01T00:00:00Z"),
+                ("ver", "integer", "0"),
+                ("nid", "text", ""),
+            ] {
+                let name = format!("{prefix}_hlc_{suffix}");
+                if schema.has_column("media_file_similarity", &name).await? {
+                    let mut column = ColumnDef::new(Alias::new(&name));
+                    if kind == "integer" {
+                        column.integer().not_null().default(0);
+                    } else {
+                        column.text().not_null().default(default);
+                    }
+                    create.col(&mut column);
+                    legacy_columns.push(name);
+                }
+            }
         }
         for column in ["file_id1", "file_id2"] {
             create.foreign_key(
@@ -436,26 +440,18 @@ async fn relax_similarity_pair_uniqueness(
             );
         }
         schema.create_table(create.to_owned()).await?;
-        let columns = [
-            "id",
-            "file_id1",
-            "file_id2",
-            "similarity",
-            "hlc_uuid",
-            "created_at_hlc_ts",
-            "updated_at_hlc_ts",
-            "created_at_hlc_ver",
-            "updated_at_hlc_ver",
-            "created_at_hlc_nid",
-            "updated_at_hlc_nid",
-        ];
+        let mut columns: Vec<String> = ["id", "file_id1", "file_id2", "similarity", "hlc_uuid"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        columns.extend(legacy_columns);
         let select = Query::select()
-            .columns(columns.map(Alias::new))
+            .columns(columns.iter().map(Alias::new))
             .from(Alias::new("media_file_similarity"))
             .to_owned();
         let insert = Query::insert()
             .into_table(temp.clone())
-            .columns(columns.map(Alias::new))
+            .columns(columns.iter().map(Alias::new))
             .select_from(select)
             .map_err(|e| DbErr::Custom(e.to_string()))?
             .to_owned();
@@ -481,9 +477,13 @@ async fn relax_similarity_pair_uniqueness(
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
         let txn = db.begin().await?;
+        source_uuid_conversion::identities(&txn, "media_files").await?;
         let select = Query::select()
             .from_as(Alias::new("media_file_stats"), Alias::new("s"))
             .columns(
@@ -512,7 +512,7 @@ impl MigrationTrait for Migration {
         let rows = LegacyStat::find_by_statement(db.get_database_backend().build(&select))
             .all(&txn)
             .await?;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for row in &rows {
             if !seen.insert(row.media_file_id) {
                 return Err(DbErr::Custom(format!(
@@ -763,17 +763,19 @@ impl MigrationTrait for Migration {
                 ])
                 .to_owned();
             txn.execute(&stats_insert).await?;
-            let like_insert = Query::insert()
-                .into_table(Alias::new("media_file_likes"))
-                .columns(["media_file_id", "hlc_uuid", "liked", "updated_at"].map(Alias::new))
-                .values_panic([
-                    row.media_file_id.into(),
-                    file_uuid_text.into(),
-                    row.liked.into(),
-                    row.updated_at.into(),
-                ])
-                .to_owned();
-            txn.execute(&like_insert).await?;
+            if row.liked {
+                let like_insert = Query::insert()
+                    .into_table(Alias::new("media_file_likes"))
+                    .columns(["media_file_id", "hlc_uuid", "liked", "updated_at"].map(Alias::new))
+                    .values_panic([
+                        row.media_file_id.into(),
+                        file_uuid_text.into(),
+                        row.liked.into(),
+                        row.updated_at.into(),
+                    ])
+                    .to_owned();
+                txn.execute(&like_insert).await?;
+            }
         }
         schema
             .drop_table(
@@ -812,7 +814,7 @@ impl MigrationTrait for Migration {
         let likes = FileId::find_by_statement(db.get_database_backend().build(&likes_select))
             .all(&txn)
             .await?;
-        let mut ids = std::collections::HashSet::new();
+        let mut ids = HashSet::new();
         if stats.iter().any(|row| !ids.insert(row.media_file_id))
             || likes.iter().any(|row| !ids.contains(&row.media_file_id))
         {
@@ -1024,6 +1026,7 @@ impl MigrationTrait for Migration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog_identity::ParentKind;
     use sea_orm_migration::sea_orm::{ConnectionTrait, Database, Statement};
 
     async fn setup() -> sea_orm_migration::sea_orm::DatabaseConnection {
@@ -1036,6 +1039,57 @@ mod tests {
         .unwrap();
         db.execute_unprepared("CREATE TABLE media_file_stats (id INTEGER PRIMARY KEY, media_file_id INTEGER NOT NULL, liked BOOLEAN NOT NULL, skipped INTEGER NOT NULL, played_through INTEGER NOT NULL, updated_at TEXT NOT NULL)").await.unwrap();
         db
+    }
+    #[tokio::test]
+    async fn sync_migrations_run_in_transactions() {
+        let _ = crate::initialize_node_id("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let position = crate::Migrator::migrations()
+            .iter()
+            .position(|m| m.name() == "m20261101_000034_create_download_rules")
+            .unwrap();
+        crate::Migrator::up(&db, Some(position as u32))
+            .await
+            .unwrap();
+        db.execute_unprepared("CREATE TABLE sync_download_jobs (id TEXT)")
+            .await
+            .unwrap();
+        assert!(crate::Migrator::up(&db, None).await.is_err());
+        assert!(
+            !SchemaManager::new(&db)
+                .has_table("sync_download_rules")
+                .await
+                .unwrap()
+        );
+        let record = db.query_one_raw(Statement::from_string(db.get_database_backend(), "SELECT version FROM seaql_migrations WHERE version='m20261101_000034_create_download_rules'".to_owned())).await.unwrap();
+        assert!(record.is_none());
+    }
+    #[tokio::test]
+    async fn legacy_unliked_rows_do_not_create_favorites() {
+        let db = setup().await;
+        db.execute_unprepared(
+            "INSERT INTO media_files VALUES (7, 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared("INSERT INTO media_file_stats VALUES (4, 7, 0, 3, 9, '2020-01-01')")
+            .await
+            .unwrap();
+        crate::with_migration_actor(
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            Migration.up(&SchemaManager::new(&db)),
+        )
+        .await
+        .unwrap();
+        let row = db
+            .query_one_raw(Statement::from_string(
+                db.get_database_backend(),
+                "SELECT COUNT(*) AS n FROM media_file_likes".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
     }
     #[tokio::test]
     async fn fresh_database_migrates() {
@@ -1249,8 +1303,7 @@ mod tests {
         let db = setup_catalog().await;
         Migration.up(&SchemaManager::new(&db)).await.unwrap();
         let row = db.query_one_raw(Statement::from_string(db.get_database_backend(), "SELECT a.id AS artist_id, a.hlc_uuid AS artist_uuid, l.id AS link_id, l.track_uuid, l.artist_uuid AS link_artist_uuid, l.hlc_uuid AS link_uuid FROM artists a JOIN media_file_artists l ON l.artist_uuid=a.hlc_uuid".to_owned())).await.unwrap().unwrap();
-        let parent =
-            crate::catalog_identity::parent(crate::catalog_identity::ParentKind::Artist, "Artist");
+        let parent = crate::catalog_identity::parent(ParentKind::Artist, "Artist");
         let file = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
         assert_eq!(row.try_get::<i32>("", "artist_id").unwrap(), 3);
         assert_eq!(row.try_get::<i32>("", "link_id").unwrap(), 5);
@@ -1268,12 +1321,7 @@ mod tests {
         );
         assert_eq!(
             row.try_get::<String>("", "link_uuid").unwrap(),
-            crate::catalog_identity::membership(
-                file,
-                crate::catalog_identity::ParentKind::Artist,
-                parent
-            )
-            .to_string()
+            crate::catalog_identity::membership(file, ParentKind::Artist, parent).to_string()
         );
     }
     #[tokio::test]
@@ -1316,7 +1364,7 @@ mod tests {
     #[tokio::test]
     async fn artwork_uses_body_digest_and_preserves_crc_collisions() {
         let db = setup().await;
-        db.execute_unprepared("CREATE TABLE media_cover_art (id INTEGER PRIMARY KEY, file_hash TEXT NOT NULL, binary BLOB NOT NULL, hlc_uuid TEXT NOT NULL, updated_at_hlc_ts TEXT NOT NULL DEFAULT '')").await.unwrap();
+        db.execute_unprepared("CREATE TABLE media_cover_art (id INTEGER PRIMARY KEY, file_hash TEXT NOT NULL, binary BLOB NOT NULL, hlc_uuid TEXT NOT NULL)").await.unwrap();
         db.execute_unprepared("INSERT INTO media_cover_art(id,file_hash,binary,hlc_uuid) VALUES (1,'same',x'010203','old-a'), (2,'same',x'040506','old-b'), (3,'',x'','00000000-0000-0000-0000-000000000000')").await.unwrap();
         Migration.up(&SchemaManager::new(&db)).await.unwrap();
         let rows = db

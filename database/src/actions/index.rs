@@ -1,3 +1,5 @@
+use crate::actions::metadata::author_indexed_track_row;
+use sea_orm::sea_query::Expr;
 use std::collections::HashMap;
 
 use anyhow::{Error, Result};
@@ -82,10 +84,7 @@ pub async fn index_media_files(
         if summary.file_uuid.is_empty() {
             let id = Uuid::new_v4().to_string();
             media_files::Entity::update_many()
-                .col_expr(
-                    media_files::Column::HlcUuid,
-                    sea_orm::sea_query::Expr::value(id.clone()),
-                )
+                .col_expr(media_files::Column::HlcUuid, Expr::value(id.clone()))
                 .filter(media_files::Column::Id.eq(summary.id))
                 .exec(&txn)
                 .await?;
@@ -106,9 +105,7 @@ pub async fn index_media_files(
                     .one(&txn)
                     .await?
                     .ok_or_else(|| Error::msg("indexed file missing"))?;
-                if let Err(error) =
-                    crate::actions::metadata::author_indexed_track_row(&txn, store, file).await
-                {
+                if let Err(error) = author_indexed_track_row(&txn, store, file).await {
                     txn.rollback().await?;
                     return Err(error);
                 }

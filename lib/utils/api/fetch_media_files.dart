@@ -1,3 +1,4 @@
+import 'request_failure.dart';
 import '../../bindings/bindings.dart';
 import '../../widgets/track_list/utils/internal_media_file.dart';
 
@@ -10,10 +11,13 @@ Future<List<InternalMediaFile>> fetchMediaFiles(
     pageSize: pageSize,
     bakeCoverArts: true,
   );
-  fetchMediaFiles.sendSignalToRust(); // GENERATED
 
   // Listen for the response from Rust
-  final rustSignal = await FetchMediaFilesResponse.rustSignalStream.first;
+  final rustSignal = await awaitResponse(
+    'FetchMediaFilesRequest',
+    FetchMediaFilesResponse.rustSignalStream,
+    send: () => fetchMediaFiles.sendSignalToRust(),
+  );
   final response = rustSignal.message;
 
   return response.mediaFiles
@@ -28,6 +32,7 @@ Future<List<InternalMediaFile>> fetchMediaFiles(
           coverArtPath: response.coverArtMap[x.id] ?? '',
           trackNumber: x.trackNumber,
           audioAvailability: x.audioAvailability,
+          audioOrigin: x.audioOrigin,
         ),
       )
       .toList();

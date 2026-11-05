@@ -89,6 +89,9 @@ pub struct ListClientsResponse {
 }
 
 #[derive(Deserialize, Serialize, RustSignal)]
+pub struct TrustedClientsChanged {}
+
+#[derive(Deserialize, Serialize, RustSignal)]
 pub struct IncommingClientPermissionNotification {
     pub user: ClientSummary,
 }
@@ -116,6 +119,7 @@ pub struct RemoveTrustedClientResponse {
 pub struct UpdateClientStatusRequest {
     pub fingerprint: String,
     pub status: ClientStatus,
+    pub preset: Option<super::DevicePreset>,
 }
 
 #[derive(Deserialize, Serialize, RustSignal)]

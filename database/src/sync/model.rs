@@ -1,10 +1,15 @@
 //! Rune source-row declarations and pure portable value conversions.
+
+use crate::actions::file::validate_digest;
 use crate::entities::*;
 use migration::catalog_identity::{self, ParentKind};
-use sea_orm::{ColumnTrait, Condition, DbErr, Value};
+use sea_orm::{ColumnTrait, Condition, DbErr, Value, sea_query::Expr};
 use serde::{Deserialize, Serialize};
 use sync_orm::row_policy::{FieldCodec, RowView};
 use uuid::Uuid;
+
+/// Maximum fingerprint size included in synchronization.
+pub const MAX_PORTABLE_FINGERPRINT_BYTES: usize = 32768;
 
 /// Metadata describing a blob; the sync engine does not transfer its bytes.
 /// The digest is an opaque, nonempty string of at most 256 UTF-8 bytes.
@@ -83,8 +88,9 @@ impl FieldCodec for ScoreValue {
 fn validate_blob(hash: Option<&str>, size: Option<i64>) -> Result<(), DbErr> {
     match (hash, size) {
         (None, None) => Ok(()),
-        (Some(hash), Some(size)) if size >= 0 => crate::actions::file::validate_digest(hash)
-            .map_err(|error| DbErr::Custom(error.to_string())),
+        (Some(hash), Some(size)) if size >= 0 => {
+            validate_digest(hash).map_err(|error| DbErr::Custom(error.to_string()))
+        }
         _ => Err(DbErr::Custom(
             "content digest and nonnegative length must be present together".into(),
         )),
@@ -355,7 +361,7 @@ sync_orm::row_policies! {
                         media_files::Column::LocalAvailable => false,
                         media_files::Column::CoverArtCheckedAt => None::<String>,
                     },
-                    local_reads: [media_files::Column::LocalAvailable],
+                    local_reads: [media_files::Column::LocalAvailable, media_files::Column::FileName],
                     lists: {
                         metadata: MetadataTag => {
                             entity: media_metadata::Entity,
@@ -372,7 +378,11 @@ sync_orm::row_policies! {
                             owner: |row: &RowView<media_files::Entity>| -> Result<Vec<Value>, DbErr> {
                                 Ok(vec![Some(row.read::<i32>(media_files::Column::Id)?.to_string()).into(), Some("track".to_owned()).into()])
                             },
-                            derive: |_: &RowView<media_files::Entity>, value: Option<&Track>| search_documents(value.and_then(|value| value.metadata.iter().find(|tag| tag.key == "track_title").map(|tag| tag.value.as_str()))),
+                            derive: |row: &RowView<media_files::Entity>, value: Option<&Track>| {
+                                let Some(value) = value else { return search_documents(None); };
+                                let filename = row.read::<String>(media_files::Column::FileName)?;
+                                search_documents(value.metadata.iter().find(|tag| tag.key == "track_title").map(|tag| tag.value.as_str()).or_else(|| (!filename.is_empty()).then_some(filename.as_str())))
+                            },
                         }
                     },
                     local_updates: |before: Option<&RowView<media_files::Entity>>,
@@ -634,11 +644,12 @@ sync_orm::row_policies! {
                         format_version: Option<i32> => media_file_fingerprint::Column::FormatVersion
                     },
                     defaults: {},
+                    source_filter: Condition::all().add(Expr::cust_with_values("length(fingerprint) <= ?", [MAX_PORTABLE_FINGERPRINT_BYTES as i64])),
                     references: {
                         file_id => "tracks"
                     },
                     limits: {
-                        bytes => (0, 32768),
+                        bytes => (0, MAX_PORTABLE_FINGERPRINT_BYTES as i128),
                         source_hash => (64, 64),
                         source_size => (0, i64::MAX as i128),
                         algorithm => (1, 256),

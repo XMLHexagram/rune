@@ -1,9 +1,12 @@
+use crate::access_policy::Action;
+use discovery::access_policy::{AccessPolicy, PeerIdentity};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
+    Extension,
     extract::{
         ConnectInfo, Query, State,
-        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -15,83 +18,69 @@ use tokio::sync::mpsc;
 use crate::{
     Session,
     backends::remote::{decode_message, encode_message},
-    server::ServerState,
+    messages::RemoteRequestFailed,
+    request_error::classify,
+    server::{ServerState, sync_auth::AuthenticatedFingerprint},
 };
 use discovery::server::{User, UserStatus};
 
 pub async fn websocket_handler(
     ws: WebSocketUpgrade,
+    Extension(AuthenticatedFingerprint(fingerprint)): Extension<AuthenticatedFingerprint>,
     Query(params): Query<HashMap<String, String>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<ServerState>>,
 ) -> Response {
-    let auth_key = params
-        .get("auth")
-        .or_else(|| params.get("public_key"))
-        .or_else(|| params.get("fingerprint"))
-        .cloned();
-
     let host = params
         .get("host")
         .cloned()
         .unwrap_or("127.0.0.1".to_owned());
-
-    let auth_result = async {
-        let auth_key = auth_key.ok_or(StatusCode::BAD_REQUEST)?;
-
-        if let Some(user) = state
-            .permission_manager
-            .read()
-            .await
-            .verify_by_public_key(&auth_key)
-            .await
-        {
-            return match user.status {
-                UserStatus::Approved => Ok(user),
-                UserStatus::Blocked => Err(StatusCode::FORBIDDEN),
-                UserStatus::Pending => Err(StatusCode::UNAUTHORIZED),
+    let user = state
+        .permission_manager
+        .read()
+        .await
+        .verify_by_fingerprint(&fingerprint)
+        .await
+        .filter(|user| user.status == UserStatus::Approved);
+    match user {
+        Some(user) => {
+            let Some(node) = state.node.upgrade() else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
-        }
-
-        if let Some(user) = state
-            .permission_manager
-            .read()
-            .await
-            .verify_by_fingerprint(&auth_key)
-            .await
-        {
-            return match user.status {
-                UserStatus::Approved => Ok(user),
-                UserStatus::Blocked => Err(StatusCode::FORBIDDEN),
-                UserStatus::Pending => Err(StatusCode::UNAUTHORIZED),
+            let peer = PeerIdentity {
+                fingerprint: user.fingerprint.clone(),
+                public_key: user.public_key.clone(),
             };
-        }
-
-        Err(StatusCode::UNAUTHORIZED)
-    }
-    .await;
-
-    match auth_result {
-        Ok(user) => {
+            if node.access_policy.check(&peer, &Action::Control).is_err() {
+                return StatusCode::FORBIDDEN.into_response();
+            }
             info!("Connection authorized for {} @ {}", user.alias, addr);
             let host = format!("https://{host}:7863");
             ws.on_upgrade(move |socket| handle_socket(socket, state, user, host))
         }
-        Err(code) => {
-            warn!(
-                "Unauthorized connection attempt from {}({})",
-                addr,
-                match params.get("fingerprint") {
-                    Some(x) => x,
-                    None => "",
-                }
-            );
-            code.into_response()
+        None => {
+            warn!("Unauthorized connection attempt from {}", addr);
+            StatusCode::UNAUTHORIZED.into_response()
         }
     }
 }
 
 pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, user: User, host: String) {
+    let mut changes = state.permission_manager.read().await.changes();
+    let Some(node) = state.node.upgrade() else {
+        return;
+    };
+    let policy = node.access_policy.clone();
+    drop(node);
+    let mut grant_changes = policy.changes();
+    let peer = PeerIdentity {
+        fingerprint: user.fingerprint.clone(),
+        public_key: user.public_key.clone(),
+    };
+    let session_peer = peer.clone();
+    let permission_manager = state.permission_manager.clone();
+    let session_cancel = state.session_cancel.clone();
+    let session_fingerprint = user.fingerprint.clone();
     let (mut sender, mut receiver) = socket.split();
     let mut broadcast_rx = state.websocket_service.broadcast_tx.subscribe();
     let (tx, mut rx) = mpsc::channel(32);
@@ -122,27 +111,41 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, user: Use
             {
                 debug!("[{incoming_alias}] Received: {msg_type}");
 
-                if let Some((resp_type, response)) = state
+                let result = state
                     .websocket_service
                     .handle_message(
                         &msg_type,
                         msg_payload,
                         Some(Session {
                             fingerprint: fingerprint.to_owned(),
+                            public_key: peer.public_key.clone(),
                             host: host.to_owned(),
                         }),
                     )
-                    .await
-                {
-                    let response = match response {
-                        Ok(response) => response,
+                    .await;
+                if let Some((resp_type, response)) = result {
+                    let (response_type, response) = match response {
+                        Ok(response) => (resp_type, response),
                         Err(e) => {
-                            error!("[{incoming_alias}] Failed to handle message: {e}");
-                            continue;
+                            error!("[{incoming_alias}] Failed to handle {msg_type}: {e:#}");
+                            let failure = RemoteRequestFailed {
+                                kind: classify(&e),
+                                request: msg_type,
+                                detail: format!("{e:#}"),
+                            };
+                            match rinf::serialize(&failure) {
+                                Ok(payload) => ("RemoteRequestFailed".to_owned(), payload),
+                                Err(error) => {
+                                    error!(
+                                        "[{incoming_alias}] Failed to encode request failure: {error}"
+                                    );
+                                    continue;
+                                }
+                            }
                         }
                     };
 
-                    let response_payload = encode_message(&resp_type, &response, Some(uuid));
+                    let response_payload = encode_message(&response_type, &response, Some(uuid));
                     if let Err(e) = incoming_tx
                         .send(WsMessage::Binary(response_payload.into()))
                         .await
@@ -171,14 +174,38 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, user: Use
         drop(broadcast_tx);
     };
 
-    // Drop the original tx as we've cloned it for both tasks
-    drop(tx);
-
-    // Run tasks concurrently
-    tokio::select! {
-        _ = incoming => {},
-        _ = outgoing => {},
+    let revoked = async {
+        loop {
+            let approved = permission_manager
+                .read()
+                .await
+                .verify_by_fingerprint(&session_fingerprint)
+                .await
+                .is_some_and(|user| user.status == UserStatus::Approved);
+            if !approved || policy.check(&session_peer, &Action::Control).is_err() {
+                break;
+            }
+            tokio::select! {
+                result = changes.changed() => if result.is_err() { break; },
+                result = grant_changes.changed() => if result.is_err() { break; },
+            }
+        }
     };
+    let close = tokio::select! {
+        _ = incoming => None,
+        _ = outgoing => None,
+        _ = revoked => Some((4403, "revoked")),
+        _ = session_cancel.cancelled() => Some((1001, "server stopping")),
+    };
+    if let Some((code, reason)) = close {
+        let _ = tx
+            .send(WsMessage::Close(Some(CloseFrame {
+                code,
+                reason: reason.into(),
+            })))
+            .await;
+    }
+    drop(tx);
 
     // Wait for the send task to complete
     let _ = send_task.await;

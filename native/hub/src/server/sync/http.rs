@@ -1,13 +1,30 @@
 //! Audio content endpoints mounted by an authenticated caller.
+
 use anyhow::Result;
-use axum::{Router, extract::State, http::StatusCode, routing::get};
-use database::sync::LibrarySyncStore;
-use database::sync::model::{BlobRef, Collection, ObjectKey, Payload};
-use database::{
-    actions::{downloads, file},
-    entities,
+use axum::body::Body;
+use axum::http::Response;
+use axum::{
+    Router,
+    extract::State,
+    http::{
+        StatusCode,
+        header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
+    },
+    routing::get,
 };
-use std::{sync::Arc, time::Duration};
+use database::{
+    actions::{cover_art::verify_body, file},
+    entities,
+    sync::{
+        LibrarySyncStore,
+        model::{Collection, ObjectKey, Payload},
+    },
+};
+use entities::media_cover_art::Column;
+use entities::media_cover_art::Entity;
+use std::io::Error;
+use std::io::ErrorKind;
+use std::sync::Arc;
 
 /// The application replaces a library only while its background workers are stopped.
 #[derive(Clone)]
@@ -26,19 +43,24 @@ pub struct BlobContext {
 }
 
 pub fn blob_router(context: BlobContext) -> Router {
-    use axum::routing::put;
     Router::new()
         .route("/sync/artworks/{id}", get(get_artwork))
-        .route(
-            "/sync/blobs/{digest}",
-            get(get_blob).head(head_blob).merge(put(put_blob)),
-        )
+        .route("/sync/blobs/{digest}", get(get_blob).head(head_blob))
         .with_state(context)
+}
+
+#[derive(serde::Deserialize)]
+struct ArtworkPath {
+    id: uuid::Uuid,
+}
+#[derive(serde::Deserialize)]
+struct BlobPath {
+    digest: String,
 }
 
 async fn get_artwork(
     State(context): State<BlobContext>,
-    axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+    axum::extract::Path(ArtworkPath { id }): axum::extract::Path<ArtworkPath>,
 ) -> Result<axum::response::Response, StatusCode> {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
     let store = context.store.read().await;
@@ -56,8 +78,8 @@ async fn get_artwork(
     let body = artwork
         .body()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let rows = entities::media_cover_art::Entity::find()
-        .filter(entities::media_cover_art::Column::HlcUuid.eq(id.to_string()))
+    let rows = Entity::find()
+        .filter(Column::HlcUuid.eq(id.to_string()))
         .all(&context.db)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -65,12 +87,11 @@ async fn get_artwork(
         return Err(StatusCode::NOT_FOUND);
     }
     let bytes = rows.into_iter().next().unwrap().binary;
-    database::actions::cover_art::verify_body(id, &body.digest, body.size, &bytes)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
-    axum::http::Response::builder()
+    verify_body(id, &body.digest, body.size, &bytes).map_err(|_| StatusCode::NOT_FOUND)?;
+    Response::builder()
         .status(StatusCode::OK)
-        .header(axum::http::header::CONTENT_LENGTH, bytes.len())
-        .body(axum::body::Body::from(bytes))
+        .header(CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -80,7 +101,7 @@ struct HeadQuery {
 }
 async fn head_blob(
     State(context): State<BlobContext>,
-    axum::extract::Path(digest): axum::extract::Path<String>,
+    axum::extract::Path(BlobPath { digest }): axum::extract::Path<BlobPath>,
     axum::extract::Query(query): axum::extract::Query<HeadQuery>,
 ) -> Result<StatusCode, StatusCode> {
     file::validate_digest(&digest).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -120,7 +141,7 @@ async fn head_blob(
 
 async fn get_blob(
     State(context): State<BlobContext>,
-    axum::extract::Path(digest): axum::extract::Path<String>,
+    axum::extract::Path(BlobPath { digest }): axum::extract::Path<BlobPath>,
     headers: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
     use std::io::{Read, Seek, SeekFrom};
@@ -136,17 +157,17 @@ async fn get_blob(
         .seek(SeekFrom::End(0))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let requested = headers
-        .get(axum::http::header::RANGE)
+        .get(RANGE)
         .map(|h| h.to_str().ok().and_then(|r| parse_range(r, size)));
     let (start, length, partial) = match requested {
         None => (0, size, false),
         Some(Some((start, end))) => (start, end - start + 1, true),
         Some(None) => {
-            return axum::http::Response::builder()
+            return Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header(axum::http::header::CONTENT_RANGE, format!("bytes */{size}"))
-                .header(axum::http::header::ACCEPT_RANGES, "bytes")
-                .body(axum::body::Body::empty())
+                .header(CONTENT_RANGE, format!("bytes */{size}"))
+                .header(ACCEPT_RANGES, "bytes")
+                .body(Body::empty())
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -159,30 +180,27 @@ async fn get_blob(
         let mut buffer = vec![0; remaining.min(64 * 1024) as usize];
         let count = file.read(&mut buffer)?;
         if count == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "audio file shortened",
-            ));
+            return Err(Error::new(ErrorKind::UnexpectedEof, "audio file shortened"));
         }
         buffer.truncate(count);
         Ok(Some((buffer, (file, remaining - count as u64))))
     });
-    let mut response = axum::http::Response::builder()
+    let mut response = Response::builder()
         .status(if partial {
             StatusCode::PARTIAL_CONTENT
         } else {
             StatusCode::OK
         })
-        .header(axum::http::header::CONTENT_LENGTH, length)
-        .header(axum::http::header::ACCEPT_RANGES, "bytes");
+        .header(CONTENT_LENGTH, length)
+        .header(ACCEPT_RANGES, "bytes");
     if partial {
         response = response.header(
-            axum::http::header::CONTENT_RANGE,
+            CONTENT_RANGE,
             format!("bytes {start}-{}/{size}", start + length - 1),
         );
     }
     response
-        .body(axum::body::Body::from_stream(chunks))
+        .body(Body::from_stream(chunks))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -212,155 +230,4 @@ fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
         return None;
     }
     Some((start, end))
-}
-
-struct UploadTemp {
-    fsio: Arc<fsio::FsIo>,
-    path: std::path::PathBuf,
-}
-impl Drop for UploadTemp {
-    fn drop(&mut self) {
-        let fsio = self.fsio.clone();
-        let path = self.path.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = fsio.remove_file(&path).await;
-            });
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct UploadQuery {
-    track_id: uuid::Uuid,
-    size: u64,
-    extension: String,
-}
-async fn put_blob(
-    State(context): State<BlobContext>,
-    axum::extract::Path(digest): axum::extract::Path<String>,
-    axum::extract::Query(query): axum::extract::Query<UploadQuery>,
-    body: axum::body::Body,
-) -> Result<StatusCode, StatusCode> {
-    use futures::StreamExt;
-    use std::io::Write;
-
-    file::validate_digest(&digest).map_err(|_| StatusCode::BAD_REQUEST)?;
-    file::validate_extension(&query.extension).map_err(|_| StatusCode::BAD_REQUEST)?;
-    if query.size > file::MAX_BLOB_BYTES {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    }
-    let blob = BlobRef {
-        digest: digest.clone(),
-        size: query.size,
-    };
-    let key = ObjectKey {
-        collection: Collection::Tracks,
-        id: query.track_id,
-    };
-    let record = context
-        .store
-        .read()
-        .await
-        .get(&key)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    if !matches!(record.value, Some(Payload::Track(ref track)) if track.blob().ok().flatten().as_ref() == Some(&blob) && track.extension == query.extension)
-    {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let path = downloads::prepare_download(
-        &context.db,
-        &context.fsio,
-        &context.root,
-        query.track_id,
-        &blob,
-        &query.extension,
-    )
-    .await
-    .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let temp = path.with_extension(format!("part-{}", uuid::Uuid::new_v4()));
-    let _cleanup = UploadTemp {
-        fsio: context.fsio.clone(),
-        path: temp.clone(),
-    };
-
-    async {
-        let mut file = context
-            .fsio
-            .open(&temp, "wt")
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let mut stream = body.into_data_stream();
-        let mut count = 0u64;
-        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(30), stream.next())
-            .await
-            .map_err(|_| StatusCode::REQUEST_TIMEOUT)?
-        {
-            let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
-            count = count
-                .checked_add(chunk.len() as u64)
-                .ok_or(StatusCode::PAYLOAD_TOO_LARGE)?;
-            if count > query.size {
-                return Err(StatusCode::PAYLOAD_TOO_LARGE);
-            }
-            file.write_all(&chunk)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        }
-        file.flush()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        drop(file);
-        if count != query.size
-            || file::hash_file(&context.fsio, &temp).map_err(|_| StatusCode::BAD_REQUEST)? != blob
-        {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        let _upload_guard = context.upload_lock.lock().await;
-        if context
-            .fsio
-            .exists(&path)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        {
-            #[cfg(not(target_os = "android"))]
-            {
-                let metadata = std::fs::symlink_metadata(&path)
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    return Err(StatusCode::BAD_REQUEST);
-                }
-            }
-            if file::hash_file(&context.fsio, &path).ok().as_ref() != Some(&blob) {
-                context
-                    .fsio
-                    .remove_file(&path)
-                    .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            }
-        }
-        if !context
-            .fsio
-            .exists(&path)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        {
-            context
-                .fsio
-                .rename_file(&temp, &path)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        }
-        file::attach_download(
-            &context.db,
-            &context.store.read().await.record_store(),
-            &context.fsio,
-            &context.root,
-            query.track_id,
-            &blob,
-            &path,
-        )
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        (context.notify)();
-        Ok(StatusCode::CREATED)
-    }
-    .await
 }

@@ -1,5 +1,26 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use database::sync::LibrarySyncStore;
+use database::{
+    actions::{
+        cover_art::scan_cover_arts,
+        metadata::{
+            MissingHostFilePolicy, ScanOptions, empty_progress_callback,
+            get_metadata_summary_by_file_ids, scan_audio_library,
+        },
+        search::search_for,
+    },
+    connection::{check_storage_mode, connect_main_db, connect_recommendation_db},
+    library_registry::{LibraryRegistry, resolve_library},
+};
+use reqwest::header::HeaderMap;
+use reqwest::header::HeaderValue;
+use std::time::Duration;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use dunce::canonicalize;
@@ -7,14 +28,6 @@ use log::{error, info};
 use prettytable::{Table, row};
 use tracing_subscriber::filter::EnvFilter;
 
-use database::{
-    actions::{
-        cover_art::scan_cover_arts,
-        metadata::{empty_progress_callback, get_metadata_summary_by_file_ids, scan_audio_library},
-        search::search_for,
-    },
-    connection::{connect_main_db, connect_recommendation_db},
-};
 use fsio::FsIo;
 
 use rune::{
@@ -137,6 +150,14 @@ enum Commands {
     },
 }
 
+async fn resolve_library_id(fsio: &FsIo, config_path: &Path, lib_path: &str) -> Result<Uuid> {
+    let mode = check_storage_mode(fsio, lib_path)?;
+    let mut registry = LibraryRegistry::load(config_path)?;
+    Ok(resolve_library(fsio, &mut registry, lib_path, "", mode)
+        .await?
+        .library_id)
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -225,6 +246,15 @@ async fn main() {
         }
     };
 
+    // Each library syncs under its own id from this device's library registry.
+    let library_id = match resolve_library_id(&fsio, &config_path, lib_path).await {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Failed to resolve library identity: {e:#}");
+            std::process::exit(1);
+        }
+    };
+
     if let Commands::Sync {
         server,
         ca,
@@ -233,8 +263,8 @@ async fn main() {
     {
         let result: Result<(), Box<dyn std::error::Error>> = async {
             let mut builder = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .read_timeout(std::time::Duration::from_secs(30));
+                .connect_timeout(Duration::from_secs(30))
+                .read_timeout(Duration::from_secs(30));
             if let Some(path) = ca {
                 builder =
                     builder.add_root_certificate(reqwest::Certificate::from_pem(&fs::read(path)?)?);
@@ -247,20 +277,16 @@ async fn main() {
                 if !server.starts_with("https://") {
                     return Err("credentials require an HTTPS server".into());
                 }
-                let mut headers = reqwest::header::HeaderMap::new();
-                let mut value =
-                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim()))?;
+                let mut headers = HeaderMap::new();
+                let mut value = HeaderValue::from_str(&format!("Bearer {}", token.trim()))?;
                 value.set_sensitive(true);
                 headers.insert(reqwest::header::AUTHORIZATION, value);
                 builder = builder.default_headers(headers);
             }
-            let library = database::sync::LibrarySyncStore::open(
+            let library = LibrarySyncStore::open(
                 main_db.clone(),
                 Uuid::parse_str(&node_id)?,
-                Some(Uuid::new_v5(
-                    &Uuid::NAMESPACE_URL,
-                    b"https://rune.audio/catalog",
-                )),
+                Some(library_id),
             )
             .await?;
             library.import_existing(Uuid::parse_str(&node_id)?).await?;
@@ -299,13 +325,10 @@ async fn main() {
     match &cli.command {
         Commands::Sync { .. } => unreachable!(),
         Commands::Scan => {
-            let library = match database::sync::LibrarySyncStore::open(
+            let library = match LibrarySyncStore::open(
                 main_db.clone(),
                 Uuid::parse_str(&node_id).expect("validated device UUID"),
-                Some(Uuid::new_v5(
-                    &Uuid::NAMESPACE_URL,
-                    b"https://rune.audio/catalog",
-                )),
+                Some(library_id),
             )
             .await
             {
@@ -320,10 +343,13 @@ async fn main() {
                 &main_db,
                 &node_id,
                 &path,
-                true,
-                false,
+                ScanOptions {
+                    cleanup: true,
+                    force: false,
+                    missing_host_file: MissingHostFilePolicy::RemoveEverywhere,
+                    cancel_token: None,
+                },
                 empty_progress_callback,
-                None,
                 &library.record_store(),
             )
             .await
@@ -349,13 +375,10 @@ async fn main() {
         }
         Commands::Index => {
             let result = async {
-                let library = database::sync::LibrarySyncStore::open(
+                let library = LibrarySyncStore::open(
                     main_db.clone(),
                     Uuid::parse_str(&node_id)?,
-                    Some(Uuid::new_v5(
-                        &Uuid::NAMESPACE_URL,
-                        b"https://rune.audio/catalog",
-                    )),
+                    Some(library_id),
                 )
                 .await?;
                 index_audio_library(&main_db, &node_id, &library.record_store()).await
@@ -373,7 +396,6 @@ async fn main() {
                 &main_db,
                 &analysis_db,
                 &path,
-                "",
             )
             .await;
         }
@@ -413,11 +435,17 @@ async fn main() {
         // In the main function, update the match statement for Commands::Play
         Commands::Play { mode, id } => match mode.as_deref() {
             Some("random") => {
-                play_random(&main_db, &canonicalized_path).await;
+                play_random(&main_db, &canonicalized_path, &library_id.to_string()).await;
             }
             Some("id") => {
                 if let Some(file_id) = id {
-                    play_by_id(&main_db, &canonicalized_path, *file_id).await;
+                    play_by_id(
+                        &main_db,
+                        &canonicalized_path,
+                        *file_id,
+                        &library_id.to_string(),
+                    )
+                    .await;
                 } else {
                     error!("File ID is required for playById mode.");
                 }

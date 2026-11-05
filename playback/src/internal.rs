@@ -1,4 +1,6 @@
+use crate::stream_utils::ManagedStream;
 use std::{
+    collections::HashSet,
     fmt::Debug,
     io::BufReader,
     path::PathBuf,
@@ -38,9 +40,11 @@ async fn open_library_stream(
     id: i32,
 ) -> Result<(AnySource, PathBuf)> {
     let remote = resolver.resolve(id).await?;
+    let guard = remote.cancellation.clone().drop_guard();
     let reader =
         crate::stream_utils::create_stream_with_authorizer(remote.request, &remote.url).await?;
-    let reader = crate::stream_utils::ManagedStream::new(reader, remote.cancellation);
+    let reader = ManagedStream::new(reader, remote.cancellation);
+    guard.disarm();
     let decoder = RuneDecoder::new(reader, Some(&remote.extension))?;
     Ok((AnySource::Online(rune_buffered(decoder)), PathBuf::new()))
 }
@@ -144,6 +148,12 @@ impl From<PlaybackMode> for u32 {
 
 #[derive(Debug)]
 pub enum PlayerCommand {
+    Restore {
+        tracks: Vec<(PlayingItem, PlaybackSource)>,
+        index: Option<usize>,
+        position: Duration,
+        mode: PlaybackMode,
+    },
     Load {
         index: usize,
     },
@@ -183,6 +193,8 @@ pub enum PlayerCommand {
 
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
+    Unavailable(PlayingItem),
+    UnavailableCleared(Option<PlayingItem>),
     Stopped,
     Loaded {
         item: PlayingItem,
@@ -309,6 +321,8 @@ pub(crate) struct PlayerInternal {
     stream_error_receiver: mpsc::UnboundedReceiver<String>,
     stream_retry_count: usize,
     adaptive_switching: bool,
+    restore_position: Option<Duration>,
+    unavailable: HashSet<PlayingItem>,
 }
 
 impl PlayerInternal {
@@ -347,6 +361,8 @@ impl PlayerInternal {
             stream_error_receiver,
             stream_retry_count: 0,
             adaptive_switching: false,
+            restore_position: None,
+            unavailable: HashSet::new(),
         }
     }
 
@@ -371,7 +387,22 @@ impl PlayerInternal {
 
                     debug!("Received command: {cmd:?}");
                     match cmd {
-                        PlayerCommand::Load { index } => self.load(Some(index), false, true)?,
+                        PlayerCommand::Restore { tracks, index, position, mode } => {
+                            self.clear_unavailable(None)?;
+                            self.add_to_playlist(tracks, AddMode::AppendToEnd);
+                            self.debounce_timer = None;
+                            self.send_playlist_updated()?;
+                            self.set_playback_mode(mode)?;
+                            self.restore_position = Some(position);
+                            self.load(index, false, false)?;
+                        },
+                        PlayerCommand::Load { index } => {
+                            if index < self.playlist.len() {
+                                let mapped = self.get_mapped_track_index(index);
+                                self.clear_unavailable(Some(self.playlist[mapped].item.clone()))?;
+                            }
+                            self.load(Some(index), false, true)?;
+                        },
                         PlayerCommand::LoadComplete { result, item, original_item, index, playlist_index, path, play } => {
                             self.state = InternalPlaybackState::Stopped;
                             match *result {
@@ -383,10 +414,17 @@ impl PlayerInternal {
                                         self.schedule_playlist_update();
                                     }
                                     self.setup_sink(source, item, index, path, play)?;
+                                    if let Some(position) = self.restore_position.take() { self.seek(position.as_secs_f64())?; }
                                 }
                                 Err(e) => {
                                     error!("Failed to load track: {e:?}");
-                                    self.next()?;
+                                    self.restore_position = None;
+                                    self.unavailable.insert(item.clone());
+                                    self.event_sender.send(PlayerEvent::Unavailable(item))?;
+                                    // Advance from the failed load, including when no track has loaded yet.
+                                    let next = self.find_available_after(playlist_index);
+                                    if let Some(next) = next { self.load(Some(next), play, true)?; }
+                                    else { self.stop()?; self.event_sender.send(PlayerEvent::EndOfPlaylist)?; }
                                 }
                             }
                         },
@@ -499,21 +537,32 @@ impl PlayerInternal {
             tokio::spawn(async move {
                 let original_item = item.item.clone();
                 let source_future = async {
-                    let resolved_item = if let (PlayingItem::InLibrary(id), Some(resolver)) =
+                    let mut fsio = fsio;
+                    let mut resolver = resolver;
+                    if let (PlayingItem::InLibrary(_, library_id), Some(root)) =
                         (&item.item, resolver.as_ref())
+                        && let Some(library) = root.for_library(library_id.clone()).await?
                     {
-                        PlayingItem::InLibrary(
-                            resolver
-                                .resolve_id(*id)
-                                .await?
-                                .context("library track no longer exists")?,
-                        )
-                    } else {
-                        item.item.clone()
-                    };
+                        fsio = library.fsio;
+                        resolver = Some(library.resolver);
+                    }
+                    let resolved_item =
+                        if let (PlayingItem::InLibrary(id, library_id), Some(resolver)) =
+                            (&item.item, resolver.as_ref())
+                        {
+                            PlayingItem::InLibrary(
+                                resolver
+                                    .resolve_id(*id)
+                                    .await?
+                                    .context("library track no longer exists")?,
+                                library_id.clone(),
+                            )
+                        } else {
+                            item.item.clone()
+                        };
                     match &resolved_item {
-                        PlayingItem::IndependentFile(_) | PlayingItem::InLibrary(_) => {
-                            let path = if let (PlayingItem::InLibrary(id), Some(resolver)) =
+                        PlayingItem::IndependentFile(_) | PlayingItem::InLibrary(_, _) => {
+                            let path = if let (PlayingItem::InLibrary(id, _), Some(resolver)) =
                                 (&resolved_item, resolver.as_ref())
                             {
                                 if item
@@ -551,10 +600,7 @@ impl PlayerInternal {
                             info!("Downloading from url: {url}");
                             let ext = url.split('?').next().and_then(|u| u.rsplit('.').next());
                             let reader = crate::stream_utils::create_stream_from_url(url).await?;
-                            let reader = crate::stream_utils::ManagedStream::new(
-                                reader,
-                                CancellationToken::new(),
-                            );
+                            let reader = ManagedStream::new(reader, CancellationToken::new());
                             let decoder = RuneDecoder::new(reader, ext)?;
                             Ok((
                                 AnySource::Online(rune_buffered(decoder)),
@@ -805,6 +851,7 @@ impl PlayerInternal {
     fn switch(&mut self, index: usize) -> Result<()> {
         if index < self.playlist.len() {
             debug!("Switching to track at index: {}", { index });
+            self.clear_unavailable(Some(self.playlist[index].item.clone()))?;
             self.load(Some(index), true, false)?;
         } else {
             warn!("Switch command received but index {index} is out of bounds");
@@ -815,7 +862,7 @@ impl PlayerInternal {
 
     fn seek(&mut self, position: f64) -> Result<()> {
         if let Some(sink) = &self.sink {
-            match sink.try_seek(std::time::Duration::from_secs_f64(position)) {
+            match sink.try_seek(Duration::from_secs_f64(position)) {
                 Ok(_) => {
                     info!("Seeking to position: {position} s");
 
@@ -913,7 +960,8 @@ impl PlayerInternal {
     fn remove_from_playlist(&mut self, index: usize) -> Result<()> {
         if index < self.playlist.len() {
             debug!("Removing from playlist at index: {}", { index });
-            self.playlist.remove(index);
+            let removed = self.playlist.remove(index);
+            self.clear_unavailable(Some(removed.item))?;
             self.playback_strategy.on_playlist_updated(
                 self.playlist.len(),
                 UpdateReason::RemoveFromPlaylist { index },
@@ -930,6 +978,7 @@ impl PlayerInternal {
     }
 
     fn clear_playlist(&mut self) -> Result<()> {
+        self.clear_unavailable(None)?;
         self.playlist.clear();
         self.playback_strategy
             .on_playlist_updated(0, UpdateReason::ClearPlaylist);
@@ -963,6 +1012,47 @@ impl PlayerInternal {
     fn get_mapped_track_index(&self, index: usize) -> usize {
         self.playback_strategy
             .get_mapped_track_index(index, self.playlist.len())
+    }
+
+    fn find_available_after(&self, failed_playlist_index: usize) -> Option<usize> {
+        let playlist_len = self.playlist.len();
+        if playlist_len == 0 {
+            return None;
+        }
+        let strategy_index = (0..playlist_len)
+            .find(|index| self.get_mapped_track_index(*index) == failed_playlist_index)?;
+        let repeat = matches!(
+            self.playback_mode,
+            PlaybackMode::RepeatAll | PlaybackMode::Shuffle
+        );
+        for offset in 1..=playlist_len {
+            if !repeat && strategy_index + offset >= playlist_len {
+                break;
+            }
+            let candidate = (strategy_index + offset) % playlist_len;
+            let mapped = self.get_mapped_track_index(candidate);
+            if !self.unavailable.contains(&self.playlist[mapped].item) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn clear_unavailable(&mut self, item: Option<PlayingItem>) -> Result<()> {
+        let changed = match &item {
+            Some(item) => self.unavailable.remove(item),
+            None => {
+                let changed = !self.unavailable.is_empty();
+                self.unavailable.clear();
+                changed
+            }
+        };
+        if changed {
+            self.event_sender
+                .send(PlayerEvent::UnavailableCleared(item))
+                .context("Failed to clear unavailable status")?;
+        }
+        Ok(())
     }
 
     fn send_progress(&mut self) -> Result<()> {
@@ -1098,5 +1188,43 @@ impl PlayerInternal {
         info!("Adaptive switching status changed: {:#?}", { x });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod stream_open_tests {
+    use super::*;
+    use crate::player::{AudioRequest, RemoteAudioSource};
+    use futures::future::BoxFuture;
+
+    struct FailingRequest;
+    impl AudioRequest for FailingRequest {
+        fn get(
+            &self,
+            _: Option<(u64, Option<u64>)>,
+        ) -> BoxFuture<'static, Result<reqwest::Response>> {
+            Box::pin(async { anyhow::bail!("request failed") })
+        }
+    }
+    struct Resolver(CancellationToken);
+    impl PlaybackSourceResolver for Resolver {
+        fn resolve(&self, _: i32) -> BoxFuture<'static, Result<RemoteAudioSource>> {
+            let cancellation = self.0.clone();
+            Box::pin(async move {
+                Ok(RemoteAudioSource {
+                    request: Arc::new(FailingRequest),
+                    url: "http://localhost/audio".into(),
+                    extension: "mp3".into(),
+                    cancellation,
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn failed_stream_creation_cancels_watcher() {
+        let token = CancellationToken::new();
+        let resolver: Arc<dyn PlaybackSourceResolver> = Arc::new(Resolver(token.clone()));
+        assert!(open_library_stream(&resolver, 1).await.is_err());
+        assert!(token.is_cancelled());
     }
 }

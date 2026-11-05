@@ -1,19 +1,23 @@
+use database::sync::LibrarySyncStore;
+use database::{
+    actions::{
+        analysis::{
+            analysis_audio_library, empty_progress_callback as empty_analysis_progress_callback,
+        },
+        metadata::{
+            MissingHostFilePolicy, ScanOptions,
+            empty_progress_callback as empty_scan_progress_callback, scan_audio_library,
+        },
+        recommendation::sync_recommendation,
+    },
+    connection::{connect_main_db, connect_recommendation_db},
+};
 use std::{path::PathBuf, sync::Arc};
 
 use log::{error, info};
 use tracing_subscriber::filter::EnvFilter;
 
 use analysis::utils::computing_device::ComputingDevice;
-use database::{
-    actions::{
-        analysis::{
-            analysis_audio_library, empty_progress_callback as empty_analysis_progress_callback,
-        },
-        metadata::{empty_progress_callback as empty_scan_progress_callback, scan_audio_library},
-        recommendation::sync_recommendation,
-    },
-    connection::{connect_main_db, connect_recommendation_db},
-};
 use fsio::FsIo;
 
 #[tokio::main]
@@ -41,7 +45,7 @@ async fn main() {
 
     let root_path = PathBuf::from(&path);
 
-    let library = database::sync::LibrarySyncStore::open(main_db.clone(), node_id, None)
+    let library = LibrarySyncStore::open(main_db.clone(), node_id, None)
         .await
         .unwrap();
     library.import_existing(node_id).await.unwrap();
@@ -52,10 +56,13 @@ async fn main() {
         &main_db,
         &node_id.to_string(),
         &root_path,
-        true,
-        false,
+        ScanOptions {
+            cleanup: true,
+            force: false,
+            missing_host_file: MissingHostFilePolicy::RemoveEverywhere,
+            cancel_token: None,
+        },
         empty_scan_progress_callback,
-        None,
         &library.record_store(),
     )
     .await;
@@ -66,7 +73,6 @@ async fn main() {
         Arc::clone(&fsio),
         &main_db,
         &root_path,
-        "",
         10,
         ComputingDevice::Gpu,
         empty_analysis_progress_callback,

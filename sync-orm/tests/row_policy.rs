@@ -1,3 +1,7 @@
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
+use sea_orm::sea_query as sea_orm_sea_query;
 use sea_orm::{ConnectionTrait, Database, EntityTrait, Schema, TransactionTrait, sea_query::Expr};
 use sync::protocol::{ObjectKey, SyncModel};
 use uuid::Uuid;
@@ -602,12 +606,10 @@ async fn causal_selected_survivor_and_source_rollback() -> anyhow::Result<()> {
     use sync::protocol::Observed;
     use sync_orm::{
         causal_capabilities::TransactionProjection,
-        causal_schema,
         causal_store::CausalReplica,
         registry::{ProjectionBudget, RegistryProjection},
     };
-    let db = Database::connect("sqlite::memory:").await?;
-    causal_schema::install_fresh(&db).await?;
+    let db = fixtures::fresh_database().await?;
     let schema = Schema::new(db.get_database_backend());
     db.execute(&schema.create_table_from_entity(folders::Entity))
         .await?;
@@ -718,12 +720,11 @@ async fn endpoint_receives_generated_projection_atomically() -> anyhow::Result<(
     use sync::protocol::{self as p, ReceiveStore, SyncStore};
     use sync_orm::{
         causal_capabilities::CausalEndpoint,
-        causal_progress, causal_schema,
+        causal_progress,
         causal_store::CausalReplica,
         registry::{ProjectionBudget, RegistryProjection},
     };
-    let db = Database::connect("sqlite::memory:").await?;
-    causal_schema::install_fresh(&db).await?;
+    let db = fixtures::fresh_database().await?;
     let schema = Schema::new(db.get_database_backend());
     db.execute(&schema.create_table_from_entity(folders::Entity))
         .await?;
@@ -826,12 +827,11 @@ async fn endpoint_source_constraint_failure_rolls_back_batch() -> anyhow::Result
     use sync::protocol::{self as p, ReceiveStore, SyncStore};
     use sync_orm::{
         causal_capabilities::CausalEndpoint,
-        causal_progress, causal_schema,
+        causal_progress,
         causal_store::CausalReplica,
         registry::{ProjectionBudget, RegistryProjection},
     };
-    let db = Database::connect("sqlite::memory:").await?;
-    causal_schema::install_fresh(&db).await?;
+    let db = fixtures::fresh_database().await?;
     db.execute(&Schema::new(db.get_database_backend()).create_table_from_entity(folders::Entity))
         .await?;
     let namespace = Uuid::new_v4();
@@ -905,9 +905,9 @@ async fn endpoint_source_constraint_failure_rolls_back_batch() -> anyhow::Result
     else {
         anyhow::bail!("unexpected fragmented page")
     };
-    let completion_query = sea_orm::sea_query::Query::select()
-        .column(sea_orm::sea_query::Alias::new("completed_at"))
-        .from(sea_orm::sea_query::Alias::new("sync_checkpoints"))
+    let completion_query = sea_orm_sea_query::Query::select()
+        .column(sea_orm_sea_query::Alias::new("completed_at"))
+        .from(sea_orm_sea_query::Alias::new("sync_checkpoints"))
         .to_owned();
     let completion_before: String = db
         .query_one(&completion_query)
@@ -1614,5 +1614,91 @@ async fn distinct_primary_owners_share_scoped_derived_table() -> anyhow::Result<
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].text, "note");
     assert_eq!(search_docs::Entity::find().all(&db).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_canonicalizes_uppercase_uuid() -> anyhow::Result<()> {
+    use sea_orm::{ActiveModelTrait, Set};
+    let db = Database::connect("sqlite::memory:").await?;
+    db.execute(&Schema::new(db.get_database_backend()).create_table_from_entity(folders::Entity))
+        .await?;
+    let id = Uuid::new_v4();
+    folders::ActiveModel {
+        uuid: Set(id.to_string().to_uppercase()),
+        label: Set("old".into()),
+        local: Set(String::new()),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await?;
+    let tx = db.begin().await?;
+    Catalog::scan_on(
+        &tx,
+        &Collection::Folder,
+        None,
+        sync_orm::row_policy::ScanLimits {
+            max_records: 128,
+            max_rows: 2,
+            max_bytes: 4096,
+            max_mutations: 1,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    let key = ObjectKey::<Catalog> {
+        collection: Collection::Folder,
+        id,
+    };
+    Catalog::project(
+        &db,
+        &key,
+        Some(&Payload::Folder(Folder {
+            label: "new".into(),
+        })),
+    )
+    .await?;
+    let rows = folders::Entity::find().all(&db).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].uuid, id.to_string());
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_canonicalizes_uuid_references() -> anyhow::Result<()> {
+    use sea_orm::{ActiveModelTrait, Set};
+    let db = Database::connect("sqlite::memory:").await?;
+    db.execute(
+        &Schema::new(db.get_database_backend()).create_table_from_entity(associations::Entity),
+    )
+    .await?;
+    let left = Uuid::new_v4();
+    let right = Uuid::new_v4();
+    let id = association_identity(&Association { left, right })?;
+    associations::ActiveModel {
+        uuid: Set(id.to_string()),
+        left: Set(left.to_string().to_uppercase()),
+        right: Set(right.to_string().to_uppercase()),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await?;
+    let tx = db.begin().await?;
+    Catalog::scan_on(
+        &tx,
+        &Collection::Association,
+        None,
+        sync_orm::row_policy::ScanLimits {
+            max_records: 128,
+            max_rows: 2,
+            max_bytes: 4096,
+            max_mutations: 1,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    let row = associations::Entity::find().one(&db).await?.unwrap();
+    assert_eq!(row.left, left.to_string());
+    assert_eq!(row.right, right.to_string());
     Ok(())
 }

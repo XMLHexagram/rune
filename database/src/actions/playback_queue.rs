@@ -2,14 +2,12 @@ use anyhow::Result;
 use sea_orm::{EntityTrait, QueryOrder, Set};
 use sea_orm::{TransactionTrait, prelude::*};
 
-use crate::entities::playback_queue;
+use crate::entities::playback_queue::{self, Entity as PlaybackQueueEntity};
 
 pub async fn replace_playback_queue(
     main_db: &DatabaseConnection,
     media_file_ids: Vec<i32>,
 ) -> Result<()> {
-    use playback_queue::Entity as PlaybackQueueEntity;
-
     let txn = main_db.begin().await?;
 
     PlaybackQueueEntity::delete_many().exec(&txn).await?;
@@ -27,9 +25,8 @@ pub async fn replace_playback_queue(
     Ok(())
 }
 
-pub async fn list_playback_queue(db: &DatabaseConnection) -> Result<Vec<i32>> {
-    use playback_queue::Entity as PlaybackQueueEntity;
-
+/// Read the old catalog table only for the one-time session migration.
+pub async fn list_legacy_playback_queue(db: &DatabaseConnection) -> Result<Vec<i32>> {
     let entries = PlaybackQueueEntity::find()
         .order_by_asc(playback_queue::Column::Id)
         .all(db)

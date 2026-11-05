@@ -1,13 +1,16 @@
+use support::fixtures;
+
 #[path = "support/causal_library.rs"]
 mod support;
-use anyhow::Result;
-use database::sync::{LibrarySyncStore, model::*};
+use anyhow::{Context, Result};
+use database::sync::model::*;
 use sea_orm::{
     ConnectionTrait, ExprTrait,
     sea_query::{Alias, Expr, Query},
 };
 use std::{
     collections::BTreeMap,
+    env::consts::{ARCH, OS},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -96,7 +99,7 @@ async fn source_build_measurement() -> Result<()> {
             entry.failed += usize::from(info.failed);
         }
     });
-    let measured = LibrarySyncStore::open(measured_db, actor, Some(namespace)).await?;
+    let measured = fixtures::open_library(measured_db, actor, Some(namespace)).await?;
     let source = measured.endpoint();
     let request = Uuid::new_v4();
     let mut cursor = None;
@@ -135,8 +138,8 @@ async fn source_build_measurement() -> Result<()> {
             WorkOutcome::Ready(_) => {
                 eprintln!(
                     "environment={} {} profile={} store=sqlite::memory: collections={} records={} elapsed_ms={}",
-                    std::env::consts::OS,
-                    std::env::consts::ARCH,
+                    OS,
+                    ARCH,
                     if cfg!(debug_assertions) {
                         "debug"
                     } else {
@@ -168,34 +171,10 @@ async fn source_build_measurement() -> Result<()> {
             }
         }
         let state: serde_json::Value = serde_json::from_slice(&data)?;
-        phase = if state["collection_index"].as_u64().unwrap()
-            < support::scope().collections.len() as u64
-        {
-            if state["union"]["phase"].is_string() {
-                state["union"]["phase"].as_str().unwrap()
-            } else if state["awaiting_union"].as_bool().unwrap_or(false) {
-                "context-begin"
-            } else if state["pending_context"].is_object()
-                || state["collection_end"].as_bool().unwrap_or(false)
-            {
-                "context-segment"
-            } else {
-                "context-boundary"
-            }
-        } else if !state["reversal"]["done"].as_bool().unwrap_or(false) {
-            "segment-order"
-        } else if state["partition_index"].as_u64().unwrap()
-            < support::scope().collections.len() as u64
-        {
-            "partitions"
-        } else if !state["root_promoted"].as_bool().unwrap_or(false) {
-            "root"
-        } else if !state["staging"]["done"].as_bool().unwrap_or(false) {
-            "staging"
-        } else {
-            "summaries"
-        }
-        .to_owned();
+        phase = state["phase"]
+            .as_str()
+            .context("snapshot work phase missing")?
+            .to_owned();
     }
     anyhow::bail!("source build did not finish")
 }

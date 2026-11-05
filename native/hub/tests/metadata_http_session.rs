@@ -1,12 +1,16 @@
 //! Real TCP metadata sessions with acknowledged writes whose replies are lost.
+use std::io::Error;
+use std::io::ErrorKind;
+use tokio::net::TcpListener;
 #[path = "support/causal_library.rs"]
 mod support;
 use anyhow::{Context, Result, ensure};
 use axum::{
     body::{Body, to_bytes},
     extract::{Request, State},
-    http::StatusCode,
-    middleware::{self, Next},
+    http::{StatusCode, header::CONTENT_LENGTH},
+    middleware,
+    middleware::Next,
     response::{IntoResponse, Response},
 };
 use database::sync::model::{Collection, Payload, Playlist, RuneModel};
@@ -78,14 +82,14 @@ async fn lose_reply(
         return response;
     };
     let (mut parts, body) = response.into_parts();
-    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    parts.headers.remove(CONTENT_LENGTH);
     let bytes = to_bytes(body, 32 * 1024 * 1024).await.unwrap();
     let body = match disturbance {
         Disturbance::Truncate => Body::from(bytes.slice(..bytes.len() / 2)),
         Disturbance::Reset => Body::from_stream(futures::stream::iter(vec![
             Ok(bytes.slice(..bytes.len().min(32))),
-            Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
+            Err(Error::new(
+                ErrorKind::ConnectionReset,
                 "injected connection reset",
             )),
         ])),
@@ -128,7 +132,7 @@ impl Endpoint {
             ..Default::default()
         }));
         let app = router(store).layer(middleware::from_fn_with_state(faults.clone(), lose_reply));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Ok(Self {
@@ -252,7 +256,7 @@ async fn first_contact_and_fragmented_tail_retry_committed_http_operations() -> 
         &[
             "open_snapshot",
             "begin_reconciliation",
-            "stage_context_page",
+            "promote_step",
             "stage_leaf_page",
             "commit_complete_range",
             "complete_reconciliation",
@@ -428,6 +432,7 @@ async fn sqlite_sessions_resume_through_truncation_reset_timeout_and_slow_respon
     );
     let mut coordinator = p::Coordinator::new(scope(), limits(65536))?;
     let mut errors = 0;
+    let mut invalid_responses = 0;
     let mut suspended = false;
     let mut complete = false;
     for step in 0..4096 {
@@ -454,11 +459,17 @@ async fn sqlite_sessions_resume_through_truncation_reset_timeout_and_slow_respon
             Ok(p::SessionAdvance::Incomplete) => (),
             Ok(other) => anyhow::bail!("unexpected session state: {other:?}"),
             Err(p::SyncError::Transport(_)) => errors += 1,
+            Err(p::SyncError::Invalid(message))
+                if message.starts_with("invalid metadata response:") =>
+            {
+                invalid_responses += 1;
+            }
             Err(error) => return Err(error.into()),
         }
     }
     ensure!(complete && suspended, "session failed to resume");
-    assert_eq!(errors, 6);
+    assert_eq!(errors, 4);
+    assert_eq!(invalid_responses, 2);
     assert_eq!(source_http.faults.lock().await.exercised.len(), 4);
     assert_eq!(target_http.faults.lock().await.exercised.len(), 4);
     assert_eq!(
@@ -554,7 +565,7 @@ async fn lost_batched_snapshot_reply_retries_old_cursor_and_preserves_view() -> 
         fault.clone(),
         lose_batched_snapshot_reply,
     ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
     let base = format!("http://{}", listener.local_addr()?);
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let peer = MetadataPeer::new(base, reqwest::Client::new());

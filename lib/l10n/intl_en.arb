@@ -1101,11 +1101,11 @@
   "@editDeviceInformationSubtitle": {
     "description": "Emphasize that changes affect visibility in others' scan lists. Avoid technical terms. Focus on 'scans' as interaction context."
   },
-  "enableBroadcast": "Enable Broadcast",
+  "enableBroadcast": "Visible to nearby devices",
   "@enableBroadcast": {
     "description": "'Broadcast' implies actively sending device info. If target language lacks direct equivalent, prioritize 'make visible' or 'share availability'."
   },
-  "enableBroadcastSubtitle": "Share your device information publicly for others to discover.",
+  "enableBroadcastSubtitle": "Let nearby devices find this device.",
   "@enableBroadcastSubtitle": {
     "description": "Avoid ambiguity: 'publicly' = to users in the local network, not the entire internet."
   },
@@ -1177,15 +1177,15 @@
       }
     }
   },
-  "server": "Server",
+  "server": "Sharing",
   "@server": {
     "description": "The settings page title for controlling media player sharing behaviors. Includes managing authorized users and broadcasting device presence."
   },
-  "serverControl": "Server Control",
+  "serverControl": "Allow other devices to connect",
   "@serverControl": {
     "description": "Section title for controlling the local network server. 'Server' here refers to the background service that handles device discovery."
   },
-  "serverControlSubtitle": "Start the server to allow other devices to discover this device on the local network.",
+  "serverControlSubtitle": "Let other devices connect to this device.",
   "@serverControlSubtitle": {
     "description": "Clarify that the server only operates on the local network. Emphasize that starting enables visibility to others."
   },
@@ -1209,7 +1209,7 @@
   "@unknownStatus": {
     "description": "Shown as a user/client status badge. Indicates the status is unrecognized or undefined. Suggest terms like 'Unrecognized' or 'Undefined' but maintain neutral tone without implying errors. Associated with neutral colors like grey in the UI."
   },
-  "review": "Review",
+  "review": "Respond",
   "@review": {
     "description": "Button to review pending device connection requests. Triggers a modal to approve or block the device."
   },
@@ -1217,11 +1217,11 @@
   "@reviewRequestTitle": {
     "description": "Title shown in the modal when reviewing a device connection. Keep concise, focus on action required."
   },
-  "blockDevice": "Block Device",
+  "blockDevice": "Block",
   "@blockDevice": {
     "description": "Action to permanently deny access. Use strong verbs like 'Ban' if culturally more appropriate, but avoid negative connotations."
   },
-  "allowAccess": "Allow Access",
+  "allowAccess": "My device",
   "@allowAccess": {
     "description": "Action to grant connection permission. Align with terms like 'Approve' or 'Authorize' if better suited to target language."
   },
@@ -1239,7 +1239,7 @@
       }
     }
   },
-  "allowAccessSubtitle": "Grant access to control playback and download tracks from this device.",
+  "allowAccessSubtitle": "This device can browse, play and sync your libraries.",
   "@allowAccessSubtitle": {
     "description": "Explains permissions granted when allowing access. Use 'Authorize' or 'Grant permissions' as alternatives. Clarify that 'download' refers to media content retrieval."
   },
@@ -1447,5 +1447,72 @@
   },
   "audioRemoteReference": "Remote audio (connection unknown)",
   "audioUnavailable": "Audio unavailable",
-  "audioImportPending": "Import in progress"
+  "audioImportPending": "Import in progress",
+  "allowPairedSync": "Allow paired devices to sync from this device",
+  "@allowPairedSync": {
+    "description": "Label for allowing incoming paired device sync"
+  },
+  "allowPairedSyncDescription": "Turning this off stops listening and LAN announcements. This device can still sync from others.",
+  "@allowPairedSyncDescription": {
+    "description": "Explanation of the incoming sync setting"
+  },
+  "audioSyncedCopy": "Synced copy",
+  "@audioSyncedCopy": {
+    "description": "Label for audio downloaded from a paired device."
+  },
+  "offlineCleanupDefault": "Delete downloaded files when they are no longer kept offline",
+  "@offlineCleanupDefault": {
+    "description": "Default option to clean up unneeded offline downloads."
+  },
+  "offlineCleanupDefaultDescription": "Choose the default for deleting unneeded downloads when stopping offline availability.",
+  "@offlineCleanupDefaultDescription": {
+    "description": "Explanation of the offline cleanup default."
+  },
+  "offlineCleanupCheckbox": "Also delete downloaded files that are no longer needed",
+  "@offlineCleanupCheckbox": {
+    "description": "Option to delete downloads no enabled offline rule needs."
+  },
+  "offlineSelectionCleaned": "Offline selection updated and cleanup attempted.",
+  "@offlineSelectionCleaned": {
+    "description": "Confirmation after attempting to clean up offline downloads."
+  },
+  "remoteOpenUntrusted": "This device does not trust that server yet. Pair it first.",
+  "remoteOpenNotAuthorized": "The other device has not allowed this device, or has blocked it.",
+  "remoteOpenUnreachable": "The device cannot be reached. Check that it is on and on the same network.",
+  "remoteOpenProtocol": "Could not talk to the device. Both devices need the same version of Rune.",
+  "remoteLossRevoked": "This device's access was removed.",
+  "remoteLossServerStopped": "The other device stopped sharing.",
+  "remoteLossNetworkLost": "The connection was lost.",
+  "deviceLibraries": "Libraries",
+  "addSharedLibrary": "Add",
+  "sharedLibraryAdded": "Added",
+  "openSharedLibrary": "Open",
+  "noSharedLibraries": "This device has no libraries to share",
+  "libraryFromDevice": "From {device}",
+  "backgroundLibrarySync": "Keep in sync in the background",
+  "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
+  "requestItemMissing": "This item no longer exists",
+  "requestInvalid": "The request was not valid",
+  "requestUnavailable": "This isn't available right now",
+  "mixNoLongerExists": "This mix no longer exists",
+  "devices": "Devices",
+  "thisDevice": "This device",
+  "devicesThatCanConnect": "Devices that can connect to this one",
+  "otherDevices": "Other devices",
+  "myDevice": "My device",
+  "waitingForApproval": "Waiting for approval",
+  "guest": "Guest",
+  "myDeviceAccessDescription": "Can play, browse and sync your libraries",
+  "guestAccessDescription": "Can control playback and browse while doing so",
+  "guestControlSummary": "Guest · Can control playback",
+  "customDeviceAccess": "Custom",
+  "customizeDevice": "Customize",
+  "controlPlayback": "Control playback",
+  "controlPlaybackDescription": "Can browse and queue while controlling",
+  "deviceAccessLibraries": "Libraries",
+  "deviceNotShared": "Not shared",
+  "deviceReadOnly": "Read only",
+  "deviceReadWrite": "Read and write",
+  "requestPermissionDenied": "This device isn't allowed to do that",
+  "readOnly": "Read only"
 }

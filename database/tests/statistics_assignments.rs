@@ -1,3 +1,5 @@
+use support::fixtures;
+
 #[path = "support/causal_library.rs"]
 mod support;
 use anyhow::Result;
@@ -6,8 +8,7 @@ use database::{
     entities::media_file_stats,
     sync::model::*,
 };
-use migration::{Migrator, MigratorTrait};
-use sea_orm::{ConnectionTrait, Database, EntityTrait};
+use sea_orm::{ConnectionTrait, EntityTrait};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -128,9 +129,7 @@ async fn mix_filters_and_orders_by_likes_and_per_device_totals() -> Result<()> {
     };
     use sea_orm::Set;
     let node = Uuid::new_v4();
-    let _ = migration::initialize_node_id(node.to_string());
-    let db = Database::connect("sqlite::memory:").await?;
-    Migrator::up(&db, None).await?;
+    let db = fixtures::memory_database(node).await?;
     for id in 1..=3 {
         media_files::Entity::insert(media_files::ActiveModel {
             id: Set(id),
@@ -172,10 +171,15 @@ async fn mix_filters_and_orders_by_likes_and_per_device_totals() -> Result<()> {
     let ids =
         |rows: Vec<media_files::Model>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
     assert_eq!(
-        ids(
-            query_mix_media_files(&db, &recommendations, query("filter::liked", "true"), 0, 10)
-                .await?
-        ),
+        ids(query_mix_media_files(
+            &db,
+            &recommendations,
+            query("filter::liked", "true"),
+            0,
+            10,
+            &[]
+        )
+        .await?),
         [3]
     );
     assert_eq!(
@@ -184,16 +188,22 @@ async fn mix_filters_and_orders_by_likes_and_per_device_totals() -> Result<()> {
             &recommendations,
             query("filter::liked", "false"),
             0,
-            10
+            10,
+            &[]
         )
         .await?),
         [1, 2]
     );
     assert_eq!(
-        ids(
-            query_mix_media_files(&db, &recommendations, query("sort::skipped", "true"), 0, 10)
-                .await?
-        ),
+        ids(query_mix_media_files(
+            &db,
+            &recommendations,
+            query("sort::skipped", "true"),
+            0,
+            10,
+            &[]
+        )
+        .await?),
         [1, 3, 2]
     );
     assert_eq!(
@@ -202,7 +212,8 @@ async fn mix_filters_and_orders_by_likes_and_per_device_totals() -> Result<()> {
             &recommendations,
             query("sort::playedthrough", "true"),
             0,
-            10
+            10,
+            &[]
         )
         .await?),
         [1, 2, 3]
@@ -218,6 +229,7 @@ async fn mix_filters_and_orders_by_likes_and_per_device_totals() -> Result<()> {
         ],
         0,
         10,
+        &[],
     )
     .await?;
     assert_eq!(ids(recommended), [1, 2, 3]);

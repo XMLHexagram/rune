@@ -1,18 +1,13 @@
 mod cli;
 
-#[cfg(target_os = "android")]
 use std::path::Path;
-use std::{
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use log::info;
 use rustls::crypto::ring::default_provider;
-use tokio::sync::{Mutex, RwLock};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 use cli::{
@@ -20,18 +15,15 @@ use cli::{
     server::handle_server,
 };
 use hub::{
-    server::{ServerManager, WebSocketService},
-    utils::{
-        GlobalParams, RunningMode, TaskTokens, initialize_databases, nid::get_or_create_node_id,
-        player::initialize_local_player,
-    },
+    node::initialize_node,
+    server::WebSocketService,
+    utils::{GlobalParams, RunningMode, TaskTokens},
 };
 
-use ::database::connection::{MainDbConnection, RecommendationDbConnection};
-use ::discovery::{client::CertValidator, protocol::DiscoveryService, server::PermissionManager};
+use ::database::connection::check_storage_mode;
+use ::database::library_registry::{LibraryRegistry, resolve_library};
 use ::fsio::FsIo;
-use ::playback::{player::Player, sfx_player::SfxPlayer};
-use ::scrobbling::manager::ScrobblingManager;
+use ::playback::sfx_player::SfxPlayer;
 
 #[derive(Parser)]
 #[command(name = "Rune", author = "Rune Developers", version)]
@@ -115,60 +107,46 @@ async fn initialize_global_params(lib_path: &str, config_path: &str) -> Result<A
     #[cfg(target_os = "android")]
     let fsio = Arc::new(FsIo::new(Path::new(".rune/.android-fs.db"), &lib_path)?);
 
-    let db_path = format!("{lib_path}/.rune");
-    let node_id = Arc::new(get_or_create_node_id(config_path).await?.to_string());
+    let node = initialize_node(config_path, config_path, Arc::new(WebSocketService::new())).await?;
+    let node_id = node.node_id.clone();
 
-    let db_connections = initialize_databases(&fsio, lib_path, Some(&db_path), &node_id).await?;
+    let mode = check_storage_mode(&fsio, lib_path)?;
+    let mut registry = LibraryRegistry::load(Path::new(config_path))?;
+    let descriptor = resolve_library(&fsio, &mut registry, lib_path, "", mode).await?;
+    info!("Resolved library id: {}", descriptor.library_id);
 
-    let main_db: Arc<MainDbConnection> = db_connections.main_db;
-    let recommend_db: Arc<RecommendationDbConnection> = db_connections.recommend_db;
-    let lib_path: Arc<String> = Arc::new(lib_path.to_string());
-    let config_path: Arc<String> = Arc::new(config_path.to_string());
+    let pool = node.library_pool.clone();
+    let library = pool.acquire_ui(descriptor.library_id).await?;
+    let config_path = node.config_path.clone();
 
-    let main_cancel_token = CancellationToken::new();
-    let library_sync = hub::utils::initialize_library_replica(&main_db, &node_id).await?;
+    let main_cancel_token = node.token.child_token();
     let task_tokens: Arc<Mutex<TaskTokens>> = Arc::new(Mutex::new(TaskTokens::default()));
 
     info!("Initializing player");
-    let player = Player::new(Arc::clone(&fsio), Some(main_cancel_token.clone()));
-    let player: Arc<Mutex<Player>> = Arc::new(Mutex::new(player));
+    let session = node.session()?;
+    session.migrate_legacy(&library).await?;
+    let player = session.player.clone();
+    let scrobbler = session.scrobbler.clone();
 
     let sfx_player = SfxPlayer::new(Some(main_cancel_token.clone()));
     let sfx_player: Arc<Mutex<SfxPlayer>> = Arc::new(Mutex::new(sfx_player));
 
     let main_cancel_token = Arc::new(main_cancel_token);
 
-    let scrobbler = ScrobblingManager::new(10, Duration::new(5, 0));
-    let scrobbler = Arc::new(Mutex::new(scrobbler));
-
-    let broadcaster = Arc::new(WebSocketService::new());
-    let device_scanner = Arc::new(DiscoveryService::without_store());
-
-    let permission_manager = Arc::new(RwLock::new(PermissionManager::new(config_path.as_str())?));
-    let cert_validator = Arc::new(RwLock::new(CertValidator::new(config_path.as_str()).await?));
-
-    info!("Initializing Player events");
-    tokio::spawn(initialize_local_player(
-        fsio.clone(),
-        lib_path.clone(),
-        main_db.clone(),
-        library_sync.record_store(),
-        library_sync.record_store().author(),
-        player.clone(),
-        scrobbler.clone(),
-        broadcaster.clone(),
-        cert_validator.clone(),
-        permission_manager.clone(),
-    ));
+    let broadcaster = node.broadcaster.clone();
+    let device_scanner = node.device_scanner.clone();
+    let permission_manager = node.permission_manager.clone();
+    let cert_validator = node.cert_validator.clone();
 
     let global_params = Arc::new(GlobalParams {
-        fsio,
-        lib_path,
+        node: node.clone(),
+        library_id: Some(descriptor.library_id),
+        library_pool: pool,
+        library: Some(library.clone()),
+        ui_library: Arc::new(Mutex::new(Some(library))),
+        sync_settings: node.sync_settings.clone(),
         config_path,
         node_id,
-        main_db,
-        library_sync: Some(library_sync),
-        recommend_db,
         main_token: main_cancel_token,
         task_tokens,
         player,
@@ -182,11 +160,12 @@ async fn initialize_global_params(lib_path: &str, config_path: &str) -> Result<A
         running_mode: RunningMode::Server,
     });
 
-    let server_manager = Arc::new(ServerManager::new(global_params.clone()).await?);
+    let server_manager = node.manager()?;
+    node.attach_ui(&global_params).await;
     global_params
         .server_manager
         .set(server_manager.clone())
-        .expect("Failed to set server manager in global params");
+        .map_err(|_| anyhow::anyhow!("Library server already initialized"))?;
 
     Ok(global_params)
 }

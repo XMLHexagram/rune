@@ -1,46 +1,49 @@
+use crate::request_error::ExpectedRequestError;
+use database::actions::cover_art::bake_cover_art_by_media_files;
+use database::actions::metadata::get_metadata_summary_by_files;
+use database::actions::playlists::{
+    OccurrenceCursor, add_item_to_playlist, create_m3u8_playlist, create_playlist,
+    list_occurrences, remove_item_from_playlist, remove_playlist, reorder_playlist_item_position,
+    update_playlist,
+};
+use database::error::ExpectedError;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use uuid::Uuid;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 
-use ::database::actions::playlists::{get_all_playlists, get_playlist_by_id};
-use ::database::connection::MainDbConnection;
-
-use crate::utils::{GlobalParams, ParamsExtractor};
+use crate::library_pool::LibraryHandle;
+use crate::utils::{GlobalParams, ParamsExtractor, require_library};
 use crate::{Session, Signal, messages::*};
+use ::database::actions::playlists::{get_all_playlists, get_playlist_by_id};
 
-type PlaylistArgs = (
-    Arc<MainDbConnection>,
-    Option<database::sync::SeaOrmSyncStore>,
-    Arc<String>,
-);
+type PlaylistArgs = Option<LibraryHandle>;
 
 fn playlist_args(params: &GlobalParams) -> PlaylistArgs {
-    (
-        params.main_db.clone(),
-        params.library_sync.as_ref().map(|sync| sync.record_store()),
-        params.node_id.clone(),
-    )
+    params.library.clone()
 }
 
 impl ParamsExtractor for FetchAllPlaylistsRequest {
-    type Params = (Arc<MainDbConnection>,);
+    type Params = Option<LibraryHandle>;
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (Arc::clone(&all_params.main_db),)
+        all_params.library.clone()
     }
 }
 
 impl Signal for FetchAllPlaylistsRequest {
-    type Params = (Arc<MainDbConnection>,);
+    type Params = Option<LibraryHandle>;
     type Response = FetchAllPlaylistsResponse;
     async fn handle(
         &self,
-        (main_db,): Self::Params,
+        library: Self::Params,
         _session: Option<Session>,
         _dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        let playlists = get_all_playlists(&main_db)
+        let library = require_library(library)?;
+        let playlists = get_all_playlists(&library.main_db)
             .await
             .with_context(|| "Failed to fetch all playlists")?;
 
@@ -58,43 +61,31 @@ impl Signal for FetchAllPlaylistsRequest {
 }
 
 impl ParamsExtractor for CreatePlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            playlist_args(all_params),
-            all_params.broadcaster.clone(),
-            all_params.lib_path.clone(),
-        )
+        (playlist_args(all_params), all_params.broadcaster.clone())
     }
 }
 
 impl Signal for CreatePlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
     type Response = CreatePlaylistResponse;
     async fn handle(
         &self,
-        ((db, store, actor), broadcaster, path): Self::Params,
+        (library, broadcaster): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
+        let library = require_library(library)?;
         let request = dart_signal;
 
         let name = &request.name;
         let group = &request.group;
 
-        let playlist = database::actions::playlists::create_playlist(
-            &db,
-            &store.context("playlist store unavailable")?,
-            actor.parse()?,
+        let playlist = create_playlist(
+            &library.main_db,
+            &library.library_sync.record_store(),
             name.clone(),
             group.clone(),
         )
@@ -102,7 +93,7 @@ impl Signal for CreatePlaylistRequest {
         .with_context(|| format!("Failed to create playlist: name={name}, group={group}"))?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: path.to_string(),
+            path: library.media_root.clone(),
         });
         Ok(Some(CreatePlaylistResponse {
             playlist: Playlist {
@@ -115,43 +106,31 @@ impl Signal for CreatePlaylistRequest {
 }
 
 impl ParamsExtractor for UpdatePlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            playlist_args(all_params),
-            all_params.broadcaster.clone(),
-            all_params.lib_path.clone(),
-        )
+        (playlist_args(all_params), all_params.broadcaster.clone())
     }
 }
 
 impl Signal for UpdatePlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
     type Response = UpdatePlaylistResponse;
     async fn handle(
         &self,
-        ((db, store, actor), broadcaster, path): Self::Params,
+        (library, broadcaster): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
+        let library = require_library(library)?;
         let request = dart_signal;
 
         let name = &request.name;
         let group = &request.group;
 
-        let playlist = database::actions::playlists::update_playlist(
-            &db,
-            &store.context("playlist store unavailable")?,
-            actor.parse()?,
+        let playlist = update_playlist(
+            &library.main_db,
+            &library.library_sync.record_store(),
             request.playlist_id,
             Some(name.clone()),
             Some(group.clone()),
@@ -165,7 +144,7 @@ impl Signal for UpdatePlaylistRequest {
         })?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: path.to_string(),
+            path: library.media_root.clone(),
         });
         Ok(Some(UpdatePlaylistResponse {
             playlist: Playlist {
@@ -178,46 +157,35 @@ impl Signal for UpdatePlaylistRequest {
 }
 
 impl ParamsExtractor for RemovePlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            playlist_args(all_params),
-            all_params.broadcaster.clone(),
-            all_params.lib_path.clone(),
-        )
+        (playlist_args(all_params), all_params.broadcaster.clone())
     }
 }
 
 impl Signal for RemovePlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
     type Response = RemovePlaylistResponse;
     async fn handle(
         &self,
-        ((db, store, _actor), broadcaster, path): Self::Params,
+        (library, broadcaster): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
+        let library = require_library(library)?;
         let request = dart_signal;
 
-        database::actions::playlists::remove_playlist(
-            &db,
-            &store.context("playlist store unavailable")?,
+        remove_playlist(
+            &library.main_db,
+            &library.library_sync.record_store(),
             request.playlist_id,
         )
         .await
         .with_context(|| format!("Removing playlist: id={}", request.playlist_id))?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: path.to_string(),
+            path: library.media_root.clone(),
         });
         Ok(Some(RemovePlaylistResponse {
             playlist_id: request.playlist_id,
@@ -227,40 +195,28 @@ impl Signal for RemovePlaylistRequest {
 }
 
 impl ParamsExtractor for AddItemToPlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            playlist_args(all_params),
-            all_params.broadcaster.clone(),
-            all_params.lib_path.clone(),
-        )
+        (playlist_args(all_params), all_params.broadcaster.clone())
     }
 }
 
 impl Signal for AddItemToPlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
     type Response = AddItemToPlaylistResponse;
     async fn handle(
         &self,
-        ((db, store, actor), broadcaster, path): Self::Params,
+        (library, broadcaster): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
+        let library = require_library(library)?;
         let request = dart_signal;
 
-        let entry = database::actions::playlists::add_item_to_playlist(
-            &db,
-            &store.context("playlist store unavailable")?,
-            actor.parse()?,
+        let entry = add_item_to_playlist(
+            &library.main_db,
+            &library.library_sync.record_store(),
             request.playlist_id,
             request.media_file_id,
             request.position,
@@ -274,7 +230,7 @@ impl Signal for AddItemToPlaylistRequest {
         })?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: path.to_string(),
+            path: library.media_root.clone(),
         });
         Ok(Some(AddItemToPlaylistResponse {
             success: true,
@@ -284,39 +240,28 @@ impl Signal for AddItemToPlaylistRequest {
 }
 
 impl ParamsExtractor for ReorderPlaylistItemPositionRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            playlist_args(all_params),
-            all_params.broadcaster.clone(),
-            all_params.lib_path.clone(),
-        )
+        (playlist_args(all_params), all_params.broadcaster.clone())
     }
 }
 
 impl Signal for ReorderPlaylistItemPositionRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
     type Response = ReorderPlaylistItemPositionResponse;
     async fn handle(
         &self,
-        ((db, store, actor), broadcaster, path): Self::Params,
+        (library, broadcaster): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
+        let library = require_library(library)?;
         let request = dart_signal;
 
-        database::actions::playlists::reorder_playlist_item_position(
-            &db, &store.context("playlist store unavailable")?, actor.parse()?, request.playlist_id,
-            request.occurrence_id.parse().context("invalid occurrence UUID")?,
+        reorder_playlist_item_position(
+            &library.main_db, &library.library_sync.record_store(), request.playlist_id,
+            parse_occurrence_id(&request.occurrence_id)?,
             request.new_position,
         )
         .await
@@ -328,38 +273,37 @@ impl Signal for ReorderPlaylistItemPositionRequest {
         })?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: path.to_string(),
+            path: library.media_root.clone(),
         });
         Ok(Some(ReorderPlaylistItemPositionResponse { success: true }))
     }
 }
 
 impl ParamsExtractor for GetPlaylistByIdRequest {
-    type Params = (Arc<MainDbConnection>,);
+    type Params = Option<LibraryHandle>;
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (Arc::clone(&all_params.main_db),)
+        all_params.library.clone()
     }
 }
 
 impl Signal for GetPlaylistByIdRequest {
-    type Params = (Arc<MainDbConnection>,);
+    type Params = Option<LibraryHandle>;
     type Response = GetPlaylistByIdResponse;
     async fn handle(
         &self,
-        (main_db,): Self::Params,
+        library: Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
+        let library = require_library(library)?;
         let request = dart_signal;
 
-        let playlist = get_playlist_by_id(&main_db, request.playlist_id)
+        let playlist = get_playlist_by_id(&library.main_db, request.playlist_id)
             .await
             .with_context(|| format!("Failed to get playlist by id: {}", request.playlist_id))?
-            .ok_or(anyhow!(
-                "Playlist not found with id: {}",
-                request.playlist_id
-            ))?;
+            .ok_or(ExpectedError::NotFound { what: "playlist" })
+            .with_context(|| format!("Playlist not found with id: {}", request.playlist_id))?;
 
         Ok(Some(GetPlaylistByIdResponse {
             playlist: Playlist {
@@ -372,44 +316,32 @@ impl Signal for GetPlaylistByIdRequest {
 }
 
 impl ParamsExtractor for CreateM3u8PlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            playlist_args(all_params),
-            all_params.broadcaster.clone(),
-            all_params.lib_path.clone(),
-        )
+        (playlist_args(all_params), all_params.broadcaster.clone())
     }
 }
 
 impl Signal for CreateM3u8PlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
     type Response = CreateM3u8PlaylistResponse;
     async fn handle(
         &self,
-        ((db, store, actor), broadcaster, library_path): Self::Params,
+        (library, broadcaster): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
+        let library = require_library(library)?;
         let request = dart_signal;
 
         let name = &request.name;
         let group = &request.group;
         let path = &request.path;
 
-        match database::actions::playlists::create_m3u8_playlist(
-            &db,
-            &store.context("playlist store unavailable")?,
-            actor.parse()?,
+        match create_m3u8_playlist(
+            &library.main_db,
+            &library.library_sync.record_store(),
             name.clone(),
             group.clone(),
             Path::new(&path),
@@ -418,7 +350,7 @@ impl Signal for CreateM3u8PlaylistRequest {
         {
             Ok((playlist, import_result)) => {
                 broadcaster.broadcast(&LibraryContentChanged {
-                    path: library_path.to_string(),
+                    path: library.media_root.clone(),
                 });
                 Ok(Some(CreateM3u8PlaylistResponse {
                     playlist: Some(Playlist {
@@ -444,52 +376,37 @@ impl Signal for CreateM3u8PlaylistRequest {
 }
 
 impl ParamsExtractor for RemoveItemFromPlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            playlist_args(all_params),
-            all_params.broadcaster.clone(),
-            all_params.lib_path.clone(),
-        )
+        (playlist_args(all_params), all_params.broadcaster.clone())
     }
 }
 
 impl Signal for RemoveItemFromPlaylistRequest {
-    type Params = (
-        PlaylistArgs,
-        Arc<dyn crate::utils::Broadcaster>,
-        Arc<String>,
-    );
+    type Params = (PlaylistArgs, Arc<dyn crate::utils::Broadcaster>);
     type Response = RemoveItemFromPlaylistResponse;
 
     async fn handle(
         &self,
-        ((db, store, actor), broadcaster, path): Self::Params,
+        (library, broadcaster): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
+        let library = require_library(library)?;
         let request = dart_signal;
 
-        match database::actions::playlists::remove_item_from_playlist(
-            &db,
-            &store.context("playlist store unavailable")?,
-            actor.parse()?,
+        match remove_item_from_playlist(
+            &library.main_db,
+            &library.library_sync.record_store(),
             request.playlist_id,
-            request
-                .occurrence_id
-                .parse()
-                .context("invalid occurrence UUID")?,
+            parse_occurrence_id(&request.occurrence_id)?,
         )
         .await
         {
             Ok(_) => {
                 broadcaster.broadcast(&LibraryContentChanged {
-                    path: path.to_string(),
+                    path: library.media_root.clone(),
                 });
                 Ok(Some(RemoveItemFromPlaylistResponse {
                     success: true,
@@ -505,46 +422,29 @@ impl Signal for RemoveItemFromPlaylistRequest {
 }
 
 impl ParamsExtractor for FetchPlaylistOccurrencesRequest {
-    type Params = (
-        Arc<fsio::FsIo>,
-        Arc<MainDbConnection>,
-        Arc<String>,
-        Arc<String>,
-    );
+    type Params = (Option<LibraryHandle>, Arc<String>);
     fn extract_params(&self, params: &GlobalParams) -> Self::Params {
-        (
-            params.fsio.clone(),
-            params.main_db.clone(),
-            params.lib_path.clone(),
-            params.node_id.clone(),
-        )
+        (params.library.clone(), params.node_id.clone())
     }
 }
 
 impl Signal for FetchPlaylistOccurrencesRequest {
-    type Params = (
-        Arc<fsio::FsIo>,
-        Arc<MainDbConnection>,
-        Arc<String>,
-        Arc<String>,
-    );
+    type Params = (Option<LibraryHandle>, Arc<String>);
     type Response = FetchPlaylistOccurrencesResponse;
     async fn handle(
         &self,
-        (fsio, db, root, node): Self::Params,
+        (library, node): Self::Params,
         _session: Option<Session>,
         request: &Self,
     ) -> Result<Option<Self::Response>> {
-        let page = database::actions::playlists::list_occurrences(
-            &db,
+        let library = require_library(library)?;
+        let page = list_occurrences(
+            &library.main_db,
             request.playlist_id,
-            request
-                .after
-                .as_ref()
-                .map(|cursor| database::actions::playlists::OccurrenceCursor {
-                    position: cursor.position,
-                    occurrence_id: cursor.occurrence_id.clone(),
-                }),
+            request.after.as_ref().map(|cursor| OccurrenceCursor {
+                position: cursor.position,
+                occurrence_id: cursor.occurrence_id.clone(),
+            }),
             request.page_size,
         )
         .await?;
@@ -553,19 +453,23 @@ impl Signal for FetchPlaylistOccurrencesRequest {
             .iter()
             .filter_map(|entry| entry.file.clone())
             .collect::<Vec<_>>();
-        let summaries = database::actions::metadata::get_metadata_summary_by_files(
-            db.as_ref(),
-            source_files.clone(),
+        let summaries =
+            get_metadata_summary_by_files(library.main_db.as_ref(), source_files.clone()).await?;
+        let root = Arc::new(library.media_root.clone());
+        let files = crate::utils::parse_media_files(
+            &library.fsio,
+            &library.main_db,
+            &node,
+            summaries,
+            root,
         )
         .await?;
-        let files = crate::utils::parse_media_files(&fsio, &db, &node, summaries, root).await?;
         let files: std::collections::HashMap<_, _> =
             files.into_iter().map(|file| (file.id, file)).collect();
         let cover_art_map = if request.bake_cover_arts {
-            database::actions::cover_art::bake_cover_art_by_media_files(&fsio, &db, source_files)
-                .await?
+            bake_cover_art_by_media_files(&library.fsio, &library.main_db, source_files).await?
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
         Ok(Some(FetchPlaylistOccurrencesResponse {
             request_id: request.request_id.clone(),
@@ -585,5 +489,27 @@ impl Signal for FetchPlaylistOccurrencesRequest {
             }),
             cover_art_map,
         }))
+    }
+}
+
+fn parse_occurrence_id(value: &str) -> Result<Uuid> {
+    value
+        .parse()
+        .map_err(|error| {
+            ExpectedRequestError::invalid_input(format!("invalid occurrence UUID: {error}"))
+        })
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod request_error_tests {
+    use super::parse_occurrence_id;
+    use crate::{messages::RequestErrorKind, request_error::classify};
+
+    #[test]
+    fn invalid_occurrence_uuid_is_invalid_input() {
+        let error = parse_occurrence_id("not-a-uuid").unwrap_err();
+        assert!(format!("{error:#}").contains("invalid occurrence UUID"));
+        assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
     }
 }

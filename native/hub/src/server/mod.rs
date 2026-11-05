@@ -1,19 +1,27 @@
 #[macro_use]
 mod server_request;
+mod access;
 pub mod api;
 pub mod http;
+pub(crate) mod libraries;
 mod manager;
 pub mod sync;
 mod sync_auth;
-mod sync_worker;
+pub(crate) mod sync_worker;
+pub use sync_worker::PairedAudioResolver;
 pub mod utils;
 
-use fsio::FsIo;
 pub use manager::{
     ServerManager, generate_or_load_certificates, get_or_generate_alias, update_root_password,
 };
 
-use std::{collections::HashMap, future::Future, path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, Weak},
+};
 
 use anyhow::Result;
 use log::error;
@@ -24,6 +32,7 @@ use ::discovery::{protocol::DiscoveryService, server::PermissionManager, utils::
 use crate::{
     Session,
     backends::remote::encode_message,
+    node::NodeContext,
     utils::{Broadcaster, RinfRustSignal},
 };
 
@@ -36,18 +45,18 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type BroadcastTx = broadcast::Sender<Vec<u8>>;
 
 pub struct AppState {
-    pub lib_path: PathBuf,
     pub cover_temp_dir: PathBuf,
 }
 
 #[derive(Clone)]
 pub struct ServerState {
+    pub node: Weak<NodeContext>,
     pub app_state: Arc<AppState>,
     pub websocket_service: Arc<WebSocketService>,
+    pub session_cancel: tokio_util::sync::CancellationToken,
     pub discovery_device_info: Arc<RwLock<DeviceInfo>>,
     pub permission_manager: Arc<RwLock<PermissionManager>>,
     pub device_scanner: Arc<DiscoveryService>,
-    pub fsio: Arc<FsIo>,
 }
 
 pub struct WebSocketService {

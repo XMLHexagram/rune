@@ -1,8 +1,6 @@
 use anyhow::{Context as _, Result};
 use std::collections::BTreeSet;
-use sync::causal::{
-    Candidate, CausalMap, CompleteRange, Context, Dot, KeyRange, Limits, MAX_DOT_COUNTER,
-};
+use sync::causal::{Candidate, CausalMap, Context, Dot, KeyRange, Limits, MAX_DOT_COUNTER};
 use uuid::Uuid;
 type Map = CausalMap<u32, u32, u64>;
 fn dot(actor: u128, n: u64) -> Dot {
@@ -27,6 +25,25 @@ fn context(dots: &[Dot]) -> Context {
         c.insert(*d).unwrap();
     }
     c
+}
+type MapSnapshot = (Vec<(u32, Candidate<u32, u64>)>, Context);
+trait Snapshot {
+    fn snapshot(&self) -> MapSnapshot;
+}
+impl Snapshot for Map {
+    fn snapshot(&self) -> MapSnapshot {
+        (self.live_entries(), self.base().clone())
+    }
+}
+fn merge_leaf(target: &mut Map, source: &Map, range: KeyRange<u32>) -> Result<()> {
+    let incoming: Vec<_> = source
+        .live_entries()
+        .into_iter()
+        .filter(|(key, _)| range.contains(key))
+        .collect();
+    let (added, observed) = target.plan_leaf(&range, &incoming, source.base())?;
+    target.apply_merge(&added, &observed)?;
+    Ok(())
 }
 fn seed(s: &mut u64) -> u64 {
     *s = s
@@ -89,18 +106,20 @@ fn concurrent_remove_readd_and_immutable_collision() -> Result<()> {
     remove.remove(&1);
     remove.assign(1, cand(3, 1, 30))?;
     assert_eq!(remove.winner(&1).unwrap().value, 30);
-    let old = remove.export()?;
-    let bad = CompleteRange {
-        range: rg(None, None),
-        context: context(&[dot(3, 1), dot(4, 1)]),
-        candidates: vec![(2, cand(4, 1, 5)), (1, cand(3, 1, 999))],
-    };
-    assert!(remove.merge_range(&bad).is_err());
-    assert_eq!(old, remove.export()?);
+    let old = remove.snapshot();
+    assert!(
+        remove
+            .apply_merge(
+                &[(2, cand(4, 1, 5)), (1, cand(3, 1, 999))],
+                &Context::default()
+            )
+            .is_err()
+    );
+    assert_eq!(old, remove.snapshot());
     Ok(())
 }
 #[test]
-fn receipt_relay_gaps_and_ranges() -> Result<()> {
+fn receipt_relay_gaps_and_leaf_merges() -> Result<()> {
     let stale = dot(1, 1);
     let unseen = dot(1, 2);
     let mut src = map();
@@ -108,33 +127,24 @@ fn receipt_relay_gaps_and_ranges() -> Result<()> {
     src.remove(&1);
     src.assign(8, cand(1, 2, 80))?;
     let mut mid = map();
-    let first = CompleteRange {
-        range: rg(None, Some(5)),
-        context: src.effective_context(&1)?,
-        candidates: vec![],
-    };
-    assert!(mid.merge_range(&first)?);
-    assert!(!mid.merge_range(&first)?);
+    // Only source-dead dots can travel without their live evidence.
+    let dead = src.base().difference(&src.live_dots())?;
+    assert!(mid.apply_merge(&[], &dead)?);
+    assert!(!mid.apply_merge(&[], &dead)?);
+    assert!(!mid.base().contains(unseen));
     let mut old = map();
     old.assign(1, cand(1, 1, 10))?;
-    for p in mid.export()? {
-        old.merge_range(&p)?;
-    }
+    old.apply_merge(&[], mid.base())?;
     assert!(old.winner(&1).is_none());
     let mut third = map();
     third.assign(1, cand(1, 1, 10))?;
-    for p in old.export()? {
-        third.merge_range(&p)?;
-    }
+    third.apply_merge(&[], old.base())?;
     assert!(third.winner(&1).is_none());
-    let part = CompleteRange {
-        range: rg(Some(5), None),
-        context: context(&[stale, unseen]),
-        candidates: vec![(8, cand(1, 2, 80))],
-    };
-    mid.merge_range(&part)?;
+    let (added, observed) =
+        mid.plan_leaf(&rg(Some(5), None), &[(8, cand(1, 2, 80))], src.base())?;
+    mid.apply_merge(&added, &observed)?;
     assert_eq!(mid.winner(&8).unwrap().value, 80);
-    assert!(mid.effective_context(&1)?.contains(stale));
+    assert!(mid.base().contains(stale));
     Ok(())
 }
 #[test]
@@ -165,16 +175,8 @@ fn algebra_for_seeded_reachable_states() -> Result<()> {
             "seed={INITIAL_SEED} trial={trial} trace_seed={trace_seed}"
         );
         covered[1] += 1;
-        let segment = CompleteRange {
-            range: rg(Some(0), Some(1)),
-            context: states[0].effective_context(&0)?,
-            candidates: states[0]
-                .candidates(&0)
-                .cloned()
-                .map(|candidate| (0, candidate))
-                .collect(),
-        };
-        states[2].merge_range(&segment)?;
+        let source = states[0].clone();
+        merge_leaf(&mut states[2], &source, rg(Some(0), Some(1)))?;
         covered[3] += 1;
         // Fixed four high-bit draws per step, independent of the chosen branch.
         for step in 0..48 {
@@ -201,27 +203,14 @@ fn algebra_for_seeded_reachable_states() -> Result<()> {
                 }
                 3 => {
                     let other = states[peer].clone();
-                    if !other
-                        .export()?
-                        .iter()
-                        .all(|part| part.candidates.is_empty())
-                    {
+                    if !other.live_entries().is_empty() {
                         covered[2] += 1;
                     }
                     states[writer].merge(&other).with_context(|| format!("merge seed={INITIAL_SEED} trial={trial} trace_seed={trace_seed} step={step}"))?;
                 }
                 _ => {
                     let other = states[peer].clone();
-                    let segment = CompleteRange {
-                        range: rg(Some(key), Some(key + 1)),
-                        context: other.effective_context(&key)?,
-                        candidates: other
-                            .candidates(&key)
-                            .cloned()
-                            .map(|candidate| (key, candidate))
-                            .collect(),
-                    };
-                    states[writer].merge_range(&segment).with_context(|| format!("range seed={INITIAL_SEED} trial={trial} trace_seed={trace_seed} step={step}"))?;
+                    merge_leaf(&mut states[writer], &other, rg(Some(key), Some(key + 1))).with_context(|| format!("range seed={INITIAL_SEED} trial={trial} trace_seed={trace_seed} step={step}"))?;
                     covered[3] += 1;
                 }
             }
@@ -232,18 +221,13 @@ fn algebra_for_seeded_reachable_states() -> Result<()> {
         victim.assign(1, cand(writer, 1, 10))?;
         let mut conflicting = map();
         conflicting.assign(8, cand(writer, 1, 80))?;
-        conflicting.merge_range(&CompleteRange {
-            range: rg(None, Some(5)),
-            context: context(&[dot(writer + 1000, 1)]),
-            candidates: vec![],
-        })?;
-        let before = victim.export()?;
+        let before = victim.snapshot();
         assert!(
             victim.merge(&conflicting).is_err(),
             "collision seed={INITIAL_SEED} trial={trial} trace_seed={trace_seed}"
         );
         assert_eq!(
-            victim.export()?,
+            victim.snapshot(),
             before,
             "collision atomicity seed={INITIAL_SEED} trial={trial} trace_seed={trace_seed}"
         );
@@ -260,8 +244,8 @@ fn algebra_for_seeded_reachable_states() -> Result<()> {
         let mut ba = states[1].clone();
         ba.merge(&states[0])?;
         assert_eq!(
-            ab.export()?,
-            ba.export()?,
+            ab.snapshot(),
+            ba.snapshot(),
             "commutative seed={INITIAL_SEED} trial={trial} trace_seed={trace_seed}"
         );
         let mut id = states[0].clone();
@@ -276,8 +260,8 @@ fn algebra_for_seeded_reachable_states() -> Result<()> {
         let mut rhs = states[0].clone();
         rhs.merge(&bc)?;
         assert_eq!(
-            lhs.export()?,
-            rhs.export()?,
+            lhs.snapshot(),
+            rhs.snapshot(),
             "associative seed={INITIAL_SEED} trial={trial} trace_seed={trace_seed}"
         );
     }
@@ -291,116 +275,81 @@ fn algebra_for_seeded_reachable_states() -> Result<()> {
     Ok(())
 }
 #[test]
-fn range_validation_and_resource_failure_are_atomic() -> Result<()> {
+fn leaf_validation_and_resource_failure_are_atomic() -> Result<()> {
     assert!(KeyRange::new(Some(5u32), Some(5)).is_err());
     let mut m = Map::new(Limits {
         max_live: 1,
         ..Limits::default()
     })?;
     m.assign(1, cand(1, 1, 1))?;
-    let old = m.export()?;
+    let old = m.snapshot();
     assert!(m.assign(2, cand(2, 1, 2)).is_err());
-    assert_eq!(old, m.export()?);
-    let bad = CompleteRange {
-        range: rg(Some(2), Some(3)),
-        context: context(&[dot(4, 1)]),
-        candidates: vec![(9, cand(4, 1, 1))],
-    };
-    assert!(m.merge_range(&bad).is_err());
-    assert_eq!(old, m.export()?);
+    assert_eq!(old, m.snapshot());
+    assert!(
+        m.plan_leaf(
+            &rg(Some(2), Some(3)),
+            &[(9, cand(4, 1, 1))],
+            &context(&[dot(4, 1)])
+        )
+        .is_err()
+    );
+    assert_eq!(old, m.snapshot());
+    assert!(
+        m.apply_merge(&[(2, cand(4, 1, 1))], &Context::default())
+            .is_err()
+    );
+    assert_eq!(old, m.snapshot());
     Ok(())
 }
 #[test]
-fn semantic_equal_partitions_and_steady_state() -> Result<()> {
+fn semantic_equal_merge_chunks_and_steady_state() -> Result<()> {
     let ctx = context(&[dot(9, 1), dot(9, 3)]);
     let mut a = map();
     let mut b = map();
-    a.merge_range(&CompleteRange {
-        range: rg(None, Some(5)),
-        context: ctx.clone(),
-        candidates: vec![],
-    })?;
-    a.merge_range(&CompleteRange {
-        range: rg(Some(5), None),
-        context: ctx.clone(),
-        candidates: vec![],
-    })?;
-    b.merge_range(&CompleteRange {
-        range: rg(None, None),
-        context: ctx,
-        candidates: vec![],
-    })?;
-    assert_eq!(a.export()?, b.export()?);
+    a.apply_merge(&[], &context(&[dot(9, 1)]))?;
+    a.apply_merge(&[], &context(&[dot(9, 3)]))?;
+    b.apply_merge(&[], &ctx)?;
+    assert_eq!(a.snapshot(), b.snapshot());
     assert!(!a.merge(&b)?);
     assert!(!b.merge(&a)?);
     Ok(())
 }
 #[test]
-fn local_write_between_ranges_survives_and_receipt_is_qualified() -> Result<()> {
+fn local_write_between_leaves_survives_and_receipt_is_collection_wide() -> Result<()> {
     let mut s = map();
     let observed = dot(1, 1);
-    let part = CompleteRange {
-        range: rg(None, Some(5)),
-        context: context(&[observed]),
-        candidates: vec![],
-    };
-    s.merge_range(&part)?;
+    s.apply_merge(&[], &context(&[observed]))?;
     assert!(s.assign(1, cand(1, 1, 1)).is_err());
     assert!(s.assign(8, cand(1, 1, 1)).is_err());
-    // A relayed existing dot remains valid outside the qualified range.
-    s.merge_range(&CompleteRange {
-        range: rg(Some(8), Some(9)),
-        context: context(&[observed]),
-        candidates: vec![(8, cand(1, 1, 1))],
-    })?;
+    assert!(!s.apply_merge(&[(8, cand(1, 1, 1))], &Context::default())?);
     s.assign(1, cand(2, 1, 2))?;
-    let later = CompleteRange {
-        range: rg(Some(5), None),
-        context: context(&[observed]),
-        candidates: vec![(8, cand(1, 1, 1))],
-    };
-    s.merge_range(&later)?;
-    assert_eq!(s.winner(&8).unwrap().value, 1);
+    let (added, removed) = s.plan_leaf(
+        &rg(Some(5), None),
+        &[(8, cand(1, 1, 1))],
+        &context(&[observed]),
+    )?;
+    assert!(!s.apply_merge(&added, &removed)?);
+    assert!(s.winner(&8).is_none());
     assert_eq!(s.winner(&1).unwrap().value, 2);
     Ok(())
 }
 #[test]
-fn overlapping_ranges_reordered_and_late_stale_relay() -> Result<()> {
+fn merge_chunks_reordered_and_late_stale_relay() -> Result<()> {
     let d = dot(7, 1);
-    let c = Candidate {
-        dot: d,
-        revision: 1,
-        value: 7,
-    };
-    let suppress = CompleteRange {
-        range: rg(None, Some(7)),
-        context: context(&[d]),
-        candidates: vec![],
-    };
-    let other = CompleteRange {
-        range: rg(Some(3), None),
-        context: context(&[dot(8, 1)]),
-        candidates: vec![],
-    };
+    let suppress = context(&[d]);
+    let other = context(&[dot(8, 1)]);
     let mut left = map();
-    left.merge_range(&suppress)?;
-    left.merge_range(&other)?;
+    left.apply_merge(&[], &suppress)?;
+    left.apply_merge(&[], &other)?;
     let mut right = map();
-    right.merge_range(&other)?;
-    right.merge_range(&suppress)?;
-    assert_eq!(left.export()?, right.export()?);
-    let stale = CompleteRange {
-        range: rg(Some(2), Some(3)),
-        context: context(&[d]),
-        candidates: vec![(2, c)],
-    };
-    left.merge_range(&stale)?;
+    right.apply_merge(&[], &other)?;
+    right.apply_merge(&[], &suppress)?;
+    assert_eq!(left.snapshot(), right.snapshot());
+    assert!(!left.apply_merge(&[(2, cand(7, 1, 7))], &Context::default())?);
     assert!(left.winner(&2).is_none());
     assert!(left.base().contains(d));
     let mut relay = map();
-    for segment in left.export()? {
-        relay.merge_range(&segment)?;
-    }
+    relay.apply_merge(&[], left.base())?;
     let mut third = map();
     third.assign(2, cand(7, 1, 7))?;
     third.merge(&relay)?;
@@ -431,20 +380,12 @@ fn full_merge_checks_all_dots_against_original_receiver_before_removal() -> Resu
     receiver.assign(1, cand(1, 1, 10))?;
     let mut source = map();
     source.assign(8, cand(1, 1, 80))?;
-    // Force the source to export the first interval without key 8. Its base
-    // context contains d, so a progressive merge would first remove key 1.
-    source.merge_range(&CompleteRange {
-        range: rg(None, Some(5)),
-        context: context(&[dot(2, 1)]),
-        candidates: vec![],
-    })?;
-    assert!(source.export()?.len() > 1);
-    let before = receiver.export()?;
+    let before = receiver.snapshot();
     // This type deliberately has no public persistent encoding; the debug
     // snapshot also checks internal state and limits beyond semantic export.
     let internal_before = format!("{receiver:?}").into_bytes();
     assert!(receiver.merge(&source).is_err());
-    assert_eq!(receiver.export()?, before);
+    assert_eq!(receiver.snapshot(), before);
     assert_eq!(format!("{receiver:?}").into_bytes(), internal_before);
     assert_eq!(receiver.winner(&1).unwrap().dot, d);
     Ok(())
@@ -468,10 +409,10 @@ fn full_merge_rejects_same_dot_conflicting_value_or_revision_atomically() -> Res
     ] {
         let mut source = map();
         source.assign(1, conflict)?;
-        let before = receiver.export()?;
+        let before = receiver.snapshot();
         let internal_before = format!("{receiver:?}").into_bytes();
         assert!(receiver.merge(&source).is_err());
-        assert_eq!(receiver.export()?, before);
+        assert_eq!(receiver.snapshot(), before);
         assert_eq!(format!("{receiver:?}").into_bytes(), internal_before);
     }
     Ok(())
@@ -487,12 +428,12 @@ fn explicit_observed_subset_preserves_unobserved_candidates_atomically() -> Resu
     a.assign_observed(1, cand(3, 1, 30), &selected)?;
     let dots: BTreeSet<_> = a.candidates(&1).map(|c| c.dot).collect();
     assert_eq!(dots, BTreeSet::from([dot(2, 1), dot(3, 1)]));
-    let before = a.export()?;
+    let before = a.snapshot();
     assert!(
         a.remove_observed(&1, &BTreeSet::from([dot(99, 1)]))
             .is_err()
     );
-    assert_eq!(a.export()?, before);
+    assert_eq!(a.snapshot(), before);
     Ok(())
 }
 #[test]
@@ -504,12 +445,12 @@ fn key_delta_context_only_relay_is_idempotent_and_suppresses_late_value() -> Res
     assert!(a.base().contains(d));
     assert!(!a.merge_key_delta(3, &[], &[cand(1, 1, 11)])?);
     assert!(a.winner(&3).is_none());
-    let before = a.export()?;
+    let before = a.snapshot();
     assert!(
         a.merge_key_delta(3, &[dot(9, 1)], &[cand(9, 1, 4)])
             .is_err()
     );
-    assert_eq!(a.export()?, before);
+    assert_eq!(a.snapshot(), before);
     Ok(())
 }
 
@@ -518,33 +459,8 @@ fn indexed_snapshot_scan_matches_complete_export() -> Result<()> {
     let mut state = map();
     state.assign(2, cand(1, 1, 10))?;
     state.assign(7, cand(1, 2, 20))?;
-    state.merge_range(&CompleteRange {
-        range: rg(None, Some(5)),
-        context: context(&[dot(2, 4)]),
-        candidates: vec![],
-    })?;
-    state.merge_range(&CompleteRange {
-        range: rg(Some(8), Some(12)),
-        context: context(&[dot(3, 3)]),
-        candidates: vec![],
-    })?;
-    // Both local assignments and relayed deltas grow the base after range
-    // knowledge has arrived. Indexed contexts must include the new live dots.
     state.assign(3, cand(4, 1, 30))?;
     state.merge_key_delta(9, &[], &[cand(5, 1, 40)])?;
-    let expected = state.normalized()?;
-    let mut actual = Vec::new();
-    let mut lower = None;
-    loop {
-        let segment = state.next_segment(lower);
-        let end = segment.range.end;
-        actual.push(segment);
-        if end.is_none() {
-            break;
-        }
-        lower = end;
-    }
-    assert_eq!(actual, expected);
     let mut cursor = None;
     let mut live = Vec::new();
     loop {
@@ -553,11 +469,168 @@ fn indexed_snapshot_scan_matches_complete_export() -> Result<()> {
         cursor = Some((key, candidate.dot));
         live.push((key, candidate));
     }
-    let expected_live: Vec<_> = state
-        .export()?
-        .into_iter()
-        .flat_map(|s| s.candidates)
-        .collect();
+    let expected_live = state.live_entries();
     assert_eq!(live, expected_live);
+    Ok(())
+}
+
+#[test]
+fn additive_context_algebra_and_merge_rejections() -> Result<()> {
+    let mut a = Context::default();
+    let mut b = Context::default();
+    let mut oracle_a = BTreeSet::new();
+    let mut oracle_b = BTreeSet::new();
+    for actor in 1..=3 {
+        for n in 1..=100 {
+            let d = dot(actor, n);
+            if n % 3 != 0 {
+                a.insert(d)?;
+                oracle_a.insert(d);
+            }
+            if n % 4 != 0 {
+                b.insert(d)?;
+                oracle_b.insert(d);
+            }
+        }
+    }
+    a.insert(dot(1, MAX_DOT_COUNTER))?;
+    oracle_a.insert(dot(1, MAX_DOT_COUNTER));
+    let diff = a.difference(&b)?;
+    let expected: BTreeSet<_> = oracle_a.difference(&oracle_b).copied().collect();
+    for d in &oracle_a {
+        assert_eq!(diff.contains(*d), expected.contains(d));
+    }
+    assert!(diff.is_subset(&a));
+    assert!(Context::default().is_empty());
+    let mut cursor = None;
+    let mut rebuilt = Context::default();
+    loop {
+        let (piece, next) = diff.chunk(cursor, 2);
+        rebuilt = rebuilt.union(&piece)?;
+        if next.is_none() {
+            break;
+        }
+        cursor = next;
+    }
+    assert_eq!(diff, rebuilt);
+    let mut state = map();
+    state.assign(1, cand(1, 1, 10))?;
+    let before = state.snapshot();
+    assert!(
+        state
+            .apply_merge(&[(2, cand(2, 1, 20))], &context(&[dot(2, 1)]))
+            .is_err()
+    );
+    assert!(
+        state
+            .apply_merge(
+                &[(2, cand(2, 1, 20)), (2, cand(2, 1, 20))],
+                &Context::default()
+            )
+            .is_err()
+    );
+    assert!(
+        state
+            .apply_merge(&[(2, cand(1, 1, 20))], &Context::default())
+            .is_err()
+    );
+    assert_eq!(before, state.snapshot());
+    Ok(())
+}
+
+#[test]
+fn session_decomposition_equals_full_join() -> Result<()> {
+    let mut random = 991u64;
+    let mut skipped = 0usize;
+    for trial in 0..120 {
+        let mut states = [map(), map(), map()];
+        let mut counters = [0u64; 3];
+        for _ in 0..48 {
+            let i = (seed(&mut random) >> 32) as usize % 3;
+            let key = ((seed(&mut random) >> 32) % 8) as u32;
+            let op = (seed(&mut random) >> 32) % 4;
+            let j = (seed(&mut random) >> 32) as usize % 3;
+            match op {
+                0 | 1 => {
+                    counters[i] += 1;
+                    states[i].assign(key, cand(i as u128 + 1, counters[i], key))?;
+                }
+                2 => {
+                    states[i].remove(&key);
+                }
+                _ => {
+                    let other = states[j].clone();
+                    states[i].merge(&other)?;
+                }
+            }
+        }
+        let source = states[0].clone();
+        let snapshot = states[1].clone();
+        let third = states[2].clone();
+        let mut result = snapshot.clone();
+        let mut intermediates = Vec::new();
+        let mut source_live = Context::default();
+        let interleave = (seed(&mut random) % 5) as usize;
+        for i in 0..4 {
+            if i == interleave {
+                result.merge(&third)?;
+            }
+            let range = rg(Some(i as u32 * 2), Some(i as u32 * 2 + 2));
+            let incoming: Vec<_> = source
+                .live_entries()
+                .into_iter()
+                .filter(|(k, _)| range.contains(k))
+                .collect();
+            let snapshot_live: Vec<_> = snapshot
+                .live_entries()
+                .into_iter()
+                .filter(|(k, _)| range.contains(k))
+                .collect();
+            // Equal candidate summaries skip the leaf; its dots never enter D.
+            if incoming == snapshot_live {
+                skipped += 1;
+                intermediates.push(result.clone());
+                continue;
+            }
+            for (_, c) in &incoming {
+                source_live.insert(c.dot)?;
+            }
+            let (added, observed) = result.plan_leaf(&range, &incoming, source.base())?;
+            result.apply_merge(&added, &observed)?;
+            intermediates.push(result.clone());
+        }
+        if interleave == 4 {
+            result.merge(&third)?;
+        }
+        let mut arrivals = Context::default();
+        for (key, c) in result.live_entries() {
+            if !snapshot.candidates(&key).any(|old| old.dot == c.dot)
+                && source.base().contains(c.dot)
+                && !source_live.contains(c.dot)
+            {
+                arrivals.insert(c.dot)?;
+            }
+        }
+        result.apply_merge(&[], &arrivals)?;
+        let mut after = None;
+        loop {
+            let (chunk, next) = source.base().chunk(after, 2);
+            let observed = chunk.difference(result.base())?;
+            result.apply_merge(&[], &observed)?;
+            if next.is_none() {
+                break;
+            }
+            after = next;
+        }
+        let mut expected = snapshot;
+        expected.merge(&third)?;
+        expected.merge(&source)?;
+        assert!(result.semantic_eq(&expected)?, "trial {trial}");
+        assert!(!result.clone().merge(&source)?, "trial {trial}");
+        for state in intermediates {
+            assert!(!expected.clone().merge(&state)?, "trial {trial}");
+        }
+    }
+    assert!(skipped > 0, "no equal range was skipped");
     Ok(())
 }

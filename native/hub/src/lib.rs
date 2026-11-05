@@ -1,3 +1,7 @@
+#![recursion_limit = "256"]
+
+use fmt::time::ChronoLocal;
+pub mod access_policy;
 mod apple_bridge;
 pub mod flutter_bridge;
 #[macro_use]
@@ -5,7 +9,11 @@ mod macros;
 mod handlers;
 #[macro_use]
 pub mod backends;
+pub mod library_pool;
 pub mod messages;
+pub mod node;
+pub mod request_error;
+pub mod session;
 #[macro_use]
 pub mod server;
 pub mod utils;
@@ -29,6 +37,7 @@ use utils::{TaskTokens, diagnostics::receive_fs_self_test, receive_media_library
 use crate::utils::init_logging;
 
 pub struct Session {
+    pub public_key: String,
     pub fingerprint: String,
     pub host: String,
 }
@@ -68,7 +77,7 @@ async fn main() {
         tracing_subscriber::fmt()
             .with_env_filter(file_filter)
             .with_writer(non_blocking)
-            .with_timer(fmt::time::ChronoLocal::rfc_3339())
+            .with_timer(ChronoLocal::rfc_3339())
             .init();
 
         info!("Logging is enabled");
@@ -82,13 +91,19 @@ async fn main() {
     // not initialized, so it runs as an independent task instead of going
     // through the handler dispatch.
     tokio::spawn(receive_fs_self_test());
+    tokio::spawn(node::receive_initialize_node());
 
     // Start receiving the media library path
-    if let Err(e) = receive_media_library_path(scrobbler).await {
-        error!("Failed to receive media library path: {e:?}");
+    tokio::select! {
+        result = receive_media_library_path(scrobbler) => {
+            if let Err(error) = result { error!("Failed to receive media library path: {error:?}"); }
+        }
+        _ = rinf::dart_shutdown() => {}
     }
 
-    rinf::dart_shutdown().await;
+    if let Err(error) = node::shutdown_node().await {
+        error!("Node shutdown failed: {error:#}");
+    }
 
     if let Some(guard) = _guard {
         drop(guard);

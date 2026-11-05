@@ -1,3 +1,4 @@
+use crate::decoder::RuneDecoder;
 use std::{fs::File, io::BufReader, path::PathBuf};
 
 use anyhow::{Context, Result};
@@ -58,7 +59,11 @@ impl SfxPlayerInternal {
                 self.state = InternalSfxPlaybackState::Empty;
             }
 
-            if let Some(cmd) = self.commands.recv().await {
+            let cmd = tokio::select! {
+                _ = self.cancellation_token.cancelled() => break,
+                cmd = self.commands.recv() => cmd,
+            };
+            if let Some(cmd) = cmd {
                 if self.cancellation_token.is_cancelled() {
                     debug!("Cancellation token triggered, exiting run loop");
                     if let Some(sink) = &self.sink {
@@ -72,6 +77,8 @@ impl SfxPlayerInternal {
                     SfxPlayerCommand::Load { path } => self.load(Some(path)),
                     SfxPlayerCommand::SetVolume(volume) => self.set_volume(volume),
                 }?;
+            } else {
+                break;
             }
         }
 
@@ -90,7 +97,7 @@ impl SfxPlayerInternal {
             let file = File::open(path.clone())
                 .with_context(|| format!("Failed to open file: {:?}", path.clone()))?;
             let ext = path.extension().and_then(|e| e.to_str());
-            let source = crate::decoder::RuneDecoder::new(BufReader::new(file), ext)
+            let source = RuneDecoder::new(BufReader::new(file), ext)
                 .with_context(|| "Failed to decode audio")?;
             let (stream, stream_handle) =
                 OutputStream::try_default().context("Failed to create output stream")?;

@@ -1,11 +1,14 @@
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
 use anyhow::{Context, Result, ensure};
 use sea_orm::{
-    ConnectionTrait, Database, ExprTrait,
+    ConnectionTrait, ExprTrait,
     sea_query::{Alias, Expr, Query},
 };
 use serde::{Deserialize, Serialize};
 use sync::protocol::{self as p, SnapshotSource, SyncStore};
-use sync_orm::{causal_capabilities::CausalEndpoint, causal_schema, causal_store::CausalReplica};
+use sync_orm::{causal_capabilities::CausalEndpoint, causal_store::CausalReplica};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,8 +122,7 @@ async fn split(
 
 #[tokio::test]
 async fn split_reuses_exact_summaries_and_preserves_the_pinned_view() -> Result<()> {
-    let db = Database::connect("sqlite::memory:").await?;
-    causal_schema::install_fresh(&db).await?;
+    let db = fixtures::fresh_database().await?;
     let namespace = Uuid::new_v4();
     let store = CausalReplica::<Model>::create_empty(db.clone(), namespace, Uuid::new_v4()).await?;
     let endpoint = CausalEndpoint::new(store);
@@ -168,7 +170,7 @@ async fn split_reuses_exact_summaries_and_preserves_the_pinned_view() -> Result<
         &db,
         cached.snapshot_id,
         root.clone(),
-        "ContextFallback",
+        "FindCandidate",
     )
     .await?;
     ensure!(root_split.len() == 2, "root did not split");
@@ -192,7 +194,7 @@ async fn split_reuses_exact_summaries_and_preserves_the_pinned_view() -> Result<
         &db,
         cached.snapshot_id,
         subrange.clone(),
-        "ContextFallback",
+        "FindCandidate",
     )
     .await?;
     let fallback_result = split(
@@ -235,7 +237,7 @@ async fn split_reuses_exact_summaries_and_preserves_the_pinned_view() -> Result<
             &db,
             cached.snapshot_id,
             range.clone(),
-            "ContextFallback",
+            "FindCandidate",
         )
         .await?;
         let right = split(

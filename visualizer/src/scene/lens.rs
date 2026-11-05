@@ -13,6 +13,7 @@
 //! `crate::transition::Overlay`): this only says that one starts ([`Lens::take_overlay`]).
 
 use super::inputs::MusicValues;
+use std::f32::consts::TAU;
 use std::sync::Arc;
 
 use crate::bind::{CourseBinds, MomentBinds, RuntimeBindings};
@@ -486,7 +487,7 @@ impl Lens {
                 let along = leak.origin + leak.way * LEAK_TRAVEL * travelled;
                 frame.leak_at = edge_point(along, outside);
                 frame.leak_size = LEAK_SIZE;
-                frame.leak_phase = travelled * std::f32::consts::TAU;
+                frame.leak_phase = travelled * TAU;
                 leak.run.course.tick(dt, music);
                 leak.travelled += (leak.run.course.progress() - course.progress()).max(0.0);
             }
@@ -499,6 +500,7 @@ impl Lens {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     /// Music at 120 bpm in 4/4, the beat followed, at full intensity.
     fn music(cue: f32, cues: u32) -> MusicValues {
@@ -923,7 +925,7 @@ mod tests {
             (first, furthest)
         };
         assert_eq!(start_at(2.0, 5).0, start_at(2.0, 5).0);
-        let mut sides = std::collections::HashSet::new();
+        let mut sides = HashSet::new();
         let mut points = Vec::new();
         for section in 0..4 {
             for bars in [0, 3, 6] {

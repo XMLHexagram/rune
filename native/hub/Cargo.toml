@@ -43,6 +43,7 @@ tracing-subscriber = { version = "0.3.20", features = ["chrono", "registry"] }
 paste = "1.0.15"
 tokio-util = "0.7.11"
 num_cpus = "1.16.0"
+thiserror = "2"
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 futures = "0.3.30"
 blake3 = "1"
@@ -118,6 +119,8 @@ tracing-logcat = "0.1.0"
 swift-rs = { version = "1.0.7", features = ["build"] }
 
 [dev-dependencies]
+playback = { path = "../../playback", features = ["test-output"] }
+tokio = { version = "1.44.2", features = ["test-util"] }
 sync-orm = { path = "../../sync-orm" }
 hyper = "1.6.0"
 portpicker = "0.1.1"
@@ -126,3 +129,6 @@ rust_decimal = "1.36.0"
 rust_decimal_macros = "1.36.0"
 migration = { path = "../../migration" }
 tempfile = "3.17.1"
+
+[lints]
+workspace = true

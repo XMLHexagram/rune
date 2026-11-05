@@ -1091,11 +1091,11 @@
   "@editDeviceInformationSubtitle": {
     "description": "Betont, dass Änderungen die Sichtbarkeit in den Scan-Listen anderer beeinflussen. Vermeidet technische Begriffe. Fokussiert auf 'Scans' als Interaktionskontext."
   },
-  "enableBroadcast": "Broadcast aktivieren",
+  "enableBroadcast": "Für Geräte in der Nähe sichtbar",
   "@enableBroadcast": {
     "description": "'Broadcast' impliziert aktives Senden von Geräteinformationen. Wenn die Zielsprache keine direkte Entsprechung hat, priorisieren Sie 'sichtbar machen' oder 'Verfügbarkeit teilen'."
   },
-  "enableBroadcastSubtitle": "Teilen Sie Ihre Geräteinformationen öffentlich, damit andere sie entdecken können.",
+  "enableBroadcastSubtitle": "Geräte in der Nähe können dieses Gerät finden.",
   "@enableBroadcastSubtitle": {
     "description": "Vermeidet Mehrdeutigkeit: 'öffentlich' = für Benutzer im lokalen Netzwerk, nicht das gesamte Internet."
   },
@@ -1167,15 +1167,15 @@
       }
     }
   },
-  "server": "Server",
+  "server": "Freigabe",
   "@server": {
     "description": "Der Titel der Einstellungsseite zur Steuerung der Mediaplayer-Freigabeverhalten. Beinhaltet die Verwaltung autorisierter Benutzer und das Übertragen der Gerätepräsenz."
   },
-  "serverControl": "Server-Steuerung",
+  "serverControl": "Verbindungen von anderen Geräten erlauben",
   "@serverControl": {
     "description": "Abschnittstitel zur Steuerung des lokalen Netzwerkservers. 'Server' bezieht sich hier auf den Hintergrunddienst, der die Geräteerkennung verwaltet."
   },
-  "serverControlSubtitle": "Starten Sie den Server, damit andere Geräte dieses Gerät im lokalen Netzwerk entdecken können.",
+  "serverControlSubtitle": "Andere Geräte können sich mit diesem Gerät verbinden.",
   "@serverControlSubtitle": {
     "description": "Klarstellt, dass der Server nur im lokalen Netzwerk operiert. Betont, dass das Starten die Sichtbarkeit für andere ermöglicht."
   },
@@ -1199,7 +1199,7 @@
   "@unknownStatus": {
     "description": "Angezeigt als Benutzer-/Client-Status-Badge. Zeigt an, dass der Status nicht erkannt oder undefiniert ist. Schlagen Sie Begriffe wie 'Nicht erkannt' oder 'Undefiniert' vor, aber behalten Sie einen neutralen Ton bei, ohne Fehler zu implizieren. Mit neutralen Farben wie Grau in der Benutzeroberfläche verbunden."
   },
-  "review": "Überprüfen",
+  "review": "Anfrage bearbeiten",
   "@review": {
     "description": "Button zur Überprüfung ausstehender Geräteverbindungsanfragen. Löst ein Modal aus, um das Gerät zu genehmigen oder zu blockieren."
   },
@@ -1207,11 +1207,11 @@
   "@reviewRequestTitle": {
     "description": "Titel angezeigt im Modal bei der Überprüfung einer Geräteverbindung. Kurz halten, auf erforderliche Aktion fokussieren."
   },
-  "blockDevice": "Gerät blockieren",
+  "blockDevice": "Blockieren",
   "@blockDevice": {
     "description": "Aktion zum dauerhaften Verweigern des Zugriffs. Verwenden Sie starke Verben wie 'Sperren', wenn kulturell angemessener, aber vermeiden Sie negative Konnotationen."
   },
-  "allowAccess": "Zugriff erlauben",
+  "allowAccess": "Mein Gerät",
   "@allowAccess": {
     "description": "Aktion zur Gewährung der Verbindungsberechtigung. Angleichen mit Begriffen wie 'Genehmigen' oder 'Autorisieren', wenn besser für die Zielsprache geeignet."
   },
@@ -1229,7 +1229,7 @@
       }
     }
   },
-  "allowAccessSubtitle": "Gewähren Sie Zugriff zur Steuerung der Wiedergabe und zum Herunterladen von Titeln von diesem Gerät.",
+  "allowAccessSubtitle": "Dieses Gerät kann deine Bibliotheken durchsuchen, abspielen und synchronisieren.",
   "@allowAccessSubtitle": {
     "description": "Erklärt die gewährten Berechtigungen bei Zugriffsgenehmigung. Verwenden Sie 'Autorisieren' oder 'Berechtigungen gewähren' als Alternativen. Klarstellen, dass sich 'Herunterladen' auf Medieninhalts-Abruf bezieht."
   },
@@ -1341,5 +1341,81 @@
   },
   "interfaceScale": "Oberflächenskalierung",
   "interfaceScaleSubtitle": "Ändert Text und App-Inhalte sofort relativ zur Systemskalierung. Fenstergröße und Bildschirmauflösung bleiben unverändert. 100 % entspricht der Systemskalierung.",
-  "interfaceScaleSaveError": "Oberflächenskalierung konnte nicht gespeichert werden"
+  "interfaceScaleSaveError": "Oberflächenskalierung konnte nicht gespeichert werden",
+  "linuxCustomWindowControls": "Benutzerdefinierte Fenstersteuerung",
+  "@linuxCustomWindowControls": {"description": "Title for the Linux custom window controls setting option."},
+  "linuxCustomWindowControlsSubtitle": "Benutzerdefinierte Fenstersteuerung für ein rahmenloses Fenster wie im Windows-Modus aktivieren.",
+  "@linuxCustomWindowControlsSubtitle": {"description": "Subtitle explaining what the Linux custom window controls setting does."},
+  "offlineAvailability": "Offline-Verfügbarkeit",
+  "@offlineAvailability": {"description": "Context menu for the audio retained on this device."},
+  "keepAvailableOffline": "Offline verfügbar halten",
+  "@keepAvailableOffline": {"description": "Save a mix-query selection for background audio downloads."},
+  "stopKeepingOffline": "Nicht mehr offline verfügbar halten",
+  "@stopKeepingOffline": {"description": "Disable future downloads for this selection without deleting existing files."},
+  "offlineSelectionSaved": "Offline-Auswahl gespeichert",
+  "@offlineSelectionSaved": {"description": "Acknowledges that a persistent download selection has been saved."},
+  "offlineSelectionRemoved": "Automatische Downloads gestoppt",
+  "@offlineSelectionRemoved": {"description": "Acknowledges disabling an offline selection."},
+  "offlineSelectionFailed": "Offline-Auswahl konnte nicht gespeichert werden",
+  "@offlineSelectionFailed": {"description": "Error title when saving a download selection fails."},
+  "offlineSelectionQueued": "Passende Titel werden heruntergeladen, sobald ein gekoppeltes Gerät verfügbar ist. Solange es online ist, kannst du sie streamen.",
+  "@offlineSelectionQueued": {"description": "Explains the difference between a queued offline selection and online playback."},
+  "offlineSelectionRetained": "Vorhandene lokale Dateien bleiben erhalten.",
+  "@offlineSelectionRetained": {"description": "Explains that disabling downloads does not delete audio."},
+  "audioRemoteReference": "Audio auf entferntem Gerät (Verbindung unbekannt)",
+  "audioUnavailable": "Audio nicht verfügbar",
+  "audioImportPending": "Import läuft",
+  "allowPairedSync": "Gekoppelten Geräten die Synchronisierung von diesem Gerät erlauben",
+  "@allowPairedSync": {"description": "Label for allowing incoming paired device sync"},
+  "allowPairedSyncDescription": "Beim Ausschalten werden eingehende Verbindungen und LAN-Ankündigungen beendet. Dieses Gerät kann weiterhin von anderen synchronisieren.",
+  "@allowPairedSyncDescription": {"description": "Explanation of the incoming sync setting"},
+  "audioSyncedCopy": "Synchronisierte Kopie",
+  "@audioSyncedCopy": {"description": "Label for audio downloaded from a paired device."},
+  "offlineCleanupDefault": "Heruntergeladene Dateien löschen, wenn sie nicht mehr offline verfügbar gehalten werden",
+  "@offlineCleanupDefault": {"description": "Default option to clean up unneeded offline downloads."},
+  "offlineCleanupDefaultDescription": "Standard für das Löschen nicht mehr benötigter Downloads beim Beenden der Offline-Verfügbarkeit wählen.",
+  "@offlineCleanupDefaultDescription": {"description": "Explanation of the offline cleanup default."},
+  "offlineCleanupCheckbox": "Auch nicht mehr benötigte heruntergeladene Dateien löschen",
+  "@offlineCleanupCheckbox": {"description": "Option to delete downloads no enabled offline rule needs."},
+  "offlineSelectionCleaned": "Offline-Auswahl aktualisiert und Bereinigung versucht.",
+  "@offlineSelectionCleaned": {"description": "Confirmation after attempting to clean up offline downloads."},
+  "remoteOpenUntrusted": "Dieses Gerät vertraut dem Server noch nicht. Kopple es zuerst.",
+  "remoteOpenNotAuthorized": "Das andere Gerät hat dieses Gerät noch nicht zugelassen oder blockiert.",
+  "remoteOpenUnreachable": "Das Gerät ist nicht erreichbar. Prüfe, ob es eingeschaltet und im selben Netzwerk ist.",
+  "remoteOpenProtocol": "Das Gerät antwortet nicht wie erwartet. Beide Geräte benötigen dieselbe Rune-Version.",
+  "remoteLossRevoked": "Der Zugriff dieses Geräts wurde entfernt.",
+  "remoteLossServerStopped": "Das andere Gerät hat die Freigabe beendet.",
+  "remoteLossNetworkLost": "Die Verbindung wurde unterbrochen.",
+  "deviceLibraries": "Bibliotheken",
+  "addSharedLibrary": "Hinzufügen",
+  "sharedLibraryAdded": "Hinzugefügt",
+  "openSharedLibrary": "Öffnen",
+  "noSharedLibraries": "Dieses Gerät hat keine Bibliotheken zum Teilen",
+  "libraryFromDevice": "Von {device}",
+  "backgroundLibrarySync": "Im Hintergrund synchron halten",
+  "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
+  "requestItemMissing": "Dieses Element existiert nicht mehr",
+  "requestInvalid": "Die Anfrage war ungültig",
+  "requestUnavailable": "Dies ist derzeit nicht verfügbar",
+  "mixNoLongerExists": "Dieser Mix existiert nicht mehr",
+  "devices": "Geräte",
+  "thisDevice": "Dieses Gerät",
+  "devicesThatCanConnect": "Geräte, die sich mit diesem verbinden können",
+  "otherDevices": "Andere Geräte",
+  "myDevice": "Mein Gerät",
+  "waitingForApproval": "Wartet auf Bestätigung",
+  "guest": "Gast",
+  "myDeviceAccessDescription": "Kann deine Mediatheken abspielen, durchsuchen und synchronisieren",
+  "guestAccessDescription": "Kann die Wiedergabe steuern und dabei browsen",
+  "guestControlSummary": "Gast · Kann die Wiedergabe steuern",
+  "customDeviceAccess": "Benutzerdefiniert",
+  "customizeDevice": "Anpassen",
+  "controlPlayback": "Wiedergabe steuern",
+  "controlPlaybackDescription": "Kann beim Steuern browsen und Titel einreihen",
+  "deviceAccessLibraries": "Mediatheken",
+  "deviceNotShared": "Nicht geteilt",
+  "deviceReadOnly": "Nur lesen",
+  "deviceReadWrite": "Lesen und schreiben",
+  "requestPermissionDenied": "Dieses Gerät darf das nicht tun",
+  "readOnly": "Schreibgeschützt"
 }

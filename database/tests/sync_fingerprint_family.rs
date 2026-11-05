@@ -1,24 +1,25 @@
+use std::path::Path;
+use support::fixtures;
 #[path = "support/causal_library.rs"]
 mod support;
 use anyhow::Result;
-use database::sync::model::{Fingerprint, ScoreValue, Similarity};
 use database::{
-    actions::fingerprint::{ComputedFingerprint, assign_computed_fingerprint},
-    entities::{media_file_fingerprint, media_files},
-    sync::SeaOrmSyncStore,
+    actions::fingerprint::{
+        ComputedFingerprint, assign_computed_fingerprint, reset_duplicate_marks,
+    },
+    entities::{media_file_fingerprint, media_file_similarity, media_files},
+    sync::{
+        SeaOrmSyncStore,
+        model::{Fingerprint, ScoreValue, Similarity},
+    },
 };
-use migration::{Migrator, MigratorTrait};
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, Database, EntityTrait, QueryFilter, Set, sea_query::Expr,
-};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, sea_query::Expr};
 use uuid::Uuid;
 
 #[tokio::test]
 async fn fingerprint_source_change_and_failed_journal_leave_no_assignment() -> Result<()> {
     let node = Uuid::new_v4();
-    let _ = migration::initialize_node_id(node.to_string());
-    let db = Database::connect("sqlite::memory:").await?;
-    Migrator::up(&db, None).await?;
+    let db = fixtures::memory_database(node).await?;
     let store = SeaOrmSyncStore::create_empty(db.clone(), Uuid::new_v4(), node).await?;
     let file_id = Uuid::new_v4();
     support::local_file(&db, 1, file_id, "file").await?;
@@ -127,9 +128,7 @@ async fn independent_configurations_coexist_in_primary_rows() -> Result<()> {
     };
     use sea_orm::TransactionTrait;
     let node = Uuid::new_v4();
-    let _ = migration::initialize_node_id(node.to_string());
-    let db = Database::connect("sqlite::memory:").await?;
-    Migrator::up(&db, None).await?;
+    let db = fixtures::memory_database(node).await?;
     let store = SeaOrmSyncStore::create_empty(db.clone(), Uuid::new_v4(), node).await?;
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
@@ -196,17 +195,11 @@ async fn independent_configurations_coexist_in_primary_rows() -> Result<()> {
         tx.commit().await?;
     }
     assert_eq!(
-        database::entities::media_file_fingerprint::Entity::find()
-            .all(&db)
-            .await?
-            .len(),
+        media_file_fingerprint::Entity::find().all(&db).await?.len(),
         2
     );
     assert_eq!(
-        database::entities::media_file_similarity::Entity::find()
-            .all(&db)
-            .await?
-            .len(),
+        media_file_similarity::Entity::find().all(&db).await?.len(),
         2
     );
     assert_eq!(
@@ -216,11 +209,7 @@ async fn independent_configurations_coexist_in_primary_rows() -> Result<()> {
         4
     );
     db.execute_unprepared("CREATE TRIGGER reject_reset BEFORE INSERT ON sync_journal BEGIN SELECT RAISE(ABORT, 'test'); END").await?;
-    assert!(
-        database::actions::fingerprint::reset_duplicate_marks(&db, |_, _| {}, &store)
-            .await
-            .is_err()
-    );
+    assert!(reset_duplicate_marks(&db, |_, _| {}, &store).await.is_err());
     assert!(
         media_file_fingerprint::Entity::find()
             .all(&db)
@@ -229,10 +218,7 @@ async fn independent_configurations_coexist_in_primary_rows() -> Result<()> {
             .all(|row| row.is_duplicated == 1)
     );
     db.execute_unprepared("DROP TRIGGER reject_reset").await?;
-    assert_eq!(
-        database::actions::fingerprint::reset_duplicate_marks(&db, |_, _| {}, &store).await?,
-        2
-    );
+    assert_eq!(reset_duplicate_marks(&db, |_, _| {}, &store).await?, 2);
     for row in media_file_fingerprint::Entity::find().all(&db).await? {
         assert_eq!(row.is_duplicated, 0);
         let record = store
@@ -256,9 +242,7 @@ async fn independent_configurations_coexist_in_primary_rows() -> Result<()> {
 async fn legacy_fingerprint_does_not_block_supported_assignment() -> Result<()> {
     use database::actions::fingerprint::current_fingerprint;
     let node = Uuid::new_v4();
-    let _ = migration::initialize_node_id(node.to_string());
-    let db = Database::connect("sqlite::memory:").await?;
-    Migrator::up(&db, None).await?;
+    let db = fixtures::memory_database(node).await?;
     let store = SeaOrmSyncStore::create_empty(db.clone(), Uuid::new_v4(), node).await?;
     let file_id = Uuid::new_v4();
     let legacy = migration::catalog_identity::fingerprint(file_id, None, None, None);
@@ -334,9 +318,7 @@ async fn duplicate_filter_uses_supported_current_identity_once() -> Result<()> {
         connection::RecommendationDbConnection,
     };
     let node = Uuid::new_v4();
-    let _ = migration::initialize_node_id(node.to_string());
-    let db = Database::connect("sqlite::memory:").await?;
-    Migrator::up(&db, None).await?;
+    let db = fixtures::memory_database(node).await?;
     let store = SeaOrmSyncStore::create_empty(db.clone(), Uuid::new_v4(), node).await?;
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
@@ -386,8 +368,180 @@ async fn duplicate_filter_uses_supported_current_identity_once() -> Result<()> {
         vec![("lib::all".into(), "true".into())],
         0,
         20,
+        &[],
     )
     .await?;
     assert_eq!(files.into_iter().map(|f| f.id).collect::<Vec<_>>(), vec![2]);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn attach_download_accepts_symlinked_root() -> Result<()> {
+    use database::actions::{downloads::prepare_download, file::attach_download};
+    use database::sync::model::BlobRef;
+    use fsio::FsIo;
+    use std::os::unix::fs::symlink;
+    let node = Uuid::new_v4();
+    let db = fixtures::memory_database(node).await?;
+    let store = SeaOrmSyncStore::create_empty(db.clone(), Uuid::new_v4(), node).await?;
+    let id = Uuid::new_v4();
+    support::local_file(&db, 1, id, "file").await?;
+    let data = b"downloaded audio";
+    let blob = BlobRef {
+        digest: blake3::hash(data).to_hex().to_string(),
+        size: data.len() as u64,
+    };
+    media_files::Entity::update_many()
+        .filter(media_files::Column::Id.eq(1))
+        .col_expr(
+            media_files::Column::ContentHash,
+            Expr::value(Some(blob.digest.clone())),
+        )
+        .col_expr(
+            media_files::Column::ContentSize,
+            Expr::value(Some(blob.size as i64)),
+        )
+        .col_expr(media_files::Column::LocalAvailable, Expr::value(false))
+        .exec(&db)
+        .await?;
+    let dir = tempfile::tempdir()?;
+    let actual = dir.path().join("actual");
+    std::fs::create_dir(&actual)?;
+    let root = dir.path().join("link");
+    symlink(&actual, &root)?;
+    let fs = FsIo::new();
+    let path = prepare_download(&db, &fs, &root, id, &blob, "ogg").await?;
+    std::fs::write(&path, data)?;
+    attach_download(&db, &store, &fs, &root, id, &blob, &path).await?;
+    let row = media_files::Entity::find_by_id(1).one(&db).await?.unwrap();
+    assert!(row.local_available);
+    assert!(!Path::new(&row.directory).is_absolute());
+    assert_eq!(actual.join(&row.directory).join(&row.file_name), path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_fingerprint_is_local_only() -> Result<()> {
+    use database::sync::model::{Collection, ObjectKey};
+    use sea_orm::TransactionTrait;
+    let node = Uuid::new_v4();
+    let db = fixtures::memory_database(node).await?;
+    let store = SeaOrmSyncStore::create_empty(db.clone(), Uuid::new_v4(), node).await?;
+    let file_id = Uuid::new_v4();
+    support::local_file(&db, 1, file_id, "file").await?;
+    let file = media_files::Entity::find_by_id(1).one(&db).await?.unwrap();
+    assign_computed_fingerprint(
+        &db,
+        &store,
+        &file,
+        ComputedFingerprint {
+            algorithm: "chromaprint".into(),
+            configuration: "default".into(),
+            format_version: 1,
+            bytes: vec![1; 40000],
+            is_duplicated: 0,
+        },
+    )
+    .await?;
+    assert_eq!(
+        media_file_fingerprint::Entity::find()
+            .one(&db)
+            .await?
+            .unwrap()
+            .fingerprint
+            .len(),
+        40000
+    );
+    let tx = db.begin().await?;
+    let key = ObjectKey {
+        collection: Collection::Fingerprints,
+        id: migration::catalog_identity::fingerprint(
+            file_id,
+            Some("chromaprint"),
+            Some("default"),
+            Some(1),
+        ),
+    };
+    assert!(store.get_on(&tx, &key).await?.is_none());
+    tx.rollback().await?;
+    assign_computed_fingerprint(
+        &db,
+        &store,
+        &file,
+        ComputedFingerprint {
+            algorithm: "chromaprint".into(),
+            configuration: "default".into(),
+            format_version: 1,
+            bytes: vec![1; 4],
+            is_duplicated: 0,
+        },
+    )
+    .await?;
+    assign_computed_fingerprint(
+        &db,
+        &store,
+        &file,
+        ComputedFingerprint {
+            algorithm: "chromaprint".into(),
+            configuration: "default".into(),
+            format_version: 1,
+            bytes: vec![1; 40000],
+            is_duplicated: 0,
+        },
+    )
+    .await?;
+    let tx = db.begin().await?;
+    assert!(
+        store
+            .get_on(&tx, &key)
+            .await?
+            .is_none_or(|record| record.value.is_none())
+    );
+    tx.rollback().await?;
+    assert_eq!(
+        media_file_fingerprint::Entity::find()
+            .one(&db)
+            .await?
+            .unwrap()
+            .fingerprint
+            .len(),
+        40000
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_existing_skips_oversized_fingerprint() -> Result<()> {
+    use database::sync::model::{Collection, ObjectKey};
+    use sea_orm::TransactionTrait;
+    let node = Uuid::new_v4();
+    let db = fixtures::memory_database(node).await?;
+    let library = fixtures::open_library(db.clone(), node, Some(Uuid::new_v4())).await?;
+    let mut keys = Vec::new();
+    for (n, size) in [(1, 40000), (2, 4)] {
+        let id = Uuid::new_v4();
+        support::local_file(&db, n, id, "file").await?;
+        let key = ObjectKey {
+            collection: Collection::Fingerprints,
+            id: migration::catalog_identity::fingerprint(id, None, None, None),
+        };
+        media_file_fingerprint::Entity::insert(media_file_fingerprint::ActiveModel {
+            track_uuid: Set(id.to_string()),
+            fingerprint: Set(vec![1; size]),
+            is_duplicated: Set(0),
+            hlc_uuid: Set(key.id.to_string()),
+            ..Default::default()
+        })
+        .exec(&db)
+        .await?;
+        keys.push(key);
+    }
+    library.import_existing(node).await?;
+    let tx = db.begin().await?;
+    let store = library.record_store();
+    assert!(store.get_on(&tx, &keys[0]).await?.is_none());
+    assert!(store.get_on(&tx, &keys[1]).await?.is_some());
+    tx.rollback().await?;
     Ok(())
 }

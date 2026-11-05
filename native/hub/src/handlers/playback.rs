@@ -1,12 +1,11 @@
+use crate::request_error::ExpectedRequestError;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use fsio::FsIo;
 use tokio::sync::Mutex;
 
 use ::database::{
     actions::{mixes::query_mix_media_files, stats::increase_skipped},
-    connection::{MainDbConnection, RecommendationDbConnection},
     playing_item::dispatcher::PlayingItemActionDispatcher,
 };
 use ::playback::{
@@ -16,14 +15,19 @@ use ::playback::{
 
 use crate::{
     Session, Signal,
+    library_pool::LibraryHandle,
     messages::*,
-    utils::{GlobalParams, ParamsExtractor, files_to_playback_request, find_nearest_index},
+    node::NodeContext,
+    utils::{
+        GlobalParams, ParamsExtractor, files_to_playback_request, find_nearest_index,
+        require_library,
+    },
 };
 
 impl From<PlayingItem> for PlayingItemRequest {
     fn from(x: PlayingItem) -> Self {
         match x {
-            PlayingItem::InLibrary(x) => PlayingItemRequest {
+            PlayingItem::InLibrary(x, _) => PlayingItemRequest {
                 in_library: Some(InLibraryPlayingItem { file_id: x }),
                 independent_file: None,
             },
@@ -45,7 +49,7 @@ impl From<PlayingItemRequest> for PlayingItem {
         if let Some(in_library) = x.in_library
             && in_library.file_id != 0
         {
-            return PlayingItem::InLibrary(in_library.file_id);
+            return PlayingItem::InLibrary(in_library.file_id, String::new());
         }
 
         if let Some(independent_file) = x.independent_file
@@ -128,54 +132,38 @@ impl Signal for PauseRequest {
     }
 }
 
+async fn record_skip(node: &NodeContext, player: &Arc<Mutex<dyn Playable>>) -> Result<()> {
+    let item = player.lock().await.get_status().item;
+    if let Some(PlayingItem::InLibrary(file_id, library_id)) = item
+        && let Ok(library) = node.library_pool.acquire(library_id.parse()?).await
+    {
+        let store = library.library_sync.record_store();
+        increase_skipped(&library.main_db, &store, file_id, store.author())
+            .await
+            .context("Unable to increase skipped count")?;
+    }
+    Ok(())
+}
+
 impl ParamsExtractor for NextRequest {
-    type Params = (
-        Arc<MainDbConnection>,
-        Option<database::sync::SeaOrmSyncStore>,
-        Arc<Mutex<dyn Playable>>,
-    );
+    type Params = (Arc<NodeContext>, Arc<Mutex<dyn Playable>>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            all_params.main_db.clone(),
-            all_params
-                .library_sync
-                .as_ref()
-                .map(|library| library.record_store()),
-            Arc::clone(&all_params.player),
-        )
+        (all_params.node.clone(), Arc::clone(&all_params.player))
     }
 }
 
 impl Signal for NextRequest {
-    type Params = (
-        Arc<MainDbConnection>,
-        Option<database::sync::SeaOrmSyncStore>,
-        Arc<Mutex<dyn Playable>>,
-    );
+    type Params = (Arc<NodeContext>, Arc<Mutex<dyn Playable>>);
     type Response = ();
 
     async fn handle(
         &self,
-        (main_db, store, player): Self::Params,
+        (node, player): Self::Params,
         _session: Option<Session>,
         _: &Self,
     ) -> Result<Option<Self::Response>> {
-        let item = player.lock().await.get_status().item;
-
-        if let Some(PlayingItem::InLibrary(file_id)) = item {
-            increase_skipped(
-                &main_db,
-                store.as_ref().context("library replica unavailable")?,
-                file_id,
-                store
-                    .as_ref()
-                    .context("library replica unavailable")?
-                    .author(),
-            )
-            .await
-            .context("Unable to increase skipped count")?;
-        }
+        record_skip(&node, &player).await?;
 
         player.lock().await.next();
         Ok(Some(()))
@@ -183,53 +171,24 @@ impl Signal for NextRequest {
 }
 
 impl ParamsExtractor for PreviousRequest {
-    type Params = (
-        Arc<MainDbConnection>,
-        Option<database::sync::SeaOrmSyncStore>,
-        Arc<Mutex<dyn Playable>>,
-    );
+    type Params = (Arc<NodeContext>, Arc<Mutex<dyn Playable>>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            all_params.main_db.clone(),
-            all_params
-                .library_sync
-                .as_ref()
-                .map(|library| library.record_store()),
-            Arc::clone(&all_params.player),
-        )
+        (all_params.node.clone(), Arc::clone(&all_params.player))
     }
 }
 
 impl Signal for PreviousRequest {
-    type Params = (
-        Arc<MainDbConnection>,
-        Option<database::sync::SeaOrmSyncStore>,
-        Arc<Mutex<dyn Playable>>,
-    );
+    type Params = (Arc<NodeContext>, Arc<Mutex<dyn Playable>>);
     type Response = ();
 
     async fn handle(
         &self,
-        (main_db, store, player): Self::Params,
+        (node, player): Self::Params,
         _session: Option<Session>,
         _: &Self,
     ) -> Result<Option<Self::Response>> {
-        let item = player.lock().await.get_status().item;
-
-        if let Some(PlayingItem::InLibrary(file_id)) = item {
-            increase_skipped(
-                &main_db,
-                store.as_ref().context("library replica unavailable")?,
-                file_id,
-                store
-                    .as_ref()
-                    .context("library replica unavailable")?
-                    .author(),
-            )
-            .await
-            .context("Unable to increase skipped count")?;
-        }
+        record_skip(&node, &player).await?;
 
         player.lock().await.previous();
         Ok(Some(()))
@@ -261,51 +220,24 @@ impl Signal for SetPlaybackModeRequest {
 }
 
 impl ParamsExtractor for SwitchRequest {
-    type Params = (
-        Arc<MainDbConnection>,
-        Option<database::sync::SeaOrmSyncStore>,
-        Arc<Mutex<dyn Playable>>,
-    );
+    type Params = (Arc<NodeContext>, Arc<Mutex<dyn Playable>>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            all_params.main_db.clone(),
-            all_params
-                .library_sync
-                .as_ref()
-                .map(|library| library.record_store()),
-            Arc::clone(&all_params.player),
-        )
+        (all_params.node.clone(), Arc::clone(&all_params.player))
     }
 }
 
 impl Signal for SwitchRequest {
-    type Params = (
-        Arc<MainDbConnection>,
-        Option<database::sync::SeaOrmSyncStore>,
-        Arc<Mutex<dyn Playable>>,
-    );
+    type Params = (Arc<NodeContext>, Arc<Mutex<dyn Playable>>);
     type Response = ();
 
     async fn handle(
         &self,
-        (main_db, store, player): Self::Params,
+        (node, player): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        if let Some(PlayingItem::InLibrary(file_id)) = player.lock().await.get_status().item {
-            increase_skipped(
-                &main_db,
-                store.as_ref().context("library replica unavailable")?,
-                file_id,
-                store
-                    .as_ref()
-                    .context("library replica unavailable")?
-                    .author(),
-            )
-            .await
-            .context("Unable to increase skipped count")?;
-        }
+        record_skip(&node, &player).await?;
 
         player
             .lock()
@@ -411,10 +343,14 @@ impl Signal for MovePlaylistItemRequest {
         let old_index = request.old_index;
         let new_index = request.new_index;
 
-        player
-            .lock()
-            .await
-            .move_playlist_item(old_index.try_into()?, new_index.try_into()?);
+        player.lock().await.move_playlist_item(
+            old_index.try_into().map_err(|error| {
+                ExpectedRequestError::invalid_input(format!("Invalid old index: {error}"))
+            })?,
+            new_index.try_into().map_err(|error| {
+                ExpectedRequestError::invalid_input(format!("Invalid new index: {error}"))
+            })?,
+        );
         Ok(Some(()))
     }
 }
@@ -469,43 +405,38 @@ impl Signal for SetAdaptiveSwitchingEnabledRequest {
 
 impl ParamsExtractor for OperatePlaybackWithMixQueryRequest {
     type Params = (
-        Arc<FsIo>,
-        Arc<MainDbConnection>,
-        Arc<RecommendationDbConnection>,
-        Arc<String>,
+        Option<LibraryHandle>,
         Arc<String>,
         Arc<Mutex<dyn Playable>>,
+        Arc<NodeContext>,
     );
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
         (
-            Arc::clone(&all_params.fsio),
-            Arc::clone(&all_params.main_db),
-            Arc::clone(&all_params.recommend_db),
-            Arc::clone(&all_params.lib_path),
+            all_params.library.clone(),
             Arc::clone(&all_params.node_id),
             Arc::clone(&all_params.player),
+            all_params.node.clone(),
         )
     }
 }
 
 impl Signal for OperatePlaybackWithMixQueryRequest {
     type Params = (
-        Arc<FsIo>,
-        Arc<MainDbConnection>,
-        Arc<RecommendationDbConnection>,
-        Arc<String>,
+        Option<LibraryHandle>,
         Arc<String>,
         Arc<Mutex<dyn Playable>>,
+        Arc<NodeContext>,
     );
     type Response = OperatePlaybackWithMixQueryResponse;
 
     async fn handle(
         &self,
-        (fsio, main_db, recommend_db, lib_path, node_id, player): Self::Params,
+        (library, _node_id, player, node): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
+        let library = require_library(library)?;
         let request = dart_signal;
 
         let items: Vec<PlayingItem> = request
@@ -518,12 +449,15 @@ impl Signal for OperatePlaybackWithMixQueryRequest {
         // Retrieve tracks
         let tracks = if request.queries.is_empty() {
             PlayingItemActionDispatcher::new()
-                .get_file_handle(&fsio, &main_db, &items)
+                .get_file_handle(&library.fsio, &library.main_db, &items)
                 .await?
         } else {
+            let queue = node
+                .session_queue_for_library(library.descriptor.library_id)
+                .await?;
             query_mix_media_files(
-                &main_db,
-                &recommend_db,
+                &library.main_db,
+                &library.recommend_db,
                 request
                     .queries
                     .iter()
@@ -531,6 +465,7 @@ impl Signal for OperatePlaybackWithMixQueryRequest {
                     .collect(),
                 0,
                 4096,
+                &queue,
             )
             .await
             .with_context(|| format!("Failed to query tracks: {:?}", request.queries))?
@@ -539,9 +474,14 @@ impl Signal for OperatePlaybackWithMixQueryRequest {
             .collect()
         };
 
-        let prepared =
-            files_to_playback_request(&fsio, &main_db, &node_id, lib_path.as_ref(), &tracks)
-                .await?;
+        let prepared = files_to_playback_request(
+            &library.fsio,
+            &library.main_db,
+            &library.descriptor.library_id.to_string(),
+            &library.media_root,
+            &tracks,
+        )
+        .await?;
         let mut player = player.lock().await;
 
         let operate_mode = request.operate_mode;
@@ -578,7 +518,11 @@ impl Signal for OperatePlaybackWithMixQueryRequest {
         } else {
             find_nearest_index(&items, request.hint_position.try_into().unwrap(), |x| {
                 if let Some(initial_item) = &request.initial_playback_item {
-                    *x == PlayingItem::from(initial_item.clone())
+                    let mut initial = PlayingItem::from(initial_item.clone());
+                    if let PlayingItem::InLibrary(_, library_id) = &mut initial {
+                        *library_id = library.descriptor.library_id.to_string();
+                    }
+                    *x == initial
                 } else {
                     false
                 }

@@ -1,3 +1,5 @@
+#[path = "support/fixtures.rs"]
+mod fixtures;
 use analysis::{CURRENT_ANALYSIS_VERSION, utils::computing_device::ComputingDevice};
 use anyhow::Result;
 use database::{
@@ -17,7 +19,7 @@ use fsio::FsIo;
 use metadata::describe::describe_file;
 use migration::{Migrator, MigratorTrait};
 use sea_orm::{ConnectionTrait, Database, EntityTrait, PaginatorTrait};
-use std::{path::Path, sync::Arc};
+use std::{f64::consts::PI, sync::Arc};
 
 #[tokio::test]
 async fn legacy_rows_are_invalid_and_replaced_only_after_success() -> Result<()> {
@@ -30,13 +32,14 @@ async fn legacy_rows_are_invalid_and_replaced_only_after_success() -> Result<()>
         .expect("analysis version migration must be registered");
     Migrator::up(&db, Some(prior_count as u32)).await?;
     db.execute_unprepared("INSERT INTO media_files(id,file_name,directory,extension,file_hash,last_modified,sample_rate,duration,hlc_uuid) VALUES(1,'startup_0.ogg','','ogg','legacy','2020',44100,1,'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')").await?;
-    db.execute_unprepared("INSERT INTO media_analysis (file_id,rms,hlc_uuid,created_at_hlc_ts,created_at_hlc_ver,created_at_hlc_nid,updated_at_hlc_ts,updated_at_hlc_ver,updated_at_hlc_nid) VALUES (1,999,'legacy','',0,'','',0,'')").await?;
+    db.execute_unprepared(
+        "INSERT INTO media_analysis (file_id,rms,hlc_uuid) VALUES (1,999,'legacy')",
+    )
+    .await?;
     Migrator::up(&db, None).await?;
     let fs = Arc::new(FsIo::new());
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../assets")
-        .canonicalize()?;
-    let store = database::sync::LibrarySyncStore::open(db.clone(), actor, None).await?;
+    let root = fixtures::asset_directory().canonicalize()?;
+    let store = fixtures::open_library(db.clone(), actor, None).await?;
     let node = fs.canonicalize(&root.join("startup_0.ogg"))?;
     let mut descriptions = vec![Some(describe_file(&fs, &node, &Some(root.clone()))?)];
     sync_file_descriptions(
@@ -69,7 +72,8 @@ async fn legacy_rows_are_invalid_and_replaced_only_after_success() -> Result<()>
                     ("filter::analyzed".into(), value.into())
                 ],
                 0,
-                10
+                10,
+                &[]
             )
             .await?
             .len(),
@@ -82,7 +86,6 @@ async fn legacy_rows_are_invalid_and_replaced_only_after_success() -> Result<()>
         fs.clone(),
         &db,
         &root,
-        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         1,
         ComputingDevice::Cpu,
         |_, _| {},
@@ -97,7 +100,6 @@ async fn legacy_rows_are_invalid_and_replaced_only_after_success() -> Result<()>
         fs.clone(),
         &db,
         &root,
-        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         1,
         ComputingDevice::Cpu,
         |_, _| {},
@@ -116,22 +118,15 @@ async fn legacy_rows_are_invalid_and_replaced_only_after_success() -> Result<()>
         1
     );
     assert_eq!(
-        analysis_audio_library(
-            fs,
-            &db,
-            &root,
-            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            1,
-            ComputingDevice::Cpu,
-            |_, _| {},
-            None
-        )
-        .await?,
+        analysis_audio_library(fs, &db, &root, 1, ComputingDevice::Cpu, |_, _| {}, None).await?,
         0
     );
     assert_eq!(media_analysis::Entity::find().one(&db).await?.unwrap(), new);
     // Old clients that omit the new column must still write invalid version 1.
-    db.execute_unprepared("INSERT INTO media_analysis (file_id,rms,hlc_uuid,created_at_hlc_ts,created_at_hlc_ver,created_at_hlc_nid,updated_at_hlc_ts,updated_at_hlc_ver,updated_at_hlc_nid) VALUES (1,999,'late-legacy','',0,'','',0,'')").await?;
+    db.execute_unprepared(
+        "INSERT INTO media_analysis (file_id,rms,hlc_uuid) VALUES (1,999,'late-legacy')",
+    )
+    .await?;
     assert_eq!(get_analyze_count(&db).await?, 1);
     sync_recommendation(&db, &recommendations).await?;
     assert_eq!(recommendations.vectors().len(), 1);
@@ -165,17 +160,14 @@ fn silence_short_clips_and_sample_rates_produce_finite_features() -> Result<()> 
                         // Taper the one-second frequency fixture to exclude onset/EOF
                         // broadband transients from its centroid expectation.
                         let envelope = if frames == rate as usize {
-                            (std::f64::consts::PI * i as f64 / (frames - 1) as f64)
-                                .sin()
-                                .powi(2)
+                            (PI * i as f64 / (frames - 1) as f64).sin().powi(2)
                         } else {
                             1.0
                         };
                         (16000.0
                             * envelope
-                            * (2.0 * std::f64::consts::PI * 1100.0 * (i as f64 + 0.5)
-                                / rate as f64)
-                                .sin()) as i16
+                            * (2.0 * PI * 1100.0 * (i as f64 + 0.5) / rate as f64).sin())
+                            as i16
                     };
                     wav.extend(x.to_le_bytes());
                 }

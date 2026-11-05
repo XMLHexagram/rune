@@ -1,3 +1,6 @@
+use database::actions::file::{
+    AudioAvailability as FileAudioAvailability, AudioOrigin as FileAudioOrigin,
+};
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,10 +26,7 @@ pub enum AudioAvailability {
 
 impl AudioAvailability {
     /// A pending persistent download does not remove an existing remote content reference.
-    pub fn from_local(
-        value: database::actions::file::AudioAvailability,
-        has_remote_content: bool,
-    ) -> Self {
+    pub fn from_local(value: FileAudioAvailability, has_remote_content: bool) -> Self {
         use database::actions::file::AudioAvailability as State;
         match value {
             State::Local => Self::Local,
@@ -34,6 +34,23 @@ impl AudioAvailability {
             State::Unavailable => Self::Unavailable,
             State::ImportPending if has_remote_content => Self::RemoteOnly,
             State::ImportPending => Self::ImportPending,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, SignalPiece, Debug, PartialEq, Eq)]
+pub enum AudioOrigin {
+    Host,
+    SyncedCopy,
+    Remote,
+}
+
+impl From<FileAudioOrigin> for AudioOrigin {
+    fn from(value: FileAudioOrigin) -> Self {
+        match value {
+            FileAudioOrigin::Host => Self::Host,
+            FileAudioOrigin::SyncedCopy => Self::SyncedCopy,
+            FileAudioOrigin::Remote => Self::Remote,
         }
     }
 }
@@ -49,6 +66,7 @@ pub struct MediaFile {
     pub cover_art_id: i32,
     pub track_number: i32,
     pub audio_availability: AudioAvailability,
+    pub audio_origin: AudioOrigin,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]

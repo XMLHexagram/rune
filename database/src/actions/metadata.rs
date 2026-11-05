@@ -1,11 +1,24 @@
+use crate::actions::{
+    file::{
+        MANAGED_AUDIO_DIRECTORY, get_file_ids_by_descriptions, is_managed_directory, remove_track,
+    },
+    index::index_media_files,
+    logging::{LogLevel, insert_log},
+};
+use crate::entities::{
+    albums, artists, media_file_albums, media_file_artists, media_files, media_metadata,
+    sync_download_jobs, sync_download_jobs::Column,
+};
+use crate::error::ExpectedError;
 use sea_orm::ExprTrait;
+use sea_orm::sqlx::Error;
+use std::collections::HashSet;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
 use log::{debug, error, info};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -21,17 +34,6 @@ use ::metadata::{
     describe::{FileDescription, describe_file},
     reader::get_metadata,
     scanner::AudioScanner,
-};
-
-use crate::actions::{
-    collection::CollectionQueryType,
-    file::get_file_ids_by_descriptions,
-    index::index_media_files,
-    logging::{LogLevel, insert_log},
-    search::add_term,
-};
-use crate::entities::{
-    albums, artists, media_file_albums, media_file_artists, media_files, media_metadata,
 };
 
 use super::utils::DatabaseExecutor;
@@ -61,12 +63,12 @@ pub async fn get_existing_files_modified(
     file_keys: Vec<(String, String)>, // (directory, file_name)
 ) -> Result<std::collections::HashMap<(String, String), String>> {
     if file_keys.is_empty() {
-        return Ok(std::collections::HashMap::new());
+        return Ok(HashMap::new());
     }
 
     // Split into chunks to avoid SQL query size limits
     let chunk_size = 500;
-    let mut result = std::collections::HashMap::new();
+    let mut result = HashMap::new();
 
     for chunk in file_keys.chunks(chunk_size) {
         let mut conditions = sea_orm::Condition::any();
@@ -129,6 +131,27 @@ pub fn filter_modified_files(
     (filtered, skipped_count)
 }
 
+// SQLite constraint failures and explicit row validation reject one record. Connection,
+// query, and I/O failures are fatal even if they occur inside a savepoint.
+pub(crate) fn is_fatal_scan_error(error: &anyhow::Error) -> bool {
+    use std::ops::Deref;
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<sea_orm::DbErr>())
+        .any(|db| match db {
+            sea_orm::DbErr::Custom(_) => false,
+            sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(error))
+            | sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(error)) => match error.deref() {
+                Error::Database(error) => !error
+                    .code()
+                    .and_then(|code| code.parse::<i32>().ok())
+                    .is_some_and(|code| code & 0xff == 19),
+                _ => true,
+            },
+            _ => true,
+        })
+}
+
 pub async fn sync_file_descriptions(
     fsio: &FsIo,
     main_db: &DatabaseConnection,
@@ -137,34 +160,51 @@ pub async fn sync_file_descriptions(
     force: bool,
     store: &crate::sync::SeaOrmSyncStore,
 ) -> Result<()> {
+    let mut work = descriptions.to_vec();
+    let failed =
+        sync_file_descriptions_inner(fsio, main_db, node_id, &mut work, force, store).await?;
+    for (original, result) in descriptions.iter_mut().zip(work) {
+        if result.is_some() {
+            *original = result;
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("Failed to save metadata for {failed} files");
+    }
+    Ok(())
+}
+
+async fn sync_file_descriptions_inner(
+    fsio: &FsIo,
+    main_db: &DatabaseConnection,
+    node_id: &str,
+    descriptions: &mut [Option<FileDescription>],
+    force: bool,
+    store: &crate::sync::SeaOrmSyncStore,
+) -> Result<usize> {
     // Bound both prepared metadata memory and write-lock duration. File I/O is
     // finished before opening each batch transaction; savepoints isolate bad files.
     const WRITE_BATCH_SIZE: usize = 16;
-    let mut first_error = None;
+    let mut failed = 0;
+    let mut rejected = HashSet::new();
     for batch in descriptions.chunks_mut(WRITE_BATCH_SIZE) {
         let mut ready = Vec::new();
         for description in batch.iter_mut().flatten() {
             // Managed copies are verified by file actions and attached after download.
             // Unreferenced old versions must never become newly authored files.
-            if std::path::Path::new(&description.directory)
-                .starts_with(crate::actions::file::MANAGED_AUDIO_DIRECTORY)
-            {
+            if Path::new(&description.directory).starts_with(MANAGED_AUDIO_DIRECTORY) {
+                rejected.insert((description.directory.clone(), description.file_name.clone()));
                 continue;
             }
             // The download queue reserves destinations until attachment completes.
-            if crate::entities::sync_download_jobs::Entity::find()
-                .filter(
-                    crate::entities::sync_download_jobs::Column::Directory
-                        .eq(&description.directory),
-                )
-                .filter(
-                    crate::entities::sync_download_jobs::Column::FileName
-                        .eq(&description.file_name),
-                )
+            if sync_download_jobs::Entity::find()
+                .filter(Column::Directory.eq(&description.directory))
+                .filter(Column::FileName.eq(&description.file_name))
                 .one(main_db)
                 .await?
                 .is_some()
             {
+                rejected.insert((description.directory.clone(), description.file_name.clone()));
                 continue;
             }
             let existing = media_files::Entity::find()
@@ -180,6 +220,7 @@ pub async fn sync_file_descriptions(
                         && file.last_modified == description.last_modified
                 })
             {
+                rejected.insert((description.directory.clone(), description.file_name.clone()));
                 continue;
             }
 
@@ -207,6 +248,8 @@ pub async fn sync_file_descriptions(
                 Ok(value) => value,
                 Err(e) => {
                     error!("Failed to prepare {}: {e:#}", description.file_name);
+                    failed += 1;
+                    rejected.insert((description.directory.clone(), description.file_name.clone()));
                     continue;
                 }
             };
@@ -217,12 +260,12 @@ pub async fn sync_file_descriptions(
                         .as_ref()
                         .is_some_and(|expected| expected != &digest)
             }) {
-                if first_error.is_none() {
-                    first_error = Some(anyhow::anyhow!(
-                        "Local content does not match the catalog reference: {}",
-                        description.file_name
-                    ));
-                }
+                error!(
+                    "Local content does not match the catalog reference: {}",
+                    description.file_name
+                );
+                failed += 1;
+                rejected.insert((description.directory.clone(), description.file_name.clone()));
                 continue;
             }
             *description = prepared;
@@ -235,19 +278,14 @@ pub async fn sync_file_descriptions(
         let batch_txn = main_db.begin().await?;
         store.lock(&batch_txn).await?;
         for (description, existing, metadata, digest, size) in ready {
-            if crate::entities::sync_download_jobs::Entity::find()
-                .filter(
-                    crate::entities::sync_download_jobs::Column::Directory
-                        .eq(&description.directory),
-                )
-                .filter(
-                    crate::entities::sync_download_jobs::Column::FileName
-                        .eq(&description.file_name),
-                )
+            if sync_download_jobs::Entity::find()
+                .filter(Column::Directory.eq(&description.directory))
+                .filter(Column::FileName.eq(&description.file_name))
                 .one(&batch_txn)
                 .await?
                 .is_some()
             {
+                rejected.insert((description.directory.clone(), description.file_name.clone()));
                 continue;
             }
             let current = media_files::Entity::find()
@@ -256,12 +294,12 @@ pub async fn sync_file_descriptions(
                 .one(&batch_txn)
                 .await?;
             if current != existing {
-                if first_error.is_none() {
-                    first_error = Some(anyhow::anyhow!(
-                        "File changed during metadata scan: {}",
-                        description.file_name
-                    ));
-                }
+                error!(
+                    "File changed during metadata scan: {}",
+                    description.file_name
+                );
+                failed += 1;
+                rejected.insert((description.directory.clone(), description.file_name.clone()));
                 continue;
             }
             let txn = batch_txn.begin().await?;
@@ -272,17 +310,10 @@ pub async fn sync_file_descriptions(
                         update_file_metadata(fsio, &txn, node_id, file, description, metadata)
                             .await?;
                         unlink_cover_art(&txn, file).await?;
-                        let title = metadata
-                            .metadata
-                            .iter()
-                            .find(|(key, _)| key == "track_title")
-                            .map(|(_, value)| value.as_str())
-                            .unwrap_or(&description.file_name);
-                        add_term(&txn, CollectionQueryType::Track, file.id, title).await?;
                     }
                     (Some(file), None) => update_last_modified(&txn, file, description).await?,
                     (None, Some(metadata)) => {
-                        insert_new_file(fsio, &txn, node_id, metadata, description).await?
+                        insert_new_file(fsio, &txn, metadata, description).await?
                     }
                     (None, None) => unreachable!("New files always have metadata"),
                 }
@@ -305,9 +336,11 @@ pub async fn sync_file_descriptions(
                 Err(e) => {
                     txn.rollback().await?;
                     error!("Failed to save {}: {e:#}", description.file_name);
-                    if first_error.is_none() {
-                        first_error = Some(e);
+                    if is_fatal_scan_error(&e) {
+                        return Err(e);
                     }
+                    failed += 1;
+                    rejected.insert((description.directory.clone(), description.file_name.clone()));
                 }
             }
         }
@@ -316,10 +349,15 @@ pub async fn sync_file_descriptions(
             .await
             .context("Failed to commit metadata batch")?;
     }
-    match first_error {
-        Some(error) => Err(error).context("Failed to save file metadata"),
-        None => Ok(()),
+    for description in descriptions.iter_mut() {
+        if description
+            .as_ref()
+            .is_some_and(|d| rejected.contains(&(d.directory.clone(), d.file_name.clone())))
+        {
+            *description = None;
+        }
     }
+    Ok(failed)
 }
 
 async fn author_track(
@@ -523,7 +561,6 @@ where
 async fn insert_new_file(
     fsio: &FsIo,
     main_db: &sea_orm::DatabaseTransaction,
-    node_id: &str,
     metadata: &FileMetadata,
     description: &mut FileDescription,
 ) -> Result<()> {
@@ -550,37 +587,9 @@ async fn insert_new_file(
         last_modified: ActiveValue::Set(description.last_modified.clone()),
         hlc_uuid: ActiveValue::Set(Uuid::new_v4().to_string()),
         local_available: ActiveValue::Set(true),
-        created_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
-        updated_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
-        created_at_hlc_ver: ActiveValue::Set(0),
-        updated_at_hlc_ver: ActiveValue::Set(0),
-        created_at_hlc_nid: ActiveValue::Set(node_id.to_owned()),
-        updated_at_hlc_nid: ActiveValue::Set(node_id.to_owned()),
         ..Default::default()
     };
     let inserted_file = media_files::Entity::insert(new_file).exec(main_db).await?;
-
-    if let Some((_, value)) = metadata
-        .metadata
-        .iter()
-        .find(|(key, _)| key == "track_title")
-    {
-        add_term(
-            main_db,
-            CollectionQueryType::Track,
-            inserted_file.last_insert_id,
-            value,
-        )
-        .await?;
-    } else if let Some(file_name) = metadata.path.file_name() {
-        add_term(
-            main_db,
-            CollectionQueryType::Track,
-            inserted_file.last_insert_id,
-            &file_name.to_string_lossy(),
-        )
-        .await?;
-    }
 
     let file_id = inserted_file.last_insert_id;
 
@@ -600,7 +609,7 @@ async fn replace_metadata_on(
     type Tags = OwnedListPolicy<media_metadata::Entity, MetadataMap>;
     let owner = [file_id.into()];
     let previous = Tags::read_on(tx, &owner, Tags::read_ceiling()).await?;
-    let mut used = std::collections::HashSet::new();
+    let mut used = HashSet::new();
     let incoming = tags
         .iter()
         .enumerate()
@@ -638,30 +647,81 @@ async fn replace_metadata_on(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum MissingHostFilePolicy {
+    #[default]
+    RemoveEverywhere,
+    KeepAsRemote,
+}
+
 async fn clean_up_database(
     fsio: &FsIo,
     main_db: &DatabaseConnection,
     root_path: &Path,
+    policy: MissingHostFilePolicy,
+    store: &crate::sync::SeaOrmSyncStore,
 ) -> Result<()> {
-    let db_files = media_files::Entity::find()
+    let files = media_files::Entity::find()
         .filter(media_files::Column::LocalAvailable.eq(true))
         .all(main_db)
         .await?;
-    for db_file in db_files {
-        let full_path = root_path.join(&db_file.directory).join(&db_file.file_name);
-        // An I/O error is not proof of absence.
-        if matches!(fsio.exists(&full_path), Ok(false)) {
-            media_files::Entity::update_many()
-                .col_expr(media_files::Column::LocalAvailable, Expr::value(false))
-                .filter(media_files::Column::Id.eq(db_file.id))
-                .filter(media_files::Column::Directory.eq(db_file.directory))
-                .filter(media_files::Column::FileName.eq(db_file.file_name))
-                .filter(media_files::Column::LocalAvailable.eq(true))
-                .exec(main_db)
-                .await?;
+    let host_total = files
+        .iter()
+        .filter(|file| !is_managed_directory(&file.directory))
+        .count();
+    let missing: Vec<_> = files
+        .into_iter()
+        .filter(|file| {
+            matches!(
+                fsio.exists(&root_path.join(&file.directory).join(&file.file_name)),
+                Ok(false)
+            )
+        })
+        .collect();
+    let host_missing = missing
+        .iter()
+        .filter(|file| !is_managed_directory(&file.directory))
+        .count();
+    let mass_missing = host_missing > 5 && host_missing * 2 > host_total;
+    if mass_missing {
+        log::warn!("Skipping missing host file removals because the library looks unmounted");
+    }
+    let root_listable = fsio.read_dir(root_path).await.is_ok();
+    for file in missing {
+        let result: Result<()> = async {
+            if !is_managed_directory(&file.directory)
+                && policy == MissingHostFilePolicy::RemoveEverywhere
+                && root_listable
+                && !mass_missing
+            {
+                let tx = main_db.begin().await?;
+                store.lock(&tx).await?;
+                let current = media_files::Entity::find_by_id(file.id).one(&tx).await?;
+                if current.as_ref().is_some_and(|row| {
+                    row.local_available
+                        && row.directory == file.directory
+                        && row.file_name == file.file_name
+                }) {
+                    remove_track(&tx, store, file.id).await?;
+                }
+                tx.commit().await?;
+            } else {
+                media_files::Entity::update_many()
+                    .col_expr(media_files::Column::LocalAvailable, Expr::value(false))
+                    .filter(media_files::Column::Id.eq(file.id))
+                    .filter(media_files::Column::Directory.eq(file.directory))
+                    .filter(media_files::Column::FileName.eq(file.file_name))
+                    .filter(media_files::Column::LocalAvailable.eq(true))
+                    .exec(main_db)
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            error!("Failed to clean up missing file {}: {error:#}", file.id);
         }
     }
-
     Ok(())
 }
 
@@ -686,23 +746,44 @@ pub async fn scan_audio_file(
     Ok(id)
 }
 
-#[allow(clippy::too_many_arguments)]
+pub struct ScanOptions {
+    pub cleanup: bool,
+    pub force: bool,
+    pub missing_host_file: MissingHostFilePolicy,
+    pub cancel_token: Option<CancellationToken>,
+}
+
 pub async fn scan_audio_library<F>(
     fsio: &FsIo,
     main_db: &DatabaseConnection,
     node_id: &str,
     lib_path: &Path,
-    cleanup: bool,
-    force: bool,
+    options: ScanOptions,
     progress_callback: F,
-    cancel_token: Option<CancellationToken>,
     store: &crate::sync::SeaOrmSyncStore,
 ) -> Result<usize>
 where
     F: Fn(usize) + Send + Sync,
 {
+    let ScanOptions {
+        cleanup,
+        force,
+        missing_host_file: policy,
+        cancel_token,
+    } = options;
     let root_path_str = lib_path.to_str().expect("Invalid UTF-8 sequence in path");
-    let mut scanner = AudioScanner::new(fsio, &root_path_str)?;
+    let mut scanner = match AudioScanner::new(fsio, &root_path_str) {
+        Ok(scanner) => scanner,
+        Err(error) => {
+            if cleanup
+                && let Err(cleanup_error) =
+                    clean_up_database(fsio, main_db, lib_path, policy, store).await
+            {
+                log::error!("Unable to clean up unavailable library: {cleanup_error:#}");
+            }
+            return Err(error.into());
+        }
+    };
 
     info!("Starting audio library scan with last-modified pre-filtering");
 
@@ -734,7 +815,13 @@ where
             .clone()
             .into_iter()
             .map(|file| describe_file(fsio, &file, &Some(lib_path.to_path_buf())))
-            .map(|result| result.ok())
+            .map(|result| match result {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    error!("Failed to describe audio file: {error:#}");
+                    None
+                }
+            })
             .collect();
 
         // Pre-filtering: Skip files that haven't been modified
@@ -776,11 +863,14 @@ where
             continue;
         }
 
-        match sync_file_descriptions(fsio, main_db, node_id, &mut descriptions, force, store)
+        match sync_file_descriptions_inner(fsio, main_db, node_id, &mut descriptions, force, store)
             .await
             .with_context(|| "Unable to describe files")
         {
-            Ok(_) => {
+            Ok(failed) => {
+                if failed > 0 {
+                    info!("Failed to scan {failed} files in this batch");
+                }
                 debug!(
                     "Finished one batch with {} files to process",
                     descriptions.iter().filter(|d| d.is_some()).count()
@@ -789,6 +879,12 @@ where
             Err(e) => return Err(e),
         };
 
+        if cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Ok(processed_files);
+        }
         let file_ids = get_file_ids_by_descriptions(main_db, &descriptions).await?;
 
         match index_media_files(main_db, node_id, file_ids, cancel_token.as_ref(), store)
@@ -810,9 +906,13 @@ where
         info!("Pre-filtering skipped {} unchanged files", skipped_files);
     }
 
-    if cleanup {
+    if cleanup
+        && !cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+    {
         info!("Starting cleanup process.");
-        match clean_up_database(fsio, main_db, lib_path)
+        match clean_up_database(fsio, main_db, lib_path, policy, store)
             .await
             .with_context(|| "Unable to cleanup database")
         {
@@ -984,7 +1084,10 @@ pub async fn get_metadata_summary_by_file_id<C: sea_orm::ConnectionTrait>(
     results
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow::anyhow!("Metadata summary not found for file ID: {}", file_id))
+        .ok_or(ExpectedError::NotFound {
+            what: "metadata summary",
+        })
+        .with_context(|| format!("Metadata summary not found for file ID: {file_id}"))
 }
 
 pub async fn get_parsed_file_by_id(

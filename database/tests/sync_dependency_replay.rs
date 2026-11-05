@@ -1,6 +1,9 @@
+use support::fixtures;
+
 #[path = "support/causal_library.rs"]
 mod support;
 use anyhow::Result;
+use database::entities::{artists, media_files};
 use database::{
     actions::{
         mixes::{executable_mix_queries, query_mix_media_files},
@@ -8,7 +11,7 @@ use database::{
     },
     connection::RecommendationDbConnection,
     entities::{media_file_artists, media_file_playlists, mix_queries, mixes},
-    sync::{LibrarySyncStore, model::*},
+    sync::model::*,
 };
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use support::{Peer, SqlLibrary, key};
@@ -85,7 +88,7 @@ async fn reference_before_parent_survives_endpoint_restart_and_parent_removal() 
         .apply_page(&first, support::limits().apply)
         .await?;
     assert_eq!(local.library.pending_mixes().await?.len(), 1);
-    let restarted = LibrarySyncStore::open(local.db.clone(), actor, Some(ns)).await?;
+    let restarted = fixtures::open_library(local.db.clone(), actor, Some(ns)).await?;
     let second = page(&source, &selected, first.next).await?;
     restarted
         .endpoint()
@@ -286,17 +289,15 @@ async fn file_artist_keeps_membership_while_parents_arrive_and_return() -> Resul
         link
     );
     assert!(local.library.pending_references().await?.is_empty());
-    let artist_row = database::entities::artists::Entity::find()
-        .one(&local.db)
-        .await?
-        .unwrap();
+    let artist_row = artists::Entity::find().one(&local.db).await?.unwrap();
     assert_eq!(
         query_mix_media_files(
             &local.db,
             &RecommendationDbConnection::new(),
             vec![("lib::artist".into(), artist_row.id.to_string())],
             0,
-            20
+            20,
+            &[]
         )
         .await?
         .len(),
@@ -340,12 +341,6 @@ async fn source_uuid_resolves_reference_without_a_second_identity_registry() -> 
         .apply_page(&second, support::limits().apply)
         .await?;
     assert!(get_liked(&local.db, 1).await?);
-    assert_eq!(
-        database::entities::media_files::Entity::find()
-            .all(&local.db)
-            .await?
-            .len(),
-        1
-    );
+    assert_eq!(media_files::Entity::find().all(&local.db).await?.len(), 1);
     Ok(())
 }

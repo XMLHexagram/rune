@@ -22,37 +22,37 @@ macro_rules! process_server_handlers {
 macro_rules! register_single_handler {
     ($server:expr, $global_params:expr, $request:ty, $with_response:tt) => {
         paste::paste! {
-            let global_params = $global_params.clone();
+            let global_params = Arc::downgrade(&$global_params);
             $server.register_handler(stringify!($request), move |payload, session| {
                 let global_params = global_params.clone();
                 async move {
+                    let Some(global_params) = global_params.upgrade() else {
+                        return (String::new(), Err(anyhow::anyhow!("Node has shut down")));
+                    };
+                    let ui_params = match global_params.current_ui().await {
+                        Ok(params) => params,
+                        Err(error) => return (String::new(), Err(error)),
+                    };
+                    if let Some(session) = &session
+                        && let Err(error) = global_params.authorize_request(session, stringify!($request), &ui_params).await
+                    {
+                        return (String::new(), Err(error));
+                    }
                     let buf = payload.as_slice();
                     let request = match rinf::deserialize::<$request>(buf) {
                         Ok(req) => req,
                         Err(e) => {
-                            error!("Failed to deserialize request: {e:?}");
-                            return (
-                                "CrashResponse".to_owned(),
-                                rinf::serialize(&CrashResponse {
-                                    detail: format!("Failed to deserialize request: {e}")
-                                }).map_err(|e| anyhow::Error::new(e))
-                            );
+                            return (String::new(), Err(anyhow::Error::new(e).context("Failed to deserialize request")));
                         }
                     };
 
-                    let params = request.extract_params(&global_params);
+                    let params = request.extract_params(&ui_params);
                     match request.handle(params, session, &request).await {
                         Ok(_response) => {
                             handle_server_response!(_response, $with_response)
                         }
                         Err(e) => {
-                            error!("Error handling request: {e:?}");
-                            (
-                                "CrashResponse".to_owned(),
-                                rinf::serialize(&CrashResponse {
-                                    detail: e.to_string()
-                                }).map_err(|e| anyhow::Error::new(e))
-                            )
+                            (String::new(), Err(e))
                         }
                     }
                 }

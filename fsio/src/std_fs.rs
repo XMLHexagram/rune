@@ -1,3 +1,4 @@
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -21,7 +22,7 @@ impl FileIo for StdFsIo {
     }
 
     fn open(&self, path: &Path, open_mode: &str) -> Result<Box<dyn FileStream>, FileIoError> {
-        let mut options = std::fs::OpenOptions::new();
+        let mut options = OpenOptions::new();
         options.read(open_mode.contains('r'));
         options.write(open_mode.contains('w'));
         options.append(open_mode.contains('a'));
@@ -106,7 +107,14 @@ impl FileIo for StdFsIo {
         if from.parent() != to.parent() || !fs::metadata(from).await?.is_file() {
             return Err(FileIoError::InvalidPath);
         }
-        fs::rename(from, to).await.map_err(FileIoError::Io)
+        fs::rename(from, to).await?;
+        #[cfg(unix)]
+        {
+            let parent = to.parent().ok_or(FileIoError::InvalidPath)?;
+            let directory = fs::File::open(parent).await?;
+            directory.sync_all().await?;
+        }
+        Ok(())
     }
 
     async fn remove_dir_all(&self, path: &Path) -> Result<(), FileIoError> {

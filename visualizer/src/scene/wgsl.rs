@@ -1,6 +1,13 @@
 //! The shader sources of a scene: the runtime's prelude in front of the author's files, checked
 //! with naga so that errors name the author's file and line.
 
+use naga::front::wgsl::ParseError;
+use naga::front::wgsl::parse_str;
+use naga::proc::Layouter;
+use naga::valid::Capabilities;
+use naga::valid::ValidationFlags;
+use naga::valid::Validator;
+use std::error::Error;
 use std::fmt::Write;
 
 use anyhow::{Result, anyhow};
@@ -380,15 +387,12 @@ impl Source {
 
     /// Parse and validate, with errors in the author's terms.
     pub fn check(&self) -> Result<naga::Module> {
-        let module = naga::front::wgsl::parse_str(&self.text)
+        let module = parse_str(&self.text)
             .map_err(|e| anyhow!(self.at(e.location(&self.text), &parse_message(&e))))?;
-        let mut validator = naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::default(),
-        );
+        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::default());
         if let Err(e) = validator.validate(&module) {
             let mut message = e.as_inner().to_string();
-            let mut source = std::error::Error::source(e.as_inner());
+            let mut source = Error::source(e.as_inner());
             while let Some(inner) = source {
                 let _ = write!(message, ": {inner}");
                 source = inner.source();
@@ -402,7 +406,7 @@ impl Source {
 }
 
 /// naga's message with the labels of its spans ("expected ...").
-fn parse_message(e: &naga::front::wgsl::ParseError) -> String {
+fn parse_message(e: &ParseError) -> String {
     let mut message = e.message().to_string();
     for (_, label) in e.labels() {
         if !label.is_empty() {
@@ -414,7 +418,7 @@ fn parse_message(e: &naga::front::wgsl::ParseError) -> String {
 
 /// The size of `struct State` in `module` (at least 16 bytes).
 pub fn state_size(module: &naga::Module) -> Result<u64> {
-    let mut layouter = naga::proc::Layouter::default();
+    let mut layouter = Layouter::default();
     layouter
         .update(module.to_ctx())
         .map_err(|e| anyhow!("State: {e}"))?;
@@ -503,7 +507,13 @@ fn rv_fragment(v: RvVaryings) -> @location(0) vec4f {{
 
 #[cfg(test)]
 mod tests {
+
+    use super::super::manifest as super_super_manifest;
+    use super::super::manifest::MAX_ASSETS;
     use super::*;
+    use crate::scene::director::ShotState;
+    use naga::front::wgsl::parse_str;
+    use naga::proc::Layouter;
 
     fn manifest() -> Manifest {
         Manifest::parse(
@@ -542,7 +552,7 @@ inputs = ["prev:trail"]
         let words = SHOT.matches(": u32,").count() + SHOT.matches(": f32,").count();
         assert_eq!(words as u64 * 4, SHOT_SIZE);
         assert_eq!(
-            crate::scene::director::ShotState {
+            ShotState {
                 index: 0,
                 cuts: 0,
                 size: 0,
@@ -580,8 +590,8 @@ inputs = ["prev:trail"]
         let frame = format!(
             "{FRAME}@group(0) @binding(0) var<uniform> frame: Frame;\n@fragment fn f() -> @location(0) vec4f {{ return vec4f(f32(frame.covers)); }}\n"
         );
-        let module = naga::front::wgsl::parse_str(&frame).unwrap();
-        let mut layouter = naga::proc::Layouter::default();
+        let module = parse_str(&frame).unwrap();
+        let mut layouter = Layouter::default();
         layouter.update(module.to_ctx()).unwrap();
         let (handle, _) = module
             .types
@@ -631,7 +641,7 @@ inputs = ["prev:trail"]
                     .contains(&format!("@binding({BIND_SHOT}) var<uniform> shot: Shot;"))
             );
         }
-        assert!(BIND_ASSETS + super::super::manifest::MAX_ASSETS as u32 <= BIND_SHOT);
+        assert!(BIND_ASSETS + MAX_ASSETS as u32 <= BIND_SHOT);
         const { assert!(BIND_SHOT < BIND_INPUT) };
     }
 
@@ -646,7 +656,7 @@ inputs = ["prev:trail"]
         // The slot is its own: after the inputs, past the assets and the shot, and the struct is
         // its four words.
         const { assert!(BIND_INPUT < BIND_LOOK) };
-        assert!(BIND_ASSETS + super::super::manifest::MAX_ASSETS as u32 <= BIND_SHOT);
+        assert!(BIND_ASSETS + super_super_manifest::MAX_ASSETS as u32 <= BIND_SHOT);
         assert_eq!(LOOK_SIZE, 16);
     }
 
@@ -669,7 +679,7 @@ inputs = ["prev:trail"]
             BIND_INPUT,
             BIND_LOOK,
         ];
-        slots.extend(BIND_ASSETS..BIND_ASSETS + super::super::manifest::MAX_ASSETS as u32);
+        slots.extend(BIND_ASSETS..BIND_ASSETS + super_super_manifest::MAX_ASSETS as u32);
         let mut sorted = slots.clone();
         sorted.sort_unstable();
         sorted.dedup();

@@ -17,9 +17,18 @@ use database::{
 use fsio::FsIo;
 use http_request::sync::MetadataPeer;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
+use std::time::Duration;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 use sync::SyncPeer;
+use tokio::time::Instant;
 use uuid::Uuid;
+
+pub struct DownloadAudioContext<'a> {
+    pub node_id: Uuid,
+    pub remote: &'a MetadataPeer<RuneModel>,
+    pub notify: Arc<dyn Fn() + Send + Sync>,
+    pub playback_queue: &'a [i32],
+}
 /// Evaluate enabled rules and fetch only missing matching audio from this peer.
 pub async fn download_requested_audio(
     db: DatabaseConnection,
@@ -30,6 +39,33 @@ pub async fn download_requested_audio(
     remote: &MetadataPeer<RuneModel>,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<DownloadReport> {
+    let context = DownloadAudioContext {
+        node_id,
+        remote,
+        notify,
+        playback_queue: &[],
+    };
+    download_requested_audio_until(
+        db,
+        recommend_db,
+        fsio,
+        root,
+        context,
+        Instant::now() + Duration::from_secs(60),
+    )
+    .await
+}
+
+/// Run a pass until the deadline, allowing an in-flight transfer to finish.
+#[allow(clippy::too_many_arguments)]
+pub async fn download_requested_audio_until(
+    db: DatabaseConnection,
+    recommend_db: &RecommendationDbConnection,
+    fsio: Arc<FsIo>,
+    root: PathBuf,
+    context: DownloadAudioContext<'_>,
+    deadline: tokio::time::Instant,
+) -> Result<DownloadReport> {
     release_obsolete_reservations(&db).await?;
     let rules = sync_download_rules::Entity::find()
         .filter(sync_download_rules::Column::Enabled.eq(true))
@@ -39,14 +75,15 @@ pub async fn download_requested_audio(
     if rules.is_empty() {
         return Ok(DownloadReport::default());
     }
-    let server = remote.base_url();
-    let client = remote.client();
-    let identity = remote.identity().await?;
+    let server = context.remote.base_url();
+    let client = context.remote.client();
+    let identity = context.remote.identity().await?;
     ensure!(
         !identity.namespace.is_nil() && !identity.replica.is_nil() && !identity.generation.is_nil(),
         "invalid peer identity"
     );
-    let local = LibrarySyncStore::open(db.clone(), node_id, Some(identity.namespace)).await?;
+    let local =
+        LibrarySyncStore::open(db.clone(), context.node_id, Some(identity.namespace)).await?;
     let mut report = DownloadReport::default();
     const PAGE: usize = 100;
     const MAX_ATTEMPTS: usize = 128;
@@ -70,37 +107,68 @@ pub async fn download_requested_audio(
         }
         let mut cursor = 0usize;
         loop {
-            let files =
-                match query_mix_media_files(&db, recommend_db, queries.clone(), cursor, PAGE).await
-                {
-                    Ok(files) => files,
-                    Err(error) => {
-                        log::warn!("Could not query offline rule {}: {error:#}", rule.id);
-                        report.failed_rules += 1;
-                        break;
-                    }
-                };
+            let files = match query_mix_media_files(
+                &db,
+                recommend_db,
+                queries.clone(),
+                cursor,
+                PAGE,
+                context.playback_queue,
+            )
+            .await
+            {
+                Ok(files) => files,
+                Err(error) => {
+                    log::warn!("Could not query offline rule {}: {error:#}", rule.id);
+                    report.failed_rules += 1;
+                    break;
+                }
+            };
             let count = files.len();
             if count == 0 {
                 break;
             }
             for file in files {
-                if attempted.contains(&file.id)
-                    || is_materialized(&db, &fsio, &root, file.id).await?
-                {
+                if attempted.contains(&file.id) {
                     continue;
                 }
-                let Some((track_id, blob, extension)) = catalog_track(&db, file.id).await? else {
-                    continue;
+                let materialized = match is_materialized(&db, &fsio, &root, file.id).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log::warn!("Could not inspect file {}: {error:#}", file.id);
+                        report.failed += 1;
+                        attempted.insert(file.id);
+                        continue;
+                    }
                 };
-                if download_job(&db, track_id, &blob.digest)
-                    .await?
-                    .is_some_and(|job| !retry_is_due(&job, server))
-                {
+                if materialized {
+                    continue;
+                }
+                let (track_id, blob, extension) = match catalog_track(&db, file.id).await {
+                    Ok(Some(track)) => track,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        log::warn!("Could not look up file {}: {error:#}", file.id);
+                        report.failed += 1;
+                        attempted.insert(file.id);
+                        continue;
+                    }
+                };
+                let job = match download_job(&db, track_id, &blob.digest).await {
+                    Ok(job) => job,
+                    Err(error) => {
+                        log::warn!("Could not look up download for file {}: {error:#}", file.id);
+                        report.failed += 1;
+                        attempted.insert(file.id);
+                        continue;
+                    }
+                };
+                if job.is_some_and(|job| !retry_is_due(&job, server)) {
                     report.pending += 1;
                     continue;
                 }
-                if attempted.len() == MAX_ATTEMPTS {
+                if attempted.len() == MAX_ATTEMPTS || Instant::now() >= deadline {
+                    report.deadline_reached = true;
                     return Ok(report);
                 }
                 attempted.insert(file.id);
@@ -133,10 +201,19 @@ pub async fn download_requested_audio(
                 match transfer {
                     Ok(()) => {
                         report.downloaded += 1;
-                        notify();
+                        (context.notify)();
                     }
                     Err(error) => {
-                        record_download_failure(&db, track_id, &blob, server, &error).await?;
+                        log::warn!("Download failed for file {}: {error:#}", file.id);
+                        if let Err(record_error) =
+                            record_download_failure(&db, track_id, &blob, server, &error).await
+                        {
+                            log::warn!(
+                                "Could not record failure for file {}: {record_error:#}",
+                                file.id
+                            );
+                        }
+                        report.failed += 1;
                         report.pending += 1;
                     }
                 }

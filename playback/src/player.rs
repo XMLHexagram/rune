@@ -1,7 +1,11 @@
+use anyhow::Result;
+use futures::future::BoxFuture;
 use std::path::PathBuf;
+use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fmt, thread};
+use tokio::runtime::Runtime;
 
 use fsio::FsIo;
 use log::{debug, error};
@@ -21,6 +25,7 @@ pub struct PlayerStatus {
     pub position: Duration,
     pub state: PlaybackState,
     pub playlist: Vec<PlayingItem>,
+    pub unavailable: Vec<PlayingItem>,
     pub playback_mode: PlaybackMode,
     pub ready: bool,
     pub volume: f32,
@@ -35,7 +40,7 @@ pub struct OnlineInLibraryFile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PlayingItem {
-    InLibrary(i32),
+    InLibrary(i32, String),
     /// This is the raw content, on native platform it
     /// is the path, on Android, it is the Content URI
     IndependentFile(String),
@@ -50,7 +55,7 @@ pub enum PlayingItem {
 impl fmt::Display for PlayingItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PlayingItem::InLibrary(id) => write!(f, "PlayingItem::InLibrary({id})"),
+            PlayingItem::InLibrary(id, _) => write!(f, "PlayingItem::InLibrary({id})"),
             PlayingItem::IndependentFile(path) => {
                 write!(f, "PlayingItem::IndependentFile({path})")
             }
@@ -79,7 +84,7 @@ impl PlaybackSource {
         &self,
         id: i32,
         resolver: &dyn PlaybackSourceResolver,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool> {
         resolver.requires_stream(id).await
     }
 }
@@ -90,43 +95,44 @@ pub trait AudioRequest: Send + Sync {
     fn get(
         &self,
         range: Option<(u64, Option<u64>)>,
-    ) -> futures::future::BoxFuture<'static, anyhow::Result<reqwest::Response>>;
+    ) -> BoxFuture<'static, Result<reqwest::Response>>;
 }
 
 pub struct RemoteAudioSource {
-    pub request: std::sync::Arc<dyn AudioRequest>,
+    pub request: Arc<dyn AudioRequest>,
     pub url: String,
     pub extension: String,
     pub cancellation: CancellationToken,
 }
+pub struct LibraryPlaybackSource {
+    pub fsio: Arc<FsIo>,
+    pub resolver: Arc<dyn PlaybackSourceResolver>,
+}
+
 pub trait PlaybackSourceResolver: Send + Sync {
-    fn resolve_id(
+    fn for_library(
         &self,
-        id: i32,
-    ) -> futures::future::BoxFuture<'static, anyhow::Result<Option<i32>>> {
-        Box::pin(async move { Ok(Some(id)) })
-    }
-    fn local_path(
-        &self,
-        _id: i32,
-    ) -> futures::future::BoxFuture<'static, anyhow::Result<Option<PathBuf>>> {
+        _library_id: String,
+    ) -> BoxFuture<'static, Result<Option<LibraryPlaybackSource>>> {
         Box::pin(async { Ok(None) })
     }
-    fn requires_stream(
-        &self,
-        _id: i32,
-    ) -> futures::future::BoxFuture<'static, anyhow::Result<bool>> {
+
+    fn resolve_id(&self, id: i32) -> BoxFuture<'static, Result<Option<i32>>> {
+        Box::pin(async move { Ok(Some(id)) })
+    }
+    fn local_path(&self, _id: i32) -> BoxFuture<'static, Result<Option<PathBuf>>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn requires_stream(&self, _id: i32) -> BoxFuture<'static, Result<bool>> {
         Box::pin(async { Ok(false) })
     }
-    fn resolve(
-        &self,
-        id: i32,
-    ) -> futures::future::BoxFuture<'static, anyhow::Result<RemoteAudioSource>>;
+    fn resolve(&self, id: i32) -> BoxFuture<'static, Result<RemoteAudioSource>>;
 }
 
 #[derive(Debug, Clone)]
 pub struct PlaylistStatus {
     pub items: Vec<PlayingItem>,
+    pub unavailable: Vec<PlayingItem>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,8 +142,8 @@ pub enum PlaybackState {
     Stopped,
 }
 
-impl std::fmt::Display for PlaybackState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for PlaybackState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state_str = match self {
             PlaybackState::Playing => "Playing",
             PlaybackState::Paused => "Paused",
@@ -173,6 +179,20 @@ pub trait Playable: Send {
             mode,
         );
     }
+    fn restore(
+        &self,
+        tracks: Vec<(PlayingItem, PlaybackSource)>,
+        index: Option<usize>,
+        position: Duration,
+        mode: PlaybackMode,
+    ) {
+        self.add_to_playlist_with_sources(tracks, AddMode::AppendToEnd);
+        if let Some(index) = index {
+            self.load(index);
+            self.seek(position.as_secs_f64());
+        }
+        let _ = mode;
+    }
     fn set_source_resolver(&self, _resolver: Arc<dyn PlaybackSourceResolver>) {}
     fn remove_from_playlist(&self, index: usize);
     fn clear_playlist(&self);
@@ -197,7 +217,7 @@ pub trait Playable: Send {
 // Define the Player struct, which includes a channel sender for sending commands
 pub struct Player {
     commands: Arc<Mutex<mpsc::UnboundedSender<PlayerCommand>>>,
-    source_resolver: Arc<std::sync::RwLock<Option<Arc<dyn PlaybackSourceResolver>>>>,
+    source_resolver: Arc<RwLock<Option<Arc<dyn PlaybackSourceResolver>>>>,
     pub current_status: Arc<Mutex<PlayerStatus>>,
     status_sender: SimpleSender<PlayerStatus>,
     playlist_sender: SimpleSender<PlaylistStatus>,
@@ -246,6 +266,7 @@ impl Player {
             state: PlaybackState::Stopped,
             playback_mode: PlaybackMode::Sequential,
             playlist: Vec::new(),
+            unavailable: Vec::new(),
             ready: false,
             volume: 1.0,
         }));
@@ -254,7 +275,7 @@ impl Player {
 
         let commands = Arc::new(Mutex::new(cmd_tx.clone()));
         // Create the Player instance and wrap the command sender in Arc<Mutex>
-        let source_resolver = Arc::new(std::sync::RwLock::new(None));
+        let source_resolver = Arc::new(RwLock::new(None));
         let player = Player {
             source_resolver: source_resolver.clone(),
             commands: commands.clone(),
@@ -283,7 +304,7 @@ impl Player {
                 source_resolver,
             );
             // Create a new Tokio runtime for asynchronous tasks
-            let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+            let runtime = Runtime::new().expect("Failed to create Tokio runtime");
             // Run the main loop of PlayerInternal within the Tokio runtime
             if let Err(e) = runtime.block_on(internal.run()) {
                 error!("PlayerInternal runtime error: {e:?}");
@@ -392,11 +413,35 @@ impl Player {
                     } => {
                         error!("Error at index {index}({item:?}): {path:?} - {error}");
                     }
+                    PlayerEvent::Unavailable(item) => {
+                        if !status.unavailable.contains(&item) {
+                            status.unavailable.push(item);
+                        }
+                        playlist_sender_clone.send(PlaylistStatus {
+                            items: status.playlist.clone(),
+                            unavailable: status.unavailable.clone(),
+                        });
+                    }
+                    PlayerEvent::UnavailableCleared(item) => {
+                        if let Some(item) = item {
+                            status
+                                .unavailable
+                                .retain(|unavailable| unavailable != &item);
+                        } else {
+                            status.unavailable.clear();
+                        }
+                        playlist_sender_clone.send(PlaylistStatus {
+                            items: status.playlist.clone(),
+                            unavailable: status.unavailable.clone(),
+                        });
+                    }
                     PlayerEvent::PlaylistUpdated(playlist) => {
+                        status.unavailable.retain(|item| playlist.contains(item));
                         status.playlist = playlist.clone();
                         debug!("Sending playlist status");
                         playlist_sender_clone.send(PlaylistStatus {
                             items: playlist.clone(),
+                            unavailable: status.unavailable.clone(),
                         });
                     }
                     PlayerEvent::RealtimeFFT(data) => {
@@ -478,6 +523,20 @@ impl Playable for Player {
         mode: AddMode,
     ) {
         self.command(PlayerCommand::AddToPlaylist { tracks, mode });
+    }
+    fn restore(
+        &self,
+        tracks: Vec<(PlayingItem, PlaybackSource)>,
+        index: Option<usize>,
+        position: Duration,
+        mode: PlaybackMode,
+    ) {
+        self.command(PlayerCommand::Restore {
+            tracks,
+            index,
+            position,
+            mode,
+        });
     }
     fn set_source_resolver(&self, resolver: Arc<dyn PlaybackSourceResolver>) {
         let mut slot = self
@@ -590,6 +649,7 @@ impl Playable for MockPlayer {
             position: Duration::new(0, 0),
             state: PlaybackState::Stopped,
             playlist: Vec::new(),
+            unavailable: Vec::new(),
             playback_mode: PlaybackMode::Sequential,
             ready: false,
             volume: 1.0,

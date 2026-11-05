@@ -1,35 +1,30 @@
 use anyhow::Result;
 use database::{
     actions::mixes::{
-        add_item_to_mix, create_mix, get_mix_queries_by_mix_id, remove_mix, remove_mix_query,
+        add_item_to_mix, create_mix, get_mix_queries_by_mix_id,
+        initialize_mix_queries_before_replication, remove_mix, remove_mix_query,
         replace_mix_queries, update_mix,
     },
-    sync::{
-        LibrarySyncStore,
-        model::{Collection, ObjectKey, Payload},
-    },
+    entities::{mixes, mixes::Column, search_index},
+    sync::model::{Collection, ObjectKey, Payload},
 };
-use migration::{Migrator, MigratorTrait};
 use sea_orm::{Database, EntityTrait, PaginatorTrait};
+use support::fixtures;
 use uuid::Uuid;
 #[tokio::test]
 async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
     let db = Database::connect("sqlite::memory:").await?;
     let actor = Uuid::new_v4();
-    let _ = migration::initialize_node_id(actor.to_string());
-    Migrator::up(&db, None).await?;
-    let library = LibrarySyncStore::open(db.clone(), actor, Some(Uuid::new_v4())).await?;
+    fixtures::migrate(&db, actor).await?;
+    let library = fixtures::open_library(db.clone(), actor, Some(Uuid::new_v4())).await?;
     let store = library.record_store();
     let head = library.head().await?;
-    let mix_count = database::entities::mixes::Entity::find().count(&db).await?;
-    let search_count = database::entities::search_index::Entity::find()
-        .count(&db)
-        .await?;
+    let mix_count = mixes::Entity::find().count(&db).await?;
+    let search_count = search_index::Entity::find().count(&db).await?;
     assert!(
         create_mix(
             &db,
             &store,
-            &actor.to_string(),
             "invalid".into(),
             "m".into(),
             false,
@@ -41,25 +36,16 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
         .is_err()
     );
     assert_eq!(library.head().await?, head);
-    assert_eq!(
-        database::entities::mixes::Entity::find().count(&db).await?,
-        mix_count
-    );
-    assert_eq!(
-        database::entities::search_index::Entity::find()
-            .count(&db)
-            .await?,
-        search_count
-    );
+    assert_eq!(mixes::Entity::find().count(&db).await?, mix_count);
+    assert_eq!(search_index::Entity::find().count(&db).await?, search_count);
     assert!(
-        database::actions::mixes::initialize_mix_queries_before_replication(&db)
+        initialize_mix_queries_before_replication(&db)
             .await
             .is_err()
     );
     let mix = create_mix(
         &db,
         &store,
-        &actor.to_string(),
         "mix".into(),
         "m".into(),
         false,
@@ -81,7 +67,6 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
         update_mix(
             &db,
             &store,
-            &actor.to_string(),
             mix.id,
             Some("bad".into()),
             Some("m".into()),
@@ -95,7 +80,7 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
     );
     assert_eq!(library.head().await?, head);
     assert_eq!(
-        database::entities::mixes::Entity::find_by_id(mix.id)
+        mixes::Entity::find_by_id(mix.id)
             .one(&db)
             .await?
             .unwrap()
@@ -144,7 +129,6 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
     update_mix(
         &db,
         &store,
-        &actor.to_string(),
         mix.id,
         Some("renamed".into()),
         None,
@@ -155,14 +139,9 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
     )
     .await?;
     assert!(library.head().await?.sequence > before.sequence);
-    let before_update = database::entities::mixes::Entity::find_by_id(mix.id)
-        .one(&db)
-        .await?
-        .unwrap();
-    let after_update = update_mix(
+    update_mix(
         &db,
         &store,
-        &actor.to_string(),
         mix.id,
         Some("renamed again".into()),
         None,
@@ -172,22 +151,6 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
         None,
     )
     .await?;
-    assert_eq!(
-        after_update.created_at_hlc_ts,
-        before_update.created_at_hlc_ts
-    );
-    assert_eq!(
-        after_update.created_at_hlc_ver,
-        before_update.created_at_hlc_ver
-    );
-    assert_eq!(
-        after_update.created_at_hlc_nid,
-        before_update.created_at_hlc_nid
-    );
-    assert_eq!(
-        after_update.updated_at_hlc_ver,
-        before_update.updated_at_hlc_ver + 1
-    );
     remove_mix(&db, &store, mix.id).await?;
     assert!(library.get(&key).await?.is_none());
     Ok(())
@@ -204,11 +167,9 @@ async fn each_mix_command_replicates_its_result() -> Result<()> {
     let source = support::SqlLibrary::new(namespace, actor).await?;
     let target = support::SqlLibrary::new(namespace, Uuid::new_v4()).await?;
     let store = source.library.record_store();
-    let node = actor.to_string();
     let mix = create_mix(
         &source.db,
         &store,
-        &node,
         "Original".into(),
         "Group".into(),
         false,
@@ -237,7 +198,6 @@ async fn each_mix_command_replicates_its_result() -> Result<()> {
     update_mix(
         &source.db,
         &store,
-        &node,
         mix.id,
         Some("Updated".into()),
         None,
@@ -275,12 +235,11 @@ async fn bootstrap_initializes_builtins_before_replication() -> Result<()> {
     };
     use sea_orm::{ColumnTrait, QueryFilter};
     let db = Database::connect("sqlite::memory:").await?;
-    let _ = migration::initialize_node_id(Uuid::new_v4().to_string());
-    Migrator::up(&db, None).await?;
+    fixtures::migrate(&db, Uuid::new_v4()).await?;
     initialize_mix_queries_before_replication(&db).await?;
     initialize_mix_queries_before_replication(&db).await?;
-    let liked = database::entities::mixes::Entity::find()
-        .filter(database::entities::mixes::Column::Name.eq("\u{200B}Liked"))
+    let liked = mixes::Entity::find()
+        .filter(Column::Name.eq("\u{200B}Liked"))
         .one(&db)
         .await?
         .unwrap();
@@ -306,7 +265,6 @@ async fn directory_binding_stays_local_and_clause_identity_survives_reordering()
     let mix = create_mix(
         &source.db,
         &store,
-        &actor.to_string(),
         "Directories".into(),
         "Test".into(),
         false,

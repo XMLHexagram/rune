@@ -27,6 +27,7 @@ macro_rules! handle_single_gui_event {
                 let receiver = <$request>::get_dart_signal_receiver();
 
                 tokio::select! {
+                    biased;
                     _ = [<cancel_token_ $request:snake>].cancelled() => {
                         return;
                     }
@@ -40,14 +41,25 @@ macro_rules! handle_single_gui_event {
                                     handle_response!(_response, $response_type);
                                 }
                                 Err(e) => {
-                                    error!("Request {} failed: {:?}", stringify!($request), e);
-                                    error!("Full error chain for {}: {:#}", stringify!($request), e);
-                                    let backtrace = e.backtrace();
-                                    error!("Backtrace for {}: {:?}", stringify!($request), backtrace);
-                                    CrashResponse {
-                                        detail: format!("{e:#?}"),
+                                    let kind = classify(&e);
+                                    RequestFailedResponse {
+                                        request: stringify!($request).to_owned(),
+                                        kind,
+                                        detail: format!("{e:#}"),
                                     }
                                     .send_signal_to_dart();
+                                    if kind == RequestErrorKind::Internal {
+                                        error!("Request {} failed: {:?}", stringify!($request), e);
+                                        error!("Full error chain for {}: {:#}", stringify!($request), e);
+                                        let backtrace = e.backtrace();
+                                        error!("Backtrace for {}: {:?}", stringify!($request), backtrace);
+                                        CrashResponse {
+                                            detail: format!("{e:#?}"),
+                                        }
+                                        .send_signal_to_dart();
+                                    } else {
+                                        warn!("Request {} failed: {e:#}", stringify!($request));
+                                    }
                                 }
                             }
 

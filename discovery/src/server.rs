@@ -1,11 +1,12 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, watch};
 
 use crate::persistent::{PersistenceError, PersistentDataManager};
 use crate::utils::DeviceType;
@@ -102,7 +103,12 @@ pub enum PermissionError {
     /// Error indicating that a provided path is invalid or cannot be used.
     #[error("Path is invalid")]
     InvalidPath,
+    /// Application grant persistence failed.
+    #[error("Device grants: {0}")]
+    Grants(String),
 }
+
+type TrustChangeHook = Arc<dyn Fn(&str, Option<&UserStatus>) -> Result<(), String> + Send + Sync>;
 
 /// Manages user permissions, including adding, removing, and verifying users.
 ///
@@ -110,7 +116,6 @@ pub enum PermissionError {
 /// to manage a list of users, their statuses, and associated device information. It uses
 /// `PersistentDataManager` for storing and retrieving permission data from disk. It also maintains
 /// an in-memory cache of IP addresses to application fingerprints for rate limiting or tracking purposes.
-#[derive(Debug)]
 pub struct PermissionManager {
     /// Manages the persistent storage of the permission list.
     storage: PersistentDataManager<PermissionList>,
@@ -118,9 +123,22 @@ pub struct PermissionManager {
     /// Used for tracking recent applications from specific IPs, possibly for rate limiting or security.
     ip_applications: Arc<RwLock<HashMap<String, VecDeque<String>>>>,
     request_sender: broadcast::Sender<User>,
+    change_sender: watch::Sender<u64>,
+    trust_change_hook: Option<TrustChangeHook>,
+}
+
+impl Debug for PermissionManager {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("PermissionManager").finish_non_exhaustive()
+    }
 }
 
 impl PermissionManager {
+    /// Attach the application's durable grant lifecycle to trust edits.
+    pub fn set_trust_change_hook(&mut self, hook: TrustChangeHook) {
+        self.trust_change_hook = Some(hook);
+    }
+
     /// Creates a new `PermissionManager` instance, initializing persistent storage.
     ///
     /// This constructor sets up a `PermissionManager` by initializing its `PersistentDataManager`.
@@ -148,7 +166,14 @@ impl PermissionManager {
             storage,
             ip_applications: Arc::new(RwLock::new(HashMap::new())),
             request_sender,
+            change_sender: watch::channel(0).0,
+            trust_change_hook: None,
         })
+    }
+
+    /// Subscribe to permission changes.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.change_sender.subscribe()
     }
 
     /// Lists all users with summary information.
@@ -223,6 +248,9 @@ impl PermissionManager {
                     // Check if queue is full (max 5 entries)
                     if let Some(old_key) = queue.pop_front() {
                         // Remove oldest entry if queue is full
+                        if let Some(hook) = &self.trust_change_hook {
+                            hook(&old_key, None).map_err(PermissionError::Grants)?;
+                        }
                         permissions.users.remove(&old_key); // Optionally remove user associated with the oldest key
                     }
                 }
@@ -241,10 +269,12 @@ impl PermissionManager {
                         add_time: SystemTime::now(), // Set current time when adding user
                     },
                 );
-                Ok((permissions, ())) // Return updated permissions and success result
+                Ok::<_, PermissionError>((permissions, ())) // Return updated permissions and success result
             })
             .await?;
 
+        self.change_sender
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         if let Some(user) = self.verify_by_fingerprint(&fingerprint_clone).await
             && user.status != UserStatus::Blocked
             && user.status != UserStatus::Approved
@@ -312,10 +342,16 @@ impl PermissionManager {
                     .users
                     .get_mut(fingerprint) // Get mutable reference to user by fingerprint
                     .ok_or(PermissionError::UserNotFound)?; // Return error if user not found
+                if let Some(hook) = &self.trust_change_hook {
+                    hook(fingerprint, Some(&new_status)).map_err(PermissionError::Grants)?;
+                }
                 user.status = new_status.clone(); // Update user status
-                Ok((permissions, ())) // Return updated permissions and success result
+                Ok::<_, PermissionError>((permissions, ())) // Return updated permissions and success result
             })
-            .await
+            .await?;
+        self.change_sender
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        Ok(())
     }
 
     /// Removes a user from the permission system.
@@ -335,14 +371,22 @@ impl PermissionManager {
         self.storage
             .update(|mut permissions| async move {
                 // Update operation on persistent storage
+                if permissions.users.contains_key(fingerprint)
+                    && let Some(hook) = &self.trust_change_hook
+                {
+                    hook(fingerprint, None).map_err(PermissionError::Grants)?;
+                }
                 if permissions.users.remove(fingerprint).is_none() {
                     // Try to remove user by fingerprint
                     Err(PermissionError::UserNotFound) // Return error if user was not found (remove returned None)
                 } else {
-                    Ok((permissions, ())) // Return updated permissions and success result
+                    Ok::<_, PermissionError>((permissions, ())) // Return updated permissions and success result
                 }
             })
-            .await
+            .await?;
+        self.change_sender
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        Ok(())
     }
 
     /// Finds users by their device type.
@@ -402,5 +446,41 @@ impl PermissionManager {
 
     pub fn subscribe_new_user(&self) -> broadcast::Receiver<User> {
         self.request_sender.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod change_tests {
+    use super::{PermissionManager, UserStatus};
+    use crate::utils::DeviceType;
+
+    #[tokio::test]
+    async fn generation_tracks_mutations_not_reads() -> Result<(), Box<dyn std::error::Error>> {
+        let dir =
+            std::env::temp_dir().join(format!("permission-generation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = PermissionManager::new(&dir)?;
+        manager
+            .add_user(
+                "key".into(),
+                "fingerprint".into(),
+                "alias".into(),
+                "model".into(),
+                DeviceType::Desktop,
+                "ip".into(),
+            )
+            .await?;
+        let mut changes = manager.changes();
+        let initial = *changes.borrow_and_update();
+        manager.verify_by_fingerprint("fingerprint").await;
+        assert!(!changes.has_changed()?);
+        manager
+            .change_user_status("fingerprint", UserStatus::Approved)
+            .await?;
+        assert_eq!(*changes.borrow_and_update(), initial + 1);
+        manager.remove_user("fingerprint").await?;
+        assert_eq!(*changes.borrow_and_update(), initial + 2);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

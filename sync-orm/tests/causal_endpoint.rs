@@ -1,4 +1,74 @@
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
 use anyhow::{Context, Result, ensure};
+use sea_orm::sea_query::Condition;
+use sea_orm::sea_query::Func;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use sync::causal;
+use sync::causal::Dot;
+use sync_orm::maintenance::Maintenance;
+
+struct CompactAfterHistory<'a> {
+    source: &'a CausalEndpoint<Notes>,
+    db: sea_orm::DatabaseConnection,
+    namespace: Uuid,
+    compact_next: AtomicBool,
+}
+
+impl p::SyncPeer<Notes> for CompactAfterHistory<'_> {
+    fn identity(&self) -> p::BoxFuture<'_, p::StoreIdentity> {
+        p::SyncPeer::identity(self.source)
+    }
+
+    fn head(&self) -> p::BoxFuture<'_, p::ReceiveProgress> {
+        p::SyncPeer::head(self.source)
+    }
+
+    fn history_status<'a>(
+        &'a self,
+        key: &'a p::CheckpointKey,
+        progress: Option<p::ReceiveProgress>,
+    ) -> p::BoxFuture<'a, p::HistoryStatus> {
+        Box::pin(async move {
+            let status = p::SyncPeer::history_status(self.source, key, progress).await?;
+            if self.compact_next.swap(false, Ordering::SeqCst) {
+                let compact: Result<()> = async {
+                    let tx = self.db.begin().await?;
+                    sync_orm::causal_compaction::maintenance_step_on::<Notes>(
+                        &tx,
+                        self.namespace,
+                        64,
+                        64,
+                        65536,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    Ok(())
+                }
+                .await;
+                compact.map_err(|error| p::SyncError::Storage(format!("{error:#}")))?;
+            }
+            Ok(status)
+        })
+    }
+
+    fn read_page(&self, request: p::PageRequest<Notes>) -> p::BoxFuture<'_, p::PageRead<Notes>> {
+        p::SyncPeer::read_page(self.source, request)
+    }
+
+    fn read_fragment(
+        &self,
+        manifest: p::ManifestRef,
+        ordinal: u32,
+        max_bytes: u64,
+    ) -> p::BoxFuture<'_, p::Fragment> {
+        p::SyncPeer::read_fragment(self.source, manifest, ordinal, max_bytes)
+    }
+}
 
 fn session_limits() -> p::SessionLimits {
     p::SessionLimits {
@@ -49,6 +119,58 @@ async fn synchronize(
         }
     }
     anyhow::bail!("SQL reconciliation did not finish")
+}
+
+#[tokio::test]
+async fn incremental_cursor_below_compaction_floor_recovers_with_full_resync() -> Result<()> {
+    let namespace = Uuid::new_v4();
+    let (source_db, source, _) = setup(namespace).await?;
+    let (_, target, _) = setup(namespace).await?;
+    synchronize(&source, &target).await?;
+
+    let key = p::ObjectKey {
+        collection: 1,
+        id: Uuid::from_u128(1),
+    };
+    source
+        .write_local(key.clone(), Some(Note("after checkpoint".into())))
+        .await?;
+    let peer = CompactAfterHistory {
+        source: &source,
+        db: source_db,
+        namespace,
+        compact_next: AtomicBool::new(true),
+    };
+    let mut coordinator = p::Coordinator::new(
+        p::Scope {
+            collections: [1].into_iter().collect(),
+        },
+        session_limits(),
+    )?;
+    let mut completed = false;
+    for _ in 0..20000 {
+        match coordinator
+            .advance(&target, &target, &target, &peer, &source)
+            .await?
+        {
+            p::SessionAdvance::Complete(_) => {
+                completed = true;
+                break;
+            }
+            p::SessionAdvance::BudgetExhausted => coordinator.start_pass(),
+            p::SessionAdvance::Incomplete => (),
+            p::SessionAdvance::Cancelled => anyhow::bail!("unexpected cancellation"),
+        }
+    }
+    ensure!(
+        completed,
+        "SQL reconciliation did not finish after floor advance"
+    );
+    assert_eq!(
+        target.get(&key).await?.unwrap().value,
+        Some(Note("after checkpoint".into()))
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -132,27 +254,12 @@ async fn removed_prefix_without_live_candidates_survives_relay() -> Result<()> {
         "prefix-only observation was discarded"
     );
     let tx = db.begin().await?;
-    let meta = tx
-        .query_one(
-            &Query::select()
-                .columns(["floor_state_seq", "state_seq"].map(Alias::new))
-                .from(Alias::new("sync_meta"))
-                .to_owned(),
-        )
-        .await?
-        .unwrap();
     assert!(
-        sync_orm::causal_context::globally_observed_on(
+        sync_orm::causal_observed::contains_on(
             &tx,
-            sync_orm::causal_context::GlobalObservation {
-                namespace,
-                collection: b"notes",
-                writer: source.store().writer_incarnation(),
-                counter: 1,
-                floor: meta.try_get_by_index(0)?,
-                state_seq: meta.try_get_by_index(1)?,
-                max_assertions: 1024
-            }
+            namespace,
+            b"notes",
+            Dot::new(source.store().writer_incarnation(), 1)?
         )
         .await?
     );
@@ -207,29 +314,9 @@ async fn preexisting_context_manifest_is_indexed_when_accepted() -> Result<()> {
     tx.commit().await?;
     synchronize(&source, &target).await?;
     let tx = db.begin().await?;
-    let meta = tx
-        .query_one(
-            &Query::select()
-                .columns(["floor_state_seq", "state_seq"].map(Alias::new))
-                .from(Alias::new("sync_meta"))
-                .to_owned(),
-        )
-        .await?
-        .unwrap();
     assert!(
-        sync_orm::causal_context::globally_observed_on(
-            &tx,
-            sync_orm::causal_context::GlobalObservation {
-                namespace,
-                collection: b"notes",
-                writer,
-                counter: 1,
-                floor: meta.try_get_by_index(0)?,
-                state_seq: meta.try_get_by_index(1)?,
-                max_assertions: 1024
-            }
-        )
-        .await?,
+        sync_orm::causal_observed::contains_on(&tx, namespace, b"notes", Dot::new(writer, 1)?)
+            .await?,
         "accepted observation is absent from the interval index"
     );
     tx.commit().await?;
@@ -373,28 +460,13 @@ async fn relay_graph_stability_survives_first_contact_between_leaves() -> Result
     let stable = heads(&peers).await?;
     for (index, db) in databases.iter().enumerate() {
         let tx = db.begin().await?;
-        let meta = tx
-            .query_one(
-                &Query::select()
-                    .columns(["floor_state_seq", "state_seq"].map(Alias::new))
-                    .from(Alias::new("sync_meta"))
-                    .to_owned(),
-            )
-            .await?
-            .unwrap();
         let mut missing = Vec::new();
         for (writer_index, peer) in peers.iter().take(7).enumerate() {
-            if !sync_orm::causal_context::globally_observed_on(
+            if !sync_orm::causal_observed::contains_on(
                 &tx,
-                sync_orm::causal_context::GlobalObservation {
-                    namespace,
-                    collection: b"notes",
-                    writer: peer.store().writer_incarnation(),
-                    counter: 1,
-                    floor: meta.try_get_by_index(0)?,
-                    state_seq: meta.try_get_by_index(1)?,
-                    max_assertions: 1024,
-                },
+                namespace,
+                b"notes",
+                Dot::new(peer.store().writer_incarnation(), 1)?,
             )
             .await?
             {
@@ -484,7 +556,7 @@ async fn sql_coordinator_reconciles_split_ranges_then_journal_and_reaches_stabil
     let count = target_db
         .query_one(
             &Query::select()
-                .expr(sea_orm::sea_query::Func::count(Expr::val(1)))
+                .expr(Func::count(Expr::val(1)))
                 .from(Alias::new("notes"))
                 .to_owned(),
         )
@@ -589,18 +661,14 @@ async fn sql_snapshot_build_resumes_after_restart_and_cancels_after_lost_reply()
 }
 use async_trait::async_trait;
 use sea_orm::{
-    ConnectionTrait, Database, DatabaseTransaction, ExprTrait, TransactionTrait,
+    ConnectionTrait, DatabaseTransaction, ExprTrait, TransactionTrait,
     sea_query::{Alias, ColumnDef, Expr, OnConflict, Query, Table},
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use sync::protocol::{self as p, ReceiveStore, SnapshotSink, SyncStore};
 use sync_orm::{
     causal_capabilities::{CausalEndpoint, TransactionProjection},
-    causal_progress, causal_schema,
+    causal_progress,
     causal_store::CausalReplica,
 };
 use uuid::Uuid;
@@ -689,8 +757,7 @@ async fn setup(
     CausalEndpoint<Notes>,
     Arc<Projection>,
 )> {
-    let db = Database::connect("sqlite::memory:").await?;
-    causal_schema::install_fresh(&db).await?;
+    let db = fixtures::fresh_database().await?;
     db.execute(
         &Table::create()
             .table(Alias::new("notes"))
@@ -940,57 +1007,32 @@ async fn committed_range_survives_receiver_restart_before_completion() -> Result
         max_scanned: 128,
         max_bytes: 65536,
     };
-    let mut after = p::ContextCursor {
-        segment_index: 0,
-        next_lower: range.lower,
-    };
-    loop {
-        let page = p::SnapshotSource::context_page(
-            &source,
-            remote.snapshot_id,
-            range.clone(),
-            after,
-            pages,
-        )
-        .await?;
-        endpoint.stage_context_page(session, page.clone()).await?;
-        for segment in &page.segments {
-            let manifest = segment.context.manifest.clone();
-            let stage = endpoint
-                .begin_stage(
-                    p::StageDescriptor {
-                        origin: p::StageOrigin::Snapshot {
-                            session,
-                            snapshot_id: remote.snapshot_id,
-                            range: range.clone(),
-                        },
-                        manifest: manifest.clone(),
+    for context in &remote.contexts {
+        let manifest = context.context.manifest.clone();
+        let stage = endpoint
+            .begin_stage(
+                p::StageDescriptor {
+                    origin: p::StageOrigin::SnapshotContext {
+                        session,
+                        snapshot_id: remote.snapshot_id,
+                        collection: context.collection,
                     },
-                    p::StageLimits {
-                        max_total_bytes: p::DEFAULT_STAGE_BYTES,
-                        max_stages: p::DEFAULT_STAGES,
-                        max_event_bytes: p::DEFAULT_LOGICAL_BYTES,
-                        max_event_items: p::DEFAULT_LOGICAL_ITEMS,
-                        max_fragment_bytes: p::DEFAULT_PAGE_BYTES,
-                    },
-                )
-                .await?;
-            for ordinal in stage.next_ordinal..manifest.fragment_count {
-                let fragment = p::SnapshotSource::read_fragment(
-                    &source,
-                    remote.snapshot_id,
-                    manifest.clone(),
-                    ordinal,
-                    65536,
-                )
-                .await?;
-                endpoint.stage_fragment(stage.stage, fragment).await?;
-            }
+                    manifest: manifest.clone(),
+                },
+                session_limits().stages,
+            )
+            .await?;
+        for ordinal in 0..manifest.fragment_count {
+            let fragment = p::SnapshotSource::read_fragment(
+                &source,
+                remote.snapshot_id,
+                manifest.clone(),
+                ordinal,
+                pages.max_bytes,
+            )
+            .await?;
+            endpoint.stage_fragment(stage.stage, fragment).await?;
         }
-        if page.done {
-            break;
-        }
-        after = page.next;
     }
     let mut after = None;
     loop {
@@ -1013,22 +1055,18 @@ async fn committed_range_survives_receiver_restart_before_completion() -> Result
     assert!(endpoint.get(&key).await?.is_none());
     assert!(text(&db).await?.is_none());
     projection.fail.store(false, Ordering::SeqCst);
-    db.execute_unprepared("CREATE TRIGGER reject_completion BEFORE INSERT ON sync_checkpoints BEGIN SELECT RAISE(ABORT, 'completion fault'); END").await?;
-    assert!(
-        endpoint
-            .commit_complete_range(session, range.clone(), limits())
-            .await
-            .is_err()
-    );
-    assert!(endpoint.get(&key).await?.is_none());
-    assert!(text(&db).await?.is_none());
-    db.execute_unprepared("DROP TRIGGER reject_completion")
-        .await?;
     let (coverage, changed) = endpoint
         .commit_complete_range(session, range.clone(), limits())
         .await?;
     assert!(coverage.complete);
     assert_eq!(changed.changes.len(), 1);
+    db.execute_unprepared("CREATE TRIGGER reject_completion BEFORE INSERT ON sync_checkpoints BEGIN SELECT RAISE(ABORT, 'completion fault'); END").await?;
+    while !endpoint.promote_step(session, limits()).await?.done {}
+    assert!(endpoint.complete_reconciliation(session).await.is_err());
+    assert!(endpoint.get(&key).await?.is_some());
+    db.execute_unprepared("DROP TRIGGER reject_completion")
+        .await?;
+
     let committed_head = endpoint.head().await?;
     let retry = endpoint
         .commit_complete_range(session, range, limits())
@@ -1041,10 +1079,7 @@ async fn committed_range_survives_receiver_restart_before_completion() -> Result
         source_generation: remote.source.generation,
         scope_id: p::scope_id(&scope)?,
     };
-    assert_eq!(
-        endpoint.checkpoint(&checkpoint).await?,
-        Some(remote.head.clone())
-    );
+    assert_eq!(endpoint.checkpoint(&checkpoint).await?, None);
     let author = endpoint.store().author();
     drop(endpoint);
     let reopened = CausalEndpoint::with_projection(
@@ -1057,10 +1092,7 @@ async fn committed_range_survives_receiver_restart_before_completion() -> Result
     );
     assert_eq!(text(&db).await?.as_deref(), Some("accepted range"));
     assert_eq!(reopened.head().await?, committed_head);
-    assert_eq!(
-        reopened.checkpoint(&checkpoint).await?,
-        Some(remote.head.clone())
-    );
+    assert_eq!(reopened.checkpoint(&checkpoint).await?, None);
     assert_eq!(
         reopened.complete_reconciliation(session).await,
         Err(p::SyncError::StaleWork)
@@ -1069,155 +1101,63 @@ async fn committed_range_survives_receiver_restart_before_completion() -> Result
 }
 
 #[tokio::test]
-async fn resumable_baseline_respects_pins_and_commits_floor_atomically() -> Result<()> {
-    use sync_orm::causal_compaction::{
-        BaselineAdvance, advance_baseline_on, prune_history_step_on,
-    };
-    let namespace = Uuid::new_v4();
-    let (db, source, _) = setup(namespace).await?;
-    let (_, stale, _) = setup(namespace).await?;
+async fn floor_respects_pins_and_commits_atomically() -> Result<()> {
+    use sync_orm::causal_compaction::{FloorStep, maintenance_step_on};
+    let ns = Uuid::new_v4();
+    let (db, source, _) = setup(ns).await?;
     let key = p::ObjectKey {
         collection: 1,
         id: Uuid::from_u128(1),
     };
     source
-        .write_local(key.clone(), Some(Note("remove me".into())))
+        .write_local(key.clone(), Some(Note("old".into())))
         .await?;
-    synchronize(&source, &stale).await?;
-    let scope = p::Scope {
-        collections: [1].into_iter().collect(),
-    };
-    let work = p::WorkLimits {
-        max_requests: 64,
-        max_bytes: 1024 * 1024,
-        max_depth: 32,
-        max_rows_scanned: 16,
-        max_mutations: 1024,
-    };
     let pin = Uuid::new_v4();
-    let mut cursor = None;
-    loop {
-        match p::SnapshotSource::open_snapshot(&source, pin, scope.clone(), work, cursor).await? {
-            p::WorkOutcome::Ready(_) => break,
-            p::WorkOutcome::Incomplete { cursor: next } => cursor = Some(next),
-        }
-    }
-    source.write_local(key.clone(), None).await?;
-    for id in 2..=16 {
-        source
-            .write_local(
-                p::ObjectKey {
-                    collection: 1,
-                    id: Uuid::from_u128(id),
-                },
-                Some(Note(format!("value {id}"))),
-            )
-            .await?;
-    }
-    let captured = source.head().await?;
-    let request = Uuid::new_v4();
-    let identity = source.identity().await?;
-    let mut cursor = None;
-    let mut pinned = false;
-    for step in 0..20000 {
-        let tx = db.begin().await?;
-        let result = advance_baseline_on::<Notes>(
-            &tx,
-            identity.clone(),
-            request,
-            chrono::Utc::now().timestamp_millis(),
-            work,
-            cursor.clone(),
-        )
-        .await?;
-        tx.commit().await?;
-        if step == 0 {
-            source
-                .write_local(
-                    p::ObjectKey {
-                        collection: 1,
-                        id: Uuid::from_u128(100),
-                    },
-                    Some(Note("after capture".into())),
-                )
-                .await?;
-        }
-        match result {
-            BaselineAdvance::Incomplete { cursor: next } => cursor = Some(next),
-            BaselineAdvance::Pinned { cursor: next } => {
-                cursor = Some(next);
-                pinned = true;
-                break;
-            }
-            BaselineAdvance::Advanced { .. } => {
-                anyhow::bail!("advanced through an older live snapshot")
-            }
-        }
-    }
-    ensure!(pinned, "baseline did not reach its protected floor");
-    p::SnapshotSource::close_snapshot(&source, pin).await?;
-    db.execute_unprepared("CREATE TRIGGER reject_floor BEFORE UPDATE OF baseline_generation ON sync_meta WHEN NEW.baseline_generation != OLD.baseline_generation BEGIN SELECT RAISE(ABORT, 'floor fault'); END").await?;
     let tx = db.begin().await?;
-    assert!(
-        advance_baseline_on::<Notes>(
-            &tx,
-            identity.clone(),
-            request,
-            chrono::Utc::now().timestamp_millis(),
-            work,
-            cursor.clone()
-        )
-        .await
-        .is_err()
-    );
-    tx.rollback().await?;
-    db.execute_unprepared("DROP TRIGGER reject_floor").await?;
-    let author = source.store().author();
-    drop(source);
-    let source = CausalEndpoint::with_projection(
-        CausalReplica::open(db.clone(), namespace, author).await?,
-        Arc::new(Projection {
-            fail: AtomicBool::new(false),
-        }),
-    );
-    let tx = db.begin().await?;
-    let result = advance_baseline_on::<Notes>(
+    sync_orm::causal_leases::create_build_on(
         &tx,
-        identity,
-        request,
-        chrono::Utc::now().timestamp_millis(),
-        work,
-        cursor,
+        sync_orm::causal_leases::BuildLeaseRequest {
+            namespace: ns,
+            id: pin,
+            scope: vec![1],
+            now_ms: 0,
+            expires_at_ms: 100,
+            max_active: 4,
+            max_ttl_ms: 1000,
+        },
     )
     .await?;
     tx.commit().await?;
-    assert!(matches!(result, BaselineAdvance::Advanced { .. }));
-    let checkpoint = p::CheckpointKey {
-        namespace,
-        source_replica: source.identity().await?.replica,
-        source_generation: source.identity().await?.generation,
-        scope_id: p::scope_id(&scope)?,
-    };
-    let status = source
-        .history_status(&checkpoint, Some(captured.clone()))
-        .await?;
-    assert!(
-        matches!(status, p::HistoryStatus::Continuous { floor, head } if floor == captured && head.sequence == captured.sequence + 1)
+    source.write_local(key, None).await?;
+    let tx = db.begin().await?;
+    assert_eq!(
+        maintenance_step_on::<Notes>(&tx, ns, 64, 64, 65536).await?,
+        FloorStep::Advanced { state_seq: 1 }
     );
-    for _ in 0..100 {
-        let tx = db.begin().await?;
-        let step = prune_history_step_on(&tx, namespace, 8).await?;
-        tx.commit().await?;
-        if !step.more {
-            break;
-        }
-    }
-    synchronize(&source, &stale).await?;
-    assert!(stale.get(&key).await?.is_none());
-    let before = source.head().await?;
-    synchronize(&stale, &source).await?;
-    assert!(source.get(&key).await?.is_none());
-    assert_eq!(source.head().await?, before);
+    tx.commit().await?;
+    let tx = db.begin().await?;
+    assert_eq!(
+        maintenance_step_on::<Notes>(&tx, ns, 64, 64, 65536).await?,
+        FloorStep::Pinned
+    );
+    sync_orm::causal_leases::revoke_on(&tx, ns, pin).await?;
+    tx.commit().await?;
+    db.execute_unprepared("CREATE TRIGGER reject_floor BEFORE UPDATE OF history_floor ON sync_meta WHEN NEW.history_floor != OLD.history_floor BEGIN SELECT RAISE(ABORT, 'floor fault'); END").await?;
+    let tx = db.begin().await?;
+    assert!(
+        maintenance_step_on::<Notes>(&tx, ns, 64, 64, 65536)
+            .await
+            .is_err()
+    );
+    tx.rollback().await?;
+    db.execute_unprepared("DROP TRIGGER reject_floor").await?;
+    let tx = db.begin().await?;
+    assert_eq!(
+        maintenance_step_on::<Notes>(&tx, ns, 64, 64, 65536).await?,
+        FloorStep::Advanced { state_seq: 2 }
+    );
+    tx.commit().await?;
+    assert_eq!(source.head().await?.sequence, 2);
     Ok(())
 }
 
@@ -1250,13 +1190,13 @@ async fn maintenance_recovers_abandoned_and_competing_builds_without_reviving_re
     let expected_head = source.head().await?;
     let identity = source.identity().await?;
     let mut now = chrono::Utc::now().timestamp_millis();
-    let mut first = sync_orm::maintenance::Maintenance::default();
+    let mut first = Maintenance::default();
     first.advance::<Notes>(&db, identity.clone(), now).await?;
     first.advance::<Notes>(&db, identity.clone(), now).await?;
     // A process restart loses the RAM cursor; its persisted build expires.
-    first = sync_orm::maintenance::Maintenance::default();
+    first = Maintenance::default();
     now += p::DEFAULT_SNAPSHOT_TTL_MS as i64 + 1;
-    let mut second = sync_orm::maintenance::Maintenance::default();
+    let mut second = Maintenance::default();
     let mut complete = false;
     for _ in 0..2000 {
         first.advance::<Notes>(&db, identity.clone(), now).await?;
@@ -1274,7 +1214,7 @@ async fn maintenance_recovers_abandoned_and_competing_builds_without_reviving_re
         let count = db
             .query_one(
                 &Query::select()
-                    .expr(sea_orm::sea_query::Func::count(Expr::val(1)))
+                    .expr(Func::count(Expr::val(1)))
                     .from(Alias::new("sync_journal"))
                     .to_owned(),
             )
@@ -1337,5 +1277,732 @@ async fn maintenance_recovers_abandoned_and_competing_builds_without_reviving_re
     let stable = source.head().await?;
     synchronize(&stale, &source).await?;
     assert_eq!(source.head().await?, stable);
+    Ok(())
+}
+
+struct CountingSource<'a> {
+    inner: &'a CausalEndpoint<Notes>,
+    calls: AtomicUsize,
+    candidates: AtomicUsize,
+}
+impl p::SnapshotSource<Notes> for CountingSource<'_> {
+    fn release_request(&self, id: Uuid) -> p::BoxFuture<'_, ()> {
+        p::SnapshotSource::release_request(self.inner, id)
+    }
+    fn close_snapshot(&self, id: Uuid) -> p::BoxFuture<'_, ()> {
+        p::SnapshotSource::close_snapshot(self.inner, id)
+    }
+    fn cancel_snapshot_build(&self, cursor: p::WorkCursor) -> p::BoxFuture<'_, ()> {
+        p::SnapshotSource::cancel_snapshot_build(self.inner, cursor)
+    }
+    fn open_snapshot(
+        &self,
+        request: Uuid,
+        scope: p::Scope<Notes>,
+        limits: p::WorkLimits,
+        resume: Option<p::WorkCursor>,
+    ) -> p::BoxFuture<'_, p::WorkOutcome<p::SnapshotDescriptor<Notes>>> {
+        p::SnapshotSource::open_snapshot(self.inner, request, scope, limits, resume)
+    }
+    fn summarize(
+        &self,
+        snapshot: Uuid,
+        range: p::KeyRange<Notes>,
+        limits: p::WorkLimits,
+        resume: Option<p::WorkCursor>,
+    ) -> p::BoxFuture<'_, p::WorkOutcome<p::RangeSummary<Notes>>> {
+        p::SnapshotSource::summarize(self.inner, snapshot, range, limits, resume)
+    }
+    fn split(
+        &self,
+        snapshot: Uuid,
+        range: p::KeyRange<Notes>,
+        limits: p::WorkLimits,
+        resume: Option<p::WorkCursor>,
+    ) -> p::BoxFuture<'_, p::WorkOutcome<Vec<p::KeyRange<Notes>>>> {
+        p::SnapshotSource::split(self.inner, snapshot, range, limits, resume)
+    }
+    fn leaf(
+        &self,
+        snapshot: Uuid,
+        range: p::KeyRange<Notes>,
+        after: Option<p::CandidateCursor<Notes>>,
+        limits: p::PageLimits,
+    ) -> p::BoxFuture<'_, p::LeafPage<Notes>> {
+        Box::pin(async move {
+            let page = p::SnapshotSource::leaf(self.inner, snapshot, range, after, limits).await?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.candidates
+                .fetch_add(page.candidates.len(), Ordering::SeqCst);
+            Ok(page)
+        })
+    }
+    fn read_fragment(
+        &self,
+        snapshot: Uuid,
+        manifest: p::ManifestRef,
+        ordinal: u32,
+        max_bytes: u64,
+    ) -> p::BoxFuture<'_, p::Fragment> {
+        p::SnapshotSource::read_fragment(self.inner, snapshot, manifest, ordinal, max_bytes)
+    }
+}
+
+#[tokio::test]
+async fn one_write_snapshot_transfers_only_changed_leaf() -> Result<()> {
+    let ns = Uuid::new_v4();
+    let (_, a, _) = setup(ns).await?;
+    let (_, b, _) = setup(ns).await?;
+    let (_, c, _) = setup(ns).await?;
+    let key = |n| p::ObjectKey {
+        collection: 1,
+        id: Uuid::from_u128(n),
+    };
+    for n in 1..=1024 {
+        a.write_local(key(n), Some(Note(n.to_string()))).await?;
+    }
+    let mut limits = session_limits();
+    limits.pages.max_scanned = 128;
+    limits.apply.max_projection_items = 128;
+    limits.apply.max_mutations = 4096;
+    limits.work.max_rows_scanned = 1024;
+    limits.work.max_mutations = 4096;
+    async fn run(
+        dst: &CausalEndpoint<Notes>,
+        src: &CausalEndpoint<Notes>,
+        source: &dyn p::SnapshotSource<Notes>,
+        limits: p::SessionLimits,
+    ) -> Result<()> {
+        let mut coordinator = p::Coordinator::new(
+            p::Scope {
+                collections: [1].into_iter().collect(),
+            },
+            limits,
+        )?;
+        for _ in 0..20000 {
+            match coordinator.advance(dst, dst, dst, src, source).await? {
+                p::SessionAdvance::Complete(_) => return Ok(()),
+                p::SessionAdvance::BudgetExhausted => coordinator.start_pass(),
+                _ => (),
+            }
+        }
+        anyhow::bail!("snapshot session did not finish")
+    }
+    run(&c, &a, &a, limits).await?;
+    run(&b, &c, &c, limits).await?;
+    a.write_local(key(500), Some(Note("9999".into()))).await?;
+    let head = b.head().await?.sequence;
+    let counting = CountingSource {
+        inner: &a,
+        calls: 0.into(),
+        candidates: 0.into(),
+    };
+    run(&b, &a, &counting, limits).await?;
+    let calls = counting.calls.load(Ordering::SeqCst);
+    let candidates = counting.candidates.load(Ordering::SeqCst);
+    let growth = b.head().await?.sequence - head;
+    eprintln!("SQL leaf calls: {calls}, candidates: {candidates}, head growth: {growth}");
+    assert_eq!(
+        b.get(&key(500)).await?.unwrap().value,
+        Some(Note("9999".into()))
+    );
+    assert!(calls <= 4 && candidates <= 256 && growth <= 2);
+    Ok(())
+}
+
+async fn open_sql(endpoint: &CausalEndpoint<Notes>) -> Result<p::SnapshotDescriptor<Notes>> {
+    use p::SnapshotSource;
+    let request = Uuid::new_v4();
+    let mut resume = None;
+    loop {
+        match endpoint
+            .open_snapshot(
+                request,
+                p::Scope {
+                    collections: [1].into_iter().collect(),
+                },
+                session_limits().work,
+                resume,
+            )
+            .await?
+        {
+            p::WorkOutcome::Ready(descriptor) => return Ok(descriptor),
+            p::WorkOutcome::Incomplete { cursor } => resume = Some(cursor),
+        }
+    }
+}
+async fn stage_sql_contexts(
+    source: &CausalEndpoint<Notes>,
+    target: &CausalEndpoint<Notes>,
+    session: Uuid,
+    remote: &p::SnapshotDescriptor<Notes>,
+) -> Result<()> {
+    for context in &remote.contexts {
+        let manifest = context.context.manifest.clone();
+        let stage = target
+            .begin_stage(
+                p::StageDescriptor {
+                    origin: p::StageOrigin::SnapshotContext {
+                        session,
+                        snapshot_id: remote.snapshot_id,
+                        collection: context.collection,
+                    },
+                    manifest: manifest.clone(),
+                },
+                session_limits().stages,
+            )
+            .await?;
+        for ordinal in 0..manifest.fragment_count {
+            let fragment = p::SnapshotSource::read_fragment(
+                source,
+                remote.snapshot_id,
+                manifest.clone(),
+                ordinal,
+                p::DEFAULT_PAGE_BYTES,
+            )
+            .await?;
+            target.stage_fragment(stage.stage, fragment).await?;
+        }
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn post_snapshot_arrival_is_removed_by_sql_promotion() -> Result<()> {
+    let ns = Uuid::new_v4();
+    let (_, a, _) = setup(ns).await?;
+    let (_, b, _) = setup(ns).await?;
+    let (_, stale, _) = setup(ns).await?;
+    let key = p::ObjectKey {
+        collection: 1,
+        id: Uuid::from_u128(42),
+    };
+    a.write_local(key.clone(), Some(Note("dead at source".into())))
+        .await?;
+    synchronize(&a, &stale).await?;
+    a.write_local(key.clone(), None).await?;
+    let remote = open_sql(&a).await?;
+    let local = open_sql(&b).await?;
+    let session = b
+        .begin_reconciliation(Uuid::new_v4(), remote.clone(), local)
+        .await?;
+    stage_sql_contexts(&a, &b, session, &remote).await?;
+    b.accept_equal_range(session, remote.roots[0].clone())
+        .await?;
+    synchronize(&stale, &b).await?;
+    assert!(b.get(&key).await?.is_some());
+    while !b.promote_step(session, limits()).await?.done {}
+    assert!(b.get(&key).await?.is_none());
+    assert_eq!(b.complete_reconciliation(session).await?, remote.head);
+    Ok(())
+}
+#[tokio::test]
+async fn sql_promotion_chunks_resume_and_are_idempotent() -> Result<()> {
+    let ns = Uuid::new_v4();
+    let (db, a, _) = setup(ns).await?;
+    let (_, b, _) = setup(ns).await?;
+    let writer = Uuid::new_v4();
+    let mut context = causal::Context::default();
+    for n in 1..=3000 {
+        context.insert(Dot::new(writer, 2 * n)?)?;
+    }
+    let mut apply = limits();
+    apply.max_mutations = 16384;
+    let tx = db.begin().await?;
+    a.store()
+        .apply_merge_on(
+            &tx,
+            &p::MergeDelta {
+                collection: 1,
+                added: vec![],
+                observed: p::exact_context(&context),
+            },
+            apply,
+            &mut 16384,
+        )
+        .await?;
+    tx.commit().await?;
+    let remote = open_sql(&a).await?;
+    let local = open_sql(&b).await?;
+    let session = b
+        .begin_reconciliation(Uuid::new_v4(), remote.clone(), local)
+        .await?;
+    stage_sql_contexts(&a, &b, session, &remote).await?;
+    b.accept_equal_range(session, remote.roots[0].clone())
+        .await?;
+    apply.max_mutations = 400;
+    let mut steps = 0;
+    loop {
+        let progress = b.promote_step(session, apply).await?;
+        steps += 1;
+        if progress.done {
+            break;
+        }
+        assert!(matches!(
+            b.complete_reconciliation(session).await,
+            Err(p::SyncError::IncompleteCoverage)
+        ));
+    }
+    assert!(steps >= 31);
+    let head = b.head().await?;
+    assert_eq!(
+        b.promote_step(session, apply).await?,
+        p::PromoteProgress {
+            done: true,
+            causal_changes: 0
+        }
+    );
+    assert_eq!(b.head().await?, head);
+    assert_eq!(b.complete_reconciliation(session).await?, remote.head);
+    let snapshot = open_sql(&b).await?;
+    assert_eq!(snapshot.contexts, remote.contexts);
+    Ok(())
+}
+
+async fn merge_sql_root(
+    source: &CausalEndpoint<Notes>,
+    target: &CausalEndpoint<Notes>,
+    session: Uuid,
+    remote: &p::SnapshotDescriptor<Notes>,
+) -> Result<()> {
+    let range = remote.roots[0].range.clone();
+    let mut after = None;
+    loop {
+        let page = p::SnapshotSource::leaf(
+            source,
+            remote.snapshot_id,
+            range.clone(),
+            after,
+            session_limits().pages,
+        )
+        .await?;
+        target.stage_leaf_page(session, page.clone()).await?;
+        if page.done {
+            break;
+        }
+        after = page.next;
+    }
+    target
+        .commit_complete_range(session, range, limits())
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_live_writes_and_journal_arrivals_survive_promotion() -> Result<()> {
+    let ns = Uuid::new_v4();
+    let (_, a, _) = setup(ns).await?;
+    let (_, b, _) = setup(ns).await?;
+    let key = |id| p::ObjectKey {
+        collection: 1,
+        id: Uuid::from_u128(id),
+    };
+    a.write_local(key(42), Some(Note("original".into())))
+        .await?;
+    a.write_local(key(43), Some(Note("remove".into()))).await?;
+    synchronize(&a, &b).await?;
+    let remote = open_sql(&a).await?;
+    let local = open_sql(&b).await?;
+    let session = b
+        .begin_reconciliation(Uuid::new_v4(), remote.clone(), local)
+        .await?;
+    stage_sql_contexts(&a, &b, session, &remote).await?;
+    merge_sql_root(&a, &b, session, &remote).await?;
+    b.write_local(key(44), Some(Note("local new".into())))
+        .await?;
+    b.write_local(key(42), Some(Note("local update".into())))
+        .await?;
+    a.write_local(key(45), Some(Note("source new".into())))
+        .await?;
+    a.write_local(key(43), None).await?;
+    synchronize(&a, &b).await?;
+    while !b.promote_step(session, limits()).await?.done {}
+    assert!(matches!(
+        b.complete_reconciliation(session).await,
+        Err(p::SyncError::RetryAt(_))
+    ));
+    for (id, value) in [
+        (42, Some("local update")),
+        (43, None),
+        (44, Some("local new")),
+        (45, Some("source new")),
+    ] {
+        assert_eq!(
+            b.get(&key(id)).await?.and_then(|r| r.value).map(|v| v.0),
+            value.map(str::to_owned)
+        );
+    }
+    synchronize(&b, &a).await?;
+    let heads = (a.head().await?, b.head().await?);
+    synchronize(&a, &b).await?;
+    synchronize(&b, &a).await?;
+    assert_eq!((a.head().await?, b.head().await?), heads);
+    Ok(())
+}
+
+async fn causal_rows(db: &sea_orm::DatabaseConnection, table: &str) -> Result<Vec<Vec<String>>> {
+    let (columns, binary, nullable): (&[&str], &[usize], &[usize]) = match table {
+        "sync_observed" => (
+            &[
+                "namespace",
+                "collection",
+                "writer",
+                "first",
+                "last",
+                "added_seq",
+                "removed_seq",
+            ],
+            &[0, 1, 2],
+            &[6],
+        ),
+        "sync_candidates" => (
+            &[
+                "namespace",
+                "collection",
+                "writer",
+                "counter",
+                "object",
+                "author",
+                "revision",
+                "body",
+                "digest",
+                "retention_seq",
+                "live_from",
+                "live_until",
+            ],
+            &[0, 1, 2, 4, 5, 7, 8],
+            &[10, 11],
+        ),
+        _ => anyhow::bail!("unexpected table"),
+    };
+    let rows = db
+        .query_all(
+            &Query::select()
+                .columns(columns.iter().map(|name| Alias::new(*name)))
+                .from(Alias::new(table))
+                .to_owned(),
+        )
+        .await?;
+    let mut values = Vec::new();
+    for row in rows {
+        let mut fields = Vec::new();
+        for index in 0..columns.len() {
+            fields.push(if binary.contains(&index) {
+                format!("{:?}", row.try_get_by_index::<Vec<u8>>(index)?)
+            } else if nullable.contains(&index) {
+                format!("{:?}", row.try_get_by_index::<Option<i64>>(index)?)
+            } else {
+                format!("{:?}", row.try_get_by_index::<i64>(index)?)
+            });
+        }
+        values.push(fields);
+    }
+    values.sort();
+    Ok(values)
+}
+
+#[tokio::test]
+async fn sql_promotion_failure_rolls_back_and_reopens() -> Result<()> {
+    let ns = Uuid::new_v4();
+    let (_, a, _) = setup(ns).await?;
+    let (db, b, projection) = setup(ns).await?;
+    let (_, stale, _) = setup(ns).await?;
+    let keys: Vec<_> = (1..=8)
+        .map(|id| p::ObjectKey {
+            collection: 1,
+            id: Uuid::from_u128(id),
+        })
+        .collect();
+    for key in &keys {
+        a.write_local(key.clone(), Some(Note("old".into()))).await?;
+    }
+    synchronize(&a, &stale).await?;
+    for key in &keys {
+        a.write_local(key.clone(), None).await?;
+    }
+    let remote = open_sql(&a).await?;
+    let local = open_sql(&b).await?;
+    let session = b
+        .begin_reconciliation(Uuid::new_v4(), remote.clone(), local)
+        .await?;
+    stage_sql_contexts(&a, &b, session, &remote).await?;
+    b.accept_equal_range(session, remote.roots[0].clone())
+        .await?;
+    let mut apply = limits();
+    apply.max_mutations = 400;
+    let first = b.promote_step(session, apply).await?;
+    assert!(!first.done);
+    synchronize(&stale, &b).await?;
+    let head = b.head().await?;
+    let observed = causal_rows(&db, "sync_observed").await?;
+    let candidates = causal_rows(&db, "sync_candidates").await?;
+    projection.fail.store(true, Ordering::SeqCst);
+    let failure = b.promote_step(session, apply).await.unwrap_err();
+    assert!(
+        matches!(failure, p::SyncError::Storage(ref message) if message.contains("injected projection failure"))
+    );
+    assert_eq!(b.head().await?, head);
+    assert_eq!(causal_rows(&db, "sync_observed").await?, observed);
+    assert_eq!(causal_rows(&db, "sync_candidates").await?, candidates);
+    let author = b.store().author();
+    drop(b);
+    projection.fail.store(false, Ordering::SeqCst);
+    let b = CausalEndpoint::with_projection(CausalReplica::open(db, ns, author).await?, projection);
+    let fresh = open_sql(&a).await?;
+    let local = open_sql(&b).await?;
+    let session = b
+        .begin_reconciliation(Uuid::new_v4(), fresh.clone(), local)
+        .await?;
+    stage_sql_contexts(&a, &b, session, &fresh).await?;
+    merge_sql_root(&a, &b, session, &fresh).await?;
+    while !b.promote_step(session, apply).await?.done {}
+    assert_eq!(b.complete_reconciliation(session).await?, fresh.head);
+    for key in &keys {
+        assert_eq!(
+            a.get(key).await?.and_then(|r| r.value),
+            b.get(key).await?.and_then(|r| r.value)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_sql_snapshot_recovers_after_partial_reconciliation() -> Result<()> {
+    let ns = Uuid::new_v4();
+    let (db, source, _) = setup(ns).await?;
+    let (_, target, _) = setup(ns).await?;
+    let key = |id| p::ObjectKey {
+        collection: 1,
+        id: Uuid::from_u128(id),
+    };
+    for id in 1..=32 {
+        source
+            .write_local(key(id), Some(Note(format!("{id}"))))
+            .await?;
+    }
+    let remote = open_sql(&source).await?;
+    let local = open_sql(&target).await?;
+    let session = target
+        .begin_reconciliation(Uuid::new_v4(), remote.clone(), local)
+        .await?;
+    stage_sql_contexts(&source, &target, session, &remote).await?;
+    let range = remote.roots[0].range.clone();
+    let mut cursor = None;
+    let children = loop {
+        match p::SnapshotSource::split(
+            &source,
+            remote.snapshot_id,
+            range.clone(),
+            session_limits().work,
+            cursor,
+        )
+        .await?
+        {
+            p::WorkOutcome::Ready(children) => break children,
+            p::WorkOutcome::Incomplete { cursor: next } => cursor = Some(next),
+        }
+    };
+    assert_eq!(children.len(), 2);
+    let mut summaries = Vec::new();
+    for child in &children {
+        let mut cursor = None;
+        loop {
+            match p::SnapshotSource::summarize(
+                &source,
+                remote.snapshot_id,
+                child.clone(),
+                session_limits().work,
+                cursor,
+            )
+            .await?
+            {
+                p::WorkOutcome::Ready(summary) => {
+                    summaries.push(summary);
+                    break;
+                }
+                p::WorkOutcome::Incomplete { cursor: next } => cursor = Some(next),
+            }
+        }
+    }
+    target
+        .split_range(session, range.clone(), summaries)
+        .await?;
+    let mut after = None;
+    loop {
+        let page = p::SnapshotSource::leaf(
+            &source,
+            remote.snapshot_id,
+            children[0].clone(),
+            after,
+            session_limits().pages,
+        )
+        .await?;
+        target.stage_leaf_page(session, page.clone()).await?;
+        if page.done {
+            break;
+        }
+        after = page.next;
+    }
+    let mut apply = limits();
+    apply.max_projection_items = 64;
+    apply.max_mutations = 65536;
+    let (coverage, _) = target
+        .commit_complete_range(session, children[0].clone(), apply)
+        .await?;
+    assert!(!coverage.complete);
+    let now = chrono::Utc::now().timestamp_millis() + p::DEFAULT_SNAPSHOT_TTL_MS as i64 + 1;
+    let mut maintenance = Maintenance::default();
+    for _ in 0..100 {
+        maintenance
+            .advance::<Notes>(&db, source.identity().await?, now)
+            .await?;
+    }
+    source.write_local(key(1), None).await?;
+    source
+        .write_local(key(33), Some(Note("new".into())))
+        .await?;
+    let expired = p::SnapshotSource::leaf(
+        &source,
+        remote.snapshot_id,
+        range,
+        None,
+        session_limits().pages,
+    )
+    .await;
+    assert!(
+        matches!(expired, Err(p::SyncError::SnapshotExpired)),
+        "{expired:?}"
+    );
+    synchronize(&source, &target).await?;
+    for id in 1..=33 {
+        assert_eq!(
+            source.get(&key(id)).await?.and_then(|r| r.value),
+            target.get(&key(id)).await?.and_then(|r| r.value)
+        );
+    }
+    for _ in 0..100 {
+        maintenance
+            .advance::<Notes>(&db, source.identity().await?, now)
+            .await?;
+    }
+    let rows = db
+        .query_all(
+            &Query::select()
+                .column(Alias::new("id"))
+                .from(Alias::new("sync_leases"))
+                .cond_where(
+                    Condition::any()
+                        .add(Expr::col(Alias::new("id")).eq(remote.snapshot_id.as_bytes().to_vec()))
+                        .add(
+                            Expr::col(Alias::new("parent_lease"))
+                                .eq(remote.snapshot_id.as_bytes().to_vec()),
+                        ),
+                )
+                .to_owned(),
+        )
+        .await?;
+    assert!(rows.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversize_leaf_reports_work_limit_and_splits_when_allowed() -> Result<()> {
+    let ns = Uuid::new_v4();
+    let (_, source, _) = setup(ns).await?;
+    let (_, limited, _) = setup(ns).await?;
+    let (_, split, _) = setup(ns).await?;
+    let key = |n| p::ObjectKey {
+        collection: 1,
+        id: Uuid::from_u128(n),
+    };
+    let (db, crowded, _) = setup(ns).await?;
+    let tx = db.begin().await?;
+    let writer = Uuid::new_v4();
+    for counter in 1..=1025_i64 {
+        tx.execute(
+            &Query::insert()
+                .into_table(Alias::new("sync_candidates"))
+                .columns(
+                    [
+                        "namespace",
+                        "collection",
+                        "writer",
+                        "counter",
+                        "object",
+                        "author",
+                        "revision",
+                        "body",
+                        "digest",
+                        "retention_seq",
+                        "live_from",
+                    ]
+                    .map(Alias::new),
+                )
+                .values_panic([
+                    ns.as_bytes().to_vec().into(),
+                    b"notes".to_vec().into(),
+                    writer.as_bytes().to_vec().into(),
+                    counter.into(),
+                    key(1).id.as_bytes().to_vec().into(),
+                    writer.as_bytes().to_vec().into(),
+                    counter.into(),
+                    vec![1_u8].into(),
+                    vec![0_u8; 32].into(),
+                    1_i64.into(),
+                    1_i64.into(),
+                ])
+                .to_owned(),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    assert_eq!(crowded.get(&key(1)).await, Err(p::SyncError::WorkLimit));
+    for n in 1..=3000 {
+        source
+            .write_local(key(n), Some(Note(n.to_string())))
+            .await?;
+    }
+    let mut limits = session_limits();
+    limits.pages.max_scanned = 128;
+    limits.apply.max_projection_items = 128;
+    limits.apply.max_mutations = 4096;
+    limits.work.max_rows_scanned = 1024;
+    limits.work.max_mutations = 4096;
+    limits.work.max_depth = 1;
+    async fn run(
+        src: &CausalEndpoint<Notes>,
+        dst: &CausalEndpoint<Notes>,
+        limits: p::SessionLimits,
+    ) -> p::Result<()> {
+        let mut coordinator = p::Coordinator::new(
+            p::Scope {
+                collections: [1].into_iter().collect(),
+            },
+            limits,
+        )?;
+        for _ in 0..100000 {
+            match coordinator.advance(dst, dst, dst, src, src).await? {
+                p::SessionAdvance::Complete(_) => return Ok(()),
+                p::SessionAdvance::BudgetExhausted => coordinator.start_pass(),
+                p::SessionAdvance::Incomplete => (),
+                p::SessionAdvance::Cancelled => {
+                    return Err(p::SyncError::Invalid("cancelled".into()));
+                }
+            }
+        }
+        Err(p::SyncError::Invalid("session did not finish".into()))
+    }
+    assert_eq!(
+        run(&source, &limited, limits).await,
+        Err(p::SyncError::WorkLimit)
+    );
+    limits.work.max_depth = 32;
+    run(&source, &split, limits).await?;
+    for n in 1..=3000 {
+        assert_eq!(
+            source.get(&key(n)).await?,
+            split.get(&key(n)).await?,
+            "key {n}"
+        );
+    }
     Ok(())
 }

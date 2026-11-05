@@ -6,6 +6,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
     QuerySelect, QueryTrait, Value, sea_query::Expr,
 };
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use uuid::Uuid;
 
@@ -14,6 +15,9 @@ pub trait FieldCodec: Sized {
     fn from_column(value: Value) -> Result<Self, DbErr>;
     fn to_column(&self) -> Value;
     fn sample() -> Value;
+    fn is_uuid() -> bool {
+        false
+    }
     fn validate(&self) -> Result<(), DbErr> {
         Ok(())
     }
@@ -93,6 +97,9 @@ scalar_codecs!(
     Vec<u8>
 );
 impl FieldCodec for Uuid {
+    fn is_uuid() -> bool {
+        true
+    }
     fn sample() -> Value {
         Uuid::nil().to_string().into()
     }
@@ -116,6 +123,9 @@ impl FieldCodec for Uuid {
     }
 }
 impl FieldCodec for Option<Uuid> {
+    fn is_uuid() -> bool {
+        true
+    }
     fn sample() -> Value {
         Option::<String>::None.into()
     }
@@ -211,6 +221,9 @@ pub trait RowMapping<E: EntityTrait>: Send + Sync {
     fn encode(model: &RowView<E>) -> Result<Self::Payload, DbErr>;
     fn decode(value: &Self::Payload) -> Result<Vec<Value>, DbErr>;
     fn field_samples() -> Vec<Value>;
+    fn uuid_fields() -> Vec<bool> {
+        Vec::new()
+    }
     fn validate(id: Uuid, value: Option<&Self::Payload>) -> Result<(), DbErr>;
     fn authoring_owner(_value: &Self::Payload) -> Option<Uuid> {
         None
@@ -302,7 +315,7 @@ pub struct RowPolicy<E: EntityTrait, M: RowMapping<E>>(PhantomData<(E, M)>);
 impl<E: EntityTrait, M: RowMapping<E>> RowPolicy<E, M> {
     fn select() -> sea_orm::Select<E> {
         use sea_orm::{IdenStatic, Iterable, PrimaryKeyToColumn};
-        let mut selected = std::collections::HashSet::new();
+        let mut selected = HashSet::new();
         let mut query = E::find().select_only().filter(M::source_filter());
         for column in <E::PrimaryKey as Iterable>::iter()
             .map(|key| key.into_column())
@@ -372,7 +385,7 @@ impl<E: EntityTrait, M: RowMapping<E>> RowPolicy<E, M> {
     pub fn validate_mapping() -> Result<(), DbErr> {
         use sea_orm::{IdenStatic, Iterable, PrimaryKeyToColumn};
         M::validate_declaration()?;
-        let mut names = std::collections::HashSet::new();
+        let mut names = HashSet::new();
         names.insert(M::uuid_column().as_str());
         for key in <E::PrimaryKey as Iterable>::iter() {
             if !names.insert(key.into_column().as_str()) {
@@ -617,27 +630,50 @@ impl<E: EntityTrait, M: RowMapping<E>> RowPolicy<E, M> {
                 return Err(DbErr::Custom(format!("nil source UUID at {position}")));
             }
             M::validate(id, Some(&payload))?;
+            let mut updates = Vec::new();
+            let canonical = id.to_string();
+            if source.as_deref() != Some(canonical.as_str()) {
+                updates.push((M::uuid_column(), canonical.into()));
+            }
+            for ((column, is_uuid), value) in M::columns()
+                .into_iter()
+                .zip(M::uuid_fields())
+                .zip(M::decode(&payload)?)
+            {
+                if is_uuid
+                    && column_value(
+                        &row.row,
+                        {
+                            use sea_orm::IdenStatic;
+                            column.as_str()
+                        },
+                        Option::<String>::None.into(),
+                    )? != value
+                {
+                    updates.push((column, value));
+                }
+            }
             let size = measure(&payload)?;
             if size > limits.max_bytes.saturating_sub(bytes)
-                || (missing && mutations == limits.max_mutations)
+                || (!updates.is_empty() && mutations == limits.max_mutations)
             {
                 if records.is_empty() {
                     return Err(DbErr::Custom("scan budget too small for source row".into()));
                 }
                 break;
             }
-            if missing {
-                let missing_filter = if source.is_none() {
-                    M::uuid_column().is_null()
-                } else {
-                    M::uuid_column().eq("")
+            if !updates.is_empty() {
+                let source_filter = match &source {
+                    Some(text) => M::uuid_column().eq(text.clone()),
+                    None => M::uuid_column().is_null(),
                 };
-                let result = E::update_many()
+                let mut update = E::update_many()
                     .filter(primary.eq(position))
-                    .filter(missing_filter)
-                    .col_expr(M::uuid_column(), Expr::value(id.to_string()))
-                    .exec(tx)
-                    .await?;
+                    .filter(source_filter);
+                for (column, value) in updates {
+                    update = update.col_expr(column, Expr::value(value));
+                }
+                let result = update.exec(tx).await?;
                 if result.rows_affected != 1 {
                     return Err(DbErr::Custom(
                         "source UUID assignment changed concurrently".into(),
@@ -678,6 +714,7 @@ impl<E: EntityTrait, M: RowMapping<E>> RowPolicy<E, M> {
             if let Some(row) = &existing {
                 M::project_children_on(db, row, None).await?;
                 E::delete_many()
+                    .filter(M::source_filter())
                     .filter(M::uuid_column().eq(id.to_string()))
                     .exec(db)
                     .await?;
@@ -715,7 +752,9 @@ impl<E: EntityTrait, M: RowMapping<E>> RowPolicy<E, M> {
             columns.push(column);
         }
         if existing.is_some() {
-            let mut update = E::update_many().filter(M::uuid_column().eq(id.to_string()));
+            let mut update = E::update_many()
+                .filter(M::source_filter())
+                .filter(M::uuid_column().eq(id.to_string()));
             for column in columns {
                 update = update.col_expr(column, Expr::value(active.get(column).unwrap()));
             }
@@ -767,6 +806,7 @@ macro_rules! row_mapping {
                 Ok($payload { $($field: model.read::<$ty>($column).map_err(|e| sea_orm::DbErr::Custom(format!("{}: {}", stringify!($field), e)))?,)* $($($list: Vec::new(),)*)? })
             }
             fn field_samples() -> Vec<sea_orm::Value> { vec![$(<$ty as $crate::row_policy::FieldCodec>::sample()),*] }
+            fn uuid_fields() -> Vec<bool> { vec![$(<$ty as $crate::row_policy::FieldCodec>::is_uuid()),*] }
             fn decode(value: &Self::Payload) -> Result<Vec<sea_orm::Value>, sea_orm::DbErr> {
                 Ok(vec![$(<$ty as $crate::row_policy::FieldCodec>::to_column(&value.$field)),*])
             }

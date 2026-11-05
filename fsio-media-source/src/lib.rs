@@ -1,4 +1,9 @@
+use once_cell::sync::Lazy;
 use std::io::{Read, Seek, SeekFrom};
+use symphonia::core::codecs::CodecRegistry;
+use symphonia::default::codecs::{
+    AdpcmDecoder, AlacDecoder, FlacDecoder, MpaDecoder, PcmDecoder, VorbisDecoder,
+};
 
 use symphonia::core::io::MediaSource;
 
@@ -85,38 +90,37 @@ impl<T: Read + Seek + Send + Sync> Seek for ReadSeekSource<T> {
     }
 }
 
-static REGISTRY: once_cell::sync::Lazy<symphonia::core::codecs::CodecRegistry> =
-    once_cell::sync::Lazy::new(|| {
-        let mut registry = symphonia::core::codecs::CodecRegistry::new();
-        register_enabled_codecs(&mut registry);
-        registry
-    });
+static REGISTRY: once_cell::sync::Lazy<CodecRegistry> = Lazy::new(|| {
+    let mut registry = CodecRegistry::new();
+    register_enabled_codecs(&mut registry);
+    registry
+});
 
 /// Returns a reference to the global `CodecRegistry` populated with Symphonia's
 /// default enabled codecs (excluding native AAC to prevent conflict), plus the
 /// external adapters for AAC (via FDK-AAC) and Opus (via libopus).
-pub fn get_codecs() -> &'static symphonia::core::codecs::CodecRegistry {
+pub fn get_codecs() -> &'static CodecRegistry {
     &REGISTRY
 }
 
 /// Registers all enabled codecs: Symphonia's native decoders (FLAC, MP3, Vorbis, ALAC, PCM, ADPCM)
 /// WITHOUT the native AAC decoder, and registers external adapters (FDK-AAC and libopus).
 /// This ensures Symphonia's native AAC decoder does not conflict with `symphonia_adapter_fdk_aac`.
-pub fn register_enabled_codecs(registry: &mut symphonia::core::codecs::CodecRegistry) {
+pub fn register_enabled_codecs(registry: &mut CodecRegistry) {
     // 1. External adapters
     register_adapters(registry);
 
     // 2. Symphonia native codecs (excluding native AacDecoder)
-    registry.register_all::<symphonia::default::codecs::FlacDecoder>();
-    registry.register_all::<symphonia::default::codecs::MpaDecoder>();
-    registry.register_all::<symphonia::default::codecs::PcmDecoder>();
-    registry.register_all::<symphonia::default::codecs::VorbisDecoder>();
-    registry.register_all::<symphonia::default::codecs::AlacDecoder>();
-    registry.register_all::<symphonia::default::codecs::AdpcmDecoder>();
+    registry.register_all::<FlacDecoder>();
+    registry.register_all::<MpaDecoder>();
+    registry.register_all::<PcmDecoder>();
+    registry.register_all::<VorbisDecoder>();
+    registry.register_all::<AlacDecoder>();
+    registry.register_all::<AdpcmDecoder>();
 }
 
 /// Registers external adapters (FDK AAC and libopus) on the provided registry.
-pub fn register_adapters(registry: &mut symphonia::core::codecs::CodecRegistry) {
+pub fn register_adapters(registry: &mut CodecRegistry) {
     registry.register_all::<symphonia_adapter_fdk_aac::AacDecoder>();
     registry.register_all::<symphonia_adapter_libopus::OpusDecoder>();
 }
@@ -125,6 +129,7 @@ pub fn register_adapters(registry: &mut symphonia::core::codecs::CodecRegistry) 
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::path::Path;
     use symphonia::core::codecs::{
         CODEC_TYPE_AAC, CODEC_TYPE_NULL, CODEC_TYPE_OPUS, DecoderOptions,
     };
@@ -183,7 +188,7 @@ mod tests {
     #[test]
     fn test_decode_opus_file() {
         let file_path = "/tmp/test_startup.opus";
-        if !std::path::Path::new(file_path).exists() {
+        if !Path::new(file_path).exists() {
             eprintln!("Skipping test_decode_opus_file because {file_path} doesn't exist");
             return;
         }
@@ -234,7 +239,7 @@ mod tests {
     #[test]
     fn test_decode_aac_file() {
         let file_path = "/tmp/test_startup.m4a";
-        if !std::path::Path::new(file_path).exists() {
+        if !Path::new(file_path).exists() {
             eprintln!("Skipping test_decode_aac_file because {file_path} doesn't exist");
             return;
         }

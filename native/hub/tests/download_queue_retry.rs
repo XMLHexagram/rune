@@ -1,24 +1,37 @@
-use database::actions::{
-    downloads::{DownloadReport, set_download_rule},
-    file::{blob_path_for_track, hash_file},
+use axum::body::Body;
+use axum::http::Response;
+use database::{
+    actions::{
+        downloads::{DownloadReport, set_download_rule},
+        file::{blob_path_for_track, hash_file, is_materialized},
+        metadata::MissingHostFilePolicy,
+    },
+    connection::RecommendationDbConnection,
+    entities::{media_files, sync_download_jobs, sync_download_rules},
+    sync::{
+        LibrarySyncStore,
+        model::{BlobRef, Collection, ObjectKey},
+    },
 };
-use database::sync::{
-    LibrarySyncStore,
-    model::{BlobRef, Collection, ObjectKey},
+use http_request::sync::MetadataPeer;
+use hub::server::sync::downloads::{
+    DownloadAudioContext, download_requested_audio, download_requested_audio_until,
 };
-use hub::server::sync::downloads::download_requested_audio;
+use sea_orm::sea_query::Expr;
+use std::collections::HashMap;
+use std::time::Duration;
+use support::fixtures;
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
+use tokio::sync::RwLock;
+use tokio::time::Instant;
 #[path = "support/causal_library.rs"]
 mod support;
 use anyhow::Result;
 use axum::{Router, extract::Path, http::StatusCode, routing::get};
-use database::{
-    connection::{RecommendationDbConnection, initialize_db},
-    entities::{media_files, sync_download_jobs, sync_download_rules},
-};
 use fsio::FsIo;
-use sea_orm::{
-    ColumnTrait, Database, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
-};
+use futures::StreamExt;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -33,6 +46,7 @@ struct Fixture {
     node: Uuid,
     tracks: Vec<(Uuid, BlobRef)>,
     fail: Arc<AtomicBool>,
+    slow: Arc<AtomicBool>,
     replace_during_download: Arc<AtomicBool>,
     gets: Arc<AtomicUsize>,
     base: String,
@@ -42,16 +56,14 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Result<Self> {
         let root = tempfile::tempdir()?;
-        let db = Database::connect("sqlite::memory:").await?;
         let node = Uuid::new_v4();
-        initialize_db(&db, &node.to_string()).await?;
+        let db = fixtures::initialized_memory(node).await?;
         let fs = Arc::new(FsIo::new());
-        let store = LibrarySyncStore::open(db.clone(), node, None).await?;
+        let store = fixtures::open_library(db.clone(), node, None).await?;
         let mut tracks = Vec::new();
-        let mut bodies = std::collections::HashMap::new();
+        let mut bodies = HashMap::new();
         for index in 0..2 {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join(format!("../../assets/startup_{index}.ogg"));
+            let path = fixtures::audio_fixture_at(index);
             let blob = hash_file(&fs, &path)?;
             bodies.insert(blob.digest.clone(), std::fs::read(path)?);
             let id = Uuid::new_v4();
@@ -90,6 +102,8 @@ impl Fixture {
         .await?;
         let metadata = support::memory(store.identity().await?.namespace, Uuid::new_v4())?;
         let fail = Arc::new(AtomicBool::new(true));
+        let slow = Arc::new(AtomicBool::new(false));
+        let request_slow = slow.clone();
         let replace_during_download = Arc::new(AtomicBool::new(false));
         let gets = Arc::new(AtomicUsize::new(0));
         let rejected = tracks[0].1.digest.clone();
@@ -103,6 +117,7 @@ impl Fixture {
             "/sync/blobs/{digest}",
             get(move |Path(digest): Path<String>| {
                 let bytes = bytes.clone();
+                let slow = request_slow.clone();
                 let fail = request_fail.clone();
                 let gets = request_gets.clone();
                 let rejected = rejected.clone();
@@ -130,15 +145,29 @@ impl Fixture {
                             .unwrap();
                     }
                     if digest == rejected && fail.load(Ordering::SeqCst) {
-                        (StatusCode::SERVICE_UNAVAILABLE, Vec::new())
-                    } else {
-                        (StatusCode::OK, bytes[&digest].clone())
+                        return Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .body(Body::empty())
+                            .unwrap();
                     }
+                    let body = bytes[&digest].clone();
+                    let split = body.len() / 2;
+                    let (first, second) = (body[..split].to_vec(), body[split..].to_vec());
+                    let stream = futures::stream::once(
+                        async move { Ok::<_, std::io::Error>(first) },
+                    )
+                    .chain(futures::stream::once(async move {
+                        if slow.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        Ok::<_, std::io::Error>(second)
+                    }));
+                    Response::new(Body::from_stream(stream))
                 }
             }),
         );
         let app = Router::new().merge(peer.clone()).nest("/alternative", peer);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -151,6 +180,7 @@ impl Fixture {
             node,
             tracks,
             fail,
+            slow,
             replace_during_download,
             gets,
             base,
@@ -165,7 +195,7 @@ impl Fixture {
             self.fs.clone(),
             self.root.path().into(),
             self.node,
-            &http_request::sync::MetadataPeer::new(base, reqwest::Client::new()),
+            &MetadataPeer::new(base, reqwest::Client::new()),
             Arc::new(|| {}),
         )
         .await
@@ -212,7 +242,7 @@ async fn failed_rules_and_items_do_not_block_following_downloads_or_repeat_attem
     sync_download_jobs::Entity::update_many()
         .col_expr(
             sync_download_jobs::Column::RetryAt,
-            sea_orm::sea_query::Expr::value("2000-01-01T00:00:00Z"),
+            Expr::value("2000-01-01T00:00:00Z"),
         )
         .exec(&fixture.db)
         .await?;
@@ -271,15 +301,7 @@ async fn preparation_failure_isolated_to_its_file() -> Result<()> {
     assert_eq!(fixture.run(&fixture.base).await?.downloaded, 1);
     let files = media_files::Entity::find().all(&fixture.db).await?;
     for file in files {
-        assert!(
-            database::actions::file::is_materialized(
-                &fixture.db,
-                &fixture.fs,
-                fixture.root.path(),
-                file.id
-            )
-            .await?
-        );
+        assert!(is_materialized(&fixture.db, &fixture.fs, fixture.root.path(), file.id).await?);
     }
     Ok(())
 }
@@ -304,13 +326,7 @@ async fn obsolete_attachment_does_not_block_the_following_file() -> Result<()> {
     assert_eq!(files.len(), 2);
     for file in files {
         assert_eq!(
-            database::actions::file::is_materialized(
-                &fixture.db,
-                &fixture.fs,
-                fixture.root.path(),
-                file.id
-            )
-            .await?,
+            is_materialized(&fixture.db, &fixture.fs, fixture.root.path(), file.id).await?,
             file.hlc_uuid == fixture.tracks[1].0.to_string()
         );
     }
@@ -320,7 +336,7 @@ async fn obsolete_attachment_does_not_block_the_following_file() -> Result<()> {
 #[tokio::test]
 async fn obsolete_reservation_is_released_without_reimporting_managed_bytes() -> Result<()> {
     use database::actions::downloads::prepare_download;
-    use database::actions::metadata::scan_audio_library;
+
     let fixture = Fixture::new().await?;
     let (track, blob) = &fixture.tracks[0];
     let path = prepare_download(
@@ -332,10 +348,7 @@ async fn obsolete_reservation_is_released_without_reimporting_managed_bytes() ->
         "ogg",
     )
     .await?;
-    std::fs::copy(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/startup_0.ogg"),
-        &path,
-    )?;
+    std::fs::copy(fixtures::audio_fixture(), &path)?;
     fixture
         .store
         .write_local(
@@ -353,10 +366,7 @@ async fn obsolete_reservation_is_released_without_reimporting_managed_bytes() ->
         )
         .await?;
     sync_download_rules::Entity::update_many()
-        .col_expr(
-            sync_download_rules::Column::Enabled,
-            sea_orm::sea_query::Expr::value(false),
-        )
+        .col_expr(sync_download_rules::Column::Enabled, Expr::value(false))
         .exec(&fixture.db)
         .await?;
     fixture.run(&fixture.base).await?;
@@ -369,16 +379,13 @@ async fn obsolete_reservation_is_released_without_reimporting_managed_bytes() ->
     assert!(path.is_file(), "reservation release must not delete files");
     let before = fixture.store.head().await?;
     let records = fixture.store.record_store();
-    scan_audio_library(
+    fixtures::cleanup_scan(
         &fixture.fs,
         &fixture.db,
         &fixture.node.to_string(),
         fixture.root.path(),
-        true,
-        false,
-        |_| {},
-        None,
         &records,
+        MissingHostFilePolicy::RemoveEverywhere,
     )
     .await?;
     assert_eq!(
@@ -475,10 +482,7 @@ async fn stale_managed_verification_cannot_invalidate_changed_source() -> Result
     );
     let replacement = blake3::hash(b"replacement").to_hex().to_string();
     media_files::Entity::update_many()
-        .col_expr(
-            media_files::Column::ContentHash,
-            sea_orm::sea_query::Expr::value(replacement),
-        )
+        .col_expr(media_files::Column::ContentHash, Expr::value(replacement))
         .filter(media_files::Column::Id.eq(row.id))
         .exec(&fixture.db)
         .await?;
@@ -498,5 +502,99 @@ async fn stale_managed_verification_cannot_invalidate_changed_source() -> Result
             .unwrap()
             .local_available
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_local_path_does_not_block_following_file() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    fixture.fail.store(false, Ordering::SeqCst);
+    media_files::Entity::update_many()
+        .col_expr(media_files::Column::Directory, Expr::value("../invalid"))
+        .col_expr(media_files::Column::FileName, Expr::value("track.ogg"))
+        .col_expr(media_files::Column::LocalAvailable, Expr::value(true))
+        .filter(media_files::Column::HlcUuid.eq(fixture.tracks[0].0.to_string()))
+        .exec(&fixture.db)
+        .await?;
+    let report = fixture.run(&fixture.base).await?;
+    assert_eq!(report.downloaded, 1);
+    assert_eq!(fixture.gets.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transfer_finishes_after_pass_deadline_without_starting_next_file() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    fixture.fail.store(false, Ordering::SeqCst);
+    fixture.slow.store(true, Ordering::SeqCst);
+    let report = download_requested_audio_until(
+        fixture.db.clone(),
+        &RecommendationDbConnection::new(),
+        fixture.fs.clone(),
+        fixture.root.path().into(),
+        DownloadAudioContext {
+            node_id: fixture.node,
+            remote: &MetadataPeer::new(&fixture.base, reqwest::Client::new()),
+            notify: Arc::new(|| {}),
+            playback_queue: &[],
+        },
+        Instant::now() + Duration::from_millis(200),
+    )
+    .await?;
+    assert_eq!(report.downloaded, 1);
+    assert!(report.deadline_reached);
+    assert_eq!(fixture.gets.load(Ordering::SeqCst), 1);
+    let complete = fixture.run(&fixture.base).await?;
+    assert!(!complete.deadline_reached);
+    let files = media_files::Entity::find().all(&fixture.db).await?;
+    assert_eq!(files.iter().filter(|file| file.local_available).count(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn head_and_get_blob_do_not_rehash() -> Result<()> {
+    use hub::server::sync::http::{BlobContext, blob_router};
+    let fixture = Fixture::new().await?;
+    fixture.fail.store(false, Ordering::SeqCst);
+    fixture.run(&fixture.base).await?;
+    let (track, blob) = &fixture.tracks[0];
+    let row = media_files::Entity::find()
+        .filter(media_files::Column::HlcUuid.eq(track.to_string()))
+        .one(&fixture.db)
+        .await?
+        .unwrap();
+    let path = fixture.root.path().join(row.directory).join(row.file_name);
+    let app = blob_router(BlobContext {
+        store: Arc::new(RwLock::new(fixture.store.clone())),
+        db: fixture.db.clone(),
+        fsio: fixture.fs.clone(),
+        root: fixture.root.path().into(),
+        node_id: fixture.node,
+        upload_lock: Arc::new(Mutex::new(())),
+        notify: Arc::new(|| {}),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!("{base}/sync/blobs/{}", blob.digest);
+    let head = format!("{url}?track_id={track}");
+    assert_eq!(client.head(&head).send().await?.status(), StatusCode::OK);
+    let mut bytes = std::fs::read(&path)?;
+    bytes[0] ^= 1;
+    std::fs::write(&path, &bytes)?;
+    assert_eq!(client.head(&head).send().await?.status(), StatusCode::OK);
+    assert_eq!(client.get(&url).send().await?.status(), StatusCode::OK);
+    bytes.pop();
+    std::fs::write(&path, &bytes)?;
+    assert_eq!(
+        client.head(&head).send().await?.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        client.get(&url).send().await?.status(),
+        StatusCode::NOT_FOUND
+    );
+    server.abort();
     Ok(())
 }

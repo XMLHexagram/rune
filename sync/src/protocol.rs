@@ -1,10 +1,14 @@
 //! Neutral synchronization core.
+use serde::de;
+use serde::ser::Error;
 mod codec;
 mod coordinator;
 mod memory;
 #[allow(dead_code)]
 mod memory_core;
+mod merge;
 mod portable_hash;
+pub use merge::plan_leaf_merge;
 mod receiver;
 pub use codec::*;
 pub use coordinator::{Coordinator, PassUsage, SessionAdvance, SessionLimits};
@@ -12,8 +16,8 @@ pub use memory::MemorySyncStore;
 pub use portable_hash::PortableHasher;
 pub use receiver::{
     CompletionAdmission, MAX_RECEIVER_EXPANDED_BYTES, MAX_RECEIVER_METADATA_BYTES,
-    MAX_RECEIVER_METADATA_ITEMS, MAX_RECEIVER_RETRY_RECEIPTS, PreparedEvent, PreparedRange,
-    RangeAdmission, ReceiverLedger,
+    MAX_RECEIVER_METADATA_ITEMS, MAX_RECEIVER_RETRY_RECEIPTS, PreparedEvent, PreparedLeaf,
+    PromotionAdmission, PromotionStep, RangeAdmission, ReceiverLedger,
 };
 use std::{collections::BTreeSet, fmt::Debug, future::Future, pin::Pin, sync::Arc};
 pub use uuid::Uuid;
@@ -77,6 +81,9 @@ pub enum SyncError {
     IncompleteCoverage,
     StaleWork,
     Cancelled,
+    Unauthorized,
+    Forbidden,
+    NamespaceNotServed,
     Storage(String),
     Transport(String),
 }
@@ -90,7 +97,7 @@ fn serialize_collection<M: SyncModel, S: serde::Serializer>(
         || !M::collections().contains(value)
         || M::collection_from_tag(tag).as_ref() != Some(value)
     {
-        return Err(serde::ser::Error::custom("invalid collection tag"));
+        return Err(Error::custom("invalid collection tag"));
     }
     serializer.serialize_str(tag)
 }
@@ -99,12 +106,12 @@ fn deserialize_collection<'de, M: SyncModel, D: serde::Deserializer<'de>>(
 ) -> std::result::Result<M::Collection, D::Error> {
     let tag = <String as serde::Deserialize>::deserialize(deserializer)?;
     if tag.is_empty() || tag.len() > MAX_TAG_BYTES {
-        return Err(serde::de::Error::custom("invalid collection tag"));
+        return Err(de::Error::custom("invalid collection tag"));
     }
-    let collection = M::collection_from_tag(&tag)
-        .ok_or_else(|| serde::de::Error::custom("unknown collection tag"))?;
+    let collection =
+        M::collection_from_tag(&tag).ok_or_else(|| de::Error::custom("unknown collection tag"))?;
     if M::collection_tag(&collection) != tag || !M::collections().contains(&collection) {
-        return Err(serde::de::Error::custom("unregistered collection tag"));
+        return Err(de::Error::custom("unregistered collection tag"));
     }
     Ok(collection)
 }
@@ -113,7 +120,7 @@ fn serialize_collections<M: SyncModel, S: serde::Serializer>(
     serializer: S,
 ) -> std::result::Result<S::Ok, S::Error> {
     if values.is_empty() || values.len() > MAX_COLLECTIONS {
-        return Err(serde::ser::Error::custom("invalid collection scope"));
+        return Err(Error::custom("invalid collection scope"));
     }
     let mut tags: Vec<_> = values.iter().map(M::collection_tag).collect();
     tags.sort_unstable();
@@ -123,7 +130,7 @@ fn serialize_collections<M: SyncModel, S: serde::Serializer>(
                 || M::collection_from_tag(M::collection_tag(v)).as_ref() != Some(v)
         })
     {
-        return Err(serde::ser::Error::custom("invalid collection registry"));
+        return Err(Error::custom("invalid collection registry"));
     }
     serde::Serialize::serialize(&tags, serializer)
 }
@@ -132,24 +139,26 @@ fn deserialize_collections<'de, M: SyncModel, D: serde::Deserializer<'de>>(
 ) -> std::result::Result<BTreeSet<M::Collection>, D::Error> {
     let tags = <Vec<String> as serde::Deserialize>::deserialize(deserializer)?;
     if tags.is_empty() || tags.len() > MAX_COLLECTIONS || tags.windows(2).any(|p| p[0] >= p[1]) {
-        return Err(serde::de::Error::custom("invalid collection scope order"));
+        return Err(de::Error::custom("invalid collection scope order"));
     }
     let mut values = BTreeSet::new();
     for tag in tags {
         let value = M::collection_from_tag(&tag)
-            .ok_or_else(|| serde::de::Error::custom("unknown collection tag"))?;
+            .ok_or_else(|| de::Error::custom("unknown collection tag"))?;
         if tag.is_empty()
             || tag.len() > MAX_TAG_BYTES
             || M::collection_tag(&value) != tag
             || !M::collections().contains(&value)
             || !values.insert(value)
         {
-            return Err(serde::de::Error::custom("invalid collection tag"));
+            return Err(de::Error::custom("invalid collection tag"));
         }
     }
     Ok(values)
 }
 mod bytes_serde {
+    use serde::de;
+    use serde::ser::Error;
     pub fn serialize<S: serde::Serializer>(
         bytes: &[u8],
         serializer: S,
@@ -157,7 +166,7 @@ mod bytes_serde {
         let mut out = String::with_capacity(bytes.len().saturating_mul(2));
         use std::fmt::Write;
         for b in bytes {
-            write!(&mut out, "{b:02x}").map_err(serde::ser::Error::custom)?;
+            write!(&mut out, "{b:02x}").map_err(Error::custom)?;
         }
         serializer.serialize_str(&out)
     }
@@ -170,15 +179,16 @@ mod bytes_serde {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
-            return Err(serde::de::Error::custom("invalid canonical hex"));
+            return Err(de::Error::custom("invalid canonical hex"));
         }
         (0..s.len())
             .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(serde::de::Error::custom))
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(de::Error::custom))
             .collect()
     }
 }
 mod digest_serde {
+    use serde::de::Error;
     pub fn serialize<S: serde::Serializer>(
         value: &super::Digest,
         serializer: S,
@@ -191,7 +201,7 @@ mod digest_serde {
         let value = super::bytes_serde::deserialize(deserializer)?;
         value
             .try_into()
-            .map_err(|_| serde::de::Error::custom("invalid digest length"))
+            .map_err(|_| Error::custom("invalid digest length"))
     }
 }
 
@@ -378,21 +388,24 @@ impl<M: SyncModel> PartialOrd for CandidateCursor<M> {
 #[serde(rename_all = "snake_case")]
 pub enum ManifestKind {
     KeyEvent,
-    RangeEvent,
+    MergeEvent,
     Context,
-    ContextPartition,
     ContextRoot,
-    Leaf,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContextPartitionRef<M: SyncModel> {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, bound(serialize = "", deserialize = ""))]
+pub struct CollectionContext<M: SyncModel> {
+    #[serde(
+        serialize_with = "serialize_collection::<M, _>",
+        deserialize_with = "deserialize_collection::<M, _>"
+    )]
     pub collection: M::Collection,
-    pub partition: ManifestRef,
+    pub context: ContextRef,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextRoot<M: SyncModel> {
     pub scope: Scope<M>,
-    pub partitions: Vec<ContextPartitionRef<M>>,
+    pub contexts: Vec<CollectionContext<M>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -414,23 +427,15 @@ pub struct ContextRef {
     pub manifest: ManifestRef,
 }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SnapshotRef {
-    pub source: StoreIdentity,
-    pub snapshot_id: Uuid,
-    pub head: ReceiveProgress,
-}
-/// Context partition and complete source-live evidence, not context alone.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, bound(serialize = "", deserialize = ""))]
-pub struct RangeEvent<M: SyncModel> {
-    pub range: KeyRange<M>,
-    pub scope: Scope<M>,
-    pub context_partition: ManifestRef,
-    pub source: SnapshotRef,
-    #[serde(with = "digest_serde")]
-    pub range_summary: Digest,
-    pub live_manifest: ManifestRef,
+pub struct MergeDelta<M: SyncModel> {
+    #[serde(
+        serialize_with = "serialize_collection::<M, _>",
+        deserialize_with = "deserialize_collection::<M, _>"
+    )]
+    pub collection: M::Collection,
+    pub added: Vec<Candidate<M>>,
+    pub observed: ExactContext,
 }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(
@@ -441,9 +446,8 @@ pub struct RangeEvent<M: SyncModel> {
 )]
 pub enum Event<M: SyncModel> {
     Key(KeyDelta<M>),
-    Range(Box<RangeEvent<M>>),
+    Merge(Box<MergeDelta<M>>),
 }
-pub(crate) type CausalSegment<M> = (KeyRange<M>, ExactContext, Vec<Candidate<M>>);
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, bound(serialize = "", deserialize = ""))]
@@ -619,6 +623,8 @@ pub struct Fragment {
     deny_unknown_fields,
     bound(serialize = "", deserialize = "")
 )]
+// Keep the journal request inline in the public admission API.
+#[allow(clippy::large_enum_variant)]
 pub enum StageOrigin<M: SyncModel> {
     Journal {
         request: PageRequest<M>,
@@ -631,10 +637,14 @@ pub enum StageOrigin<M: SyncModel> {
         #[serde(with = "digest_serde")]
         event_digest: Digest,
     },
-    Snapshot {
+    SnapshotContext {
         session: Uuid,
         snapshot_id: Uuid,
-        range: KeyRange<M>,
+        #[serde(
+            serialize_with = "serialize_collection::<M, _>",
+            deserialize_with = "deserialize_collection::<M, _>"
+        )]
+        collection: M::Collection,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -775,9 +785,6 @@ pub struct RangeSummary<M: SyncModel> {
     pub range: KeyRange<M>,
     pub candidate_count: u64,
     pub candidate_bytes: u64,
-    pub context_segments: u64,
-    #[serde(with = "digest_serde")]
-    pub context_commitment: Digest,
     #[serde(with = "digest_serde")]
     pub aggregate: Digest,
 }
@@ -789,29 +796,8 @@ pub struct SnapshotDescriptor<M: SyncModel> {
     pub snapshot_id: Uuid,
     pub head: ReceiveProgress,
     pub roots: Vec<RangeSummary<M>>,
+    pub contexts: Vec<CollectionContext<M>>,
     pub expires_unix_ms: u64,
-}
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields, bound(serialize = "", deserialize = ""))]
-pub struct ContextSegment<M: SyncModel> {
-    pub range: KeyRange<M>,
-    pub context: ContextRef,
-}
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContextCursor {
-    pub segment_index: u64,
-    pub next_lower: Option<Uuid>,
-}
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields, bound(serialize = "", deserialize = ""))]
-pub struct ContextPage<M: SyncModel> {
-    pub snapshot_id: Uuid,
-    pub range: KeyRange<M>,
-    pub after: ContextCursor,
-    pub next: ContextCursor,
-    pub done: bool,
-    pub segments: Vec<ContextSegment<M>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, bound(serialize = "", deserialize = ""))]
@@ -866,9 +852,9 @@ pub struct LeafProgress<M: SyncModel> {
 }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ContextProgress {
-    pub next: ContextCursor,
-    pub complete: bool,
+pub struct PromoteProgress {
+    pub done: bool,
+    pub causal_changes: u64,
 }
 /// Source leases survive multiple processes; expensive construction/summary are resumable.
 pub trait SnapshotSource<M: SyncModel>: Send + Sync {
@@ -896,13 +882,6 @@ pub trait SnapshotSource<M: SyncModel>: Send + Sync {
         limits: WorkLimits,
         resume: Option<WorkCursor>,
     ) -> BoxFuture<'_, WorkOutcome<Vec<KeyRange<M>>>>;
-    fn context_page(
-        &self,
-        snapshot: Uuid,
-        range: KeyRange<M>,
-        after: ContextCursor,
-        limits: PageLimits,
-    ) -> BoxFuture<'_, ContextPage<M>>;
     fn leaf(
         &self,
         snapshot: Uuid,
@@ -946,14 +925,7 @@ pub trait SnapshotSink<M: SyncModel>: Send + Sync {
         session: Uuid,
         source: RangeSummary<M>,
     ) -> BoxFuture<'_, CoverageProgress>;
-    fn context_progress(&self, session: Uuid, range: KeyRange<M>)
-    -> BoxFuture<'_, ContextProgress>;
     fn leaf_progress(&self, session: Uuid, range: KeyRange<M>) -> BoxFuture<'_, LeafProgress<M>>;
-    fn stage_context_page(
-        &self,
-        session: Uuid,
-        page: ContextPage<M>,
-    ) -> BoxFuture<'_, ContextProgress>;
     fn stage_leaf_page(&self, session: Uuid, page: LeafPage<M>) -> BoxFuture<'_, LeafProgress<M>>;
     fn commit_complete_range(
         &self,
@@ -961,12 +933,7 @@ pub trait SnapshotSink<M: SyncModel>: Send + Sync {
         range: KeyRange<M>,
         limits: ApplyLimits,
     ) -> BoxFuture<'_, (CoverageProgress, ProjectionBatch<M>)>;
-    fn normalize_step(
-        &self,
-        session: Uuid,
-        limits: WorkLimits,
-        resume: Option<WorkCursor>,
-    ) -> BoxFuture<'_, WorkOutcome<CoverageProgress>>;
+    fn promote_step(&self, session: Uuid, limits: ApplyLimits) -> BoxFuture<'_, PromoteProgress>;
     fn complete_reconciliation(&self, session: Uuid) -> BoxFuture<'_, ReceiveProgress>;
 }
 impl std::fmt::Display for SyncError {
