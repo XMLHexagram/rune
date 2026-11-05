@@ -7,6 +7,22 @@ import '../widgets/playback_controller/constants/controller_items.dart';
 
 final SettingsManager settingsManager = SettingsManager();
 
+/// [entries] in the order [storedOrder] gives them, then the ones it does not
+/// have, in the order of [entries]: an entry added since the order was saved
+/// goes to the end, after the hidden ones, rather than to the front of the
+/// bar.
+List<ControllerEntry> orderControllerEntries(
+  List<ControllerEntry> entries,
+  List<String> storedOrder,
+) {
+  int rank(ControllerEntry entry) {
+    final index = storedOrder.indexOf(entry.id);
+    return index < 0 ? storedOrder.length + entries.indexOf(entry) : index;
+  }
+
+  return [...entries]..sort((a, b) => rank(a).compareTo(rank(b)));
+}
+
 class PlaybackControllerProvider extends ChangeNotifier {
   static const String storageKey = 'controller_order';
 
@@ -17,6 +33,10 @@ class PlaybackControllerProvider extends ChangeNotifier {
   }
 
   List<ControllerEntry> get entries => List.unmodifiable(_entries);
+
+  /// The entries that are on offer now, in order.
+  List<ControllerEntry> availableEntries(BuildContext context) =>
+      _entries.where((entry) => entry.isAvailable(context)).toList();
 
   void _loadEntries() async {
     String? storedOrderJson =
@@ -37,11 +57,10 @@ class PlaybackControllerProvider extends ChangeNotifier {
         ..addAll(entryMap.values);
 
       // Sort according to storedOrder
-      _entries.sort((a, b) {
-        int indexA = storedOrder.indexOf(a.id);
-        int indexB = storedOrder.indexOf(b.id);
-        return indexA.compareTo(indexB);
-      });
+      final ordered = orderControllerEntries(_entries, storedOrder);
+      _entries
+        ..clear()
+        ..addAll(ordered);
 
       // Ensure all new entries are added to the end
       for (var item in controllerItems) {
@@ -58,9 +77,20 @@ class PlaybackControllerProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  void reorder(int oldIndex, int newIndex) {
-    final item = _entries.removeAt(oldIndex);
-    _entries.insert(newIndex, item);
+  /// Moves an entry of [shown], a list of the available entries as shown,
+  /// from [oldIndex] to [newIndex] in it, and keeps the others where they are.
+  void reorderShown(List<ControllerEntry> shown, int oldIndex, int newIndex) {
+    final item = shown[oldIndex];
+    final rest = List.of(shown)..removeAt(oldIndex);
+    _entries.remove(item);
+    if (newIndex >= rest.length) {
+      _entries.insert(
+        rest.isEmpty ? 0 : _entries.indexOf(rest.last) + 1,
+        item,
+      );
+    } else {
+      _entries.insert(_entries.indexOf(rest[newIndex]), item);
+    }
 
     _saveEntries();
     notifyListeners();

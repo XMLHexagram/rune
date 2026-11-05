@@ -5422,12 +5422,14 @@ dependencies = [
  "symphonia",
  "symphonia-adapter-fdk-aac",
  "symphonia-adapter-libopus",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-logcat",
  "tracing-subscriber",
  "url",
+ "uuid",
  "windows 0.44.0",
 ]
 

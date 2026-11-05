@@ -1,8 +1,10 @@
 use super::sync_auth::SyncAuth;
+use super::sync_worker::wait_for_revocation;
 use crate::backends::remote::{RemoteConnectError, token_error};
 use database::actions::file::catalog_track;
 use database::sync::model::RuneModel;
 use std::net::TcpListener;
+use std::sync::Mutex as StdMutex;
 use std::{
     net::SocketAddr,
     path::Path,
@@ -30,6 +32,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use database::actions::cover_art::COVER_TEMP_DIR;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use log::{error, info};
+use playback::player::{RemoteAudioError, UnavailableReason};
 use rand::{
     RngCore,
     distributions::{Alphanumeric, DistString},
@@ -583,13 +586,22 @@ impl ServerManager {
                         "peer library mismatch"
                     );
                     let url = format!("{base}/sync/blobs/{}", blob.digest);
-                    let mut response = client.head(&url).query(&[("track_id", track_id.to_string())]).send().await?;
-                    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                    let access_url = format!("{url}?track_id={track_id}");
+                    let mut response = client.head(&url).query(&[("track_id", track_id.to_string())]).send().await
+                        .map_err(RemoteAudioError::unreachable)?;
+                    if matches!(response.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND) {
                         let (_, renewed) = super::sync_worker::authenticated_client(&node, &own, &self.private_key, &fingerprint, &host, port).await?;
                         client = renewed;
-                        response = client.head(&url).query(&[("track_id", track_id.to_string())]).send().await?;
+                        response = client.head(&url).query(&[("track_id", track_id.to_string())]).send().await
+                            .map_err(RemoteAudioError::unreachable)?;
                     }
-                    response.error_for_status()?;
+                    if matches!(response.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND) {
+                        lifetime.cancel();
+                        anyhow::bail!(RemoteAudioError::AccessRevoked);
+                    }
+                    if !response.status().is_success() {
+                        anyhow::bail!(RemoteAudioError::unreachable(format!("unexpected status {}", response.status())));
+                    }
                     let mut stream_handles = self.stream_handles.lock().await;
                     let cancellation = self.sync_cancel.lock().await.as_ref()
                         .ok_or_else(|| anyhow::anyhow!("node synchronization is closing"))?.child_token();
@@ -598,53 +610,76 @@ impl ServerManager {
                     let request = Arc::new(super::sync_worker::RenewableAudio {
                         global: Arc::downgrade(&node), own: own.clone(), private_key: self.private_key.clone(),
                         endpoint: super::sync_worker::PeerEndpoint { fingerprint: fingerprint.clone(), trusted_host: trusted_host.clone(), host: host.clone(), port },
-                        url: url.clone(), size: blob.size,
+                        url: url.clone(), access_url, size: blob.size,
                         client: Arc::new(Mutex::new(super::sync_worker::AudioCredentials { client, generation: 0 })), cancel: cancellation.clone(),
                     });
+                    let failure_reason = Arc::new(StdMutex::new(None));
+                    let watcher_failure_reason = failure_reason.clone();
                     let watch_cancel = cancellation.clone();
                     let watch_params = Arc::downgrade(&node);
                     let watch_fingerprint = fingerprint.clone();
                     let revocation_host = trusted_host.clone();
                     let watch_request = request.clone();
-                    let probe_url = format!("{base}/sync/head");
                     let watcher = tokio::spawn(async move {
-                        let remote_probe = async {
+                        let access_probe = async {
                             loop {
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                                let (client, generation) = {
-                                    let credentials = watch_request.client.lock().await;
-                                    (credentials.client.clone(), credentials.generation)
-                                };
-                                match client.get(&probe_url).send().await {
-                                    Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                                        if let Err(error) = watch_request.refresh_if_current(generation).await {
-                                            log::debug!("Audio authorization refresh failed: {error:#}");
-                                            if watch_cancel.is_cancelled() { break; }
-                                        }
-                                    },
-                                    _ => {},
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                if let Err(error) = watch_request.check_library_access().await {
+                                    if watch_cancel.is_cancelled() {
+                                        break;
+                                    }
+                                    if let Ok(mut reason) = watcher_failure_reason.lock() {
+                                        *reason = Some(UnavailableReason::classify(&error));
+                                    }
+                                    watch_cancel.cancel();
+                                    log::debug!("Audio library access check failed: {error:#}");
                                 }
                             }
                         };
                         tokio::select! {
                             _ = watch_cancel.cancelled() => {},
-                            _ = library_cancel.cancelled() => watch_cancel.cancel(),
-                            _ = super::sync_worker::wait_for_revocation(watch_params, &watch_fingerprint, &revocation_host) => watch_cancel.cancel(),
-                            _ = remote_probe => {},
+                            _ = library_cancel.cancelled() => {
+                                if let Ok(mut reason) = watcher_failure_reason.lock() { *reason = Some(UnavailableReason::SourceUnreachable); }
+                                watch_cancel.cancel()
+                            },
+                            _ = wait_for_revocation(watch_params, &watch_fingerprint, &revocation_host) => {
+                                if let Ok(mut reason) = watcher_failure_reason.lock() { *reason = Some(UnavailableReason::AccessRevoked); }
+                                watch_cancel.cancel()
+                            },
+                            _ = access_probe => {},
                         }
                     });
                     stream_handles.push(watcher);
                     Ok::<_, anyhow::Error>(playback::player::RemoteAudioSource {
-                        request, url, extension: extension.clone(), cancellation,
+                        request,
+                        url,
+                        extension: extension.clone(),
+                        size: blob.size,
+                        cancellation,
+                        failure_reason,
                     })
                 }
                 .await;
-                if let Ok(source) = result {
-                    return Ok(source);
+                match result {
+                    Ok(source) => return Ok(source),
+                    Err(error)
+                        if error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<RemoteAudioError>()
+                                .is_some_and(|remote| {
+                                    matches!(remote, RemoteAudioError::AccessRevoked)
+                                })
+                        }) =>
+                    {
+                        return Err(error);
+                    }
+                    Err(_) => {}
                 }
             }
         }
-        anyhow::bail!("no paired device currently has this audio")
+        anyhow::bail!(RemoteAudioError::unreachable(
+            "no paired device currently has this audio"
+        ))
     }
 
     pub fn is_running(&self) -> bool {
@@ -1260,13 +1295,16 @@ mod lifecycle_tests {
         let second = tempfile::tempdir()?;
         let a = fixture(first.path()).await?;
         let b = fixture(second.path()).await?;
-        let addr = paired_full(&a, &b).await?;
-        let mut socket = connect_remote(
-            "127.0.0.1",
-            addr.port(),
-            &b.global_params.config_path,
-            b.global_params.cert_validator.read().await.clone(),
-        )
+        let addr = peer_step("pair headless controller nodes", paired_full(&a, &b)).await?;
+        let mut socket = peer_step("connect headless controller", async {
+            Ok(connect_remote(
+                "127.0.0.1",
+                addr.port(),
+                &b.global_params.config_path,
+                b.global_params.cert_validator.read().await.clone(),
+            )
+            .await?)
+        })
         .await?;
         let id = a.global_params.library_id.context("library")?;
         close_ui(&a.global_params).await?;
@@ -2367,6 +2405,15 @@ mod lifecycle_tests {
             b.global_params.cert_validator.read().await.clone(),
         )
         .await?;
+        assert!(
+            a.global_params
+                .node
+                .websocket_service
+                .broadcast_tx
+                .receiver_count()
+                > 0,
+            "controller connection returned before broadcast subscription"
+        );
         let broadcaster = &a.global_params.broadcaster;
         broadcaster.broadcast(&TrustListUpdated {
             certificates: vec![],
@@ -2386,17 +2433,21 @@ mod lifecycle_tests {
             cover_art_path: None,
             lib_path: a.global_params.test_library().media_root.clone(),
         });
-        let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
-            .await?
-            .context("controller socket closed")??;
+        let frame = peer_step_with_timeout(
+            "controller playback status frame",
+            Duration::from_secs(3),
+            async { Ok(socket.next().await.context("controller socket closed")??) },
+        )
+        .await?;
         let (name, payload, _) = decode_message(&frame.into_data()).context("status frame")?;
         assert_eq!(name, "PlaybackStatus");
         let status: PlaybackStatus = rinf::deserialize(&payload)?;
         assert_eq!(status.progress_seconds, 12.0);
+        let unexpected_frame =
+            tokio::time::timeout(Duration::from_millis(200), socket.next()).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), socket.next())
-                .await
-                .is_err()
+            unexpected_frame.is_err(),
+            "controller received a disallowed frame"
         );
         a.global_params.node.shutdown().await?;
         b.global_params.node.shutdown().await?;
@@ -3407,7 +3458,7 @@ mod lifecycle_tests {
         )
         .await?;
         assert!(
-            matches!(&queued[..], [(PlayingItem::InLibrary(id, _), PlaybackSource::LibraryStream)] if *id == file.id)
+            matches!(&queued[..], [(PlayingItem::InLibrary(item), PlaybackSource::LibraryStream)] if item.file_uuid.to_string() == file.hlc_uuid)
         );
         let summaries = get_metadata_summary_by_files(
             params.test_library().main_db.as_ref(),
@@ -3489,7 +3540,8 @@ mod lifecycle_tests {
             .pop()
             .context("missing updated audio")?;
         assert_eq!(current.id, file.id);
-        assert_eq!(resolver.resolve_id(file.id).await?, Some(current.id));
+        let file_uuid = Uuid::parse_str(&file.hlc_uuid)?;
+        assert_eq!(resolver.resolve_id(file_uuid).await?, Some(current.id));
         params.main_token.cancel();
         Ok(())
     }
