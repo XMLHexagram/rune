@@ -9,18 +9,20 @@ use uuid::Uuid;
 
 use ::database::{
     actions::{
-        file::{file_ids_by_uuid, file_uuids_by_id},
+        file::{file_ids_by_uuid, file_uuids_by_id, files_by_uuid},
         mixes::query_mix_media_files,
         stats::increase_skipped,
     },
-    playing_item::dispatcher::PlayingItemActionDispatcher,
+    error::ExpectedError,
+    playing_item::{MediaFileHandle, dispatcher::PlayingItemActionDispatcher},
 };
 use ::playback::{
-    player::{LibraryItem, Playable, PlayingItem},
+    player::{LibraryItem, Playable, PlaybackSource, PlayingItem},
     strategies::AddMode,
 };
 
 use crate::request_error::ExpectedRequestError;
+use crate::server::libraries::{cast_library_state, cast_library_states, parse_library_ids};
 use crate::{
     Session, Signal,
     library_pool::{LibraryHandle, LibraryPool},
@@ -114,6 +116,47 @@ pub async fn playing_items_from_requests(
         .collect())
 }
 
+fn edit_playlist(
+    player: &mut dyn Playable,
+    prepared: &[(PlayingItem, PlaybackSource)],
+    mode: PlaylistOperateMode,
+    start_index: Option<usize>,
+    playback_mode: Option<u32>,
+) -> bool {
+    let queue_changed = mode == PlaylistOperateMode::Replace && !player.get_playlist().is_empty();
+    if mode == PlaylistOperateMode::Replace {
+        player.clear_playlist();
+    }
+    let offset = match mode {
+        PlaylistOperateMode::Replace => 0,
+        PlaylistOperateMode::AppendToEnd => player.get_playlist().len(),
+        PlaylistOperateMode::PlayNext => player
+            .get_status()
+            .index
+            .map_or(0, |index| index.saturating_add(1)),
+    };
+    let add_mode = if mode == PlaylistOperateMode::PlayNext {
+        AddMode::PlayNext
+    } else {
+        AddMode::AppendToEnd
+    };
+    if !prepared.is_empty() {
+        player.add_to_playlist_with_sources(prepared.to_vec(), add_mode);
+    }
+    if let Some(playback_mode) = playback_mode
+        && playback_mode != 99
+    {
+        player.set_playback_mode(playback_mode.into());
+    }
+    if let Some(start_index) = start_index
+        && !prepared.is_empty()
+    {
+        player.switch(start_index + offset);
+        player.play();
+    }
+    queue_changed || !prepared.is_empty()
+}
+
 /// Convert many items to requests, acquiring each library and querying it once.
 pub async fn playing_item_requests(
     items: &[PlayingItem],
@@ -178,6 +221,104 @@ pub async fn playing_item_requests(
             },
         })
         .collect()
+}
+
+struct ResolvedMixQuery {
+    prepared: Vec<(PlayingItem, PlaybackSource)>,
+    response_items: Vec<PlayingItemRequest>,
+    start_index: Option<usize>,
+}
+
+async fn resolve_mix_query(
+    request: &OperatePlaybackWithMixQueryRequest,
+    library: &LibraryHandle,
+    node: &NodeContext,
+) -> Result<ResolvedMixQuery> {
+    let fallback_items =
+        playing_items_from_requests(&request.fallback_playing_items, Some(library)).await?;
+
+    let tracks = if request.queries.is_empty() {
+        PlayingItemActionDispatcher::new()
+            .get_file_handle(&library.fsio, &library.main_db, &fallback_items)
+            .await?
+    } else {
+        // TODO(C5): exclude the renderer queue while casting.
+        let queue = node
+            .session_queue_for_library(library.descriptor.library_id)
+            .await?;
+        query_mix_media_files(
+            &library.main_db,
+            &library.recommend_db,
+            request
+                .queries
+                .iter()
+                .map(|query| (query.operator.clone(), query.parameter.clone()))
+                .collect(),
+            0,
+            4096,
+            &queue,
+        )
+        .await
+        .with_context(|| format!("Failed to query tracks: {:?}", request.queries))?
+        .into_iter()
+        .map(Into::into)
+        .collect()
+    };
+
+    let prepared = files_to_playback_request(
+        &library.fsio,
+        &library.main_db,
+        &library.descriptor.library_id.to_string(),
+        &library.media_root,
+        &tracks,
+    )
+    .await?;
+    let mut items: Vec<PlayingItem> = prepared.iter().map(|(item, _)| item.clone()).collect();
+    let start_index = if !request.instantly_play {
+        None
+    } else {
+        let initial_item = match &request.initial_playback_item {
+            Some(initial_item) => {
+                Some(playing_item_from_request(initial_item.clone(), Some(library)).await?)
+            }
+            None => None,
+        };
+        let nearest_index = if request.hint_position < 0 {
+            Some(0)
+        } else {
+            let hint_position = usize::try_from(request.hint_position).map_err(|error| {
+                ExpectedRequestError::invalid_input(format!("Invalid hint position: {error}"))
+            })?;
+            find_nearest_index(&items, hint_position, |item| {
+                initial_item
+                    .as_ref()
+                    .is_some_and(|initial_item| item == initial_item)
+            })
+        };
+
+        if nearest_index.is_none() {
+            items = fallback_items;
+            Some(if request.hint_position < 0 {
+                0
+            } else {
+                usize::try_from(request.hint_position).unwrap_or_default()
+            })
+        } else {
+            nearest_index
+        }
+    };
+    let response_items = playing_item_requests(
+        &items,
+        &node.library_pool,
+        Some(library.descriptor.library_id),
+    )
+    .await;
+
+    Ok(ResolvedMixQuery {
+        prepared,
+        response_items,
+        start_index,
+    })
 }
 
 impl ParamsExtractor for LoadRequest {
@@ -556,147 +697,212 @@ impl Signal for OperatePlaybackWithMixQueryRequest {
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let library = require_library(library)?;
-        let request = dart_signal;
-
-        let items: Vec<PlayingItem> =
-            playing_items_from_requests(&request.fallback_playing_items, Some(&library)).await?;
-
-        // Retrieve tracks
-        let tracks = if request.queries.is_empty() {
-            PlayingItemActionDispatcher::new()
-                .get_file_handle(&library.fsio, &library.main_db, &items)
-                .await?
-        } else {
-            let queue = node
-                .session_queue_for_library(library.descriptor.library_id)
+        let resolved = resolve_mix_query(dart_signal, &library, &node).await?;
+        if let Some(link) = node.renderer_link()? {
+            let items = resolved
+                .prepared
+                .iter()
+                .map(|(item, _)| match item {
+                    PlayingItem::InLibrary(item) => Ok(LibraryItemRequest::from(*item)),
+                    _ => Err(anyhow::Error::new(ExpectedRequestError::Unavailable {
+                        what: "casting files outside a library",
+                    })),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let start_index = resolved
+                .start_index
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|error| {
+                    ExpectedRequestError::invalid_input(format!("Invalid start index: {error}"))
+                })?;
+            let load = CastLoadRequest {
+                items,
+                start_index,
+                mode: dart_signal.operate_mode,
+                expected_revision: dart_signal.expected_revision,
+                playback_mode: dart_signal
+                    .instantly_play
+                    .then_some(dart_signal.playback_mode),
+            };
+            let (name, payload) = link
+                .request("CastLoadRequest", &rinf::serialize(&load)?)
                 .await?;
-            query_mix_media_files(
-                &library.main_db,
-                &library.recommend_db,
-                request
-                    .queries
-                    .iter()
-                    .map(|x| (x.operator.clone(), x.parameter.clone()))
-                    .collect(),
-                0,
-                4096,
-                &queue,
-            )
-            .await
-            .with_context(|| format!("Failed to query tracks: {:?}", request.queries))?
-            .into_iter()
-            .map(|x| x.into())
-            .collect()
-        };
-
-        let prepared = files_to_playback_request(
-            &library.fsio,
-            &library.main_db,
-            &library.descriptor.library_id.to_string(),
-            &library.media_root,
-            &tracks,
-        )
-        .await?;
-        let operate_mode = request.operate_mode;
-        let add_mode = if operate_mode == PlaylistOperateMode::PlayNext {
-            AddMode::PlayNext
+            anyhow::ensure!(
+                name == "CastLoadResponse",
+                "Unexpected renderer response: {name}"
+            );
+            let _: CastLoadResponse =
+                rinf::deserialize(&payload).context("Could not decode renderer cast response")?;
         } else {
-            AddMode::AppendToEnd
-        };
-
-        let mut playlist_len = 0;
-
-        let mut items: Vec<PlayingItem> = prepared.iter().map(|(item, _)| item.clone()).collect();
-
-        // If not required to play instantly, add to playlist and return
-        if !request.instantly_play {
             node.session()?
-                .edit_queue(request.expected_revision, |player| {
-                    let queue_changed = operate_mode == PlaylistOperateMode::Replace
-                        && !player.get_playlist().is_empty();
-                    if operate_mode == PlaylistOperateMode::Replace {
-                        player.clear_playlist();
-                    }
-                    playlist_len = if operate_mode == PlaylistOperateMode::Replace {
-                        0
-                    } else {
-                        player.get_playlist().len()
-                    };
-                    if !prepared.is_empty() {
-                        player.add_to_playlist_with_sources(prepared.clone(), add_mode);
-                    }
-                    queue_changed || !prepared.is_empty()
+                .edit_queue(dart_signal.expected_revision, |player| {
+                    edit_playlist(
+                        player,
+                        &resolved.prepared,
+                        dart_signal.operate_mode,
+                        resolved.start_index,
+                        dart_signal
+                            .instantly_play
+                            .then_some(dart_signal.playback_mode),
+                    )
                 })
                 .await?;
-            return Ok(Some(OperatePlaybackWithMixQueryResponse {
-                playing_items: playing_item_requests(
-                    &items,
-                    &node.library_pool,
-                    Some(library.descriptor.library_id),
-                )
-                .await,
-            }));
         }
-
-        // Find the nearest index
-        let initial_item = if let Some(initial_item) = &request.initial_playback_item {
-            Some(playing_item_from_request(initial_item.clone(), Some(&library)).await?)
-        } else {
-            None
-        };
-        let nearest_index: Option<usize> = if request.hint_position < 0 {
-            Some(0)
-        } else {
-            find_nearest_index(&items, request.hint_position.try_into().unwrap(), |x| {
-                if let Some(initial_item) = &initial_item {
-                    x == initial_item
-                } else {
-                    false
-                }
-            })
-        };
-
-        // If no suitable index found, use fallback_media_file_ids
-        if nearest_index.is_none() {
-            items = playing_items_from_requests(&request.fallback_playing_items, Some(&library))
-                .await?;
-        }
-
-        let nearest_index = nearest_index.unwrap_or(request.hint_position.try_into().unwrap_or(0));
-
-        node.session()?
-            .edit_queue(request.expected_revision, |player| {
-                let queue_changed = operate_mode == PlaylistOperateMode::Replace
-                    && !player.get_playlist().is_empty();
-                if operate_mode == PlaylistOperateMode::Replace {
-                    player.clear_playlist();
-                }
-                playlist_len = if operate_mode == PlaylistOperateMode::Replace {
-                    0
-                } else {
-                    player.get_playlist().len()
-                };
-                if !prepared.is_empty() {
-                    player.add_to_playlist_with_sources(prepared.clone(), add_mode);
-                }
-                if request.playback_mode != 99 {
-                    player.set_playback_mode(request.playback_mode.into());
-                }
-                if !prepared.is_empty() {
-                    player.switch(nearest_index + playlist_len);
-                    player.play();
-                }
-                queue_changed || !prepared.is_empty()
-            })
-            .await?;
 
         Ok(Some(OperatePlaybackWithMixQueryResponse {
-            playing_items: playing_item_requests(
-                &items,
-                &node.library_pool,
-                Some(library.descriptor.library_id),
-            )
-            .await,
+            playing_items: resolved.response_items,
         }))
+    }
+}
+
+impl ParamsExtractor for CastPreflightRequest {
+    type Params = (Arc<NodeContext>,);
+
+    fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
+        (all_params.node.clone(),)
+    }
+}
+
+impl Signal for CastPreflightRequest {
+    type Params = (Arc<NodeContext>,);
+    type Response = CastPreflightResponse;
+
+    async fn handle(
+        &self,
+        (node,): Self::Params,
+        _session: Option<Session>,
+        request: &Self,
+    ) -> Result<Option<Self::Response>> {
+        let library_ids = parse_library_ids(&request.library_ids)?;
+        let libraries = cast_library_states(&node, &library_ids)
+            .await
+            .into_iter()
+            .map(|(library_id, state)| CastLibraryStatus {
+                library_id: library_id.to_string(),
+                state,
+            })
+            .collect();
+        Ok(Some(CastPreflightResponse { libraries }))
+    }
+}
+
+impl ParamsExtractor for CastLoadRequest {
+    type Params = (Arc<NodeContext>,);
+
+    fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
+        (all_params.node.clone(),)
+    }
+}
+
+impl Signal for CastLoadRequest {
+    type Params = (Arc<NodeContext>,);
+    type Response = CastLoadResponse;
+
+    async fn handle(
+        &self,
+        (node,): Self::Params,
+        _session: Option<Session>,
+        request: &Self,
+    ) -> Result<Option<Self::Response>> {
+        let items = request
+            .items
+            .iter()
+            .map(|item| {
+                Ok(LibraryItem {
+                    library_id: Uuid::parse_str(&item.library_id).map_err(|error| {
+                        anyhow::Error::new(ExpectedRequestError::invalid_input(format!(
+                            "Invalid cast library id: {error}"
+                        )))
+                    })?,
+                    file_uuid: Uuid::parse_str(&item.file_uuid).map_err(|error| {
+                        anyhow::Error::new(ExpectedRequestError::invalid_input(format!(
+                            "Invalid cast file uuid: {error}"
+                        )))
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut library_ids = Vec::new();
+        for item in &items {
+            if !library_ids.contains(&item.library_id) {
+                library_ids.push(item.library_id);
+            }
+        }
+        for library_id in &library_ids {
+            let state = cast_library_state(&node, *library_id).await;
+            if state != CastLibraryState::Ready {
+                return Err(ExpectedRequestError::CastNotPossible {
+                    library_id: library_id.to_string(),
+                    state,
+                }
+                .into());
+            }
+        }
+
+        let mut prepared_by_item = HashMap::new();
+        for library_id in library_ids {
+            let library = node
+                .library_pool
+                .acquire_for_request(library_id)
+                .await
+                .map_err(|error| {
+                    anyhow::Error::new(ExpectedRequestError::Unavailable {
+                        what: "cast library",
+                    })
+                    .context(error)
+                })?;
+            let file_uuids = items
+                .iter()
+                .filter(|item| item.library_id == library_id)
+                .map(|item| item.file_uuid)
+                .collect::<Vec<_>>();
+            let rows_by_uuid = files_by_uuid(&library.main_db, &file_uuids).await?;
+            let mut handles = Vec::new();
+            for item in items.iter().filter(|item| item.library_id == library_id) {
+                let row = rows_by_uuid
+                    .get(&item.file_uuid)
+                    .ok_or(ExpectedError::NotFound { what: "cast file" })?;
+                let mut handle = MediaFileHandle::from(row.clone());
+                handle.item = PlayingItem::InLibrary(*item);
+                handles.push(handle);
+            }
+            for (item, source) in files_to_playback_request(
+                &library.fsio,
+                &library.main_db,
+                &library_id.to_string(),
+                &library.media_root,
+                &handles,
+            )
+            .await?
+            {
+                if let PlayingItem::InLibrary(identity) = item {
+                    prepared_by_item.insert(identity, (PlayingItem::InLibrary(identity), source));
+                }
+            }
+        }
+        let prepared = items
+            .iter()
+            .filter_map(|item| prepared_by_item.get(item).cloned())
+            .collect::<Vec<_>>();
+        let start_index = request
+            .start_index
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|error| {
+                ExpectedRequestError::invalid_input(format!("Invalid cast start index: {error}"))
+            })?;
+        node.session()?
+            .edit_queue(request.expected_revision, |player| {
+                edit_playlist(
+                    player,
+                    &prepared,
+                    request.mode,
+                    start_index,
+                    request.playback_mode,
+                )
+            })
+            .await?;
+        Ok(Some(CastLoadResponse {}))
     }
 }

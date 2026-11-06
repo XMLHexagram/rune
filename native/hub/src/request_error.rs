@@ -3,7 +3,7 @@ use database::error::ExpectedError;
 use thiserror::Error as ThisError;
 
 use crate::access_policy::Denial;
-use crate::messages::RequestErrorKind;
+use crate::messages::{CastLibraryState, RequestErrorKind};
 
 /// Expected failures at the request boundary.
 #[derive(Debug, ThisError)]
@@ -12,8 +12,18 @@ pub enum ExpectedRequestError {
     InvalidInput { detail: String },
     #[error("{what} unavailable")]
     Unavailable { what: &'static str },
+    #[error("Renderer request failed: {detail}")]
+    Remote {
+        kind: RequestErrorKind,
+        detail: String,
+    },
     #[error("Queue changed: expected revision {expected}, current revision {current}")]
     StaleQueueRevision { expected: u64, current: u64 },
+    #[error("Cast is not possible for library {library_id}: {state:?}")]
+    CastNotPossible {
+        library_id: String,
+        state: CastLibraryState,
+    },
 }
 
 impl ExpectedRequestError {
@@ -41,7 +51,15 @@ pub fn classify(error: &Error) -> RequestErrorKind {
             return match expected {
                 ExpectedRequestError::InvalidInput { .. } => RequestErrorKind::InvalidInput,
                 ExpectedRequestError::Unavailable { .. } => RequestErrorKind::Unavailable,
+                ExpectedRequestError::Remote { kind, .. } => *kind,
                 ExpectedRequestError::StaleQueueRevision { .. } => RequestErrorKind::Conflict,
+                ExpectedRequestError::CastNotPossible { state, .. } => match state {
+                    CastLibraryState::NotHeld | CastLibraryState::AccessRevoked => {
+                        RequestErrorKind::PermissionDenied
+                    }
+                    CastLibraryState::Unreachable => RequestErrorKind::Unavailable,
+                    CastLibraryState::Ready => RequestErrorKind::Internal,
+                },
             };
         }
     }
@@ -103,5 +121,15 @@ mod tests {
         })
         .context("move playlist item");
         assert_eq!(classify(&error), RequestErrorKind::Conflict);
+    }
+
+    #[test]
+    fn remote_request_error_preserves_renderer_kind() {
+        let error = Error::new(ExpectedRequestError::Remote {
+            kind: RequestErrorKind::InvalidInput,
+            detail: "invalid cast item".into(),
+        })
+        .context("CastLoadRequest");
+        assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
     }
 }

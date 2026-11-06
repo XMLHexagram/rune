@@ -30,6 +30,11 @@ pub fn define_request_types(_input: TokenStream) -> TokenStream {
             class: RequestClass::NodeLocal,
         },
         RequestResponse {
+            request: "ListRenderersRequest".to_string(),
+            response: Some("ListRenderersResponse".to_string()),
+            class: RequestClass::NodeLocal,
+        },
+        RequestResponse {
             request: "GetDeviceGrantsRequest".to_string(),
             response: Some("GetDeviceGrantsResponse".to_string()),
             class: RequestClass::NodeLocal,
@@ -473,6 +478,16 @@ pub fn define_request_types(_input: TokenStream) -> TokenStream {
         RequestResponse {
             request: "OperatePlaybackWithMixQueryRequest".to_string(),
             response: Some("OperatePlaybackWithMixQueryResponse".to_string()),
+            class: RequestClass::Control,
+        },
+        RequestResponse {
+            request: "CastPreflightRequest".to_string(),
+            response: Some("CastPreflightResponse".to_string()),
+            class: RequestClass::Control,
+        },
+        RequestResponse {
+            request: "CastLoadRequest".to_string(),
+            response: Some("CastLoadResponse".to_string()),
             class: RequestClass::Control,
         },
         // Like
