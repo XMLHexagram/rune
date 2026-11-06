@@ -9,3 +9,13 @@ bool get isDesktop {
     TargetPlatform.macOS,
   ].contains(defaultTargetPlatform);
 }
+
+/// Checks if the current environment is a phone or tablet OS with an on-screen
+/// keyboard.
+bool get isMobile {
+  if (kIsWeb) return false;
+  return [
+    TargetPlatform.iOS,
+    TargetPlatform.android,
+  ].contains(defaultTargetPlatform);
+}
