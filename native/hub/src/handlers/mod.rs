@@ -1,6 +1,7 @@
 mod analyze;
 mod collection;
 mod connection;
+mod controllers;
 mod cover_art;
 mod device_grants;
 mod directory;
@@ -15,6 +16,7 @@ mod mix;
 pub(crate) mod neighbors;
 pub(crate) mod playback;
 mod playlist;
+mod renderer;
 mod replicas;
 mod scrobble;
 mod search;

@@ -895,7 +895,7 @@ mod lifecycle_tests {
         LibrarySyncStore,
         model::{Album, Collection, MetadataTag, ObjectKey, Payload, Track},
     };
-    use discovery::{server::UserStatus, utils::DeviceType};
+    use discovery::{capabilities::Capabilities, server::UserStatus, utils::DeviceType};
     use playback::sfx_player::SfxPlayer;
     use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
     use std::future::Future;
@@ -1152,6 +1152,8 @@ mod lifecycle_tests {
             "SetLibraryBackgroundSyncRequest",
             "ListPeerLibrariesRequest",
             "AddRemoteLibraryRequest",
+            "ListControllersRequest",
+            "DetachControllerRequest",
             "UpdateClientStatusRequest",
             "AuthenticateSingleServiceRequest",
             "AuthenticateMultipleServiceRequest",
@@ -1163,6 +1165,28 @@ mod lifecycle_tests {
 
     async fn info(manager: &Fixture) -> Result<discovery::utils::DeviceInfo> {
         load_device_info(Path::new(&*manager.global_params.config_path)).await
+    }
+
+    #[tokio::test]
+    async fn device_info_returns_rune_capabilities() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let manager = fixture(dir.path()).await?;
+        let client_fixture = fixture(client_dir.path()).await?;
+        let addr = paired_full(&manager, &client_fixture).await?;
+        let client = pinned_anonymous_client(&client_fixture.global_params, Some(0)).await?;
+
+        let response = client
+            .get(format!("https://{addr}/device-info"))
+            .send()
+            .await?
+            .error_for_status()?;
+        let body: serde_json::Value = response.json().await?;
+
+        let capabilities: discovery::capabilities::Capabilities =
+            serde_json::from_value(body["capabilities"].clone())?;
+        assert_eq!(capabilities, Capabilities::rune_native());
+        Ok(())
     }
 
     async fn close_ui(params: &GlobalParams) -> Result<()> {
@@ -1501,6 +1525,21 @@ mod lifecycle_tests {
             assert!(
                 matches!(frame, Message::Close(Some(frame)) if u16::from(frame.code) == 4403 && frame.reason == "revoked")
             );
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if a.global_params
+                        .node
+                        .session()?
+                        .attached_controllers()
+                        .iter()
+                        .all(|controller| controller.fingerprint != fingerprint)
+                    {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await??;
             if !remove {
                 assert!(matches!(
                     connect_remote("127.0.0.1", addr.port(), config, validator.clone()).await,
@@ -1555,6 +1594,200 @@ mod lifecycle_tests {
             decode_message(&frame.into_data()).context("invalid frame")?;
         assert_eq!(response_id, id);
         Ok((response_name, payload))
+    }
+
+    async fn socket_request_for_library(
+        socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+        name: &str,
+        payload: &[u8],
+        library_id: Uuid,
+    ) -> Result<(String, Vec<u8>)> {
+        use crate::backends::remote::{decode_message, encode_request};
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let id = Uuid::new_v4();
+        socket
+            .send(Message::Binary(
+                encode_request(name, payload, id, library_id).into(),
+            ))
+            .await?;
+        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await?
+            .context("socket closed")??;
+        let (response_name, payload, response_id) =
+            decode_message(&frame.into_data()).context("invalid frame")?;
+        assert_eq!(response_id, id);
+        Ok((response_name, payload))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn addressed_websocket_requests_select_and_authorize_the_named_library() -> Result<()> {
+        use crate::Session;
+        use crate::access_policy::{DeviceGrants, LibraryLevel};
+        use crate::backends::remote::connect_remote;
+        use crate::messages::CreatePlaylistRequest;
+
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let renderer = fixture(first.path()).await?;
+        let controller = fixture(second.path()).await?;
+        let renderer_id = renderer
+            .global_params
+            .library_id
+            .context("renderer library")?;
+        scan_held_track(&renderer, renderer_id, "renderer-one.ogg").await?;
+        scan_held_track(&renderer, renderer_id, "renderer-two.ogg").await?;
+        let other_id = held_owned_library(&renderer, &first.path().join("other-library")).await?;
+        scan_held_track(&renderer, other_id, "other.ogg").await?;
+
+        pair(&renderer, &controller).await?;
+        let controller_fingerprint = info(&controller).await?.fingerprint;
+        let addressed_grants = |library_id, level| DeviceGrants {
+            control: false,
+            all_libraries: None,
+            libraries: [(library_id, level)].into_iter().collect(),
+            administer: false,
+        };
+        let user = renderer
+            .global_params
+            .permission_manager
+            .read()
+            .await
+            .verify_by_fingerprint(&controller_fingerprint)
+            .await
+            .context("paired controller user")?;
+        let peer_session = Session {
+            fingerprint: user.fingerprint,
+            public_key: user.public_key,
+            host: "127.0.0.2".into(),
+        };
+        renderer.global_params.node.access_policy.set(
+            &controller_fingerprint,
+            addressed_grants(other_id, LibraryLevel::Read),
+        )?;
+        renderer
+            .global_params
+            .node
+            .authorize_request(
+                &peer_session,
+                "GetMediaFilesCountRequest",
+                None,
+                Some(other_id),
+            )
+            .await?;
+        renderer.global_params.node.access_policy.set(
+            &controller_fingerprint,
+            addressed_grants(renderer_id, LibraryLevel::Read),
+        )?;
+        let denied = renderer
+            .global_params
+            .node
+            .authorize_request(
+                &peer_session,
+                "GetMediaFilesCountRequest",
+                None,
+                Some(other_id),
+            )
+            .await
+            .expect_err("a read grant on A must not authorize a read addressed to B");
+        assert_eq!(classify(&denied), RequestErrorKind::PermissionDenied);
+
+        renderer.global_params.node.access_policy.set(
+            &controller_fingerprint,
+            DeviceGrants {
+                control: true,
+                all_libraries: None,
+                libraries: [(other_id, LibraryLevel::Read)].into_iter().collect(),
+                administer: false,
+            },
+        )?;
+
+        let addr = paired_full(&renderer, &controller).await?;
+        let validator = controller.global_params.cert_validator.read().await.clone();
+        let mut socket = connect_remote(
+            "127.0.0.1",
+            addr.port(),
+            &controller.global_params.config_path,
+            validator,
+        )
+        .await?;
+        let count_request = rinf::serialize(&GetMediaFilesCountRequest {})?;
+
+        // With the UI on the renderer's first library, the explicit address serves the other.
+        let (name, payload) = socket_request_for_library(
+            &mut socket,
+            "GetMediaFilesCountRequest",
+            &count_request,
+            other_id,
+        )
+        .await?;
+        assert_eq!(name, "GetMediaFilesCountResponse");
+        let response: GetMediaFilesCountResponse = rinf::deserialize(&payload)?;
+        assert_eq!(response.count, 1);
+
+        // Legacy frames still use the currently open UI library until C6.
+        let (name, payload) =
+            socket_request(&mut socket, "GetMediaFilesCountRequest", &count_request).await?;
+        assert_eq!(name, "GetMediaFilesCountResponse");
+        let response: GetMediaFilesCountResponse = rinf::deserialize(&payload)?;
+        assert_eq!(response.count, 2);
+
+        // With no UI attached, the renderer still serves its explicitly addressed held library.
+        renderer
+            .global_params
+            .node
+            .close_ui(&renderer.global_params.main_token)
+            .await;
+        let (name, payload) = socket_request_for_library(
+            &mut socket,
+            "GetMediaFilesCountRequest",
+            &count_request,
+            other_id,
+        )
+        .await?;
+        assert_eq!(name, "GetMediaFilesCountResponse");
+        let response: GetMediaFilesCountResponse = rinf::deserialize(&payload)?;
+        assert_eq!(response.count, 1);
+
+        // A write against a read-only addressed library is denied.
+        renderer.global_params.node.access_policy.set(
+            &controller_fingerprint,
+            DeviceGrants {
+                control: true,
+                all_libraries: None,
+                libraries: [(other_id, LibraryLevel::Read)].into_iter().collect(),
+                administer: false,
+            },
+        )?;
+        let write = rinf::serialize(&CreatePlaylistRequest {
+            name: "denied".into(),
+            group: "test".into(),
+        })?;
+        let (name, payload) =
+            socket_request_for_library(&mut socket, "CreatePlaylistRequest", &write, other_id)
+                .await?;
+        assert_eq!(name, "RemoteRequestFailed");
+        let failure: RemoteRequestFailed = rinf::deserialize(&payload)?;
+        assert_eq!(failure.kind, RequestErrorKind::PermissionDenied);
+
+        let missing_id = Uuid::new_v4();
+        let (name, payload) = socket_request_for_library(
+            &mut socket,
+            "GetMediaFilesCountRequest",
+            &count_request,
+            missing_id,
+        )
+        .await?;
+        assert_eq!(name, "RemoteRequestFailed");
+        let failure: RemoteRequestFailed = rinf::deserialize(&payload)?;
+        assert_eq!(failure.kind, RequestErrorKind::NotFound);
+
+        socket.close(None).await?;
+        renderer.manager.stop().await?;
+        renderer.global_params.node.token.cancel();
+        controller.global_params.node.token.cancel();
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2419,6 +2652,7 @@ mod lifecycle_tests {
             certificates: vec![],
         });
         broadcaster.broadcast(&PlaybackStatus {
+            session_id: a.global_params.node.session()?.session_id().await,
             state: "Playing".into(),
             progress_seconds: 12.0,
             progress_percentage: 0.5,
@@ -2428,6 +2662,7 @@ mod lifecycle_tests {
             duration: 24.0,
             index: None,
             item: None,
+            item_request: None,
             playback_mode: 0,
             ready: true,
             cover_art_path: None,

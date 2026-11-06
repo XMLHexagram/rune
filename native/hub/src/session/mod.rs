@@ -7,10 +7,10 @@ use std::{
     path::{Path, PathBuf},
     slice::from_ref,
     sync::{
-        Arc, Weak,
+        Arc, Mutex as StdMutex, MutexGuard, PoisonError, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -22,6 +22,7 @@ use database::{
         stats::increase_played_through,
     },
     connection::MainDbConnection,
+    error::ExpectedError,
     playing_item::{PlayingItemMetadataSummary, dispatcher::PlayingItemActionDispatcher},
 };
 use fsio::FsIo;
@@ -48,10 +49,12 @@ use crate::{
     handlers::playback::playing_item_requests,
     library_pool::LibraryHandle,
     messages::{
-        CrashResponse, PlaybackStatus, PlaylistItem, PlaylistUnavailableReason, PlaylistUpdate,
-        RealtimeFFT, ScrobbleServiceStatus, ScrobbleServiceStatusUpdated,
+        AttachedControllerInfo, ControllersUpdated, CrashResponse, PlaybackStatus,
+        PlayingItemRequest, PlaylistItem, PlaylistUnavailableReason, PlaylistUpdate, RealtimeFFT,
+        ScrobbleServiceStatus, ScrobbleServiceStatusUpdated,
     },
     node::NodeContext,
+    request_error::ExpectedRequestError,
     server::PairedAudioResolver,
     utils::{
         Broadcaster,
@@ -75,9 +78,188 @@ pub struct PlayerSession {
     path: PathBuf,
     node: Weak<NodeContext>,
     legacy_restore: AtomicBool,
+    attached_controllers: StdMutex<Vec<ControllerEntry>>,
+}
+
+struct ControllerEntry {
+    controller: AttachedController,
+    cancel: CancellationToken,
+}
+
+#[derive(Clone)]
+struct AttachedController {
+    id: Uuid,
+    fingerprint: String,
+    alias: String,
+    connected_at: u64,
+}
+
+/// Owns one attached controller entry for the lifetime of its WebSocket.
+pub(crate) struct AttachedControllerGuard {
+    session: Arc<PlayerSession>,
+    id: Uuid,
+    cancel: CancellationToken,
+}
+
+impl AttachedControllerGuard {
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for AttachedControllerGuard {
+    fn drop(&mut self) {
+        self.session.remove_controller(self.id);
+    }
 }
 
 impl PlayerSession {
+    pub(crate) fn attach_controller(
+        self: &Arc<Self>,
+        fingerprint: String,
+        alias: String,
+    ) -> AttachedControllerGuard {
+        let id = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+        let connected_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let controller = AttachedController {
+            id,
+            fingerprint,
+            alias,
+            connected_at,
+        };
+        self.controllers().push(ControllerEntry {
+            controller,
+            cancel: cancel.clone(),
+        });
+        self.broadcast_controllers_updated();
+        AttachedControllerGuard {
+            session: self.clone(),
+            id,
+            cancel,
+        }
+    }
+
+    /// The controller list stays consistent even if a holder panicked: every
+    /// critical section only pushes, retains or reads.
+    fn controllers(&self) -> MutexGuard<'_, Vec<ControllerEntry>> {
+        self.attached_controllers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn attached_controllers(&self) -> Vec<AttachedControllerInfo> {
+        self.controllers()
+            .iter()
+            .map(|entry| AttachedControllerInfo {
+                id: entry.controller.id.to_string(),
+                fingerprint: entry.controller.fingerprint.clone(),
+                alias: entry.controller.alias.clone(),
+                connected_at: entry.controller.connected_at,
+            })
+            .collect()
+    }
+
+    pub(crate) fn detach_controller(&self, id: Uuid) -> Result<()> {
+        let controllers = self.controllers();
+        let Some(entry) = controllers.iter().find(|entry| entry.controller.id == id) else {
+            return Err(ExpectedError::NotFound { what: "controller" }.into());
+        };
+        entry.cancel.cancel();
+        Ok(())
+    }
+
+    fn remove_controller(&self, id: Uuid) {
+        let removed = {
+            let mut controllers = self.controllers();
+            let before = controllers.len();
+            controllers.retain(|entry| entry.controller.id != id);
+            controllers.len() != before
+        };
+        if removed {
+            self.broadcast_controllers_updated();
+        }
+    }
+
+    fn broadcast_controllers_updated(&self) {
+        if let Some(node) = self.node.upgrade() {
+            node.broadcaster.broadcast(&ControllersUpdated {
+                controllers: self.attached_controllers(),
+            });
+        }
+    }
+
+    pub async fn edit_queue<F>(&self, expected_revision: Option<u64>, edit: F) -> Result<()>
+    where
+        F: FnOnce(&mut dyn Playable) -> bool + Send,
+    {
+        let mut state = self.state.lock().await;
+        if let Some(expected) = expected_revision
+            && expected != state.queue_revision
+        {
+            return Err(ExpectedRequestError::StaleQueueRevision {
+                expected,
+                current: state.queue_revision,
+            }
+            .into());
+        }
+        let mut player = self.player.lock().await;
+        if edit(&mut *player) {
+            state.queue_revision = state
+                .queue_revision
+                .checked_add(1)
+                .context("Queue revision overflow")?;
+        }
+        Ok(())
+    }
+
+    pub async fn session_id(&self) -> String {
+        self.state.lock().await.session_id.to_string()
+    }
+
+    pub async fn queue_revision(&self) -> u64 {
+        self.state.lock().await.queue_revision
+    }
+
+    /// Re-send this session's current player bar and queue after renderer control ends.
+    pub(crate) async fn reemit_current(&self) -> Result<()> {
+        let Some(node) = self.node.upgrade() else {
+            return Ok(());
+        };
+        let status = self.player.lock().await.get_status();
+        let (session_id, revision) = {
+            let state = self.state.lock().await;
+            (state.session_id.to_string(), state.queue_revision)
+        };
+        let controls = self.controls.lock().await.clone();
+        let mut item_state = ItemEventState::default();
+        handle_status_event(
+            &node,
+            status.clone(),
+            &mut item_state,
+            &controls,
+            None,
+            &node.gui_broadcaster,
+            &session_id,
+        )
+        .await;
+        let playlist = PlaylistStatus {
+            items: status.playlist,
+            unavailable: status.unavailable_reasons,
+        };
+        send_playlist(
+            &node,
+            &playlist,
+            node.gui_broadcaster.as_ref(),
+            &session_id,
+            revision,
+        )
+        .await;
+        Ok(())
+    }
+
     pub async fn queue_for_library(&self, library_id: Uuid) -> Vec<i32> {
         let items = self
             .player
@@ -165,6 +347,7 @@ impl PlayerSession {
             path,
             node: Arc::downgrade(node),
             legacy_restore: AtomicBool::new(false),
+            attached_controllers: StdMutex::new(Vec::new()),
         });
         session.start_events(node).await;
         session.player.lock().await.restore(
@@ -269,6 +452,8 @@ impl PlayerSession {
         let player = self.player.clone();
         let scrobbler = self.scrobbler.clone();
         let cancel = self.cancel.clone();
+        let session_id = self.state.lock().await.session_id.to_string();
+        let event_state = self.state.clone();
         let (persist_status_tx, mut persist_status_rx) = mpsc::channel(32);
         let (persist_playlist_tx, mut persist_playlist_rx) = mpsc::channel(32);
         let event_task = tokio::spawn(async move {
@@ -283,11 +468,14 @@ impl PlayerSession {
                     Ok(value) = status.recv() => {
                         let Some(node) = weak.upgrade() else { return };
                         if persist_status_tx.send(value.clone()).await.is_err() { return; }
-                        handle_status_event(&node, value, &mut item_state, &controls, &scrobbler, &broadcaster).await;
+                        handle_status_event(&node, value, &mut item_state, &controls, Some(&scrobbler), &broadcaster, &session_id).await;
                     }
                     Ok(value) = playlist.recv() => {
                         if persist_playlist_tx.send(value.clone()).await.is_err() { return; }
-                        if let Some(node) = weak.upgrade() { handle_playlist_event(&node, value, broadcaster.as_ref()).await; }
+                        if let Some(node) = weak.upgrade() {
+                            let revision = event_state.lock().await.queue_revision;
+                            handle_playlist_event(&node, value, broadcaster.as_ref(), &session_id, revision).await;
+                        }
                     }
                     Ok(item) = played.recv() => {
                         if let Some(node) = weak.upgrade() {
@@ -412,6 +600,9 @@ struct ItemEventState {
     library: Option<ResolvedLibrary>,
     metadata: PlayingItemMetadataSummary,
     cover: Option<String>,
+    /// `last_item` as sent to Dart, valid for `request_ui_library`.
+    request: Option<PlayingItemRequest>,
+    request_ui_library: Option<Uuid>,
 }
 
 struct ResolvedLibrary {
@@ -419,15 +610,20 @@ struct ResolvedLibrary {
     media_root: String,
 }
 
+/// Turns a player status into the GUI report. `scrobbler` is `None` when only
+/// re-showing the current state (e.g. after renderer control ends), so services
+/// never see a "now playing" for a track that did not start.
 async fn handle_status_event(
     node: &NodeContext,
     value: PlayerStatus,
     item_state: &mut ItemEventState,
     controls: &Option<Arc<Mutex<MediaControlManager>>>,
-    scrobbler: &Arc<Mutex<dyn ScrobblingServiceManager>>,
+    scrobbler: Option<&Arc<Mutex<dyn ScrobblingServiceManager>>>,
     broadcaster: &Arc<dyn Broadcaster>,
+    session_id: &str,
 ) {
-    if value.item != item_state.last_item {
+    let item_changed = value.item != item_state.last_item;
+    if item_changed {
         item_state.metadata = PlayingItemMetadataSummary::default();
         item_state.cover = None;
         item_state.library = None;
@@ -459,9 +655,11 @@ async fn handle_status_event(
                     )
                     .await;
                 }
-                scrobbler.lock().await.update_now_playing_all(
-                    metadata_summary_to_scrobbling_track(&item_state.metadata),
-                );
+                if let Some(scrobbler) = scrobbler {
+                    scrobbler.lock().await.update_now_playing_all(
+                        metadata_summary_to_scrobbling_track(&item_state.metadata),
+                    );
+                }
             }
         }
         playing_cover_changed(item_state.cover.as_deref());
@@ -483,7 +681,25 @@ async fn handle_status_event(
             .as_ref()
             .map(|library| library.fsio.clone()),
     );
-    let report = format_status(&value, &item_state.metadata, item_state.cover.clone(), root);
+    let ui_library_id = current_ui_library_id(node).await;
+    if item_changed || ui_library_id != item_state.request_ui_library {
+        item_state.request_ui_library = ui_library_id;
+        item_state.request = match &value.item {
+            Some(item) => playing_item_requests(from_ref(item), &node.library_pool, ui_library_id)
+                .await
+                .pop(),
+            None => None,
+        };
+    }
+    let item_request = item_state.request.clone();
+    let report = format_status(
+        &value,
+        &item_state.metadata,
+        item_state.cover.clone(),
+        root,
+        item_request,
+        session_id,
+    );
     if let Some(manager) = controls {
         let _ = update_media_controls_progress(manager.clone(), &report).await;
     }
@@ -494,8 +710,10 @@ async fn handle_playlist_event(
     node: &NodeContext,
     value: PlaylistStatus,
     broadcaster: &dyn Broadcaster,
+    session_id: &str,
+    revision: u64,
 ) {
-    send_playlist(node, &value, broadcaster).await;
+    send_playlist(node, &value, broadcaster, session_id, revision).await;
 }
 
 async fn handle_played_event(
@@ -646,6 +864,8 @@ async fn send_playlist(
     node: &NodeContext,
     playlist: &PlaylistStatus,
     broadcaster: &dyn Broadcaster,
+    session_id: &str,
+    revision: u64,
 ) {
     let mut library_items = HashMap::<Uuid, Vec<PlayingItem>>::new();
     let mut independent_items = Vec::new();
@@ -698,7 +918,9 @@ async fn send_playlist(
         }
     }
 
-    let item_requests = playing_item_requests(&playlist.items, &node.library_pool).await;
+    let ui_library_id = current_ui_library_id(node).await;
+    let item_requests =
+        playing_item_requests(&playlist.items, &node.library_pool, ui_library_id).await;
     let items = playlist
         .items
         .iter()
@@ -722,7 +944,11 @@ async fn send_playlist(
             }
         })
         .collect();
-    broadcaster.broadcast(&PlaylistUpdate { items });
+    broadcaster.broadcast(&PlaylistUpdate {
+        items,
+        session_id: session_id.to_string(),
+        revision,
+    });
 }
 
 fn format_status(
@@ -730,8 +956,11 @@ fn format_status(
     metadata: &PlayingItemMetadataSummary,
     cover_art_path: Option<String>,
     lib_path: String,
+    item_request: Option<PlayingItemRequest>,
+    session_id: &str,
 ) -> PlaybackStatus {
     PlaybackStatus {
+        session_id: session_id.to_string(),
         state: status.state.to_string(),
         progress_seconds: status.position.as_secs_f32(),
         progress_percentage: if metadata.duration > 0.0 {
@@ -745,11 +974,22 @@ fn format_status(
         duration: metadata.duration,
         index: status.index.map(|i| i as i32),
         item: status.item.clone().map(|item| item.to_string()),
+        item_request,
         playback_mode: status.playback_mode.into(),
         ready: status.ready,
         cover_art_path,
         lib_path,
     }
+}
+
+async fn current_ui_library_id(node: &NodeContext) -> Option<Uuid> {
+    let params = node.current_ui().await.ok()?;
+    params
+        .ui_library
+        .lock()
+        .await
+        .as_ref()
+        .map(|library| library.descriptor.library_id)
 }
 
 impl Drop for PlayerSession {

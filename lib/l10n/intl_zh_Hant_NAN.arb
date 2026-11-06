@@ -1349,6 +1349,10 @@
   "remoteOpenUnreachable": "Bô hoat-tō͘ liân-chiap siat-pī, chhiáⁿ kiám-cha kám ū khui-ki kap tī kāng chi̍t ê bāng-lō͘.",
   "remoteOpenProtocol": "Bô hoat-tō͘ kap siat-pī thong-sìn, nn̄g ê siat-pī su-iàu sio-kâng pán-pún ê Rune.",
   "remoteLossRevoked": "Chit ê siat-pī ê hóng-būn koân-hān í-keng hō͘ thô͘-khì.",
+  "remoteLossDetached": "Phòng-sàng ê siat-pī í-keng chhú-tēng chit-ê hong-kòng-khì.",
+  "@remoteLossDetached": {
+    "description": "Shown when the renderer owner detaches this controller."
+  },
   "remoteLossServerStopped": "Lēng-gōa ê siat-pī í-keng thêng-chí hūn-hióng.",
   "remoteLossNetworkLost": "Liân-soàⁿ í-keng tiong-toān.",
   "deviceLibraries": "音樂庫",
@@ -1381,6 +1385,7 @@
   "deviceNotShared": "不共享",
   "deviceReadOnly": "唯讀",
   "deviceReadWrite": "讀寫",
+  "requestConflict": "播放隊列已經變矣，請閣試一擺",
   "requestPermissionDenied": "此裝置不允許執行此操作",
   "readOnly": "唯讀",
   "queueUnavailableAccessRevoked": "存取權已取消",

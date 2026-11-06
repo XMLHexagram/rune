@@ -1,3 +1,4 @@
+use playback::player::LibraryItem;
 use playback::player::UnavailableReason;
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
@@ -6,6 +7,7 @@ use super::mix::MixQuery;
 
 #[derive(Clone, Deserialize, Serialize, RustSignal)]
 pub struct PlaybackStatus {
+    pub session_id: String,
     pub state: String,
     pub progress_seconds: f32,
     pub progress_percentage: f32,
@@ -15,6 +17,7 @@ pub struct PlaybackStatus {
     pub duration: f64,
     pub index: Option<i32>,
     pub item: Option<String>,
+    pub item_request: Option<PlayingItemRequest>,
     pub playback_mode: u32,
     pub ready: bool,
     pub cover_art_path: Option<String>,
@@ -56,12 +59,16 @@ pub struct SeekRequest {
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct RemoveRequest {
     pub index: u32,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct MovePlaylistItemRequest {
     pub old_index: u32,
     pub new_index: u32,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, SignalPiece)]
@@ -96,6 +103,8 @@ impl From<UnavailableReason> for PlaylistUnavailableReason {
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct PlaylistUpdate {
     pub items: Vec<PlaylistItem>,
+    pub session_id: String,
+    pub revision: u64,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
@@ -140,10 +149,26 @@ pub struct IndependentFilePlayingItem {
     pub raw_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, SignalPiece)]
+pub struct LibraryItemRequest {
+    pub library_id: String,
+    pub file_uuid: String,
+}
+
+impl From<LibraryItem> for LibraryItemRequest {
+    fn from(item: LibraryItem) -> Self {
+        Self {
+            library_id: item.library_id.to_string(),
+            file_uuid: item.file_uuid.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, SignalPiece)]
 pub struct PlayingItemRequest {
     pub in_library: Option<InLibraryPlayingItem>,
     pub independent_file: Option<IndependentFilePlayingItem>,
+    pub library_item: Option<LibraryItemRequest>,
 }
 
 #[derive(Debug, Serialize, Deserialize, DartSignal)]
@@ -155,6 +180,8 @@ pub struct OperatePlaybackWithMixQueryRequest {
     pub instantly_play: bool,
     pub operate_mode: PlaylistOperateMode,
     pub fallback_playing_items: Vec<PlayingItemRequest>,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, RustSignal)]

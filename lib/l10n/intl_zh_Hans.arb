@@ -1444,6 +1444,10 @@
   "remoteOpenUnreachable": "无法连接设备，请检查设备是否已开启并连接到同一网络。",
   "remoteOpenProtocol": "无法与设备通信，两台设备需要相同版本的 Rune。",
   "remoteLossRevoked": "此设备的访问权限已被移除。",
+  "remoteLossDetached": "播放设备已断开此设备的遥控连接。",
+  "@remoteLossDetached": {
+    "description": "Shown when the renderer owner detaches this controller."
+  },
   "remoteLossServerStopped": "另一台设备已停止共享。",
   "remoteLossNetworkLost": "连接已断开。",
   "deviceLibraries": "音乐库",
@@ -1476,6 +1480,7 @@
   "deviceNotShared": "不共享",
   "deviceReadOnly": "只读",
   "deviceReadWrite": "读写",
+  "requestConflict": "播放队列已变化，请重试",
   "requestPermissionDenied": "此设备不允许执行此操作",
   "readOnly": "只读",
   "queueUnavailableAccessRevoked": "访问权限已撤销",

@@ -1,4 +1,3 @@
-use crate::request_error::ExpectedRequestError;
 use std::collections::HashMap;
 use std::slice;
 use std::sync::Arc;
@@ -21,6 +20,7 @@ use ::playback::{
     strategies::AddMode,
 };
 
+use crate::request_error::ExpectedRequestError;
 use crate::{
     Session, Signal,
     library_pool::{LibraryHandle, LibraryPool},
@@ -34,7 +34,7 @@ use crate::{
 
 pub async fn playing_item_from_request(
     request: PlayingItemRequest,
-    library: &LibraryHandle,
+    library: Option<&LibraryHandle>,
 ) -> Result<PlayingItem> {
     let mut items = playing_items_from_requests(slice::from_ref(&request), library).await?;
     Ok(items.pop().unwrap_or(PlayingItem::Unknown))
@@ -43,24 +43,60 @@ pub async fn playing_item_from_request(
 /// Convert many requests against one library with a single id lookup.
 pub async fn playing_items_from_requests(
     requests: &[PlayingItemRequest],
-    library: &LibraryHandle,
+    library: Option<&LibraryHandle>,
 ) -> Result<Vec<PlayingItem>> {
+    let library_items = requests
+        .iter()
+        .map(|request| {
+            request
+                .library_item
+                .as_ref()
+                .map(|item| {
+                    Ok(LibraryItem {
+                        library_id: Uuid::parse_str(&item.library_id).map_err(|error| {
+                            ExpectedRequestError::invalid_input(format!(
+                                "Invalid library id in library item: {error}"
+                            ))
+                        })?,
+                        file_uuid: Uuid::parse_str(&item.file_uuid).map_err(|error| {
+                            ExpectedRequestError::invalid_input(format!(
+                                "Invalid file uuid in library item: {error}"
+                            ))
+                        })?,
+                    })
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
     let ids = requests
         .iter()
+        .filter(|request| request.library_item.is_none())
         .filter_map(|request| request.in_library.as_ref())
         .map(|in_library| in_library.file_id)
         .filter(|id| *id != 0)
         .collect::<Vec<_>>();
-    let uuids = file_uuids_by_id(&library.main_db, &ids).await?;
+    let uuids = if ids.is_empty() {
+        HashMap::new()
+    } else {
+        let library = library.ok_or(ExpectedRequestError::Unavailable {
+            what: "UI library for integer item",
+        })?;
+        file_uuids_by_id(&library.main_db, &ids).await?
+    };
     Ok(requests
         .iter()
-        .map(|request| {
+        .zip(library_items)
+        .map(|(request, library_item)| {
+            if let Some(item) = library_item {
+                return PlayingItem::InLibrary(item);
+            }
             if let Some(in_library) = &request.in_library
                 && in_library.file_id != 0
             {
                 return uuids
                     .get(&in_library.file_id)
-                    .map(|file_uuid| {
+                    .zip(library)
+                    .map(|(file_uuid, library)| {
                         PlayingItem::InLibrary(LibraryItem {
                             library_id: library.descriptor.library_id,
                             file_uuid: *file_uuid,
@@ -82,10 +118,13 @@ pub async fn playing_items_from_requests(
 pub async fn playing_item_requests(
     items: &[PlayingItem],
     pool: &Arc<LibraryPool>,
+    ui_library_id: Option<Uuid>,
 ) -> Vec<PlayingItemRequest> {
     let mut by_library: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     for item in items {
-        if let PlayingItem::InLibrary(identity) = item {
+        if let PlayingItem::InLibrary(identity) = item
+            && Some(identity.library_id) == ui_library_id
+        {
             by_library
                 .entry(identity.library_id)
                 .or_default()
@@ -122,16 +161,20 @@ pub async fn playing_item_requests(
                     .get(identity)
                     .map(|file_id| InLibraryPlayingItem { file_id: *file_id }),
                 independent_file: None,
+                library_item: (!ids.contains_key(identity))
+                    .then(|| LibraryItemRequest::from(*identity)),
             },
             PlayingItem::IndependentFile(path) => PlayingItemRequest {
                 in_library: None,
                 independent_file: Some(IndependentFilePlayingItem {
                     raw_path: path.clone(),
                 }),
+                library_item: None,
             },
             PlayingItem::Online(_, _) | PlayingItem::Unknown => PlayingItemRequest {
                 in_library: None,
                 independent_file: None,
+                library_item: None,
             },
         })
         .collect()
@@ -350,27 +393,30 @@ impl Signal for SeekRequest {
 }
 
 impl ParamsExtractor for RemoveRequest {
-    type Params = (Arc<Mutex<dyn Playable>>,);
+    type Params = (Arc<NodeContext>,);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (Arc::clone(&all_params.player),)
+        (all_params.node.clone(),)
     }
 }
 
 impl Signal for RemoveRequest {
-    type Params = (Arc<Mutex<dyn Playable>>,);
+    type Params = (Arc<NodeContext>,);
     type Response = ();
 
     async fn handle(
         &self,
-        (player,): Self::Params,
+        (node,): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        player
-            .lock()
-            .await
-            .remove_from_playlist(dart_signal.index as usize);
+        node.session()?
+            .edit_queue(dart_signal.expected_revision, |player| {
+                let changed = (dart_signal.index as usize) < player.get_playlist().len();
+                player.remove_from_playlist(dart_signal.index as usize);
+                changed
+            })
+            .await?;
         Ok(Some(()))
     }
 }
@@ -400,20 +446,20 @@ impl Signal for VolumeRequest {
 }
 
 impl ParamsExtractor for MovePlaylistItemRequest {
-    type Params = (Arc<Mutex<dyn Playable>>,);
+    type Params = (Arc<NodeContext>,);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (Arc::clone(&all_params.player),)
+        (all_params.node.clone(),)
     }
 }
 
 impl Signal for MovePlaylistItemRequest {
-    type Params = (Arc<Mutex<dyn Playable>>,);
+    type Params = (Arc<NodeContext>,);
     type Response = ();
 
     async fn handle(
         &self,
-        (player,): Self::Params,
+        (node,): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -421,14 +467,20 @@ impl Signal for MovePlaylistItemRequest {
         let old_index = request.old_index;
         let new_index = request.new_index;
 
-        player.lock().await.move_playlist_item(
-            old_index.try_into().map_err(|error| {
-                ExpectedRequestError::invalid_input(format!("Invalid old index: {error}"))
-            })?,
-            new_index.try_into().map_err(|error| {
-                ExpectedRequestError::invalid_input(format!("Invalid new index: {error}"))
-            })?,
-        );
+        let old_index = old_index.try_into().map_err(|error| {
+            ExpectedRequestError::invalid_input(format!("Invalid old index: {error}"))
+        })?;
+        let new_index = new_index.try_into().map_err(|error| {
+            ExpectedRequestError::invalid_input(format!("Invalid new index: {error}"))
+        })?;
+        node.session()?
+            .edit_queue(dart_signal.expected_revision, |player| {
+                let len = player.get_playlist().len();
+                let changed = old_index != new_index && old_index < len && new_index < len;
+                player.move_playlist_item(old_index, new_index);
+                changed
+            })
+            .await?;
         Ok(Some(()))
     }
 }
@@ -482,35 +534,24 @@ impl Signal for SetAdaptiveSwitchingEnabledRequest {
 }
 
 impl ParamsExtractor for OperatePlaybackWithMixQueryRequest {
-    type Params = (
-        Option<LibraryHandle>,
-        Arc<String>,
-        Arc<Mutex<dyn Playable>>,
-        Arc<NodeContext>,
-    );
+    type Params = (Option<LibraryHandle>, Arc<String>, Arc<NodeContext>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
         (
             all_params.library.clone(),
             Arc::clone(&all_params.node_id),
-            Arc::clone(&all_params.player),
             all_params.node.clone(),
         )
     }
 }
 
 impl Signal for OperatePlaybackWithMixQueryRequest {
-    type Params = (
-        Option<LibraryHandle>,
-        Arc<String>,
-        Arc<Mutex<dyn Playable>>,
-        Arc<NodeContext>,
-    );
+    type Params = (Option<LibraryHandle>, Arc<String>, Arc<NodeContext>);
     type Response = OperatePlaybackWithMixQueryResponse;
 
     async fn handle(
         &self,
-        (library, _node_id, player, node): Self::Params,
+        (library, _node_id, node): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -518,7 +559,7 @@ impl Signal for OperatePlaybackWithMixQueryRequest {
         let request = dart_signal;
 
         let items: Vec<PlayingItem> =
-            playing_items_from_requests(&request.fallback_playing_items, &library).await?;
+            playing_items_from_requests(&request.fallback_playing_items, Some(&library)).await?;
 
         // Retrieve tracks
         let tracks = if request.queries.is_empty() {
@@ -556,39 +597,50 @@ impl Signal for OperatePlaybackWithMixQueryRequest {
             &tracks,
         )
         .await?;
-        let mut player = player.lock().await;
-
         let operate_mode = request.operate_mode;
-        // Clear the playlist if requested
-        if operate_mode == PlaylistOperateMode::Replace {
-            player.clear_playlist();
-        }
-
         let add_mode = if operate_mode == PlaylistOperateMode::PlayNext {
             AddMode::PlayNext
         } else {
             AddMode::AppendToEnd
         };
 
-        let playlist_len = if operate_mode == PlaylistOperateMode::Replace {
-            0
-        } else {
-            player.get_playlist().len()
-        };
+        let mut playlist_len = 0;
 
         let mut items: Vec<PlayingItem> = prepared.iter().map(|(item, _)| item.clone()).collect();
 
         // If not required to play instantly, add to playlist and return
         if !request.instantly_play {
-            player.add_to_playlist_with_sources(prepared.clone(), add_mode);
+            node.session()?
+                .edit_queue(request.expected_revision, |player| {
+                    let queue_changed = operate_mode == PlaylistOperateMode::Replace
+                        && !player.get_playlist().is_empty();
+                    if operate_mode == PlaylistOperateMode::Replace {
+                        player.clear_playlist();
+                    }
+                    playlist_len = if operate_mode == PlaylistOperateMode::Replace {
+                        0
+                    } else {
+                        player.get_playlist().len()
+                    };
+                    if !prepared.is_empty() {
+                        player.add_to_playlist_with_sources(prepared.clone(), add_mode);
+                    }
+                    queue_changed || !prepared.is_empty()
+                })
+                .await?;
             return Ok(Some(OperatePlaybackWithMixQueryResponse {
-                playing_items: playing_item_requests(&items, &node.library_pool).await,
+                playing_items: playing_item_requests(
+                    &items,
+                    &node.library_pool,
+                    Some(library.descriptor.library_id),
+                )
+                .await,
             }));
         }
 
         // Find the nearest index
         let initial_item = if let Some(initial_item) = &request.initial_playback_item {
-            Some(playing_item_from_request(initial_item.clone(), &library).await?)
+            Some(playing_item_from_request(initial_item.clone(), Some(&library)).await?)
         } else {
             None
         };
@@ -606,29 +658,45 @@ impl Signal for OperatePlaybackWithMixQueryRequest {
 
         // If no suitable index found, use fallback_media_file_ids
         if nearest_index.is_none() {
-            items = playing_items_from_requests(&request.fallback_playing_items, &library).await?;
+            items = playing_items_from_requests(&request.fallback_playing_items, Some(&library))
+                .await?;
         }
 
         let nearest_index = nearest_index.unwrap_or(request.hint_position.try_into().unwrap_or(0));
 
-        // Add to playlist
-        if !prepared.is_empty() {
-            player.add_to_playlist_with_sources(prepared.clone(), add_mode);
-        }
-
-        // Set playback mode
-        if request.playback_mode != 99 {
-            player.set_playback_mode(request.playback_mode.into());
-        }
-
-        // Switch to the nearest index and play
-        if !prepared.is_empty() {
-            player.switch(nearest_index + playlist_len);
-            player.play();
-        }
+        node.session()?
+            .edit_queue(request.expected_revision, |player| {
+                let queue_changed = operate_mode == PlaylistOperateMode::Replace
+                    && !player.get_playlist().is_empty();
+                if operate_mode == PlaylistOperateMode::Replace {
+                    player.clear_playlist();
+                }
+                playlist_len = if operate_mode == PlaylistOperateMode::Replace {
+                    0
+                } else {
+                    player.get_playlist().len()
+                };
+                if !prepared.is_empty() {
+                    player.add_to_playlist_with_sources(prepared.clone(), add_mode);
+                }
+                if request.playback_mode != 99 {
+                    player.set_playback_mode(request.playback_mode.into());
+                }
+                if !prepared.is_empty() {
+                    player.switch(nearest_index + playlist_len);
+                    player.play();
+                }
+                queue_changed || !prepared.is_empty()
+            })
+            .await?;
 
         Ok(Some(OperatePlaybackWithMixQueryResponse {
-            playing_items: playing_item_requests(&items, &node.library_pool).await,
+            playing_items: playing_item_requests(
+                &items,
+                &node.library_pool,
+                Some(library.descriptor.library_id),
+            )
+            .await,
         }))
     }
 }

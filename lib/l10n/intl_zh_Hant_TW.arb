@@ -1117,6 +1117,10 @@
   "remoteOpenUnreachable": "無法連接裝置，請確認裝置已開啟並連接至相同網路。",
   "remoteOpenProtocol": "無法與裝置通訊，兩部裝置需要相同版本的 Rune。",
   "remoteLossRevoked": "此裝置的存取權限已移除。",
+  "remoteLossDetached": "播放裝置已中斷此控制器的連線。",
+  "@remoteLossDetached": {
+    "description": "Shown when the renderer owner detaches this controller."
+  },
   "remoteLossServerStopped": "另一部裝置已停止分享。",
   "remoteLossNetworkLost": "連線已中斷。",
   "deviceLibraries": "音樂庫",
@@ -1149,6 +1153,7 @@
   "deviceNotShared": "不共享",
   "deviceReadOnly": "唯讀",
   "deviceReadWrite": "讀寫",
+  "requestConflict": "播放佇列已變更，請再試一次",
   "requestPermissionDenied": "此裝置不允許執行此操作",
   "readOnly": "唯讀",
   "queueUnavailableAccessRevoked": "存取權已撤銷",

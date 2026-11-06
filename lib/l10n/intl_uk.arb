@@ -1384,6 +1384,10 @@
   "remoteOpenUnreachable": "Пристрій недоступний. Перевірте, чи він увімкнений і в тій самій мережі.",
   "remoteOpenProtocol": "Не вдалося зв’язатися з пристроєм. На обох потрібна однакова версія Rune.",
   "remoteLossRevoked": "Доступ цього пристрою видалено.",
+  "remoteLossDetached": "Рендерер від’єднав цей контролер.",
+  "@remoteLossDetached": {
+    "description": "Shown when the renderer owner detaches this controller."
+  },
   "remoteLossServerStopped": "Інший пристрій припинив спільний доступ.",
   "remoteLossNetworkLost": "З’єднання втрачено.",
   "deviceLibraries": "Медіатеки",
@@ -1416,6 +1420,7 @@
   "deviceNotShared": "Не надано доступ",
   "deviceReadOnly": "Лише читання",
   "deviceReadWrite": "Читання й запис",
+  "requestConflict": "Черга змінилася, спробуйте ще раз",
   "requestPermissionDenied": "Цьому пристрою не дозволено це робити",
   "readOnly": "Лише читання",
   "queueUnavailableAccessRevoked": "Доступ відкликано",

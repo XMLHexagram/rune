@@ -17,7 +17,7 @@ use tokio::sync::{broadcast::Receiver, mpsc};
 
 use crate::{
     Session,
-    backends::remote::{decode_message, encode_message},
+    backends::remote::{decode_message_with_library_id, encode_message},
     messages::RemoteRequestFailed,
     request_error::classify,
     server::{ServerState, sync_auth::AuthenticatedFingerprint},
@@ -77,6 +77,11 @@ pub async fn handle_socket(
     let Some(node) = state.node.upgrade() else {
         return;
     };
+    let Ok(session) = node.session() else {
+        return;
+    };
+    let controller_guard = session.attach_controller(user.fingerprint.clone(), user.alias.clone());
+    let controller_cancel = controller_guard.cancellation_token();
     let policy = node.access_policy.clone();
     drop(node);
     let mut grant_changes = policy.changes();
@@ -113,13 +118,14 @@ pub async fn handle_socket(
     let incoming = async move {
         while let Some(Ok(msg)) = receiver.next().await {
             if let WsMessage::Binary(payload) = msg
-                && let Some((msg_type, msg_payload, uuid)) = decode_message(&payload)
+                && let Some((msg_type, msg_payload, uuid, library_id)) =
+                    decode_message_with_library_id(&payload)
             {
                 debug!("[{incoming_alias}] Received: {msg_type}");
 
                 let result = state
                     .websocket_service
-                    .handle_message(
+                    .handle_addressed_message(
                         &msg_type,
                         msg_payload,
                         Some(Session {
@@ -127,6 +133,7 @@ pub async fn handle_socket(
                             public_key: peer.public_key.clone(),
                             host: host.to_owned(),
                         }),
+                        library_id,
                     )
                     .await;
                 if let Some((resp_type, response)) = result {
@@ -201,6 +208,7 @@ pub async fn handle_socket(
         _ = incoming => None,
         _ = outgoing => None,
         _ = revoked => Some((4403, "revoked")),
+        _ = controller_cancel.cancelled() => Some((4409, "detached")),
         _ = session_cancel.cancelled() => Some((1001, "server stopping")),
     };
     if let Some((code, reason)) = close {
@@ -215,5 +223,6 @@ pub async fn handle_socket(
 
     // Wait for the send task to complete
     let _ = send_task.await;
+    drop(controller_guard);
     info!("[{alias}] WebSocket connection closed");
 }
