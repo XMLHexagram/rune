@@ -273,6 +273,8 @@ pub trait Playable: Send {
     /// The raw PCM tap (disabled by default); see [`PcmTap`].
     fn pcm_tap(&self) -> Arc<PcmTap>;
     fn set_adaptive_switching_enabled(&mut self, enabled: bool);
+    /// iOS: lets other apps keep playing while this one does. Other platforms ignore it.
+    fn set_mix_with_others(&mut self, enabled: bool);
     fn terminate(&self);
     fn get_status(&self) -> PlayerStatus;
     fn get_playlist(&self) -> Vec<PlayingItem>;
@@ -351,7 +353,7 @@ impl Player {
         // The player owns the audio session on iOS. Its category is set now, so that any audio
         // the app plays has it from the start.
         #[cfg(target_os = "ios")]
-        crate::ios_session::configure();
+        crate::ios_session::configure(false);
         // Create the Player instance and wrap the command sender in Arc<Mutex>
         let source_resolver = Arc::new(RwLock::new(None));
         let player = Player {
@@ -668,6 +670,10 @@ impl Playable for Player {
         self.command(PlayerCommand::SetAdaptiveSwitchingEnabled(enabled));
     }
 
+    fn set_mix_with_others(&mut self, enabled: bool) {
+        self.command(PlayerCommand::SetMixWithOthers(enabled));
+    }
+
     fn terminate(&self) {
         self.cancellation_token.cancel();
     }
@@ -727,6 +733,7 @@ impl Playable for MockPlayer {
         PcmTap::with_capacity(1)
     }
     fn set_adaptive_switching_enabled(&mut self, _enabled: bool) {}
+    fn set_mix_with_others(&mut self, _enabled: bool) {}
     fn terminate(&self) {}
     fn get_status(&self) -> PlayerStatus {
         PlayerStatus {

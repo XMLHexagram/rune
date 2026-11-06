@@ -9,6 +9,7 @@ import '../../widgets/navigation_bar/page_content_frame.dart';
 import 'widgets/queue_mode_setting.dart';
 import 'widgets/playback_mode_setting.dart';
 import 'widgets/adaptive_switching_setting.dart';
+import 'widgets/mix_with_others_setting.dart';
 import 'widgets/middle_click_action_setting.dart';
 
 class SettingsPlayback extends StatefulWidget {
@@ -35,6 +36,7 @@ class _SettingsPlaybackState extends State<SettingsPlayback> {
                 MiddleClickActionSetting(),
                 PlaybackModeSetting(),
                 AdaptiveSwitchingSetting(),
+                MixWithOthersSetting(),
                 Padding(
                   padding:
                       EdgeInsets.only(top: 8, bottom: 2, left: 6, right: 6),
