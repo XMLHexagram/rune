@@ -1588,5 +1588,13 @@
   "requestPublicKeyMismatch": "The submitted device key does not match its fingerprint",
   "requestRegistrationConflict": "A device with this fingerprint is already registered",
   "remoteLibraryReconnecting": "Reconnecting to {alias}…",
-  "@remoteLibraryReconnecting": {"placeholders": {"alias": {"type": "String"}}}
+  "@remoteLibraryReconnecting": {"placeholders": {"alias": {"type": "String"}}},
+  "hostnameRequired": "Enter the device's IP address or hostname.",
+  "@hostnameRequired": {
+    "description": "Validation message when the IP address or hostname field of the add connection dialog is empty."
+  },
+  "hostLookupFailed": "No IPv4 address was found for this host.",
+  "@hostLookupFailed": {
+    "description": "Error shown when a typed hostname cannot be resolved to an IPv4 address."
+  }
 }

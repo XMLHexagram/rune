@@ -1542,5 +1542,7 @@
   "requestPublicKeyMismatch": "设备密钥与指纹不匹配",
   "requestRegistrationConflict": "此指纹对应的设备已注册",
   "remoteLibraryReconnecting": "正在重新连接到 {alias}…",
-  "@remoteLibraryReconnecting": {"placeholders": {"alias": {"type": "String"}}}
+  "@remoteLibraryReconnecting": {"placeholders": {"alias": {"type": "String"}}},
+  "hostnameRequired": "请输入设备的 IP 地址或主机名。",
+  "hostLookupFailed": "找不到此主机的 IPv4 地址。"
 }
