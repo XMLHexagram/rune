@@ -28,6 +28,18 @@
   "@factoryResetSubtitle": {
     "description": "設置界面中“恢復出廠設置”按鈕的說明文字。"
   },
+  "onMyIPhone": "我的 iPhone",
+  "@onMyIPhone": {
+    "description": "iPhone 上「檔案」App 中的位置，顯示在媒體庫位置的開頭。"
+  },
+  "onMyIPad": "我的 iPad",
+  "@onMyIPad": {
+    "description": "iPad 上「檔案」App 中的位置，顯示在媒體庫位置的開頭。"
+  },
+  "iCloudDrive": "iCloud 雲碟",
+  "@iCloudDrive": {
+    "description": "iCloud 雲碟在「檔案」App 中的位置，顯示在媒體庫位置的開頭。"
+  },
   "bsodBody": "您的播放器遇到問題，需要重新啟動。我們尊重您的隱私，不會收集任何數據。",
   "@bsodBody": {
     "description": "在藍屏界面，這向用戶解釋軟體遇到了致命錯誤。並信達雅提示用戶隱私保護。"
@@ -973,6 +985,14 @@
   "@adaptiveSwitchingSubtitle": {
     "description": "播放設置頁面中條目的設置描述"
   },
+  "mixWithOthers": "與其他應用同時播放",
+  "@mixWithOthers": {
+    "description": "播放設置頁面中條目的設置標題"
+  },
+  "mixWithOthersSubtitle": "其他應用在 Rune 播放時繼續播放。開啟後，鎖屏、控制中心和耳機按鍵無法控制 Rune。",
+  "@mixWithOthersSubtitle": {
+    "description": "播放設置頁面中條目的設置描述"
+  },
   "considerPurchase": "請考慮購買正版許可證。",
   "@considerPurchase": {
     "description": "關於頁面中的通知，引導用戶購買許可證"
@@ -1392,6 +1412,7 @@
   "interfaceScale": "界面缩放",
   "interfaceScaleSubtitle": "相对于系统缩放立即调整文字和应用内容。窗口大小和屏幕分辨率不会改变。100% 遵循系统缩放。",
   "interfaceScaleSaveError": "无法保存界面缩放",
+  "interfaceScaleFollowTextSize": "跟隨文字大小",
   "linuxCustomWindowControls": "自定义窗口控件",
   "@linuxCustomWindowControls": {"description": "Title for the Linux custom window controls setting option."},
   "linuxCustomWindowControlsSubtitle": "启用自定义窗口控件，使用类似 Windows 模式的无边框窗口。",
@@ -1478,6 +1499,7 @@
   "devicesThatCanConnect": "可連接此裝置的裝置",
   "otherDevices": "其他裝置",
   "myDevice": "我的裝置",
+  "controllingNow": "正在控制此裝置",
   "waitingForApproval": "等待核准",
   "guest": "訪客",
   "myDeviceAccessDescription": "可以播放、瀏覽和同步你的音樂庫",

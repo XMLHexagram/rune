@@ -28,6 +28,18 @@
   "@factoryResetSubtitle": {
     "description": "The descriptive text for the 'Factory Reset' button in the settings interface."
   },
+  "onMyIPhone": "On My iPhone",
+  "@onMyIPhone": {
+    "description": "The Files app location for folders on an iPhone, shown as the start of a library's location."
+  },
+  "onMyIPad": "On My iPad",
+  "@onMyIPad": {
+    "description": "The Files app location for folders on an iPad, shown as the start of a library's location."
+  },
+  "iCloudDrive": "iCloud Drive",
+  "@iCloudDrive": {
+    "description": "The Files app location for folders in iCloud Drive, shown as the start of a library's location."
+  },
   "bsodBody": "Your player ran into a problem and needs a restart. We respect your privacy and won't collect any data.",
   "@bsodBody": {
     "description": "On the blue screen interface, this explains to the user that the software has encountered a fatal error. The second sentence humorously addresses the widespread privacy concerns in modern software engineering. Feel free to keep it playful."
@@ -983,6 +995,14 @@
   "@adaptiveSwitchingSubtitle": {
     "description": "Settings description of an entry in the playback settings page"
   },
+  "mixWithOthers": "Play Alongside Other Apps",
+  "@mixWithOthers": {
+    "description": "Settings title of an entry in the playback settings page"
+  },
+  "mixWithOthersSubtitle": "Other apps keep playing while Rune plays. The lock screen, Control Center and headphone buttons can't control Rune while this is on.",
+  "@mixWithOthersSubtitle": {
+    "description": "Settings description of an entry in the playback settings page"
+  },
   "considerPurchase": "Please consider purchasing a genuine license.",
   "@considerPurchase": {
     "description": "Notice in the about page, guiding user to purchase a license"
@@ -1421,6 +1441,8 @@
   "@interfaceScale": {"description": "Title of the application interface scale setting."},
   "@interfaceScaleSubtitle": {"description": "Explains interface scaling relative to system scaling."},
   "@interfaceScaleSaveError": {"description": "Error title when saving interface scale fails."},
+  "interfaceScaleFollowTextSize": "Follow Text Size",
+  "@interfaceScaleFollowTextSize": {"description": "Option that sizes the interface to match the system text size."},
   "offlineAvailability": "Offline availability",
   "@offlineAvailability": {
     "description": "Context menu for the audio retained on this device."
@@ -1533,6 +1555,7 @@
   "devicesThatCanConnect": "Devices that can connect to this one",
   "otherDevices": "Other devices",
   "myDevice": "My device",
+  "controllingNow": "Controlling now",
   "waitingForApproval": "Waiting for approval",
   "guest": "Guest",
   "myDeviceAccessDescription": "Can play, browse and sync your libraries",

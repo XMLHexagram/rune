@@ -34,6 +34,7 @@ import 'utils/update_color_mode.dart';
 import 'utils/theme_color_manager.dart';
 import 'utils/storage_key_manager.dart';
 import 'utils/api/set_adaptive_switching_enabled.dart';
+import 'utils/api/set_mix_with_others.dart';
 import 'utils/api/operate_playback_with_mix_query.dart';
 import 'utils/file_storage/mac_secure_manager.dart';
 import 'utils/macos_window_control_button_manager.dart';
@@ -45,6 +46,8 @@ import 'config/shortcuts.dart';
 
 import 'widgets/app_viewport.dart';
 import 'widgets/app_scale_shortcuts.dart';
+import 'widgets/status_bar_style.dart';
+import 'widgets/dismiss_keyboard_on_tap.dart';
 import 'widgets/router/discovery_frame.dart';
 import 'widgets/router/no_effect_page_route.dart';
 import 'widgets/title_bar/window_frame.dart';
@@ -76,6 +79,7 @@ import 'providers/library_home.dart';
 import 'providers/library_manager.dart';
 import 'providers/linux_custom_window_controls.dart';
 import 'providers/playback_controller.dart';
+import 'providers/controllers.dart';
 import 'providers/renderer_attachment.dart';
 import 'providers/responsive_providers.dart';
 
@@ -150,7 +154,10 @@ void main(List<String> arguments) async {
 
   final SettingsManager settingsManager = SettingsManager();
   StorageKeyManager.initialize(profile);
-  final appScale = AppScaleProvider();
+  await detectIosDevice();
+  final appScale = AppScaleProvider(
+    supportsFollowTextSize: iosDevice == IosDevice.iPhone,
+  );
   await appScale.initialize();
   await MacSecureManager().completed;
 
@@ -303,6 +310,7 @@ void main(List<String> arguments) async {
   }
 
   setAdaptiveSwitchingEnabled();
+  setMixWithOthers();
 
   mainLoop(licenseProvider, linuxCustomWindowControls, appScale);
   if (isDesktop && !Platform.isMacOS) {
@@ -352,6 +360,10 @@ void mainLoop(
         ChangeNotifierProvider(
           lazy: false,
           create: (_) => RendererAttachmentProvider(),
+        ),
+        ChangeNotifierProvider(
+          lazy: false,
+          create: (_) => ControllersProvider(),
         ),
         ChangeNotifierProvider(
           lazy: false,
@@ -509,14 +521,18 @@ class _RuneState extends State<Rune> {
                 textDirection: appTheme.textDirection,
                 child: Shortcuts(
                   shortcuts: shortcuts,
-                  child: NavigationShortcutManager(
-                    RuneLifecycle(RevealEffectContext(child: child!)),
+                  child: DismissKeyboardOnTap(
+                    child: NavigationShortcutManager(
+                      RuneLifecycle(RevealEffectContext(child: child!)),
+                    ),
                   ),
                 ),
               ),
             );
 
-            return AppViewport(child: AppScaleShortcuts(child: content));
+            return StatusBarStyle(
+              child: AppViewport(child: AppScaleShortcuts(child: content)),
+            );
           },
         );
       },
