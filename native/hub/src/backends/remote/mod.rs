@@ -24,7 +24,10 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::{
     Connector, connect_async_tls_with_config,
-    tungstenite::{client::IntoClientRequest, protocol::Message as TungsteniteMessage},
+    tungstenite::{
+        Error as TungsteniteError, client::IntoClientRequest,
+        protocol::Message as TungsteniteMessage,
+    },
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
@@ -48,7 +51,9 @@ use crate::{
     server::{
         api::fetch_device_info_at_port,
         generate_or_load_certificates, get_or_generate_alias,
-        sync_worker::{obtain_token, tls_config, trusted_fingerprint},
+        sync_worker::{
+            SyncTokenStore, obtain_or_reuse_token, peer_base, tls_config, trusted_fingerprint,
+        },
     },
     utils::{Broadcaster, GlobalParams, ParamsExtractor, RinfRustSignal, RunningMode, TaskTokens},
 };
@@ -192,9 +197,18 @@ type RemoteStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type PendingReplies = Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<(String, Vec<u8>)>>>>>;
 
 /// A node-owned control connection to a remote renderer.
+/// What a renderer link is for: controlling the renderer shows its session
+/// in this device's UI; a one-off cast only sends requests and reads replies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RendererLinkUse {
+    Control,
+    Cast,
+}
+
 pub struct RendererLink {
     id: Uuid,
     fingerprint: String,
+    alias: String,
     write: Arc<Mutex<SplitSink<RemoteStream, TungsteniteMessage>>>,
     cancel: CancellationToken,
     locally_detached: Arc<AtomicBool>,
@@ -207,6 +221,7 @@ impl RendererLink {
     pub(crate) async fn connect(
         node: Arc<NodeContext>,
         fingerprint: &str,
+        link_use: RendererLinkUse,
     ) -> std::result::Result<(Self, String, String), RemoteConnectError> {
         let validator = node.cert_validator.read().await.clone();
         let hosts = validator.get_hosts_for_fingerprint(fingerprint).await;
@@ -227,7 +242,14 @@ impl RendererLink {
             .host_str()
             .ok_or_else(|| protocol("invalid renderer host"))?;
         let port = parsed.port().unwrap_or(7863);
-        let stream = connect_remote(host, port, &node.config_path, validator.clone()).await?;
+        let stream = connect_remote(
+            host,
+            port,
+            &node.config_path,
+            validator.clone(),
+            &node.sync_tokens,
+        )
+        .await?;
         let alias = fetch_device_info_at_port(
             host,
             port,
@@ -236,18 +258,34 @@ impl RendererLink {
         .await
         .map(|info| info.alias)
         .map_err(|_| RemoteConnectError::Unreachable)?;
-        let link = Self::new(stream, node.clone(), fingerprint.to_owned()).await;
+        let link = Self::new(
+            stream,
+            node.clone(),
+            fingerprint.to_owned(),
+            alias.clone(),
+            link_use,
+        )
+        .await;
         Ok((link, host.to_owned(), alias))
     }
 
-    async fn new(stream: RemoteStream, node: Arc<NodeContext>, fingerprint: String) -> Self {
+    async fn new(
+        stream: RemoteStream,
+        node: Arc<NodeContext>,
+        fingerprint: String,
+        alias: String,
+        link_use: RendererLinkUse,
+    ) -> Self {
         let id = Uuid::new_v4();
         let cancel = node.token.child_token();
         let locally_detached = Arc::new(AtomicBool::new(false));
         let (write, mut read) = stream.split();
         let write = Arc::new(Mutex::new(write));
         let handlers = Arc::new(Mutex::new(HashMap::<String, MessageHandler>::new()));
-        register_renderer_handlers(&handlers, node.gui_broadcaster.clone()).await;
+        if link_use == RendererLinkUse::Control {
+            register_session_handlers(&handlers, node.gui_broadcaster.clone()).await;
+        }
+        register_reply_handlers(&handlers).await;
         let reader_handlers = handlers.clone();
         let pending_replies: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
         let reader_pending_replies = pending_replies.clone();
@@ -296,6 +334,7 @@ impl RendererLink {
         Self {
             id,
             fingerprint,
+            alias,
             write,
             cancel,
             locally_detached,
@@ -364,6 +403,10 @@ impl RendererLink {
         &self.fingerprint
     }
 
+    pub(crate) fn alias(&self) -> &str {
+        &self.alias
+    }
+
     pub(crate) fn close(&self) {
         self.locally_detached.store(true, Ordering::Release);
         self.cancel.cancel();
@@ -406,6 +449,7 @@ fn renderer_reply(name: String, body: Vec<u8>) -> Result<(String, Vec<u8>)> {
     Err(ExpectedRequestError::Remote {
         kind: failure.kind,
         detail: failure.detail,
+        cause: failure.cause,
     }
     .into())
 }
@@ -425,7 +469,8 @@ impl Drop for RendererLink {
     }
 }
 
-async fn register_renderer_handlers(handlers: &HandlerMap, broadcaster: Arc<dyn Broadcaster>) {
+/// Forward the renderer's session (status, queue, spectrum) to this device's UI.
+async fn register_session_handlers(handlers: &HandlerMap, broadcaster: Arc<dyn Broadcaster>) {
     let status_broadcaster = broadcaster.clone();
     handlers.lock().await.insert(
         "PlaybackStatus".into(),
@@ -455,6 +500,9 @@ async fn register_renderer_handlers(handlers: &HandlerMap, broadcaster: Arc<dyn 
             },
         ),
     );
+}
+
+async fn register_reply_handlers(handlers: &HandlerMap) {
     for_all_responses!(register_response_handlers, handlers);
     handlers.lock().await.insert(
         "RemoteRequestFailed".into(),
@@ -482,6 +530,7 @@ pub(crate) async fn connect_remote(
     port: u16,
     config_path: &str,
     validator: CertValidator,
+    sync_tokens: &SyncTokenStore,
 ) -> std::result::Result<RemoteStream, RemoteConnectError> {
     tokio::time::timeout(Duration::from_secs(10), async {
         let entries = validator.clone_trusted_entries().await;
@@ -513,8 +562,9 @@ pub(crate) async fn connect_remote(
             .redirect(Policy::none())
             .build()
             .map_err(protocol)?;
-        let base = format!("https://{host}:{port}");
-        let token = obtain_token(
+        let base = peer_base(host, port);
+        let token = obtain_or_reuse_token(
+            sync_tokens,
             &client,
             &base,
             &fingerprint,
@@ -527,33 +577,65 @@ pub(crate) async fn connect_remote(
             token_error(error)
         })?;
         let url = format!("wss://{host}:{port}/ws?host={}", encode(host));
-        let mut request = url.into_client_request().map_err(protocol)?;
+        let mut request = url.as_str().into_client_request().map_err(protocol)?;
         request.headers_mut().insert(
             reqwest::header::AUTHORIZATION,
             format!("Bearer {token}").parse().map_err(protocol)?,
         );
-        let (stream, _) = connect_async_tls_with_config(
+        let result = connect_async_tls_with_config(
             request,
             None,
             false,
-            Some(Connector::Rustls(Arc::new(pinned_config))),
+            Some(Connector::Rustls(Arc::new(pinned_config.clone()))),
         )
-        .await
-        .map_err(|error| {
-            use tokio_tungstenite::tungstenite::Error;
-            error!("WebSocket upgrade failed: {error}");
-            match error {
-                Error::Http(response) if matches!(response.status().as_u16(), 401 | 403) => {
-                    RemoteConnectError::NotAuthorized
-                }
-                Error::Io(_) | Error::Tls(_) => RemoteConnectError::Unreachable,
-                other => protocol(other),
+        .await;
+        let (stream, _) = match result {
+            Ok(connection) => connection,
+            Err(TungsteniteError::Http(response))
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED =>
+            {
+                sync_tokens.invalidate(&server_fingerprint, &base);
+                let fresh_token = obtain_or_reuse_token(
+                    sync_tokens,
+                    &client,
+                    &base,
+                    &fingerprint,
+                    &private_key,
+                    &server_fingerprint,
+                )
+                .await
+                .map_err(token_error)?;
+                let mut retry = url.as_str().into_client_request().map_err(protocol)?;
+                retry.headers_mut().insert(
+                    reqwest::header::AUTHORIZATION,
+                    format!("Bearer {fresh_token}").parse().map_err(protocol)?,
+                );
+                connect_async_tls_with_config(
+                    retry,
+                    None,
+                    false,
+                    Some(Connector::Rustls(Arc::new(pinned_config))),
+                )
+                .await
+                .map_err(map_websocket_connect_error)?
             }
-        })?;
+            Err(error) => return Err(map_websocket_connect_error(error)),
+        };
         Ok(stream)
     })
     .await
     .map_err(|_| RemoteConnectError::Unreachable)?
+}
+
+fn map_websocket_connect_error(error: TungsteniteError) -> RemoteConnectError {
+    error!("WebSocket upgrade failed: {error}");
+    match error {
+        TungsteniteError::Http(response) if matches!(response.status().as_u16(), 401 | 403) => {
+            RemoteConnectError::NotAuthorized
+        }
+        TungsteniteError::Io(_) | TungsteniteError::Tls(_) => RemoteConnectError::Unreachable,
+        other => protocol(other),
+    }
 }
 
 fn remote_failure_detail(failure: &RemoteRequestFailed) -> String {
@@ -572,6 +654,7 @@ fn dispatch_remote_failure(payload: &[u8]) {
                 request: failure.request,
                 kind,
                 detail: failure.detail,
+                cause: failure.cause,
             }
             .send_signal_to_dart();
             if kind == RequestErrorKind::Internal {
@@ -830,6 +913,7 @@ pub async fn server_player_loop(
             parsed.port().unwrap_or(7863),
             config_path,
             (*cert_validator).clone(),
+            &node.sync_tokens,
         )
         .await
     })
@@ -853,6 +937,7 @@ pub async fn server_player_loop(
                             request: failure.request,
                             kind,
                             detail: failure.detail,
+                            cause: failure.cause,
                         }
                         .send_signal_to_dart();
                         if kind == RequestErrorKind::Internal {
@@ -928,6 +1013,7 @@ mod loss_tests {
             kind: RequestErrorKind::Internal,
             request: "ExampleRequest".into(),
             detail: "outer: inner".into(),
+            cause: None,
         };
         assert_eq!(
             remote_failure_detail(&failure),

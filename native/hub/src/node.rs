@@ -22,9 +22,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::access_policy::{Action, Denial, RuneAccessPolicy};
-use crate::backends::remote::{RemoteConnectError, RendererLink};
+use crate::backends::remote::{RemoteConnectError, RendererLink, RendererLinkUse};
 use crate::macros::{RequestClass, request_class};
 use crate::request_error::ExpectedRequestError;
+use crate::server::sync_worker::SyncTokenStore;
 use crate::{Session, session::PlayerSession};
 use crate::{
     library_pool::{LibraryHandle, LibraryPool},
@@ -46,6 +47,19 @@ use discovery::access_policy::{AccessPolicy, PeerIdentity};
 
 static NODE: NodeSlot = NodeSlot::new();
 
+fn renderer_connection_error(error: RemoteConnectError) -> anyhow::Error {
+    let detail = format!("Renderer connection failed: {error:?}");
+    match error {
+        RemoteConnectError::UntrustedEndpoint | RemoteConnectError::NotAuthorized => {
+            anyhow::Error::new(Denial::Untrusted).context(detail)
+        }
+        RemoteConnectError::Unreachable | RemoteConnectError::Protocol(_) => {
+            anyhow::Error::new(ExpectedRequestError::Unavailable { what: "renderer" })
+                .context(detail)
+        }
+    }
+}
+
 /// Process services shared by every local library and remote controller.
 pub struct NodeContext {
     pub config_path: Arc<String>,
@@ -61,6 +75,7 @@ pub struct NodeContext {
     pub gui_broadcaster: Arc<dyn Broadcaster>,
     pub renderer_link: Arc<StdMutex<Option<Arc<RendererLink>>>>,
     pub token: Arc<CancellationToken>,
+    pub(crate) sync_tokens: SyncTokenStore,
     pub server_manager: OnceLock<Arc<ServerManager>>,
     local_session: OnceLock<Arc<PlayerSession>>,
     current_ui: Mutex<Option<Weak<GlobalParams>>>,
@@ -126,13 +141,18 @@ impl NodeContext {
         let node_id = Arc::new(get_or_create_node_id(config_path).await?.to_string());
         let websocket_service = Arc::new(WebSocketService::new());
         let renderer_link = Arc::new(StdMutex::new(None));
+        let sync_tokens = SyncTokenStore::default();
         let mut permission_manager = PermissionManager::new(config_path)?;
         let access_policy = Arc::new(RuneAccessPolicy::load(
             Path::new(config_path),
             &permission_manager.list_users().await,
         )?);
         let policy = access_policy.clone();
+        let revoked_tokens = sync_tokens.clone();
         permission_manager.set_trust_change_hook(Arc::new(move |fingerprint, status| {
+            if status != Some(&UserStatus::Approved) {
+                revoked_tokens.remove_peer(fingerprint);
+            }
             policy
                 .trust_changed(fingerprint, status)
                 .map_err(|error| format!("{error:#}"))
@@ -155,6 +175,7 @@ impl NodeContext {
             websocket_service,
             renderer_link,
             token: Arc::new(CancellationToken::new()),
+            sync_tokens,
             server_manager: OnceLock::new(),
             local_session: OnceLock::new(),
             current_ui: Mutex::new(None),
@@ -265,6 +286,46 @@ impl NodeContext {
     }
 
     pub async fn attach_renderer(self: &Arc<Self>, fingerprint: &str) -> Result<()> {
+        if let Some(link) = self.renderer_link()?
+            && link.fingerprint() == fingerprint
+        {
+            self.gui_broadcaster.broadcast(&RendererAttachmentChanged {
+                renderer: Some(AttachedRenderer {
+                    fingerprint: fingerprint.to_owned(),
+                    alias: link.alias().to_owned(),
+                }),
+            });
+            return Ok(());
+        }
+        let (link, alias) = self
+            .connect_renderer(fingerprint, RendererLinkUse::Control)
+            .await?;
+        let old = {
+            let mut slot = self
+                .renderer_link
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Renderer link lock poisoned"))?;
+            slot.replace(Arc::new(link))
+        };
+        if let Some(old) = old {
+            old.close();
+        }
+        self.session()?.player.lock().await.pause();
+        self.gui_broadcaster.broadcast(&RendererAttachmentChanged {
+            renderer: Some(AttachedRenderer {
+                fingerprint: fingerprint.to_owned(),
+                alias,
+            }),
+        });
+        Ok(())
+    }
+
+    /// Connect to a trusted renderer using the same error mapping as attachment.
+    pub(crate) async fn connect_renderer(
+        self: &Arc<Self>,
+        fingerprint: &str,
+        link_use: RendererLinkUse,
+    ) -> Result<(RendererLink, String)> {
         if !self
             .cert_validator
             .read()
@@ -277,43 +338,10 @@ impl NodeContext {
                 what: "renderer",
             }));
         }
-        let (link, _host, alias) = RendererLink::connect(self.clone(), fingerprint)
+        let (link, _host, alias) = RendererLink::connect(self.clone(), fingerprint, link_use)
             .await
-            .map_err(|error| {
-                let detail = format!("Renderer connection failed: {error:?}");
-                match error {
-                    RemoteConnectError::UntrustedEndpoint => {
-                        anyhow::Error::new(Denial::Untrusted).context(detail)
-                    }
-                    RemoteConnectError::Unreachable | RemoteConnectError::Protocol(_) => {
-                        anyhow::Error::new(ExpectedRequestError::Unavailable { what: "renderer" })
-                            .context(detail)
-                    }
-                    RemoteConnectError::NotAuthorized => {
-                        anyhow::Error::new(Denial::Untrusted).context(detail)
-                    }
-                }
-            })?;
-        {
-            let mut slot = self
-                .renderer_link
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Renderer link lock poisoned"))?;
-            if slot.is_some() {
-                return Err(anyhow::Error::new(ExpectedRequestError::invalid_input(
-                    "A renderer is already attached",
-                )));
-            }
-            *slot = Some(Arc::new(link));
-        }
-        self.session()?.player.lock().await.pause();
-        self.gui_broadcaster.broadcast(&RendererAttachmentChanged {
-            renderer: Some(AttachedRenderer {
-                fingerprint: fingerprint.to_owned(),
-                alias,
-            }),
-        });
-        Ok(())
+            .map_err(renderer_connection_error)?;
+        Ok((link, alias))
     }
 
     pub async fn detach_renderer(&self) -> Result<()> {

@@ -4,7 +4,7 @@ use super::sync::client::SessionDirection;
 use super::sync::client::fetch_missing;
 use super::sync::downloads::{DownloadAudioContext, download_requested_audio_until};
 use super::sync::{library_base, library_notification};
-use super::sync_auth::{Authorization, Challenge, Token, message};
+use super::sync_auth::{Authorization, Challenge, TOKEN_TTL, Token, message};
 #[cfg(test)]
 use super::utils::device::load_device_info;
 use crate::access_policy::{Action, LibraryLevel};
@@ -22,7 +22,7 @@ use discovery::access_policy::{AccessPolicy, PeerIdentity};
 use discovery::endpoint::endpoint_host_port;
 use discovery::server::UserStatus;
 use futures::future::BoxFuture;
-use futures::future::{AbortHandle, Abortable};
+use futures::future::{AbortHandle, Abortable, Aborted};
 use http_request::sync::PageCursor;
 use playback::player::{
     LibraryPlaybackSource, PlaybackSourceResolver, RemoteAudioError, RemoteAudioSource,
@@ -42,7 +42,7 @@ use std::{
     path::Path,
 };
 use std::{
-    sync::{Arc, Weak},
+    sync::{Arc, Mutex as StdMutex, Weak},
     time::Duration,
 };
 use sync::SyncPeer;
@@ -54,6 +54,74 @@ use uuid::Uuid;
 
 const DEFAULT_PEER_PORT: u16 = 7863;
 const PEER_CONCURRENCY: usize = 4;
+const PEER_RETRY_START: Duration = Duration::from_secs(1);
+const PEER_RETRY_CAP: Duration = Duration::from_secs(30);
+const TOKEN_SAFETY_MARGIN: Duration = Duration::from_secs(30);
+
+/// A peer endpoint: its fingerprint and base URL.
+type PeerKey = (String, String);
+
+#[derive(Clone, Default)]
+pub struct SyncTokenStore {
+    tokens: Arc<StdMutex<HashMap<PeerKey, StoredSyncToken>>>,
+    authorization_locks: Arc<StdMutex<HashMap<PeerKey, Arc<Mutex<()>>>>>,
+}
+
+struct StoredSyncToken {
+    value: String,
+    obtained_at: std_time::Instant,
+}
+
+impl SyncTokenStore {
+    /// Serializes authorization per peer endpoint, so concurrent passes against one
+    /// peer share a single challenge round trip while other peers are not blocked.
+    fn authorization_lock(&self, fingerprint: &str, base: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .authorization_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks
+            .entry((fingerprint.to_owned(), base.to_owned()))
+            .or_default()
+            .clone()
+    }
+
+    fn get(&self, fingerprint: &str, base: &str) -> Option<String> {
+        let mut tokens = self.tokens.lock().ok()?;
+        tokens.retain(|_, token| token.obtained_at.elapsed() < TOKEN_TTL);
+        let token = tokens.get(&(fingerprint.to_owned(), base.to_owned()))?;
+        (token.obtained_at.elapsed() < TOKEN_TTL.saturating_sub(TOKEN_SAFETY_MARGIN))
+            .then(|| token.value.clone())
+    }
+
+    fn insert(&self, fingerprint: &str, base: &str, value: String) {
+        if let Ok(mut tokens) = self.tokens.lock() {
+            tokens.retain(|_, token| token.obtained_at.elapsed() < TOKEN_TTL);
+            tokens.insert(
+                (fingerprint.to_owned(), base.to_owned()),
+                StoredSyncToken {
+                    value,
+                    obtained_at: std_time::Instant::now(),
+                },
+            );
+        }
+    }
+
+    pub(crate) fn invalidate(&self, fingerprint: &str, base: &str) {
+        if let Ok(mut tokens) = self.tokens.lock() {
+            tokens.remove(&(fingerprint.to_owned(), base.to_owned()));
+        }
+    }
+
+    pub(crate) fn remove_peer(&self, fingerprint: &str) {
+        if let Ok(mut tokens) = self.tokens.lock() {
+            tokens.retain(|(peer, _), _| peer != fingerprint);
+        }
+        if let Ok(mut locks) = self.authorization_locks.lock() {
+            locks.retain(|(peer, _), _| peer != fingerprint);
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct PeerEndpoint {
@@ -361,24 +429,24 @@ async fn run_loop(
         async move {
             let key = (hosts[0].fingerprint.clone(), id);
             let Some(global) = global.upgrade() else {
-                return (key, Duration::from_secs(30));
+                return (key, Duration::from_secs(30), false);
             };
             let library = tokio::select! {
-                _ = cancel.cancelled() => return (key, Duration::from_secs(30)),
+                _ = cancel.cancelled() => return (key, Duration::from_secs(30), false),
                 library = global.library_pool.acquire_served(id) => library,
             };
             let library = match library {
                 Ok(Some(library)) => library,
-                Ok(None) => return (key, Duration::from_secs(30)),
+                Ok(None) => return (key, Duration::from_secs(30), true),
                 Err(error) => {
                     log::warn!("Could not acquire background library: {error:#}");
-                    return (key, Duration::from_secs(30));
+                    return (key, Duration::from_secs(30), true);
                 }
             };
             let notify = pass_notification(&global, &library, &notify).await;
             for endpoint in hosts {
                 let result = tokio::select! {
-                    _ = cancel.cancelled() => return (key, Duration::from_secs(30)),
+                    _ = cancel.cancelled() => return (key, Duration::from_secs(30), false),
                     _ = wait_for_revocation(Arc::downgrade(&global), &endpoint.fingerprint, &endpoint.trusted_host) => Err(anyhow::anyhow!("peer permission revoked")),
                     result = async {
                         let options = PassOptions { credentials: &credentials, metadata, locks: &locks };
@@ -391,7 +459,7 @@ async fn run_loop(
                     } => result,
                 };
                 match classify_peer_pass(result) {
-                    Ok(complete) => return (key, complete.retry_delay()),
+                    Ok(complete) => return (key, complete.retry_delay(), false),
                     Err(error) => log::warn!(
                         "Background {} with paired device failed: {error:#}",
                         if metadata {
@@ -402,7 +470,7 @@ async fn run_loop(
                     ),
                 }
             }
-            (key, Duration::from_secs(30))
+            (key, Duration::from_secs(30), true)
         }
     };
     schedule_peers(
@@ -430,6 +498,9 @@ async fn run_loop(
     .await;
 }
 
+type PeerWorkResult<Q> = (Q, Duration, bool);
+type PeerTaskResult<Q> = (Q, Result<PeerWorkResult<Q>, Aborted>);
+
 async fn schedule_peers<P, Q, D, DF, W, WF, K, C, CF>(
     discover: D,
     work: W,
@@ -441,16 +512,17 @@ async fn schedule_peers<P, Q, D, DF, W, WF, K, C, CF>(
     D: Fn() -> DF,
     DF: Future<Output = Vec<P>>,
     W: Fn(P) -> WF,
-    WF: Future<Output = (Q, Duration)> + Send + 'static,
+    WF: Future<Output = PeerWorkResult<Q>> + Send + 'static,
     K: Fn(&P) -> Q,
     Q: Clone + Eq + Hash + Send + 'static,
     C: Fn() -> CF,
     CF: Future<Output = ()>,
 {
     let mut due = HashMap::<Q, Instant>::new();
+    let mut backoff = HashMap::<Q, PeerFailureBackoff>::new();
     let mut running = HashMap::<Q, AbortHandle>::new();
     // Discovery and cleanup may await locks held by an in-flight peer pass.
-    let mut tasks = JoinSet::new();
+    let mut tasks: JoinSet<PeerTaskResult<Q>> = JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut next_due = None;
@@ -472,7 +544,14 @@ async fn schedule_peers<P, Q, D, DF, W, WF, K, C, CF>(
                     }
                 };
                 running.remove(&key);
-                if let Ok((key, wait)) = result {
+                if let Ok((key, wait, failed)) = result {
+                    let policy = backoff.entry(key.clone()).or_default();
+                    let wait = if failed {
+                        policy.next_failure_delay()
+                    } else {
+                        policy.reset();
+                        wait
+                    };
                     due.insert(key, Instant::now() + wait);
                 }
             }
@@ -486,6 +565,7 @@ async fn schedule_peers<P, Q, D, DF, W, WF, K, C, CF>(
         };
         let eligible: HashSet<_> = peers.iter().map(&key).collect();
         due.retain(|fingerprint, _| eligible.contains(fingerprint));
+        backoff.retain(|fingerprint, _| eligible.contains(fingerprint));
         for (key, handle) in &running {
             if !eligible.contains(key) {
                 handle.abort();
@@ -522,6 +602,23 @@ async fn schedule_peers<P, Q, D, DF, W, WF, K, C, CF>(
             None
         };
         cleanup().await;
+    }
+}
+
+#[derive(Default)]
+struct PeerFailureBackoff {
+    next_delay: Option<Duration>,
+}
+
+impl PeerFailureBackoff {
+    fn next_failure_delay(&mut self) -> Duration {
+        let delay = self.next_delay.unwrap_or(PEER_RETRY_START);
+        self.next_delay = Some(delay.saturating_mul(2).min(PEER_RETRY_CAP));
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.next_delay = None;
     }
 }
 
@@ -666,11 +763,7 @@ async fn sync_one(
         };
         let mut state = lock.lock().await;
         state.last_used = std_time::Instant::now();
-        let expected_base = if endpoint.host.contains(':') {
-            format!("https://[{}]:{}", endpoint.host, endpoint.port)
-        } else {
-            format!("https://{}:{}", endpoint.host, endpoint.port)
-        };
+        let expected_base = peer_base(&endpoint.host, endpoint.port);
         if state
             .client
             .as_ref()
@@ -746,6 +839,7 @@ async fn sync_one(
                 result = operation => result,
             };
             if result.as_ref().err().is_some_and(metadata_unauthorized) {
+                invalidate_sync_token(global, &endpoint.fingerprint, &endpoint.host, endpoint.port);
                 state.client = None;
                 if attempt == 0 {
                     continue;
@@ -755,41 +849,54 @@ async fn sync_one(
         }
         unreachable!()
     } else {
-        let (base, client) = authenticated_client(
-            global,
-            &credentials.fingerprint,
-            &credentials.private_key,
-            &endpoint.fingerprint,
-            &endpoint.host,
-            endpoint.port,
-        )
-        .await?;
         let local = library.library_sync.identity().await?;
-        let base = library_base(&base, local.namespace);
-        let peer = http_request::sync::MetadataPeer::<RuneModel>::new(&base, client);
-        let remote = peer.identity().await?;
-        ensure!(
-            local.namespace == remote.namespace,
-            "paired catalog namespace mismatch"
-        );
         let playback_queue = global
             .session_queue_for_library(library.descriptor.library_id)
             .await?;
-        let report = download_requested_audio_until(
-            (*library.main_db).clone(),
-            &library.recommend_db,
-            library.fsio.clone(),
-            library.media_root.clone().into(),
-            DownloadAudioContext {
-                node_id: global.node_id.parse()?,
-                remote: &peer,
-                notify: notify.clone(),
-                playback_queue: &playback_queue,
-            },
-            tokio_time::Instant::now() + Duration::from_secs(60),
-        )
-        .await?;
-        Ok(!report.deadline_reached)
+        for attempt in 0..2 {
+            let (base, client) = authenticated_client(
+                global,
+                &credentials.fingerprint,
+                &credentials.private_key,
+                &endpoint.fingerprint,
+                &endpoint.host,
+                endpoint.port,
+            )
+            .await?;
+            let base = library_base(&base, local.namespace);
+            let peer = http_request::sync::MetadataPeer::<RuneModel>::new(&base, client);
+            let result = async {
+                let remote = peer.identity().await?;
+                ensure!(
+                    local.namespace == remote.namespace,
+                    "paired catalog namespace mismatch"
+                );
+                let report = download_requested_audio_until(
+                    (*library.main_db).clone(),
+                    &library.recommend_db,
+                    library.fsio.clone(),
+                    library.media_root.clone().into(),
+                    DownloadAudioContext {
+                        node_id: global.node_id.parse()?,
+                        remote: &peer,
+                        notify: notify.clone(),
+                        playback_queue: &playback_queue,
+                    },
+                    tokio_time::Instant::now() + Duration::from_secs(60),
+                )
+                .await?;
+                Ok(!report.deadline_reached)
+            }
+            .await;
+            if result.as_ref().err().is_some_and(metadata_unauthorized) {
+                invalidate_sync_token(global, &endpoint.fingerprint, &endpoint.host, endpoint.port);
+                if attempt == 0 {
+                    continue;
+                }
+            }
+            return result;
+        }
+        unreachable!()
     }
 }
 
@@ -995,18 +1102,22 @@ pub(super) async fn authenticated_client(
         "peer endpoint is not trusted"
     );
     let tls = tls_config(validator, fingerprint);
-    let base = if host.contains(':') {
-        format!("https://[{host}]:{peer_port}")
-    } else {
-        format!("https://{host}:{peer_port}")
-    };
+    let base = peer_base(host, peer_port);
     let client = reqwest::Client::builder()
         .use_preconfigured_tls(tls)
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
         .redirect(Policy::none())
         .build()?;
-    let token = obtain_token(&client, &base, own, private_key, fingerprint).await?;
+    let token = obtain_or_reuse_token(
+        &global.sync_tokens,
+        &client,
+        &base,
+        own,
+        private_key,
+        fingerprint,
+    )
+    .await?;
     let mut headers = HeaderMap::new();
     headers.insert(
         reqwest::header::AUTHORIZATION,
@@ -1022,6 +1133,53 @@ pub(super) async fn authenticated_client(
         .build()?;
     Ok((base, client))
 }
+
+pub(crate) async fn obtain_or_reuse_token(
+    store: &SyncTokenStore,
+    client: &reqwest::Client,
+    base: &str,
+    own: &str,
+    private_key: &str,
+    fingerprint: &str,
+) -> Result<String> {
+    let token = match store.get(fingerprint, base) {
+        Some(token) => token,
+        None => {
+            let lock = store.authorization_lock(fingerprint, base);
+            let _authorization = lock.lock().await;
+            match store.get(fingerprint, base) {
+                Some(token) => token,
+                None => {
+                    let token = obtain_token(client, base, own, private_key, fingerprint).await?;
+                    store.insert(fingerprint, base, token.clone());
+                    token
+                }
+            }
+        }
+    };
+    Ok(token)
+}
+
+pub(crate) fn invalidate_sync_token(
+    global: &NodeContext,
+    fingerprint: &str,
+    host: &str,
+    port: u16,
+) {
+    global
+        .sync_tokens
+        .invalidate(fingerprint, &peer_base(host, port));
+}
+
+/// The base URL of a peer's HTTPS server, bracketing IPv6 hosts.
+pub(crate) fn peer_base(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("https://[{host}]:{port}")
+    } else {
+        format!("https://{host}:{port}")
+    }
+}
+
 pub(crate) async fn obtain_token(
     client: &reqwest::Client,
     base: &str,
@@ -1194,6 +1352,12 @@ impl RenewableAudio {
     async fn refresh_locked(&self, credentials: &mut AudioCredentials) -> Result<()> {
         self.check_authorization().await?;
         let global = self.global.upgrade().context("Node has shut down")?;
+        invalidate_sync_token(
+            &global,
+            &self.endpoint.fingerprint,
+            &self.endpoint.host,
+            self.endpoint.port,
+        );
         let result = tokio::select! {
             _ = self.cancel.cancelled() => anyhow::bail!(RemoteAudioError::AccessRevoked),
             result = authenticated_client(&global, &self.own, &self.private_key, &self.endpoint.fingerprint, &self.endpoint.host, self.endpoint.port) => result,
@@ -1401,7 +1565,7 @@ mod tests {
                             state.release.acquire().await.unwrap().forget();
                             drop(guard);
                             state.finished.add_permits(1);
-                            (peer, Duration::from_secs(30))
+                            (peer, Duration::from_secs(30), false)
                         }
                     },
                     |peer| *peer,
@@ -1447,6 +1611,18 @@ mod tests {
         assert_peer_progress(ContentionPhase::Cleanup).await;
     }
 
+    #[test]
+    fn peer_failure_backoff_doubles_caps_and_resets_after_success() {
+        let mut backoff = PeerFailureBackoff::default();
+        let delays = (0..7)
+            .map(|_| backoff.next_failure_delay())
+            .collect::<Vec<_>>();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs));
+
+        backoff.reset();
+        assert_eq!(backoff.next_failure_delay(), PEER_RETRY_START);
+    }
+
     #[tokio::test]
     async fn newly_due_peer_runs_while_another_is_stalled() {
         use std::sync::atomic::AtomicBool;
@@ -1477,7 +1653,7 @@ mod tests {
                                 std::future::pending::<()>().await;
                             }
                             second.notify_one();
-                            (peer, Duration::from_secs(30))
+                            (peer, Duration::from_secs(30), false)
                         }
                     },
                     |peer: &String| peer.clone(),
