@@ -11,6 +11,7 @@ use crate::{
         CastLibraryState, CastPreflightRequest, GetMediaFilesCountRequest, InLibraryPlayingItem,
         LibraryItemRequest, ListRenderersRequest, PlayingItemRequest, PlaylistUpdate,
         RendererAvailability, RendererCandidate, RequestErrorKind, RequestFailureCause,
+        SwitchRequest,
     },
     request_error::{ExpectedRequestError, classify},
     session::store::SessionState,
@@ -634,7 +635,7 @@ async fn attach_pair_with_signals(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn detached_renderer_restores_local_session_signals() -> Result<()> {
-    use crate::messages::{RemoteConnectionLost, RemoteLossKind, RendererAttachmentChanged};
+    use crate::messages::{RendererAttachmentChanged, RendererLinkLost};
 
     let a_dir = tempfile::tempdir()?;
     let b_dir = tempfile::tempdir()?;
@@ -647,6 +648,7 @@ async fn detached_renderer_restores_local_session_signals() -> Result<()> {
     )
     .await?;
     let b = fixture(b_dir.path()).await?;
+    let b_alias = super::info(&b).await?.alias;
     attach_pair_with_signals(&a, &b, &signals).await?;
     let local_track = session_audio(&a, "restore-after-detach.ogg").await?;
     queue_session(&a, &[local_track]).await?;
@@ -670,9 +672,9 @@ async fn detached_renderer_restores_local_session_signals() -> Result<()> {
             let (loss, attachment, local_queue) = {
                 let records = signals.0.lock().unwrap();
                 let loss = records.iter().position(|(name, bytes)| {
-                    name == "RemoteConnectionLost"
-                        && rinf::deserialize::<RemoteConnectionLost>(bytes)
-                            .is_ok_and(|event| event.kind == RemoteLossKind::Detached)
+                    name == "RendererLinkLost"
+                        && rinf::deserialize::<RendererLinkLost>(bytes)
+                            .is_ok_and(|event| event.alias == b_alias)
                 });
                 let attachment = records.iter().position(|(name, bytes)| {
                     name == "RendererAttachmentChanged"
@@ -703,7 +705,9 @@ async fn detached_renderer_restores_local_session_signals() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stopped_renderer_clears_link_and_reports_server_stopped() -> Result<()> {
-    use crate::messages::{RemoteConnectionLost, RemoteLossKind};
+    use crate::messages::{
+        PlaybackStatus, RemoteConnectionLost, RendererAttachmentChanged, RendererLinkLost,
+    };
 
     let a_dir = tempfile::tempdir()?;
     let b_dir = tempfile::tempdir()?;
@@ -716,15 +720,50 @@ async fn stopped_renderer_clears_link_and_reports_server_stopped() -> Result<()>
     )
     .await?;
     let b = fixture(b_dir.path()).await?;
+    let b_alias = super::info(&b).await?.alias;
     attach_pair_with_signals(&a, &b, &signals).await?;
+    let local_track = session_audio(&a, "renderer-server-stopped.ogg").await?;
+    queue_session(&a, &[local_track]).await?;
+    a.global_params.node.session()?.player.lock().await.pause();
+    let local_session_id = a.global_params.node.session()?.session_id().await;
+    let local_session_id_text = local_session_id.to_string();
     b.global_params.node.shutdown().await?;
     timeout(Duration::from_secs(5), async {
         loop {
-            if signals.0.lock().unwrap().iter().any(|(name, bytes)| {
-                name == "RemoteConnectionLost"
-                    && rinf::deserialize::<RemoteConnectionLost>(bytes)
-                        .is_ok_and(|event| event.kind == RemoteLossKind::ServerStopped)
-            }) {
+            let observed = {
+                let records = signals.0.lock().unwrap();
+                let loss = records.iter().position(|(name, bytes)| {
+                    name == "RendererLinkLost"
+                        && rinf::deserialize::<RendererLinkLost>(bytes).is_ok_and(|event| {
+                            event.alias == b_alias && !event.fingerprint.is_empty()
+                        })
+                });
+                let attachment = records.iter().position(|(name, bytes)| {
+                    name == "RendererAttachmentChanged"
+                        && rinf::deserialize::<RendererAttachmentChanged>(bytes)
+                            .is_ok_and(|event| event.renderer.is_none())
+                });
+                let status = records.iter().position(|(name, bytes)| {
+                    name == "PlaybackStatus"
+                        && rinf::deserialize::<PlaybackStatus>(bytes)
+                            .is_ok_and(|event| event.session_id == local_session_id_text)
+                });
+                let queue = records.iter().position(|(name, bytes)| {
+                    name == "PlaylistUpdate"
+                        && rinf::deserialize::<PlaylistUpdate>(bytes)
+                            .is_ok_and(|event| event.session_id == local_session_id)
+                });
+                let no_legacy_loss = !records.iter().any(|(name, bytes)| {
+                    name == "RemoteConnectionLost"
+                        && rinf::deserialize::<RemoteConnectionLost>(bytes).is_ok()
+                });
+                (loss, attachment, status, queue, no_legacy_loss)
+            };
+            if let (Some(loss), Some(attachment), Some(status), Some(queue), no_legacy_loss) =
+                observed
+            {
+                assert!(loss < attachment && attachment < status && status < queue);
+                assert!(no_legacy_loss);
                 break;
             }
             sleep(Duration::from_millis(20)).await;
@@ -733,14 +772,13 @@ async fn stopped_renderer_clears_link_and_reports_server_stopped() -> Result<()>
     .await
     .context("renderer shutdown was not reported")?;
     assert!(a.global_params.node.renderer_link()?.is_none());
+    assert!(a.global_params.ui_library.lock().await.is_some());
     a.global_params.node.shutdown().await?;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn old_renderer_reader_cannot_clear_a_new_link() -> Result<()> {
-    use crate::messages::RemoteLossKind;
-
     let a_dir = tempfile::tempdir()?;
     let b_dir = tempfile::tempdir()?;
     let signals = Arc::new(RecordedSignals::default());
@@ -765,14 +803,7 @@ async fn old_renderer_reader_cannot_clear_a_new_link() -> Result<()> {
         .node
         .renderer_link()?
         .context("second link")?;
-    a.global_params
-        .node
-        .renderer_link_lost(
-            old.id(),
-            RemoteLossKind::NetworkLost,
-            "late old reader".into(),
-        )
-        .await;
+    a.global_params.node.renderer_link_lost(old.id()).await;
     assert_eq!(
         a.global_params
             .node
@@ -3671,6 +3702,60 @@ async fn session_c2a_revision_conflicts_and_identity_persist() -> Result<()> {
         3
     );
     reopened.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn switch_request_rejects_stale_queue_revision_and_accepts_current_revision() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = fixture(dir.path()).await?;
+    let first = session_audio(&fixture, "switch-revision-first.ogg").await?;
+    let second = session_audio(&fixture, "switch-revision-second.ogg").await?;
+    let items = [
+        library_item_for_id(&fixture, first).await?,
+        library_item_for_id(&fixture, second).await?,
+    ];
+    let session = fixture.global_params.node.session()?;
+    session
+        .edit_queue(None, |player| {
+            player.add_to_playlist_with_sources(
+                items
+                    .iter()
+                    .copied()
+                    .map(|item| (PlayingItem::InLibrary(item), PlaybackSource::LibraryStream))
+                    .collect(),
+                AddMode::AppendToEnd,
+            );
+            true
+        })
+        .await?;
+    fixture.global_params.player.lock().await.switch(0);
+    wait_player(&fixture, |status| status.index == Some(0)).await?;
+    let before = fixture.global_params.player.lock().await.get_status().item;
+
+    let stale = SwitchRequest {
+        index: 1,
+        expected_revision: Some(0),
+    };
+    let params = stale.extract_params(&fixture.global_params);
+    let error = stale.handle(params, None, &stale).await.unwrap_err();
+    assert_eq!(classify(&error), RequestErrorKind::Conflict);
+    assert_eq!(
+        fixture.global_params.player.lock().await.get_status().item,
+        before
+    );
+
+    let current = SwitchRequest {
+        index: 1,
+        expected_revision: Some(1),
+    };
+    let params = current.extract_params(&fixture.global_params);
+    current.handle(params, None, &current).await?;
+    wait_player(&fixture, |status| status.index == Some(1)).await?;
+    assert_eq!(
+        fixture.global_params.player.lock().await.get_status().item,
+        Some(PlayingItem::InLibrary(items[1])),
+    );
     Ok(())
 }
 

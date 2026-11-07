@@ -1402,7 +1402,9 @@
   "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
   "requestItemMissing": "Questo elemento non esiste più",
   "requestInvalid": "La richiesta non era valida",
+  "requestCertificateMismatch": "Il certificato di questo dispositivo non corrisponde",
   "requestUnavailable": "Non è disponibile al momento",
+  "requestStorageBusy": "L’archiviazione è occupata. Riprova.",
   "mixNoLongerExists": "Questo mix non esiste più",
   "devices": "Dispositivi",
   "playOn": "Riproduci su",
@@ -1450,5 +1452,7 @@
   "queueUnavailableAccessRevoked": "L’accesso è stato revocato",
   "queueUnavailableLibraryUnavailable": "La raccolta non è disponibile",
   "queueUnavailableSourceUnreachable": "La sorgente non è raggiungibile",
-  "queueUnavailableUnreadable": "Il file audio non è leggibile"
+  "queueUnavailableUnreadable": "Il file audio non è leggibile",
+  "rendererLinkLost": "Connessione con {alias} persa",
+  "@rendererLinkLost": {"placeholders": {"alias": {"type": "String"}}}
 }

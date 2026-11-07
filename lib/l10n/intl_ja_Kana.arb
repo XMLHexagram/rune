@@ -1363,7 +1363,9 @@
   "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
   "requestItemMissing": "このアイテムはもうありません",
   "requestInvalid": "リクエストがインバリッドです",
+  "requestCertificateMismatch": "このデバイスの証明書が一致しません",
   "requestUnavailable": "いまはアベイラブルではありません",
+  "requestStorageBusy": "ストレージが使用中です。もういちどおためしください。",
   "mixNoLongerExists": "このミックスはもうありません",
   "devices": "デバイス",
   "playOn": "サイセイサキ",
@@ -1411,5 +1413,7 @@
   "queueUnavailableAccessRevoked": "アクセスがとりけされました",
   "queueUnavailableLibraryUnavailable": "ライブラリをりようできません",
   "queueUnavailableSourceUnreachable": "ソースにせつぞくできません",
-  "queueUnavailableUnreadable": "おんせいをよみとれません"
+  "queueUnavailableUnreadable": "おんせいをよみとれません",
+  "rendererLinkLost": "{alias} との接続が失われました",
+  "@rendererLinkLost": {"placeholders": {"alias": {"type": "String"}}}
 }

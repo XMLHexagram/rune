@@ -1527,7 +1527,9 @@
   "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
   "requestItemMissing": "This item no longer exists",
   "requestInvalid": "The request was not valid",
+  "requestCertificateMismatch": "This device's certificate does not match",
   "requestUnavailable": "This isn't available right now",
+  "requestStorageBusy": "Storage is busy. Try again.",
   "mixNoLongerExists": "This mix no longer exists",
   "devices": "Devices",
   "playOn": "Play on",
@@ -1575,5 +1577,7 @@
   "queueUnavailableAccessRevoked": "Access was revoked",
   "queueUnavailableLibraryUnavailable": "Library is unavailable",
   "queueUnavailableSourceUnreachable": "Source is unreachable",
-  "queueUnavailableUnreadable": "Audio cannot be read"
+  "queueUnavailableUnreadable": "Audio cannot be read",
+  "rendererLinkLost": "Connection to {alias} lost",
+  "@rendererLinkLost": {"placeholders": {"alias": {"type": "String"}}}
 }

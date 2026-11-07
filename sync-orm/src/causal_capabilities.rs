@@ -1,6 +1,9 @@
 //! Capability composition over one SQL replica and caller-owned projections.
 use crate::{
-    causal_candidates, causal_manifests, causal_progress, causal_snapshot,
+    causal_candidates,
+    causal_leases::lock_on,
+    causal_manifests, causal_progress, causal_snapshot,
+    causal_source::{open_batch_step_locked_on, split_locked_on, summarize_locked_on},
     causal_store::CausalReplica,
 };
 use anyhow::{Result, ensure};
@@ -41,6 +44,7 @@ impl<M: p::SyncModel> TransactionProjection<M> for NoProjection {
 pub struct CausalEndpoint<M: p::SyncModel> {
     inner: Arc<EndpointState<M>>,
     notify: Arc<dyn Fn() + Send + Sync>,
+    lock_holder_observer: Option<Arc<dyn Fn(&'static str, Duration) + Send + Sync>>,
 }
 struct EndpointState<M: p::SyncModel> {
     store: CausalReplica<M>,
@@ -48,10 +52,59 @@ struct EndpointState<M: p::SyncModel> {
     receiver: Mutex<p::ReceiverLedger<M>>,
 }
 fn error(error: anyhow::Error) -> p::SyncError {
+    if crate::is_storage_busy(&error) {
+        return p::SyncError::StorageBusy;
+    }
     error
         .downcast_ref::<p::SyncError>()
         .cloned()
         .unwrap_or_else(|| p::SyncError::Storage(format!("{error:#}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::{
+        ConnectionTrait, SqlxSqliteConnector,
+        sqlx::{SqlitePool, sqlite::SqliteConnectOptions},
+    };
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn sqlite_busy_db_error_converts_to_typed_sync_error() {
+        let path = std::env::temp_dir().join(format!("sync-busy-{}.db", uuid::Uuid::new_v4()));
+        let lock_pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .busy_timeout(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        let test_pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .busy_timeout(Duration::from_millis(1)),
+        )
+        .await
+        .unwrap();
+        let lock = SqlxSqliteConnector::from_sqlx_sqlite_pool(lock_pool);
+        let under_test = SqlxSqliteConnector::from_sqlx_sqlite_pool(test_pool);
+        lock.execute_unprepared("CREATE TABLE writes (value INTEGER)")
+            .await
+            .unwrap();
+        lock.execute_unprepared("BEGIN IMMEDIATE").await.unwrap();
+        let db_error = under_test
+            .execute_unprepared("INSERT INTO writes VALUES (1)")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            super::error(anyhow::Error::new(db_error)),
+            sync::SyncError::StorageBusy
+        );
+        drop(lock);
+        drop(under_test);
+        let _ = std::fs::remove_file(path);
+    }
 }
 fn now() -> u64 {
     std::cmp::max(chrono::Utc::now().timestamp_millis(), 0) as u64
@@ -203,7 +256,8 @@ impl<M: p::SyncModel> p::SnapshotSource<M> for CausalEndpoint<M> {
                     }
                     let tx = self.inner.store.connection().begin().await?;
                     crate::causal_leases::lock_on(&tx, self.inner.store.namespace()).await?;
-                    let step = crate::causal_source::open_batch_step_on(
+                    let transaction_started = Instant::now();
+                    let step = open_batch_step_locked_on(
                         &tx,
                         self.inner.store.identity_on(&tx).await?,
                         request_id,
@@ -218,6 +272,9 @@ impl<M: p::SyncModel> p::SnapshotSource<M> for CausalEndpoint<M> {
                     .await?;
                     SourceRequestBudget::validate_charge(reserved, step.charged)?;
                     tx.commit().await?;
+                    if let Some(observer) = &self.lock_holder_observer {
+                        observer("open_batch_step_on", transaction_started.elapsed());
+                    }
                     budget.release_unused(reserved, step.charged);
                     plan = step.next;
                     match step.outcome {
@@ -247,19 +304,16 @@ impl<M: p::SyncModel> p::SnapshotSource<M> for CausalEndpoint<M> {
             let limits = source_work(limits)?;
             let result: Result<p::WorkOutcome<p::RangeSummary<M>>> = async {
                 let tx = self.inner.store.connection().begin().await?;
-                crate::causal_leases::lock_on(&tx, self.inner.store.namespace()).await?;
+                lock_on(&tx, self.inner.store.namespace()).await?;
+                let transaction_started = Instant::now();
                 let ns = self.inner.store.namespace();
-                let value = crate::causal_source::summarize_on(
-                    &tx,
-                    ns,
-                    snapshot,
-                    range,
-                    now() as i64,
-                    limits,
-                    resume,
-                )
-                .await?;
+                let value =
+                    summarize_locked_on(&tx, ns, snapshot, range, now() as i64, limits, resume)
+                        .await?;
                 tx.commit().await?;
+                if let Some(observer) = &self.lock_holder_observer {
+                    observer("summarize_on", transaction_started.elapsed());
+                }
                 Ok(value)
             }
             .await;
@@ -277,19 +331,15 @@ impl<M: p::SyncModel> p::SnapshotSource<M> for CausalEndpoint<M> {
             let limits = source_work(limits)?;
             let result: Result<p::WorkOutcome<Vec<p::KeyRange<M>>>> = async {
                 let tx = self.inner.store.connection().begin().await?;
-                crate::causal_leases::lock_on(&tx, self.inner.store.namespace()).await?;
+                lock_on(&tx, self.inner.store.namespace()).await?;
+                let transaction_started = Instant::now();
                 let ns = self.inner.store.namespace();
-                let value = crate::causal_source::split_on(
-                    &tx,
-                    ns,
-                    snapshot,
-                    range,
-                    now() as i64,
-                    limits,
-                    resume,
-                )
-                .await?;
+                let value =
+                    split_locked_on(&tx, ns, snapshot, range, now() as i64, limits, resume).await?;
                 tx.commit().await?;
+                if let Some(observer) = &self.lock_holder_observer {
+                    observer("split_on", transaction_started.elapsed());
+                }
                 Ok(value)
             }
             .await;
@@ -368,12 +418,21 @@ impl<M: p::SyncModel> CausalEndpoint<M> {
                 receiver: Mutex::new(p::ReceiverLedger::new()),
             }),
             notify: Arc::new(|| {}),
+            lock_holder_observer: None,
         }
     }
     /// Shares the replica, writer and receive ledger; only its post-commit
     /// notification target changes. No notification runs inside a transaction.
     pub fn with_notification(mut self, notify: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.notify = notify;
+        self
+    }
+    /// Observe source transactions from their first lock attempt through commit.
+    pub fn with_lock_holder_observer(
+        mut self,
+        observer: Arc<dyn Fn(&'static str, Duration) + Send + Sync>,
+    ) -> Self {
+        self.lock_holder_observer = Some(observer);
         self
     }
     pub fn store(&self) -> CausalReplica<M> {
@@ -600,7 +659,11 @@ impl<M: p::SyncModel> p::ReceiveStore<M> for CausalEndpoint<M> {
                     source_generation: page.request.source.generation,
                     scope_id: p::scope_id(&page.request.scope)?,
                 };
-                let result = self.inner.store.apply_page_on(&tx, page, limits).await?;
+                let result = self
+                    .inner
+                    .store
+                    .apply_page_locked_on(&tx, page, limits)
+                    .await?;
                 self.project_with_budget_on(
                     &tx,
                     &result.projection,
@@ -609,7 +672,7 @@ impl<M: p::SyncModel> p::ReceiveStore<M> for CausalEndpoint<M> {
                 )
                 .await?;
                 if page.done && result.progress == page.request.through {
-                    causal_progress::finish_session_on::<M>(
+                    causal_progress::finish_session_locked_on::<M>(
                         &tx,
                         self.inner.store.namespace(),
                         &key,
@@ -712,7 +775,7 @@ impl<M: p::SyncModel> p::ReceiveStore<M> for CausalEndpoint<M> {
                 let result = self
                     .inner
                     .store
-                    .apply_staged_event_on(&tx, &input, limits)
+                    .apply_staged_event_locked_on(&tx, &input, limits)
                     .await?;
                 self.project_with_budget_on(
                     &tx,
@@ -722,7 +785,7 @@ impl<M: p::SyncModel> p::ReceiveStore<M> for CausalEndpoint<M> {
                 )
                 .await?;
                 if result.progress == request.through {
-                    causal_progress::finish_session_on::<M>(
+                    causal_progress::finish_session_locked_on::<M>(
                         &tx,
                         self.inner.store.namespace(),
                         &key,
@@ -757,7 +820,7 @@ impl<M: p::SyncModel> p::ReceiveStore<M> for CausalEndpoint<M> {
             async {
                 let tx = self.inner.store.connection().begin().await?;
                 crate::causal_leases::lock_on(&tx, self.inner.store.namespace()).await?;
-                causal_progress::finish_session_on::<M>(
+                causal_progress::finish_session_locked_on::<M>(
                     &tx,
                     self.inner.store.namespace(),
                     &key,
@@ -830,7 +893,7 @@ impl<M: p::SyncModel> p::SyncStore<M> for CausalEndpoint<M> {
                 let command = self
                     .inner
                     .store
-                    .write_observed_on(&tx, key, value, observed)
+                    .write_observed_locked_on(&tx, key, value, observed)
                     .await?;
                 let after = causal_progress::head_on(&tx, self.inner.store.namespace()).await?;
                 let batch = p::ProjectionBatch {
@@ -1050,7 +1113,7 @@ impl<M: p::SyncModel> p::SnapshotSink<M> for CausalEndpoint<M> {
                     Some(delta) => {
                         self.inner
                             .store
-                            .apply_merge_on(&tx, &delta, limits, &mut budget)
+                            .apply_merge_locked_on(&tx, &delta, limits, &mut budget)
                             .await?
                             .1
                     }
@@ -1166,7 +1229,7 @@ impl<M: p::SyncModel> p::SnapshotSink<M> for CausalEndpoint<M> {
                 } else {
                     self.inner
                         .store
-                        .apply_merge_on(
+                        .apply_merge_locked_on(
                             &tx,
                             &p::MergeDelta {
                                 collection,

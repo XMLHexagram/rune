@@ -327,8 +327,8 @@ impl RendererLink {
             if !reader_local_detach.load(Ordering::Acquire)
                 && let Some(node) = weak_node.upgrade()
             {
-                node.renderer_link_lost(id, classify_remote_loss(close_code), detail)
-                    .await;
+                warn!("Renderer link closed (code {close_code:?}): {detail}");
+                node.renderer_link_lost(id).await;
             }
         });
         Self {
@@ -390,8 +390,8 @@ impl RendererLink {
 
     async fn report_send_failure(&self, detail: String) {
         if let Some(node) = self.node.upgrade() {
-            node.renderer_link_lost(self.id, RemoteLossKind::NetworkLost, detail)
-                .await;
+            warn!("{detail}");
+            node.renderer_link_lost(self.id).await;
         }
     }
 
@@ -652,6 +652,7 @@ fn dispatch_remote_failure(payload: &[u8]) {
             let kind = failure.kind;
             RequestFailedResponse {
                 request: failure.request,
+                call_id: failure.call_id,
                 kind,
                 detail: failure.detail,
                 cause: failure.cause,
@@ -935,6 +936,7 @@ pub async fn server_player_loop(
                         let kind = failure.kind;
                         RequestFailedResponse {
                             request: failure.request,
+                            call_id: failure.call_id,
                             kind,
                             detail: failure.detail,
                             cause: failure.cause,
@@ -1012,6 +1014,7 @@ mod loss_tests {
         let failure = RemoteRequestFailed {
             kind: RequestErrorKind::Internal,
             request: "ExampleRequest".into(),
+            call_id: None,
             detail: "outer: inner".into(),
             cause: None,
         };

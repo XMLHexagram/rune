@@ -2,6 +2,7 @@ use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
 
 use super::CastLibraryState;
+use crate::CallIdentified;
 
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SystemInfoRequest {}
@@ -37,17 +38,50 @@ pub enum RequestErrorKind {
 
 #[derive(Deserialize, Serialize, SignalPiece, Clone, Debug, PartialEq, Eq)]
 pub enum RequestFailureCause {
+    StorageBusy,
     CastNotPossible {
         library_id: String,
         state: CastLibraryState,
     },
+    CertificateMismatch,
 }
 
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct RequestFailedResponse {
     pub request: String,
+    #[serde(default)]
+    pub call_id: Option<u64>,
     pub kind: RequestErrorKind,
     pub detail: String,
     #[serde(default)]
     pub cause: Option<RequestFailureCause>,
+}
+
+impl RequestFailedResponse {
+    pub fn for_request<T: crate::CallIdentified>(
+        request: &T,
+        request_name: &str,
+        kind: RequestErrorKind,
+        detail: String,
+        cause: Option<RequestFailureCause>,
+    ) -> Self {
+        Self {
+            request: request_name.to_owned(),
+            call_id: CallIdentified::call_id(request),
+            kind,
+            detail,
+            cause,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{CallIdentified, messages::*};
+
+    #[test]
+    fn requests_without_call_ids_use_the_default() {
+        let request = SystemInfoRequest {};
+        assert_eq!(CallIdentified::call_id(&request), None);
+    }
 }

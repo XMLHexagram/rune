@@ -1363,7 +1363,9 @@
   "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
   "requestItemMissing": "此項已不存",
   "requestInvalid": "所請有誤",
+  "requestCertificateMismatch": "此設備的憑證不相符",
   "requestUnavailable": "今不可用",
+  "requestStorageBusy": "儲存空間正忙，請再試。",
   "mixNoLongerExists": "此輯已不存",
   "devices": "裝置",
   "playOn": "播音於",
@@ -1411,5 +1413,7 @@
   "queueUnavailableAccessRevoked": "存取權已撤銷",
   "queueUnavailableLibraryUnavailable": "資料庫無法使用",
   "queueUnavailableSourceUnreachable": "無法連線至來源",
-  "queueUnavailableUnreadable": "無法讀取音訊"
+  "queueUnavailableUnreadable": "無法讀取音訊",
+  "rendererLinkLost": "與 {alias} 之連線已失",
+  "@rendererLinkLost": {"placeholders": {"alias": {"type": "String"}}}
 }

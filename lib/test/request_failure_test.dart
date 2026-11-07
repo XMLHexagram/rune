@@ -101,6 +101,31 @@ void main() {
     expect(message(RequestErrorKind.internal), s.unknownError);
   });
 
+  test('storage busy cause has its localized retry message', () {
+    final s = AppLocalizationsEn();
+    const failure = RequestFailure(
+      'Wanted',
+      RequestErrorKind.unavailable,
+      'locked',
+      RequestFailureCauseStorageBusy(),
+    );
+    expect(requestFailureMessage(s, failure), 'Storage is busy. Try again.');
+  });
+
+  test('certificate mismatch has its localized message', () {
+    final s = AppLocalizationsEn();
+    const failure = RequestFailure(
+      'AddTrustedServerRequest',
+      RequestErrorKind.invalidInput,
+      'mismatch',
+      RequestFailureCauseCertificateMismatch(),
+    );
+    expect(
+      requestFailureMessage(s, failure),
+      "This device's certificate does not match",
+    );
+  });
+
   test('error text localizes request failures and preserves other errors', () {
     final s = AppLocalizationsEn();
     expect(

@@ -1400,7 +1400,9 @@
   "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
   "requestItemMissing": "この項目はもう存在しません",
   "requestInvalid": "リクエストが無効でした",
+  "requestCertificateMismatch": "このデバイスの証明書が一致しません",
   "requestUnavailable": "現在利用できません",
+  "requestStorageBusy": "ストレージが使用中です。もう一度お試しください。",
   "mixNoLongerExists": "このミックスはもう存在しません",
   "devices": "デバイス",
   "playOn": "再生先",
@@ -1448,5 +1450,7 @@
   "queueUnavailableAccessRevoked": "アクセスが取り消されました",
   "queueUnavailableLibraryUnavailable": "ライブラリを利用できません",
   "queueUnavailableSourceUnreachable": "ソースに接続できません",
-  "queueUnavailableUnreadable": "音声を読み取れません"
+  "queueUnavailableUnreadable": "音声を読み取れません",
+  "rendererLinkLost": "{alias} との接続が失われました",
+  "@rendererLinkLost": {"placeholders": {"alias": {"type": "String"}}}
 }

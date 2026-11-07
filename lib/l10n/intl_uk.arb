@@ -1400,7 +1400,9 @@
   "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
   "requestItemMissing": "Цього елемента більше не існує",
   "requestInvalid": "Запит був недійсним",
+  "requestCertificateMismatch": "Сертифікат цього пристрою не збігається",
   "requestUnavailable": "Зараз це недоступно",
+  "requestStorageBusy": "Сховище зайняте. Спробуйте ще раз.",
   "mixNoLongerExists": "Цього міксу більше не існує",
   "devices": "Пристрої",
   "playOn": "Відтворювати на",
@@ -1448,5 +1450,7 @@
   "queueUnavailableAccessRevoked": "Доступ відкликано",
   "queueUnavailableLibraryUnavailable": "Бібліотека недоступна",
   "queueUnavailableSourceUnreachable": "Не вдалося підключитися до джерела",
-  "queueUnavailableUnreadable": "Не вдалося прочитати аудіо"
+  "queueUnavailableUnreadable": "Не вдалося прочитати аудіо",
+  "rendererLinkLost": "З’єднання з {alias} втрачено",
+  "@rendererLinkLost": {"placeholders": {"alias": {"type": "String"}}}
 }

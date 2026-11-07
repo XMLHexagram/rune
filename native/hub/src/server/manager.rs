@@ -1,6 +1,6 @@
 use super::libraries::{cast_preflight, peer_access};
 use super::sync_auth::SyncAuth;
-use super::sync_worker::{invalidate_sync_token, wait_for_revocation};
+use super::sync_worker::{authenticated_client, send_authenticated_request, wait_for_revocation};
 use crate::backends::remote::{RemoteConnectError, token_error};
 use database::actions::file::catalog_track;
 use database::sync::model::RuneModel;
@@ -575,7 +575,23 @@ impl ServerManager {
                 let trusted_host = endpoint.trusted_host;
                 let port = endpoint.port;
                 let result = async {
-                    let (base, mut client) = super::sync_worker::authenticated_client(
+                    // Check access first: it renews a cached token the peer no longer knows.
+                    let response = send_authenticated_request(
+                        &node,
+                        &own,
+                        &self.private_key,
+                        &fingerprint,
+                        &host,
+                        port,
+                        |base, client| {
+                            client
+                                .head(format!("{}/sync/blobs/{}", super::sync::library_base(base, library_id), blob.digest))
+                                .query(&[("track_id", track_id.to_string())])
+                        },
+                    )
+                    .await
+                    .map_err(RemoteAudioError::unreachable)?;
+                    let (base, client) = authenticated_client(
                         &node,
                         &own,
                         &self.private_key,
@@ -594,17 +610,6 @@ impl ServerManager {
                     );
                     let url = format!("{base}/sync/blobs/{}", blob.digest);
                     let access_url = format!("{url}?track_id={track_id}");
-                    let mut response = client.head(&url).query(&[("track_id", track_id.to_string())]).send().await
-                        .map_err(RemoteAudioError::unreachable)?;
-                    if matches!(response.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND) {
-                        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-                            invalidate_sync_token(&node, &fingerprint, &host, port);
-                        }
-                        let (_, renewed) = super::sync_worker::authenticated_client(&node, &own, &self.private_key, &fingerprint, &host, port).await?;
-                        client = renewed;
-                        response = client.head(&url).query(&[("track_id", track_id.to_string())]).send().await
-                            .map_err(RemoteAudioError::unreachable)?;
-                    }
                     if matches!(response.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND) {
                         lifetime.cancel();
                         anyhow::bail!(RemoteAudioError::AccessRevoked);
@@ -919,8 +924,13 @@ mod lifecycle_tests {
 
     use crate::backends::remote::{connect_remote, decode_message};
     use crate::library_pool::{LibraryHandle, LibraryPool};
-    use crate::messages::{PlaybackStatus, TrustListUpdated};
+    use crate::messages::{
+        PlaybackStatus, RequestErrorKind, RequestFailureCause, TrustListUpdated,
+        TrustedServerCertificate,
+    };
     use crate::node::NodeSlot;
+    use crate::request_error::request_failure_cause;
+    use crate::server::api::{add_trusted_server, edit_trusted_hosts};
     use crate::server::sync::client::sync_library;
     use database::sync::model::RuneModel;
     use futures::StreamExt;
@@ -1177,6 +1187,160 @@ mod lifecycle_tests {
 
     async fn info(manager: &Fixture) -> Result<discovery::utils::DeviceInfo> {
         load_device_info(Path::new(&*manager.global_params.config_path)).await
+    }
+
+    async fn start_test_tls_server(fixture: &Fixture) -> Result<(SocketAddr, String)> {
+        let device_info = info(fixture).await?;
+        fixture
+            .manager
+            .clone()
+            .start(([127, 0, 0, 1], 0).into(), DiscoveryParams { device_info })
+            .await?;
+        let address = fixture
+            .manager
+            .get_address()
+            .await
+            .context("server address")?;
+        Ok((address, info(fixture).await?.fingerprint))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn add_trusted_server_accepts_matching_certificate_and_stores_host() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server = fixture(server_dir.path()).await?;
+        let client = fixture(client_dir.path()).await?;
+        let (address, fingerprint) = start_test_tls_server(&server).await?;
+        let validator = client.global_params.cert_validator.read().await.clone();
+        let host = format!("127.0.0.1:{}", address.port());
+        let unreachable_host = "127.0.0.1:1".to_owned();
+
+        add_trusted_server(
+            &validator,
+            Some(&TrustedServerCertificate {
+                fingerprint: fingerprint.clone(),
+                hosts: vec![unreachable_host.clone(), host.clone()],
+            }),
+        )
+        .await?;
+
+        let stored_hosts = validator.get_hosts_for_fingerprint(&fingerprint).await;
+        assert!(stored_hosts.contains(&host));
+        assert!(stored_hosts.contains(&unreachable_host));
+        server.manager.stop().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn add_trusted_server_rejects_mismatch_with_typed_failure() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server = fixture(server_dir.path()).await?;
+        let client = fixture(client_dir.path()).await?;
+        let (address, _) = start_test_tls_server(&server).await?;
+        let validator = client.global_params.cert_validator.read().await.clone();
+        let host = format!("127.0.0.1:{}", address.port());
+        let error = add_trusted_server(
+            &validator,
+            Some(&TrustedServerCertificate {
+                fingerprint: "different fingerprint".into(),
+                hosts: vec![host],
+            }),
+        )
+        .await
+        .expect_err("mismatched certificate must be refused");
+
+        assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
+        assert_eq!(
+            request_failure_cause(&error),
+            Some(RequestFailureCause::CertificateMismatch)
+        );
+        assert!(validator.list_trusted_fingerprints().await.is_empty());
+        server.manager.stop().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_trusted_server_rejects_missing_certificate_as_invalid_input() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let client = fixture(dir.path()).await?;
+        let validator = client.global_params.cert_validator.read().await.clone();
+        let error = add_trusted_server(&validator, None)
+            .await
+            .expect_err("missing certificate must be refused");
+        assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_trusted_server_rejects_when_no_host_is_reachable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let client = fixture(dir.path()).await?;
+        let validator = client.global_params.cert_validator.read().await.clone();
+        let error = add_trusted_server(
+            &validator,
+            Some(&TrustedServerCertificate {
+                fingerprint: "expected fingerprint".into(),
+                hosts: vec!["127.0.0.1:1".into()],
+            }),
+        )
+        .await
+        .expect_err("unreachable hosts must be refused");
+        assert_eq!(classify(&error), RequestErrorKind::Unavailable);
+        assert!(validator.list_trusted_fingerprints().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn edit_hosts_refuses_untrusted_fingerprint() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let client = fixture(dir.path()).await?;
+        let validator = client.global_params.cert_validator.read().await.clone();
+        let error = edit_trusted_hosts(&validator, "unknown fingerprint", vec![])
+            .await
+            .expect_err("untrusted fingerprint must be refused");
+        assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
+        assert!(validator.list_trusted_fingerprints().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn edit_hosts_refuses_host_with_different_certificate() -> Result<()> {
+        let trusted_dir = tempfile::tempdir()?;
+        let other_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let trusted = fixture(trusted_dir.path()).await?;
+        let other = fixture(other_dir.path()).await?;
+        let client = fixture(client_dir.path()).await?;
+        let (trusted_address, trusted_fingerprint) = start_test_tls_server(&trusted).await?;
+        let (other_address, _) = start_test_tls_server(&other).await?;
+        let validator = client.global_params.cert_validator.read().await.clone();
+        let original_host = format!("127.0.0.1:{}", trusted_address.port());
+        validator
+            .add_trusted_domains([original_host.clone()], &trusted_fingerprint)
+            .await?;
+        let error = edit_trusted_hosts(
+            &validator,
+            &trusted_fingerprint,
+            vec![format!("127.0.0.1:{}", other_address.port())],
+        )
+        .await
+        .expect_err("different certificate must be refused");
+
+        assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
+        assert_eq!(
+            request_failure_cause(&error),
+            Some(RequestFailureCause::CertificateMismatch)
+        );
+        assert_eq!(
+            validator
+                .get_hosts_for_fingerprint(&trusted_fingerprint)
+                .await,
+            [original_host]
+        );
+        trusted.manager.stop().await?;
+        other.manager.stop().await?;
+        Ok(())
     }
 
     /// Deliver a discovery announcement for `info` at `addr` to `receiver`,
@@ -1567,6 +1731,75 @@ mod lifecycle_tests {
             )
             .await?;
         a.get_address().await.context("missing listener address")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_connection_keeps_frame_order() -> Result<()> {
+        use crate::backends::remote::encode_message;
+        use crate::server::register_gated_handler;
+        use futures::SinkExt;
+        use std::time::Duration;
+        use tokio::sync::Notify;
+        use tokio::time::timeout;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let renderer_dir = tempfile::tempdir()?;
+        let controller_dir = tempfile::tempdir()?;
+        let renderer = fixture(renderer_dir.path()).await?;
+        let controller = fixture(controller_dir.path()).await?;
+        let service = &renderer.global_params.node.websocket_service;
+        let (first_entered, release_first) = register_gated_handler(service, "OrderFirst").await;
+        let second_entered = Arc::new(Notify::new());
+        let second_entered_handler = second_entered.clone();
+        service
+            .register_handler("OrderSecond", move |_, _, _| {
+                let entered = second_entered_handler.clone();
+                async move {
+                    entered.notify_one();
+                    ("OrderSecondResponse".into(), Ok(Vec::new()))
+                }
+            })
+            .await;
+
+        let addr = paired_full(&renderer, &controller).await?;
+        let mut socket = connect_remote(
+            "127.0.0.1",
+            addr.port(),
+            &controller.global_params.config_path,
+            controller.global_params.cert_validator.read().await.clone(),
+            &controller.global_params.node.sync_tokens,
+        )
+        .await?;
+        socket
+            .send(Message::Binary(
+                encode_message("OrderFirst", &[], Some(Uuid::new_v4())).into(),
+            ))
+            .await?;
+        socket
+            .send(Message::Binary(
+                encode_message("OrderSecond", &[], Some(Uuid::new_v4())).into(),
+            ))
+            .await?;
+
+        timeout(Duration::from_secs(2), first_entered.notified())
+            .await
+            .context("first handler did not enter")?;
+        assert!(
+            timeout(Duration::from_millis(200), second_entered.notified())
+                .await
+                .is_err(),
+            "second frame ran before the first handler finished"
+        );
+
+        release_first.notify_one();
+        timeout(Duration::from_secs(2), second_entered.notified())
+            .await
+            .context("second handler did not enter after the first completed")?;
+
+        drop(socket);
+        renderer.global_params.node.shutdown().await?;
+        controller.global_params.node.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3506,6 +3739,14 @@ mod lifecycle_tests {
             Ok(())
         })
         .await?;
+        // A's background sync may have fetched a fresh token while B's were
+        // expired above; drop it so the stream itself has to renew.
+        sync_worker::invalidate_sync_token(
+            &a.global_params.node,
+            &b_info.fingerprint,
+            "127.0.0.2",
+            b_addr.port(),
+        );
         let renewed_ranges = tokio::join!(
             peer_step("first concurrent renewed ranged audio GET", async {
                 let response = source.request.get(Some((0, Some(15)))).await?;
@@ -3603,24 +3844,22 @@ mod lifecycle_tests {
             Ok(())
         })
         .await?;
-        let (_, raw_client) = peer_step("authenticate raw audio client", async {
-            authenticated_client(
+        // Blocking dropped A's token on B, so this renews it once on 401.
+        let suffix_bytes = peer_step("raw suffix audio GET", async {
+            let suffix = send_authenticated_request(
                 &a.global_params.node,
                 &a_info.fingerprint,
                 &a.private_key,
                 &b_info.fingerprint,
                 "127.0.0.2",
                 b_addr.port(),
+                |_, client| {
+                    client
+                        .get(&source.url)
+                        .header(reqwest::header::RANGE, "bytes=-12")
+                },
             )
-            .await
-        })
-        .await?;
-        let suffix_bytes = peer_step("raw suffix audio GET", async {
-            let suffix = raw_client
-                .get(&source.url)
-                .header(reqwest::header::RANGE, "bytes=-12")
-                .send()
-                .await?;
+            .await?;
             anyhow::ensure!(
                 suffix.status() == reqwest::StatusCode::PARTIAL_CONTENT,
                 "suffix audio GET status"
@@ -3630,11 +3869,20 @@ mod lifecycle_tests {
         .await?;
         assert_eq!(suffix_bytes.as_ref(), &expected[expected.len() - 12..]);
         let invalid = peer_step("invalid range audio GET", async {
-            Ok(raw_client
-                .get(&source.url)
-                .header(reqwest::header::RANGE, format!("bytes={}-", expected.len()))
-                .send()
-                .await?)
+            send_authenticated_request(
+                &a.global_params.node,
+                &a_info.fingerprint,
+                &a.private_key,
+                &b_info.fingerprint,
+                "127.0.0.2",
+                b_addr.port(),
+                |_, client| {
+                    client
+                        .get(&source.url)
+                        .header(reqwest::header::RANGE, format!("bytes={}-", expected.len()))
+                },
+            )
+            .await
         })
         .await?;
         assert_eq!(invalid.status(), reqwest::StatusCode::RANGE_NOT_SATISFIABLE);

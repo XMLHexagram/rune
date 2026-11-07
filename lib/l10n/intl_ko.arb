@@ -1402,7 +1402,9 @@
   "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
   "requestItemMissing": "이 항목이 더 이상 존재하지 않습니다",
   "requestInvalid": "요청이 유효하지 않습니다",
+  "requestCertificateMismatch": "이 기기의 인증서가 일치하지 않습니다",
   "requestUnavailable": "지금은 사용할 수 없습니다",
+  "requestStorageBusy": "저장소가 사용 중입니다. 다시 시도해 주세요.",
   "mixNoLongerExists": "이 믹스가 더 이상 존재하지 않습니다",
   "devices": "기기",
   "playOn": "재생 위치",
@@ -1450,5 +1452,7 @@
   "queueUnavailableAccessRevoked": "접근 권한이 취소되었습니다",
   "queueUnavailableLibraryUnavailable": "라이브러리를 사용할 수 없습니다",
   "queueUnavailableSourceUnreachable": "소스에 연결할 수 없습니다",
-  "queueUnavailableUnreadable": "오디오를 읽을 수 없습니다"
+  "queueUnavailableUnreadable": "오디오를 읽을 수 없습니다",
+  "rendererLinkLost": "{alias} 연결이 끊겼습니다",
+  "@rendererLinkLost": {"placeholders": {"alias": {"type": "String"}}}
 }

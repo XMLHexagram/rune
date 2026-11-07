@@ -1471,7 +1471,9 @@
   "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
   "requestItemMissing": "此项目已不存在",
   "requestInvalid": "请求无效",
+  "requestCertificateMismatch": "此设备的证书不匹配",
   "requestUnavailable": "目前无法使用",
+  "requestStorageBusy": "存储空间正忙，请重试。",
   "mixNoLongerExists": "此混音已不存在",
   "devices": "裝置",
   "playOn": "播放设备",
@@ -1519,5 +1521,7 @@
   "queueUnavailableAccessRevoked": "存取權已撤銷",
   "queueUnavailableLibraryUnavailable": "資料庫無法使用",
   "queueUnavailableSourceUnreachable": "無法連線至來源",
-  "queueUnavailableUnreadable": "無法讀取音訊"
+  "queueUnavailableUnreadable": "無法讀取音訊",
+  "rendererLinkLost": "与 {alias} 的连接已断开",
+  "@rendererLinkLost": {"placeholders": {"alias": {"type": "String"}}}
 }

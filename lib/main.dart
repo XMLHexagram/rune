@@ -36,6 +36,7 @@ import 'utils/storage_key_manager.dart';
 import 'utils/api/set_adaptive_switching_enabled.dart';
 import 'utils/api/set_mix_with_others.dart';
 import 'utils/api/operate_playback_with_mix_query.dart';
+import 'utils/start_cafe_playback_after_open.dart';
 import 'utils/file_storage/mac_secure_manager.dart';
 import 'utils/macos_window_control_button_manager.dart';
 
@@ -81,6 +82,7 @@ import 'providers/linux_custom_window_controls.dart';
 import 'providers/playback_controller.dart';
 import 'providers/controllers.dart';
 import 'providers/renderer_attachment.dart';
+import 'providers/renderer_link_loss.dart';
 import 'providers/responsive_providers.dart';
 
 import 'theme.dart';
@@ -554,6 +556,7 @@ class RuneLifecycleState extends State<RuneLifecycle> {
   Timer? _throttleTimer;
   bool _shouldCallUpdate = false;
   late final RemoteConnectionLossHandler _remoteLoss;
+  late final RendererLinkLossHandler _rendererLinkLoss;
 
   @override
   void initState() {
@@ -576,25 +579,41 @@ class RuneLifecycleState extends State<RuneLifecycle> {
         });
       },
     );
+    _rendererLinkLoss = RendererLinkLossHandler(
+      losses: RendererLinkLost.rustSignalStream.map((signal) => signal.message),
+      showNotice: (alias) {
+        final context = rootNavigatorKey.currentState?.overlay?.context;
+        if (context == null || !context.mounted) return;
+        displayInfoBar(
+          context,
+          builder: (_, close) => InfoBar(
+            title: Text(S.of(context).rendererLinkLost(alias)),
+            severity: InfoBarSeverity.warning,
+            onClose: close,
+          ),
+        );
+      },
+    );
 
     if (cafeMode && initialPath != null) {
-      Future.delayed(
-        Duration(seconds: disableBrandingAnimation == true ? 1 : 4),
-      ).then((_) {
-        operatePlaybackWithMixQuery(
-          queries: const QueryList([
-            ("lib::random", "1"),
-            ("filter::analyzed", "true"),
-            ("pipe::recommend", "-1"),
-          ]),
-          playbackMode: 99,
-          hintPosition: -1,
-          initialPlaybackId: -1,
-          instantlyPlay: true,
-          operateMode: PlaylistOperateMode.replace,
-          fallbackPlayingItems: [],
-        );
-      });
+      unawaited(
+        startCafePlaybackAfterOpen(
+          libraryOpened: context.read<LibraryPathProvider>().initialOpen,
+          play: () => operatePlaybackWithMixQuery(
+            queries: const QueryList([
+              ("lib::random", "1"),
+              ("filter::analyzed", "true"),
+              ("pipe::recommend", "-1"),
+            ]),
+            playbackMode: 99,
+            hintPosition: -1,
+            initialPlaybackId: -1,
+            instantlyPlay: true,
+            operateMode: PlaylistOperateMode.replace,
+            fallbackPlayingItems: [],
+          ).then((_) {}),
+        ),
+      );
     }
   }
 
@@ -619,6 +638,7 @@ class RuneLifecycleState extends State<RuneLifecycle> {
     super.dispose();
 
     _remoteLoss.dispose();
+    _rendererLinkLoss.dispose();
     license.removeListener(_updateLicense);
     status.removeListener(_throttleUpdateTray);
     $router.removeListener(_throttleUpdateTray);

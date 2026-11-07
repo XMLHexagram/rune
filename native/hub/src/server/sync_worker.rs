@@ -73,6 +73,11 @@ struct StoredSyncToken {
 }
 
 impl SyncTokenStore {
+    #[cfg(test)]
+    pub(crate) fn insert_stale_for_test(&self, fingerprint: &str, base: &str) {
+        self.insert(fingerprint, base, "unknown-to-peer".to_owned());
+    }
+
     /// Serializes authorization per peer endpoint, so concurrent passes against one
     /// peer share a single challenge round trip while other peers are not blocked.
     fn authorization_lock(&self, fingerprint: &str, base: &str) -> Arc<Mutex<()>> {
@@ -449,7 +454,7 @@ async fn run_loop(
                     _ = cancel.cancelled() => return (key, Duration::from_secs(30), false),
                     _ = wait_for_revocation(Arc::downgrade(&global), &endpoint.fingerprint, &endpoint.trusted_host) => Err(anyhow::anyhow!("peer permission revoked")),
                     result = async {
-                        let options = PassOptions { credentials: &credentials, metadata, locks: &locks };
+                        let options = PassOptions { credentials: &credentials, metadata, locks: &locks, cancel: &cancel };
                         let operation = sync_one(&global, &library, &notify, &endpoint, options);
                         if metadata {
                             tokio::time::timeout(Duration::from_secs(60), operation).await.map_err(|_| anyhow::anyhow!("peer operation timed out"))?
@@ -716,6 +721,7 @@ impl TestPeerSession {
                     credentials: &credentials,
                     metadata,
                     locks: &self.locks,
+                    cancel: &params.node.token,
                 },
             )
             .await,
@@ -739,6 +745,7 @@ struct PassOptions<'a> {
     credentials: &'a LocalCredentials,
     metadata: bool,
     locks: &'a ReplicaLocks,
+    cancel: &'a tokio_util::sync::CancellationToken,
 }
 
 async fn sync_one(
@@ -752,6 +759,7 @@ async fn sync_one(
         credentials,
         metadata,
         locks,
+        cancel,
     } = options;
     if metadata {
         let lock = {
@@ -831,6 +839,7 @@ async fn sync_one(
                 global,
                 fingerprint: &endpoint.fingerprint,
                 may_receive,
+                cancel,
             };
             let operation = metadata_pass(target, library, notify, &mut state, &base, &client);
             let result = tokio::select! {
@@ -915,6 +924,7 @@ struct MetadataTarget<'a> {
     global: &'a NodeContext,
     fingerprint: &'a str,
     may_receive: bool,
+    cancel: &'a tokio_util::sync::CancellationToken,
 }
 
 async fn metadata_pass(
@@ -929,6 +939,7 @@ async fn metadata_pass(
         global,
         fingerprint,
         may_receive,
+        cancel,
     } = target;
     let local = library.library_sync.identity().await?;
     let listings: Vec<ListedLibrary> = client
@@ -1027,7 +1038,7 @@ async fn metadata_pass(
         .session
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("missing metadata session"))?
-        .advance(&peer, notify.clone())
+        .advance_cancellable(&peer, notify.clone(), cancel)
         .await;
     let complete = match result {
         Ok(complete) => complete,
@@ -1132,6 +1143,33 @@ pub(super) async fn authenticated_client(
         .redirect(Policy::none())
         .build()?;
     Ok((base, client))
+}
+
+/// Send one authenticated peer request, renewing a cached token once if the
+/// peer no longer recognizes it.
+pub(super) async fn send_authenticated_request<F>(
+    global: &NodeContext,
+    own: &str,
+    private_key: &str,
+    fingerprint: &str,
+    host: &str,
+    peer_port: u16,
+    request: F,
+) -> Result<reqwest::Response>
+where
+    F: Fn(&str, &reqwest::Client) -> reqwest::RequestBuilder,
+{
+    let (base, client) =
+        authenticated_client(global, own, private_key, fingerprint, host, peer_port).await?;
+    let response = request(&base, &client).send().await?;
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(response);
+    }
+
+    invalidate_sync_token(global, fingerprint, host, peer_port);
+    let (base, client) =
+        authenticated_client(global, own, private_key, fingerprint, host, peer_port).await?;
+    Ok(request(&base, &client).send().await?)
 }
 
 pub(crate) async fn obtain_or_reuse_token(
