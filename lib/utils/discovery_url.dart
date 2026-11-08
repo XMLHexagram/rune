@@ -1,9 +1,29 @@
-String _encodeIPv4(String ip) {
-  final parts = ip.split('.');
-  if (parts.length != 4) throw FormatException('Invalid IPv4');
+// Leading zeros are ambiguous (octal in some parsers), so they are rejected.
+final _octet = RegExp(r'^(0|[1-9][0-9]{0,2})$');
 
-  final nums = parts.map((p) => int.parse(p)).toList();
-  if (nums.any((n) => n < 0 || n > 255)) throw FormatException('Invalid octet');
+List<int>? _parseOctets(String ip) {
+  final parts = ip.split('.');
+  if (parts.length != 4) return null;
+
+  final nums = <int>[];
+  for (final p in parts) {
+    if (!_octet.hasMatch(p)) return null;
+    final n = int.parse(p);
+    if (n > 255) return null;
+    nums.add(n);
+  }
+  return nums;
+}
+
+/// Returns the trimmed dotted IPv4 literal, or null when [input] is not one.
+String? parseIpv4Host(String input) {
+  final text = input.trim();
+  return _parseOctets(text) == null ? null : text;
+}
+
+String _encodeIPv4(String ip) {
+  final nums = _parseOctets(ip);
+  if (nums == null) throw FormatException('Invalid IPv4');
 
   int num = nums[0] << 24 | nums[1] << 16 | nums[2] << 8 | nums[3];
   final buffer = StringBuffer();

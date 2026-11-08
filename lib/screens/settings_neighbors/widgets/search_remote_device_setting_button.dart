@@ -1,20 +1,12 @@
-import 'package:provider/provider.dart';
 import 'package:fluent_ui/fluent_ui.dart';
 import 'package:material_symbols_icons/symbols.dart';
 
 import '../../../utils/l10n.dart';
-import '../../../utils/api/add_trusted_server.dart';
-import '../../../utils/api/request_failure.dart';
-import '../../../utils/api/register_device_on_server.dart';
-import '../../../utils/dialogs/information/error.dart';
 import '../../../utils/dialogs/information/information.dart';
-import '../../../utils/discovery_url.dart';
 import '../../../widgets/settings/settings_button.dart';
-import '../../../bindings/bindings.dart';
-import '../../../providers/library_path.dart';
 
 import '../utils/show_search_remote_device_dialog.dart';
-import '../utils/show_server_status_dialog.dart';
+import '../utils/pair_remote_device.dart';
 
 class SearchRemoteDeviceSettingButton extends StatelessWidget {
   const SearchRemoteDeviceSettingButton({
@@ -28,8 +20,6 @@ class SearchRemoteDeviceSettingButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final libraryPath =
-        Provider.of<LibraryPathProvider>(context, listen: false);
     final s = S.of(context);
 
     return SettingsButton(
@@ -55,61 +45,12 @@ class SearchRemoteDeviceSettingButton extends StatelessWidget {
           return;
         }
 
-        try {
-          await addTrustedServer(device.fingerprint, device.ips);
-        } catch (e) {
-          if (!context.mounted) return;
-
-          showErrorDialog(
-            context: context,
-            title: s.unknownError,
-            errorMessage: requestErrorText(S.of(context), e),
-          );
-          // Do not register with or open a device we failed to trust.
-          return;
-        }
-
-        try {
-          await registerDeviceOnServer(device.ips, device.fingerprint);
-        } catch (e) {
-          if (!context.mounted) return;
-
-          showErrorDialog(
-            context: context,
-            title: s.unknownError,
-            errorMessage: requestErrorText(S.of(context), e),
-          );
-
-          return;
-        }
-
         if (!context.mounted) return;
-        final serverStatus = await showServerStatusDialog(
+        await pairRemoteDevice(
           context,
-          device.ips,
-          device.fingerprint,
-        );
-
-        if (serverStatus == null) {
-          return;
-        }
-
-        if (!context.mounted) return;
-        if (serverStatus.status == ClientStatus.blocked) {
-          await showErrorDialog(
-            context: context,
-            title: s.clientBlockedTitle,
-            errorMessage: s.clientBlockedMessage,
-          );
-
-          return;
-        }
-
-        if (!context.mounted) return;
-        libraryPath.addLibraryPath(
-          context,
-          '@RR|${encodeRnSrvUrl(device.ips)}',
-          device.alias,
+          fingerprint: device.fingerprint,
+          hosts: device.ips,
+          alias: device.alias,
         );
       },
     );
