@@ -4,22 +4,36 @@ use thiserror::Error as ThisError;
 
 use crate::access_policy::Denial;
 use crate::messages::{CastLibraryState, RequestErrorKind, RequestFailureCause};
+use crate::rpc::UnsupportedReason;
 
 /// Expected failures at the request boundary.
 #[derive(Debug, ThisError)]
 pub enum ExpectedRequestError {
     #[error("{detail}")]
     InvalidInput { detail: String },
+    #[error("reconnecting to {alias}")]
+    Reconnecting { alias: String },
     #[error("{what} unavailable")]
     Unavailable { what: &'static str },
+    #[error("{request} is unsupported by this target: {reason}")]
+    Unsupported {
+        request: &'static str,
+        reason: UnsupportedReason,
+    },
     #[error("A host presented a different certificate")]
     CertificateMismatch,
+    #[error("The submitted public key does not match its fingerprint")]
+    PublicKeyMismatch,
+    #[error("A device with this fingerprint is already registered")]
+    RegistrationConflict,
     #[error("Renderer request failed: {detail}")]
     Remote {
         kind: RequestErrorKind,
         detail: String,
         cause: Option<RequestFailureCause>,
     },
+    #[error("Unexpected response: expected {expected}, received {actual}")]
+    UnexpectedResponse { expected: String, actual: String },
     #[error("Queue changed: expected revision {expected}, current revision {current}")]
     StaleQueueRevision { expected: u64, current: u64 },
     #[error("Cast is not possible for library {library_id}: {state:?}")]
@@ -69,9 +83,14 @@ pub fn classify(error: &Error) -> RequestErrorKind {
         if let Some(expected) = cause.downcast_ref::<ExpectedRequestError>() {
             return match expected {
                 ExpectedRequestError::InvalidInput { .. } => RequestErrorKind::InvalidInput,
-                ExpectedRequestError::Unavailable { .. } => RequestErrorKind::Unavailable,
+                ExpectedRequestError::Unavailable { .. }
+                | ExpectedRequestError::Reconnecting { .. }
+                | ExpectedRequestError::Unsupported { .. } => RequestErrorKind::Unavailable,
                 ExpectedRequestError::CertificateMismatch => RequestErrorKind::InvalidInput,
+                ExpectedRequestError::PublicKeyMismatch => RequestErrorKind::InvalidInput,
+                ExpectedRequestError::RegistrationConflict => RequestErrorKind::Conflict,
                 ExpectedRequestError::Remote { kind, .. } => *kind,
+                ExpectedRequestError::UnexpectedResponse { .. } => RequestErrorKind::Internal,
                 ExpectedRequestError::StaleQueueRevision { .. } => RequestErrorKind::Conflict,
                 ExpectedRequestError::CastNotPossible { state, .. } => match state {
                     CastLibraryState::NotHeld | CastLibraryState::AccessRevoked => {
@@ -100,9 +119,20 @@ pub fn request_failure_cause(error: &Error) -> Option<RequestFailureCause> {
                         state: *state,
                     });
                 }
+                ExpectedRequestError::Reconnecting { alias } => {
+                    return Some(RequestFailureCause::Reconnecting {
+                        alias: alias.clone(),
+                    });
+                }
                 ExpectedRequestError::Remote { cause, .. } => return cause.clone(),
                 ExpectedRequestError::CertificateMismatch => {
                     return Some(RequestFailureCause::CertificateMismatch);
+                }
+                ExpectedRequestError::PublicKeyMismatch => {
+                    return Some(RequestFailureCause::PublicKeyMismatch);
+                }
+                ExpectedRequestError::RegistrationConflict => {
+                    return Some(RequestFailureCause::RegistrationConflict);
                 }
                 _ => {}
             }

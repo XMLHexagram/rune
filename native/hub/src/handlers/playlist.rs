@@ -1,10 +1,11 @@
 use crate::request_error::ExpectedRequestError;
+use crate::server::http::file::canonicalize_media_path;
 use database::actions::cover_art::bake_cover_art_by_media_files;
 use database::actions::metadata::get_metadata_summary_by_files;
 use database::actions::playlists::{
-    OccurrenceCursor, add_item_to_playlist, create_m3u8_playlist, create_playlist,
-    list_occurrences, remove_item_from_playlist, remove_playlist, reorder_playlist_item_position,
-    update_playlist,
+    OccurrenceCursor, add_item_to_playlist, create_m3u8_playlist_from_lines, create_playlist,
+    list_occurrences, parse_m3u8_lines, remove_item_from_playlist, remove_playlist,
+    reorder_playlist_item_position, update_playlist,
 };
 use database::error::ExpectedError;
 use std::collections::HashMap;
@@ -15,7 +16,9 @@ use uuid::Uuid;
 use anyhow::{Context, Result};
 
 use crate::library_pool::LibraryHandle;
-use crate::utils::{GlobalParams, ParamsExtractor, require_library};
+use crate::utils::{
+    GlobalParams, ParamsExtractor, RunningMode, process_cover_art_map, require_library,
+};
 use crate::{Session, Signal, messages::*};
 use ::database::actions::playlists::{get_all_playlists, get_playlist_by_id};
 
@@ -93,7 +96,7 @@ impl Signal for CreatePlaylistRequest {
         .with_context(|| format!("Failed to create playlist: name={name}, group={group}"))?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: library.media_root.clone(),
+            path: library.descriptor.app_name(),
         });
         Ok(Some(CreatePlaylistResponse {
             playlist: Playlist {
@@ -144,7 +147,7 @@ impl Signal for UpdatePlaylistRequest {
         })?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: library.media_root.clone(),
+            path: library.descriptor.app_name(),
         });
         Ok(Some(UpdatePlaylistResponse {
             playlist: Playlist {
@@ -185,7 +188,7 @@ impl Signal for RemovePlaylistRequest {
         .with_context(|| format!("Removing playlist: id={}", request.playlist_id))?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: library.media_root.clone(),
+            path: library.descriptor.app_name(),
         });
         Ok(Some(RemovePlaylistResponse {
             playlist_id: request.playlist_id,
@@ -230,7 +233,7 @@ impl Signal for AddItemToPlaylistRequest {
         })?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: library.media_root.clone(),
+            path: library.descriptor.app_name(),
         });
         Ok(Some(AddItemToPlaylistResponse {
             success: true,
@@ -273,7 +276,7 @@ impl Signal for ReorderPlaylistItemPositionRequest {
         })?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: library.media_root.clone(),
+            path: library.descriptor.app_name(),
         });
         Ok(Some(ReorderPlaylistItemPositionResponse { success: true }))
     }
@@ -329,7 +332,7 @@ impl Signal for CreateM3u8PlaylistRequest {
     async fn handle(
         &self,
         (library, broadcaster): Self::Params,
-        _session: Option<Session>,
+        session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let library = require_library(library)?;
@@ -339,18 +342,32 @@ impl Signal for CreateM3u8PlaylistRequest {
         let group = &request.group;
         let path = &request.path;
 
-        match create_m3u8_playlist(
+        // A remote session may only import a playlist file inside this library.
+        // Its entries are matched against the catalog, never read from disk.
+        let content = if session.is_some() {
+            let import_path = canonicalize_media_path(
+                &library.fsio,
+                Path::new(&library.media_root),
+                Path::new(path),
+            )?;
+            library.fsio.read_to_string(&import_path)?
+        } else {
+            tokio::fs::read_to_string(path).await?
+        };
+        let lines = parse_m3u8_lines(&content);
+
+        match create_m3u8_playlist_from_lines(
             &library.main_db,
             &library.library_sync.record_store(),
             name.clone(),
             group.clone(),
-            Path::new(&path),
+            lines,
         )
         .await
         {
             Ok((playlist, import_result)) => {
                 broadcaster.broadcast(&LibraryContentChanged {
-                    path: library.media_root.clone(),
+                    path: library.descriptor.app_name(),
                 });
                 Ok(Some(CreateM3u8PlaylistResponse {
                     playlist: Some(Playlist {
@@ -406,7 +423,7 @@ impl Signal for RemoveItemFromPlaylistRequest {
         {
             Ok(_) => {
                 broadcaster.broadcast(&LibraryContentChanged {
-                    path: library.media_root.clone(),
+                    path: library.descriptor.app_name(),
                 });
                 Ok(Some(RemoveItemFromPlaylistResponse {
                     success: true,
@@ -422,19 +439,23 @@ impl Signal for RemoveItemFromPlaylistRequest {
 }
 
 impl ParamsExtractor for FetchPlaylistOccurrencesRequest {
-    type Params = (Option<LibraryHandle>, Arc<String>);
+    type Params = (Option<LibraryHandle>, Arc<String>, RunningMode);
     fn extract_params(&self, params: &GlobalParams) -> Self::Params {
-        (params.library.clone(), params.node_id.clone())
+        (
+            params.library.clone(),
+            params.node_id.clone(),
+            params.running_mode,
+        )
     }
 }
 
 impl Signal for FetchPlaylistOccurrencesRequest {
-    type Params = (Option<LibraryHandle>, Arc<String>);
+    type Params = (Option<LibraryHandle>, Arc<String>, RunningMode);
     type Response = FetchPlaylistOccurrencesResponse;
     async fn handle(
         &self,
-        (library, node): Self::Params,
-        _session: Option<Session>,
+        (library, node, running_mode): Self::Params,
+        session: Option<Session>,
         request: &Self,
     ) -> Result<Option<Self::Response>> {
         let library = require_library(library)?;
@@ -471,6 +492,13 @@ impl Signal for FetchPlaylistOccurrencesRequest {
         } else {
             HashMap::new()
         };
+        let remote_host = session.map(|session| session.host);
+        let cover_art_map = process_cover_art_map(
+            cover_art_map,
+            library.descriptor.library_id,
+            &running_mode,
+            &remote_host,
+        );
         Ok(Some(FetchPlaylistOccurrencesResponse {
             request_id: request.request_id.clone(),
             entries: page

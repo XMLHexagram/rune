@@ -115,9 +115,9 @@ async fn serve_library(
         false
     };
     let action = if write {
-        Action::LibraryWrite { library_id: id }
+        Action::SyncPush { library_id: id }
     } else {
-        Action::LibraryRead { library_id: id }
+        Action::SyncPull { library_id: id }
     };
     guarded_response(global.clone(), peer, action, async move {
         let library = match path.library_id.parse::<Uuid>() {
@@ -132,7 +132,7 @@ async fn serve_library(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-        let notify = library_notification(&global, &library.media_root);
+        let notify = library_notification(&global, &library.descriptor.app_name());
         let store = Arc::new(RwLock::new(library.library_sync.clone()));
         let router = library_router(SharedLibrary(store.clone()), notify.clone()).merge(
             blob_router(BlobContext {

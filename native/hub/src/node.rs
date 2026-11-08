@@ -1,8 +1,19 @@
+mod reconnect;
+pub(crate) use reconnect::ReconnectConfig;
+use reconnect::ReconnectTask;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
 use std::{
     fmt::{Debug, Formatter, Result as FmtResult},
     fs,
+    io::Error,
+    mem::MaybeUninit,
     path::Path,
-    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
+    sync::{
+        Arc, Mutex as StdMutex, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use uuid::Uuid;
 
@@ -23,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::access_policy::{Action, Denial, RuneAccessPolicy};
 use crate::backends::remote::{RemoteConnectError, RendererLink, RendererLinkUse};
-use crate::macros::{RequestClass, request_class};
+use crate::macros::{RequestAccess, RequestScope, request_access, request_scope};
 use crate::request_error::ExpectedRequestError;
 use crate::server::sync_worker::SyncTokenStore;
 use crate::{Session, session::PlayerSession};
@@ -31,8 +42,9 @@ use crate::{
     library_pool::{LibraryHandle, LibraryPool},
     messages::{
         AttachedRenderer, ClientStatus, ClientSummary, IncommingClientPermissionNotification,
-        InitializeNodeRequest, InitializeNodeResponse, RendererAttachmentChanged, RendererLinkLost,
-        TrustListUpdated, TrustedClientsChanged, TrustedServerCertificate,
+        InitializeNodeRequest, InitializeNodeResponse, PauseRequest, RemoteLibraryReconnecting,
+        RemoteLossKind, RendererAttachmentChanged, RendererLinkLost, TrustListUpdated,
+        TrustedClientsChanged, TrustedServerCertificate,
     },
     request_error::classify,
     server::{ServerManager, WebSocketService, utils::device::load_device_info},
@@ -59,6 +71,14 @@ fn renderer_connection_error(error: RemoteConnectError) -> anyhow::Error {
     }
 }
 
+enum UiLibrary {
+    Local,
+    Remote {
+        fingerprint: String,
+        reconnect: Option<ReconnectTask>,
+    },
+}
+
 /// Process services shared by every local library and remote controller.
 pub struct NodeContext {
     pub config_path: Arc<String>,
@@ -73,12 +93,22 @@ pub struct NodeContext {
     pub websocket_service: Arc<WebSocketService>,
     pub gui_broadcaster: Arc<dyn Broadcaster>,
     pub renderer_link: Arc<StdMutex<Option<Arc<RendererLink>>>>,
+    ui_library: Arc<StdMutex<UiLibrary>>,
+    reconnect_config: ReconnectConfig,
+    #[cfg(test)]
+    reconnect_attempts: AtomicUsize,
     pub token: Arc<CancellationToken>,
+    handoff_retry_token: CancellationToken,
     pub(crate) sync_tokens: SyncTokenStore,
     pub server_manager: OnceLock<Arc<ServerManager>>,
     local_session: OnceLock<Arc<PlayerSession>>,
     current_ui: Mutex<Option<Weak<GlobalParams>>>,
     event_handles: Mutex<Vec<JoinHandle<()>>>,
+    handoff_generation: AtomicU64,
+    handoff_gate: Mutex<()>,
+    handoff_retry_handles: Mutex<Vec<JoinHandle<()>>>,
+    #[cfg(test)]
+    handoff_pause_failures: AtomicUsize,
 }
 
 impl Debug for NodeContext {
@@ -90,6 +120,7 @@ impl Debug for NodeContext {
 }
 
 struct NodeBroadcaster {
+    ui_library: Arc<StdMutex<UiLibrary>>,
     local: Arc<dyn Broadcaster>,
     remote: Arc<WebSocketService>,
     renderer_link: Arc<StdMutex<Option<Arc<RendererLink>>>>,
@@ -110,7 +141,11 @@ const REMOTE_SIGNALS: &[&str] = &[
 
 impl Broadcaster for NodeBroadcaster {
     fn broadcast(&self, message: &dyn RinfRustSignal) {
-        let suppress_local_status = self.renderer_link.lock().is_ok_and(|link| link.is_some())
+        let suppress_local_status = (self
+            .ui_library
+            .lock()
+            .is_ok_and(|ui| matches!(*ui, UiLibrary::Remote { .. }))
+            || self.renderer_link.lock().is_ok_and(|link| link.is_some()))
             && matches!(
                 message.name().as_str(),
                 "PlaybackStatus" | "PlaylistUpdate" | "RealtimeFFT"
@@ -136,26 +171,36 @@ impl NodeContext {
         broadcaster: Arc<dyn Broadcaster>,
         os_media_controls: bool,
     ) -> Result<Arc<Self>> {
+        Self::with_reconnect_config(
+            config_path,
+            db_path,
+            broadcaster,
+            os_media_controls,
+            ReconnectConfig::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn with_reconnect_config(
+        config_path: &str,
+        db_path: &str,
+        broadcaster: Arc<dyn Broadcaster>,
+        os_media_controls: bool,
+        reconnect_config: ReconnectConfig,
+    ) -> Result<Arc<Self>> {
+        #[cfg(unix)]
+        raise_nofile_soft_limit();
         fs::create_dir_all(config_path).context("Create node configuration directory")?;
         let node_id = Arc::new(get_or_create_node_id(config_path).await?.to_string());
         let websocket_service = Arc::new(WebSocketService::new());
         let renderer_link = Arc::new(StdMutex::new(None));
+        let ui_library = Arc::new(StdMutex::new(UiLibrary::Local));
         let sync_tokens = SyncTokenStore::default();
-        let mut permission_manager = PermissionManager::new(config_path)?;
+        let permission_manager = PermissionManager::new(config_path)?;
         let access_policy = Arc::new(RuneAccessPolicy::load(
             Path::new(config_path),
             &permission_manager.list_users().await,
         )?);
-        let policy = access_policy.clone();
-        let revoked_tokens = sync_tokens.clone();
-        permission_manager.set_trust_change_hook(Arc::new(move |fingerprint, status| {
-            if status != Some(&UserStatus::Approved) {
-                revoked_tokens.remove_peer(fingerprint);
-            }
-            policy
-                .trust_changed(fingerprint, status)
-                .map_err(|error| format!("{error:#}"))
-        }));
         let node = Arc::new(Self {
             config_path: Arc::new(config_path.to_owned()),
             library_pool: LibraryPool::new(Path::new(config_path), Path::new(db_path), &node_id)?,
@@ -166,6 +211,7 @@ impl NodeContext {
             device_scanner: Arc::new(DiscoveryService::without_store()),
             sync_settings: Arc::new(RwLock::new(SyncSettings::load(Path::new(config_path)))),
             broadcaster: Arc::new(NodeBroadcaster {
+                ui_library: ui_library.clone(),
                 local: broadcaster.clone(),
                 remote: websocket_service.clone(),
                 renderer_link: renderer_link.clone(),
@@ -173,13 +219,51 @@ impl NodeContext {
             gui_broadcaster: broadcaster,
             websocket_service,
             renderer_link,
+            ui_library,
+            reconnect_config,
+            #[cfg(test)]
+            reconnect_attempts: AtomicUsize::new(0),
             token: Arc::new(CancellationToken::new()),
+            handoff_retry_token: CancellationToken::new(),
             sync_tokens,
             server_manager: OnceLock::new(),
             local_session: OnceLock::new(),
             current_ui: Mutex::new(None),
             event_handles: Mutex::new(Vec::new()),
+            handoff_generation: AtomicU64::new(0),
+            handoff_gate: Mutex::new(()),
+            handoff_retry_handles: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            handoff_pause_failures: AtomicUsize::new(0),
         });
+        let policy = node.access_policy.clone();
+        let revoked_tokens = node.sync_tokens.clone();
+        let weak_node = Arc::downgrade(&node);
+        node.permission_manager
+            .write()
+            .await
+            .set_trust_change_hook(Arc::new(move |fingerprint, status| {
+                if status != Some(&UserStatus::Approved) {
+                    revoked_tokens.remove_peer(fingerprint);
+                    let weak_node = weak_node.clone();
+                    let fingerprint = fingerprint.to_owned();
+                    tokio::spawn(async move {
+                        if let Some(node) = weak_node.upgrade() {
+                            node.revoke_outgoing_for(&fingerprint).await;
+                        }
+                    });
+                }
+                policy
+                    .trust_changed(fingerprint, status)
+                    .map_err(|error| format!("{error:#}"))
+            }));
+        let trust_listener = node
+            .permission_manager
+            .read()
+            .await
+            .watch_external_changes(node.token.child_token())
+            .await;
+        node.event_handles.lock().await.push(trust_listener);
         let manager = Arc::new(ServerManager::new(node.clone()).await?);
         node.server_manager
             .set(manager.clone())
@@ -280,6 +364,72 @@ impl NodeContext {
             .context("Node session is not initialized")
     }
 
+    /// Starts a handoff. Any pause retry left by an earlier handoff stops at its
+    /// next attempt, so it never pauses a source this handoff starts again.
+    pub(crate) async fn begin_handoff(&self) -> u64 {
+        let _guard = self.handoff_gate.lock().await;
+        self.handoff_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub(crate) fn handoff_generation(&self) -> u64 {
+        self.handoff_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn register_handoff_retry(&self, handle: JoinHandle<()>) {
+        let mut handles = self.handoff_retry_handles.lock().await;
+        handles.retain(|handle| !handle.is_finished());
+        handles.push(handle);
+    }
+
+    pub(crate) fn handoff_retry_cancellation_token(&self) -> CancellationToken {
+        self.handoff_retry_token.child_token()
+    }
+
+    pub(crate) async fn pause_handoff_source(
+        self: &Arc<Self>,
+        fingerprint: &str,
+        source: &RendererLink,
+        generation: u64,
+    ) -> Result<bool> {
+        let _guard = self.handoff_gate.lock().await;
+        if self.handoff_generation() != generation {
+            return Ok(false);
+        }
+
+        #[cfg(test)]
+        if self
+            .handoff_pause_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            anyhow::bail!("test pause failure");
+        }
+
+        match source.call(&PauseRequest {}).await {
+            Ok(()) => Ok(true),
+            Err(first_error) => {
+                let (retry_link, _) = self
+                    .connect_renderer(fingerprint, RendererLinkUse::Cast)
+                    .await
+                    .with_context(|| format!("Pause source renderer {fingerprint}"))?;
+                let result = retry_link.call(&PauseRequest {}).await;
+                retry_link.close();
+                result
+                    .context("Pause source renderer after reconnect")
+                    .map(|()| true)
+                    .or(Err(first_error))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_handoff_pauses(&self, attempts: usize) {
+        self.handoff_pause_failures
+            .store(attempts, Ordering::Release);
+    }
+
     pub async fn session_queue_for_library(&self, library_id: Uuid) -> Result<Vec<i32>> {
         Ok(self.session()?.queue_for_library(library_id).await)
     }
@@ -368,7 +518,21 @@ impl NodeContext {
         Ok(())
     }
 
-    pub(crate) async fn renderer_link_lost(&self, id: Uuid) {
+    pub(crate) async fn renderer_link_lost(self: &Arc<Self>, id: Uuid) {
+        self.renderer_connection_lost(
+            id,
+            RemoteLossKind::NetworkLost,
+            "Renderer connection ended".into(),
+        )
+        .await;
+    }
+
+    pub(crate) async fn renderer_connection_lost(
+        self: &Arc<Self>,
+        id: Uuid,
+        kind: RemoteLossKind,
+        detail: String,
+    ) {
         let removed = match self.renderer_link.lock() {
             Ok(mut slot) if slot.as_ref().is_some_and(|link| link.id() == id) => slot.take(),
             _ => None,
@@ -376,6 +540,28 @@ impl NodeContext {
         let Some(link) = removed else {
             return;
         };
+        link.close();
+        if let Ok(mut ui) = self.ui_library.lock()
+            && let UiLibrary::Remote {
+                fingerprint,
+                reconnect,
+            } = &mut *ui
+            && fingerprint == link.fingerprint()
+        {
+            *reconnect = Some(ReconnectTask::start(
+                Arc::downgrade(self),
+                fingerprint.clone(),
+                link.alias().to_owned(),
+                self.token.child_token(),
+                self.reconnect_config.clone(),
+                (kind, detail),
+            ));
+            self.gui_broadcaster.broadcast(&RemoteLibraryReconnecting {
+                fingerprint: fingerprint.clone(),
+                alias: link.alias().to_owned(),
+            });
+            return;
+        }
         self.gui_broadcaster.broadcast(&RendererLinkLost {
             fingerprint: link.fingerprint().to_owned(),
             alias: link.alias().to_owned(),
@@ -387,6 +573,49 @@ impl NodeContext {
         {
             log::warn!("Could not restore local session after renderer loss: {error:#}");
         }
+    }
+
+    pub(crate) async fn revoke_outgoing_for(self: &Arc<Self>, fingerprint: &str) {
+        let link = self
+            .renderer_link()
+            .ok()
+            .flatten()
+            .filter(|link| link.fingerprint() == fingerprint);
+        if let Some(link) = link {
+            link.close();
+            self.renderer_connection_lost(
+                link.id(),
+                RemoteLossKind::Revoked,
+                "Renderer trust was removed".into(),
+            )
+            .await;
+        }
+    }
+
+    pub(crate) fn remote_ui_library(&self) -> Result<bool> {
+        Ok(matches!(
+            *self
+                .ui_library
+                .lock()
+                .map_err(|_| anyhow::anyhow!("UI library lock poisoned"))?,
+            UiLibrary::Remote { .. }
+        ))
+    }
+
+    pub(crate) async fn attach_remote_ui(
+        &self,
+        params: &Arc<GlobalParams>,
+        fingerprint: String,
+    ) -> Result<()> {
+        self.attach_ui(params).await;
+        *self
+            .ui_library
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UI library lock poisoned"))? = UiLibrary::Remote {
+            fingerprint,
+            reconnect: None,
+        };
+        Ok(())
     }
 
     pub fn renderer_link(&self) -> Result<Option<Arc<RendererLink>>> {
@@ -422,23 +651,32 @@ impl NodeContext {
                 user.status == UserStatus::Approved && user.public_key == session.public_key
             })
             .ok_or(Denial::Untrusted)?;
-        let action = match request_class(name) {
-            Some(RequestClass::Control) => Action::Control,
-            Some(RequestClass::Administer) => Action::Administer,
-            Some(class @ (RequestClass::LibraryRead | RequestClass::LibraryWrite)) => {
-                let library_id = addressed_library_id
+        let access = request_access(name).ok_or(Denial::NodeLocal)?;
+        if access == RequestAccess::NodeLocal {
+            return Err(Denial::NodeLocal.into());
+        }
+        let scope = request_scope(name).ok_or(Denial::NodeLocal)?;
+        let library_id = if scope == RequestScope::Library {
+            Some(
+                addressed_library_id
                     .or_else(|| params.and_then(|params| params.library_id))
                     .ok_or(ExpectedRequestError::Unavailable {
                         what: "UI library identity",
-                    })?;
-                if class == RequestClass::LibraryRead {
-                    // The WebSocket is a control attachment: reads there browse.
-                    Action::Browse { library_id }
-                } else {
-                    Action::LibraryWrite { library_id }
-                }
-            }
-            _ => return Err(Denial::NodeLocal.into()),
+                    })?,
+            )
+        } else {
+            None
+        };
+        let action = match access {
+            RequestAccess::Control => Action::Control,
+            RequestAccess::Administer => Action::Administer,
+            RequestAccess::ConnectionView => Action::ConnectionView {
+                library_id: library_id.ok_or(Denial::NodeLocal)?,
+            },
+            RequestAccess::ConnectionEdit => Action::ConnectionEdit {
+                library_id: library_id.ok_or(Denial::NodeLocal)?,
+            },
+            RequestAccess::NodeLocal => return Err(Denial::NodeLocal.into()),
         };
         self.access_policy.check(
             &PeerIdentity {
@@ -472,6 +710,10 @@ impl NodeContext {
         self: &Arc<Self>,
         library: LibraryHandle,
     ) -> Result<GlobalParams> {
+        Ok(self.params_for_ui()?.for_library(library))
+    }
+
+    pub(crate) fn params_for_ui(self: &Arc<Self>) -> Result<GlobalParams> {
         let token = Arc::new(self.token.child_token());
         let session = self.session()?;
         let server_manager = OnceLock::new();
@@ -499,7 +741,7 @@ impl NodeContext {
             server_manager,
             running_mode: RunningMode::Server,
         };
-        Ok(base.for_library(library))
+        Ok(base)
     }
 
     pub async fn attach_ui(&self, params: &Arc<GlobalParams>) {
@@ -511,6 +753,8 @@ impl NodeContext {
             Self::release_ui(&old).await;
         }
         *current = Some(Arc::downgrade(params));
+        drop(current);
+        self.leave_remote_ui().await;
     }
 
     async fn release_ui(params: &GlobalParams) {
@@ -535,23 +779,57 @@ impl NodeContext {
         params.main_token.cancel();
     }
 
+    async fn leave_remote_ui(&self) {
+        let remote = self.ui_library.lock().is_ok_and(|mut ui| {
+            let remote = matches!(*ui, UiLibrary::Remote { .. });
+            if matches!(
+                *ui,
+                UiLibrary::Remote {
+                    reconnect: Some(_),
+                    ..
+                }
+            ) {
+                self.gui_broadcaster
+                    .broadcast(&RendererAttachmentChanged { renderer: None });
+            }
+            *ui = UiLibrary::Local;
+            remote
+        });
+        if remote && let Err(error) = self.detach_renderer().await {
+            log::warn!("Could not detach remote library: {error:#}");
+        }
+    }
+
     pub async fn close_ui(&self, token: &Arc<CancellationToken>) {
-        let mut current = self.current_ui.lock().await;
-        if let Some(params) = current.as_ref().and_then(Weak::upgrade)
-            && Arc::ptr_eq(&params.main_token, token)
-        {
-            *current = None;
+        let params = {
+            let mut current = self.current_ui.lock().await;
+            let params = current
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .filter(|params| Arc::ptr_eq(&params.main_token, token));
+            if params.is_some() {
+                *current = None;
+            }
+            params
+        };
+        if let Some(params) = params {
+            self.leave_remote_ui().await;
             Self::release_ui(&params).await;
         }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.handoff_retry_token.cancel();
+        self.leave_remote_ui().await;
         let session_result = if let Some(session) = self.local_session.get() {
             session.shutdown().await
         } else {
             Ok(())
         };
         self.token.cancel();
+        for handle in self.handoff_retry_handles.lock().await.drain(..) {
+            let _ = handle.await;
+        }
         if let Some(params) = self
             .current_ui
             .lock()
@@ -576,8 +854,71 @@ impl NodeContext {
     }
 }
 
+#[cfg(unix)]
+fn raise_nofile_soft_limit() {
+    let mut limits = MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) } != 0 {
+        log::warn!("Could not read RLIMIT_NOFILE: {}", Error::last_os_error());
+        return;
+    }
+    let mut limits = unsafe { limits.assume_init() };
+    let before = limits.rlim_cur;
+    let target = limits.rlim_max.min(8192);
+    if before < target {
+        limits.rlim_cur = target;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
+            log::warn!(
+                "Could not raise RLIMIT_NOFILE soft limit from {before} towards {target}: {}",
+                Error::last_os_error()
+            );
+        }
+    }
+    let mut after = MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, after.as_mut_ptr()) } != 0 {
+        log::warn!(
+            "Could not read RLIMIT_NOFILE after adjustment: {}",
+            Error::last_os_error()
+        );
+        return;
+    }
+    let after = unsafe { after.assume_init() };
+    log::info!(
+        "RLIMIT_NOFILE soft limit: {before} -> {} (hard limit {})",
+        after.rlim_cur,
+        after.rlim_max
+    );
+}
+
+#[cfg(all(test, unix))]
+mod nofile_tests {
+    use super::{MaybeUninit, raise_nofile_soft_limit};
+
+    #[cfg(unix)]
+    #[test]
+    fn raises_soft_limit_towards_hard_limit() {
+        let mut limits = MaybeUninit::<libc::rlimit>::uninit();
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) };
+        assert_eq!(result, 0, "read RLIMIT_NOFILE");
+        let limits = unsafe { limits.assume_init() };
+        let target = limits.rlim_max.min(8192);
+
+        raise_nofile_soft_limit();
+
+        let mut after = MaybeUninit::<libc::rlimit>::uninit();
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, after.as_mut_ptr()) };
+        assert_eq!(result, 0, "read RLIMIT_NOFILE after initialization");
+        let after = unsafe { after.assume_init() };
+        assert!(
+            after.rlim_cur >= target,
+            "soft limit should reach {target}, got {}",
+            after.rlim_cur
+        );
+    }
+}
+
 impl Drop for NodeContext {
     fn drop(&mut self) {
+        self.handoff_retry_token.cancel();
         self.token.cancel();
     }
 }
@@ -667,7 +1008,7 @@ mod tests {
         time::{Duration, timeout},
     };
 
-    use super::{NodeBroadcaster, NodeContext};
+    use super::{NodeBroadcaster, NodeContext, UiLibrary};
     use crate::{
         messages::{LibraryContentChanged, TrustListUpdated},
         server::WebSocketService,
@@ -731,6 +1072,7 @@ mod tests {
         let remote = Arc::new(WebSocketService::new());
         let mut received = remote.broadcast_tx.subscribe();
         let broadcaster = NodeBroadcaster {
+            ui_library: Arc::new(StdMutex::new(UiLibrary::Local)),
             local: Arc::new(Quiet(None)),
             remote,
             renderer_link: Arc::new(StdMutex::new(None)),

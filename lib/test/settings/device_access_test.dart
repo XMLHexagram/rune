@@ -8,19 +8,27 @@ void main() {
   final s = AppLocalizationsEn();
   DeviceGrantsInfo grants({
     bool control = true,
-    DeviceLibraryLevel? all,
+    DeviceConnectionLevel? allConnection = DeviceConnectionLevel.view,
+    DeviceSyncLevel? allSync = DeviceSyncLevel.none,
     List<DeviceLibraryGrant> libraries = const [],
     bool administer = false,
   }) => DeviceGrantsInfo(
     control: control,
-    allLibraries: all,
+    allConnection: allConnection,
+    allSync: allSync,
     libraries: libraries,
     administer: administer,
   );
 
   test('summarizes my device, guest, custom and missing settings', () {
     expect(
-      deviceAccessSummary(grants(all: DeviceLibraryLevel.readWrite), s),
+      deviceAccessSummary(
+        grants(
+          allConnection: DeviceConnectionLevel.viewEdit,
+          allSync: DeviceSyncLevel.pullPush,
+        ),
+        s,
+      ),
       'My device',
     );
     expect(deviceAccessSummary(grants(), s), 'Guest · Can control playback');
@@ -30,7 +38,8 @@ void main() {
           libraries: [
             const DeviceLibraryGrant(
               libraryId: 'a',
-              level: DeviceLibraryLevel.notShared,
+              connection: DeviceConnectionLevel.view,
+              sync: DeviceSyncLevel.none,
             ),
           ],
         ),
@@ -38,15 +47,32 @@ void main() {
       ),
       'Guest · Can control playback',
     );
+    expect(
+      deviceAccessSummary(
+        grants(
+          libraries: [
+            const DeviceLibraryGrant(
+              libraryId: 'a',
+              connection: DeviceConnectionLevel.none,
+              sync: DeviceSyncLevel.none,
+            ),
+          ],
+        ),
+        s,
+      ),
+      'Custom',
+    );
     expect(deviceAccessSummary(grants(control: false), s), 'Custom');
     expect(
       deviceAccessSummary(
         grants(
-          all: DeviceLibraryLevel.readWrite,
+          allConnection: DeviceConnectionLevel.viewEdit,
+          allSync: DeviceSyncLevel.pullPush,
           libraries: [
             const DeviceLibraryGrant(
               libraryId: 'a',
-              level: DeviceLibraryLevel.read,
+              connection: DeviceConnectionLevel.view,
+              sync: DeviceSyncLevel.pull,
             ),
           ],
         ),
@@ -56,21 +82,6 @@ void main() {
     );
     expect(deviceAccessSummary(grants(administer: true), s), 'Custom');
     expect(deviceAccessSummary(null, s), 'Custom');
-  });
-
-  test('library levels map to the corresponding dropdown values', () {
-    expect(
-      choiceForLevel(DeviceLibraryLevel.notShared),
-      DeviceAccessChoice.notShared,
-    );
-    expect(choiceForLevel(DeviceLibraryLevel.read), DeviceAccessChoice.read);
-    expect(
-      choiceForLevel(DeviceLibraryLevel.readWrite),
-      DeviceAccessChoice.readWrite,
-    );
-    for (final choice in DeviceAccessChoice.values) {
-      expect(choiceForLevel(levelForChoice(choice)), choice);
-    }
   });
 
   test('only approved controlling devices show the live status', () {

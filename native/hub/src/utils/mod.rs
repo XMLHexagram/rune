@@ -17,6 +17,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use crate::macros::listen_local_gui;
 use crate::node::{NodeContext, initialize_node};
 use anyhow::{Context, Result};
 use fsio::FsIo;
@@ -36,7 +37,7 @@ use ::database::{
         check_storage_mode, connect_main_db, connect_recommendation_db, create_redirect,
     },
     entities::media_files,
-    library_registry::{LibraryRegistry, resolve_library},
+    library_registry::{LibraryLocation, LibraryRegistry, resolve_library},
     playing_item::MediaFileHandle,
 };
 use ::discovery::{client::CertValidator, protocol::DiscoveryService, server::PermissionManager};
@@ -48,7 +49,7 @@ use ::scrobbling::manager::ScrobblingManager;
 
 use crate::backends::{
     local::local_player_loop,
-    remote::{RemoteConnectError, server_player_loop},
+    remote::{RemoteConnectError, open_remote_library},
 };
 use crate::library_pool::{LibraryHandle, LibraryPool};
 use crate::messages::*;
@@ -259,10 +260,45 @@ async fn handle_media_library_path(
 
         let config_path = &dart_signal.message.config_path;
         let alias = &dart_signal.message.alias;
+        // A replica is named by its library id; it lives in the data directory, which can
+        // move, so its folder comes from the registry rather than from Dart.
+        let replica_root =
+            match LibraryLocation::parse(media_library_path).and_then(|location| match location {
+                LibraryLocation::Replica(id) => {
+                    let registry = LibraryRegistry::load(Path::new(config_path))?;
+                    let descriptor = registry.replica(id)?;
+                    let root = descriptor.root(Path::new(config_path));
+                    Ok(Some((
+                        id,
+                        root.to_str()
+                            .context("Replica path is not UTF-8")?
+                            .to_owned(),
+                    )))
+                }
+                LibraryLocation::Path(_) => Ok(None),
+            }) {
+                Ok(replica) => replica,
+                Err(error) => {
+                    broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                        restore_last_index: false,
+                        error_kind: None,
+                        path: media_library_path.to_string(),
+                        success: false,
+                        error: Some(format!("{error:#}")),
+                        not_ready: false,
+                    });
+                    return;
+                }
+            };
         #[cfg(not(target_os = "android"))]
         let fsio = Arc::new(FsIo::new());
         #[cfg(target_os = "android")]
-        let fsio = match FsIo::new(Path::new(".rune/.android-fs.db"), &dart_signal.message.path) {
+        let fsio = match FsIo::new(
+            Path::new(".rune/.android-fs.db"),
+            replica_root
+                .as_ref()
+                .map_or(media_library_path, |(_, root)| root),
+        ) {
             Ok(fsio) => Arc::new(fsio),
             Err(e) => {
                 error!("Failed to initialize Android SAF filesystem: {e:#?}");
@@ -302,6 +338,13 @@ async fn handle_media_library_path(
             OperationDestination::Local => {
                 let database_mode = dart_signal.message.mode;
                 info!("Received path: {media_library_path}");
+
+                if let Some((id, _)) = replica_root {
+                    let opened = node.library_pool.acquire_ui(id).await;
+                    finish_local_open(opened, &node, &scrobbler, &broadcaster, media_library_path)
+                        .await;
+                    return;
+                }
 
                 let library_test = match check_library_state(&fsio, media_library_path) {
                     Ok(x) => x,
@@ -360,39 +403,13 @@ async fn handle_media_library_path(
                     node.library_pool.acquire_ui(descriptor.library_id).await
                 }
                 .await;
-                match opened {
-                    Ok(library) => {
-                        info!("Resolved library id: {}", library.descriptor.library_id);
-                        let result =
-                            local_player_loop(library, node.clone(), Arc::clone(&scrobbler)).await;
-                        broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                            restore_last_index: result.is_ok()
-                                && node
-                                    .session()
-                                    .is_ok_and(|session| session.take_legacy_restore()),
-                            error_kind: None,
-                            path: media_library_path.to_string(),
-                            success: result.is_ok(),
-                            error: result.err().map(|error| format!("{error:#}")),
-                            not_ready: false,
-                        });
-                    }
-                    Err(e) => {
-                        error!("Library initialization failed: {e:#?}");
-                        broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                            restore_last_index: false,
-                            error_kind: None,
-                            path: media_library_path.to_string(),
-                            success: false,
-                            error: Some(format!("{e:#?}")),
-                            not_ready: false,
-                        });
-                    }
-                }
+                finish_local_open(opened, &node, &scrobbler, &broadcaster, media_library_path)
+                    .await;
             }
             OperationDestination::Remote => {
-                match server_player_loop(fsio, media_library_path, node, alias).await {
-                    Ok(_) => {
+                match open_remote_library(node, media_library_path).await {
+                    Ok(params) => {
+                        listen_local_gui(&params, &params.main_token);
                         broadcaster.broadcast(&SetMediaLibraryPathResponse {
                             restore_last_index: false,
                             error_kind: None,
@@ -403,7 +420,7 @@ async fn handle_media_library_path(
                         });
                     }
                     Err(e) => {
-                        error!("Failed to server player loop: {e:#?}");
+                        error!("Failed to open remote library: {e:#?}");
                         broadcaster.broadcast(&SetMediaLibraryPathResponse {
                             restore_last_index: false,
                             error_kind: Some(
@@ -424,8 +441,47 @@ async fn handle_media_library_path(
     }
 }
 
+/// Run the local player loop for an opened library and report the result to Dart.
+async fn finish_local_open(
+    opened: Result<LibraryHandle>,
+    node: &Arc<NodeContext>,
+    scrobbler: &Arc<Mutex<ScrobblingManager>>,
+    broadcaster: &Arc<dyn Broadcaster>,
+    media_library_path: &str,
+) {
+    match opened {
+        Ok(library) => {
+            info!("Resolved library id: {}", library.descriptor.library_id);
+            let result = local_player_loop(library, node.clone(), Arc::clone(scrobbler)).await;
+            broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                restore_last_index: result.is_ok()
+                    && node
+                        .session()
+                        .is_ok_and(|session| session.take_legacy_restore()),
+                error_kind: None,
+                path: media_library_path.to_string(),
+                success: result.is_ok(),
+                error: result.err().map(|error| format!("{error:#}")),
+                not_ready: false,
+            });
+        }
+        Err(e) => {
+            error!("Library initialization failed: {e:#?}");
+            broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                restore_last_index: false,
+                error_kind: None,
+                path: media_library_path.to_string(),
+                success: false,
+                error: Some(format!("{e:#?}")),
+                not_ready: false,
+            });
+        }
+    }
+}
+
 pub struct CollectionCoverOptions<'a> {
     pub bake: bool,
+    pub library_id: uuid::Uuid,
     pub running_mode: &'a RunningMode,
     pub remote_host: &'a Option<String>,
     pub playback_queue: &'a [i32],
@@ -460,15 +516,12 @@ pub async fn inject_cover_art_map(
     let raw_cover_art_map = bake_cover_art_by_media_files(fsio, main_db, files).await?;
 
     // Process the cover art paths based on the running mode
-    let cover_art_map: HashMap<i32, String> = raw_cover_art_map
-        .into_iter()
-        .map(|(id, path)| {
-            (
-                id,
-                process_cover_art_path(&path, options.running_mode, options.remote_host),
-            )
-        })
-        .collect();
+    let cover_art_map = process_cover_art_map(
+        raw_cover_art_map,
+        options.library_id,
+        options.running_mode,
+        options.remote_host,
+    );
 
     Ok(Collection {
         id: collection.id,
@@ -478,6 +531,23 @@ pub async fn inject_cover_art_map(
         cover_art_map,
         readonly: collection.readonly,
     })
+}
+
+pub fn process_cover_art_map(
+    cover_art_map: HashMap<i32, String>,
+    library_id: uuid::Uuid,
+    running_mode: &RunningMode,
+    remote_host: &Option<String>,
+) -> HashMap<i32, String> {
+    cover_art_map
+        .into_iter()
+        .map(|(id, path)| {
+            (
+                id,
+                process_cover_art_path(&path, library_id, running_mode, remote_host),
+            )
+        })
+        .collect()
 }
 
 pub async fn query_cover_arts(
@@ -522,6 +592,7 @@ pub fn determine_batch_size(workload_factor: f32) -> usize {
 
 pub fn process_cover_art_path(
     path: &str,
+    library_id: uuid::Uuid,
     running_mode: &RunningMode,
     remote_host: &Option<String>,
 ) -> String {
@@ -540,7 +611,7 @@ pub fn process_cover_art_path(
                         .unwrap_or_default();
 
                     // Construct the URL using the host and cache prefix
-                    format!("{host}/files/cache/{file_name}")
+                    format!("{host}/files/cache/{file_name}?library_id={library_id}")
                 } else {
                     // No host available, return the original path
                     path.to_string()
@@ -738,6 +809,28 @@ pub fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(stdout_filter)
         .init();
+}
+
+#[cfg(test)]
+mod cover_art_url_tests {
+    use super::{RunningMode, process_cover_art_path};
+    use uuid::Uuid;
+
+    #[test]
+    fn remote_cover_url_names_its_library() {
+        let library_id = Uuid::new_v4();
+        let path = "/tmp/rune/cover_arts/cover-digest";
+        let remote_host = Some("https://peer.example".to_string());
+
+        assert_eq!(
+            process_cover_art_path(path, library_id, &RunningMode::Server, &remote_host),
+            format!("https://peer.example/files/cache/cover-digest?library_id={library_id}")
+        );
+        assert_eq!(
+            process_cover_art_path(path, library_id, &RunningMode::Client, &remote_host),
+            path
+        );
+    }
 }
 
 #[cfg(target_os = "android")]

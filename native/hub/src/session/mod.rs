@@ -225,12 +225,21 @@ impl PlayerSession {
 
     pub(crate) async fn playback_snapshot(&self) -> (PlayerStatus, u64) {
         let state = self.state.lock().await;
-        let status = self.player.lock().await.get_status();
-        (status, state.queue_revision)
+        let revision = state.queue_revision;
+        let status_after_pending = self.player.lock().await.status_after_pending();
+        drop(state);
+        (status_after_pending.await, revision)
     }
 
     /// Re-send this session's current player bar and queue after renderer control ends.
     pub(crate) async fn reemit_current(&self) -> Result<()> {
+        let Some(node) = self.node.upgrade() else {
+            return Ok(());
+        };
+        self.reemit_to(&node.gui_broadcaster).await
+    }
+
+    pub(crate) async fn reemit_to(&self, broadcaster: &Arc<dyn Broadcaster>) -> Result<()> {
         let Some(node) = self.node.upgrade() else {
             return Ok(());
         };
@@ -247,7 +256,7 @@ impl PlayerSession {
             &mut item_state,
             &controls,
             None,
-            &node.gui_broadcaster,
+            broadcaster,
             &session_id,
         )
         .await;
@@ -258,7 +267,7 @@ impl PlayerSession {
         send_playlist(
             &node,
             &playlist,
-            node.gui_broadcaster.as_ref(),
+            broadcaster.as_ref(),
             &session_id,
             revision,
         )

@@ -52,22 +52,7 @@ pub(super) async fn guarded_response(
 ) -> Response {
     let mut grants = node.access_policy.changes();
     let mut trust = node.permission_manager.read().await.changes();
-    let initial_level = match action {
-        Action::LibraryRead { library_id } | Action::LibraryWrite { library_id } => node
-            .access_policy
-            .grants(&peer.fingerprint)
-            .ok()
-            .map(|grants| (library_id, grants.level(library_id))),
-        _ => None,
-    };
-    let valid = || async {
-        allowed(&node, &peer, &action).await
-            && initial_level.is_none_or(|(id, level)| {
-                node.access_policy
-                    .grants(&peer.fingerprint)
-                    .is_ok_and(|grants| grants.level(id) >= level)
-            })
-    };
+    let valid = || async { allowed(&node, &peer, &action).await };
     if !valid().await {
         return forbidden();
     }
@@ -90,29 +75,14 @@ pub(super) async fn guarded_response(
     };
     let (parts, body) = response.into_parts();
     let stream = stream::unfold(
-        (
-            body.into_data_stream(),
-            node,
-            peer,
-            action,
-            grants,
-            trust,
-            initial_level,
-        ),
-        |(mut body, node, peer, action, mut grants, mut trust, initial_level)| async move {
+        (body.into_data_stream(), node, peer, action, grants, trust),
+        |(mut body, node, peer, action, mut grants, mut trust)| async move {
             loop {
-                if !allowed(&node, &peer, &action).await
-                    || initial_level.is_some_and(|(id, level)| {
-                        !node
-                            .access_policy
-                            .grants(&peer.fingerprint)
-                            .is_ok_and(|grants| grants.level(id) >= level)
-                    })
-                {
+                if !allowed(&node, &peer, &action).await {
                     return None;
                 }
                 tokio::select! {
-                    chunk = body.next() => return chunk.map(|chunk| (chunk, (body, node, peer, action, grants, trust, initial_level))),
+                    chunk = body.next() => return chunk.map(|chunk| (chunk, (body, node, peer, action, grants, trust))),
                     result = grants.changed() => if result.is_err() { return None; },
                     result = trust.changed() => if result.is_err() { return None; },
                     _ = node.token.cancelled() => return None,
@@ -130,20 +100,12 @@ pub(super) async fn require_library_read(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let mut query = match Query::<LibraryQuery>::try_from_uri(request.uri()) {
+    let query = match Query::<LibraryQuery>::try_from_uri(request.uri()) {
         Ok(Query(query)) => query,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if request.uri().path().starts_with("/files/cache/") {
-        // The shared cover cache has no library identity; scope it to the current UI.
-        query.library_id = match manager.node() {
-            Ok(node) => node
-                .current_ui()
-                .await
-                .ok()
-                .and_then(|params| params.library_id),
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
+    if request.uri().path().starts_with("/files/cache/") && query.library_id.is_none() {
+        return StatusCode::BAD_REQUEST.into_response();
     }
     let library = match request_library(&manager, query).await {
         Ok(library) => library,
@@ -161,9 +123,9 @@ pub(super) async fn require_library_read(
     // audio itself and need a library grant.
     let path = request.uri().path();
     let action = if path.starts_with("/files/cache/") || path.starts_with("/media/") {
-        Action::Browse { library_id }
+        Action::ConnectionView { library_id }
     } else {
-        Action::LibraryRead { library_id }
+        Action::SyncPull { library_id }
     };
     guarded_response(node, peer, action, next.run(request)).await
 }

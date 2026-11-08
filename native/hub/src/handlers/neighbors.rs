@@ -1,5 +1,6 @@
 use crate::node::NodeContext;
 use crate::request_error::ExpectedRequestError;
+use crate::server::api::remove_trusted_device;
 use crate::server::{
     ServerManager,
     api::{add_trusted_server, check_fingerprint, edit_trusted_hosts, register_device},
@@ -9,14 +10,21 @@ use crate::server::{
     },
     utils::device::load_device_info,
 };
-use std::net::SocketAddr;
-use std::{fs, future::Future, path::Path, sync::Arc, time::Duration};
+use std::net::{IpAddr, SocketAddr};
+use std::{
+    fs,
+    future::Future,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use log::info;
 use reqwest::redirect::Policy;
 use tokio::sync::RwLock;
 use url::Url;
+use uuid::Uuid;
 
 use ::database::actions::cover_art::COVER_TEMP_DIR;
 use ::discovery::{
@@ -30,6 +38,43 @@ use ::discovery::{
 
 use crate::utils::{GlobalParams, ParamsExtractor};
 use crate::{Session, Signal, messages::*};
+
+pub(crate) async fn select_pinned_pair_host(
+    hosts: Vec<String>,
+    validator: &CertValidator,
+    fingerprint: &str,
+) -> Result<String> {
+    match select_best_host(
+        hosts.clone(),
+        Arc::new(tls_config(validator.clone(), fingerprint)),
+    )
+    .await
+    {
+        Ok(host) => Ok(host),
+        Err(_) => {
+            for host in &hosts {
+                if let Ok(certificate) =
+                    fetch_server_certificate(&certificate_fetch_url(host)).await
+                    && certificate.fingerprint != fingerprint
+                {
+                    return Err(ExpectedRequestError::CertificateMismatch.into());
+                }
+            }
+            Err(ExpectedRequestError::Unavailable {
+                what: "paired server",
+            }
+            .into())
+        }
+    }
+}
+
+fn certificate_fetch_url(host: &str) -> String {
+    if matches!(host.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
+        format!("https://[{host}]/ping")
+    } else {
+        format!("https://{host}/ping")
+    }
+}
 
 impl ParamsExtractor for StartBroadcastRequest {
     type Params = (Arc<DiscoveryService>, Arc<String>);
@@ -392,29 +437,31 @@ impl Signal for GetSslCertificateFingerprintRequest {
 }
 
 impl ParamsExtractor for RemoveTrustedClientRequest {
-    type Params = (Arc<RwLock<PermissionManager>>, SyncTokenStore);
+    type Params = Arc<NodeContext>;
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            Arc::clone(&all_params.permission_manager),
-            all_params.node.sync_tokens.clone(),
-        )
+        all_params.node.clone()
     }
 }
 
 impl Signal for RemoveTrustedClientRequest {
-    type Params = (Arc<RwLock<PermissionManager>>, SyncTokenStore);
+    type Params = Arc<NodeContext>;
     type Response = RemoveTrustedClientResponse;
 
     async fn handle(
         &self,
-        (validator, sync_tokens): Self::Params,
+        node: Self::Params,
         _session: Option<Session>,
         req: &Self,
     ) -> Result<Option<Self::Response>> {
-        let result = validator.write().await.remove_user(&req.fingerprint).await;
+        let permissions = node.permission_manager.read().await;
+        let validator = node.cert_validator.read().await;
+        let result = remove_trusted_device(&permissions, &validator, &req.fingerprint).await;
+        drop(validator);
+        drop(permissions);
         if result.is_ok() {
-            sync_tokens.remove_peer(&req.fingerprint);
+            node.sync_tokens.remove_peer(&req.fingerprint);
+            node.revoke_outgoing_for(&req.fingerprint).await;
         }
         match result {
             Ok(_) => Ok(Some(RemoveTrustedClientResponse {
@@ -599,33 +646,31 @@ impl Signal for AddTrustedServerRequest {
 }
 
 impl ParamsExtractor for RemoveTrustedServerRequest {
-    type Params = (Arc<RwLock<CertValidator>>, SyncTokenStore);
+    type Params = Arc<NodeContext>;
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            Arc::clone(&all_params.cert_validator),
-            all_params.node.sync_tokens.clone(),
-        )
+        all_params.node.clone()
     }
 }
 
 impl Signal for RemoveTrustedServerRequest {
-    type Params = (Arc<RwLock<CertValidator>>, SyncTokenStore);
+    type Params = Arc<NodeContext>;
     type Response = RemoveTrustedServerResponse;
 
     async fn handle(
         &self,
-        (validator, sync_tokens): Self::Params,
+        node: Self::Params,
         _session: Option<Session>,
         req: &Self,
     ) -> Result<Option<Self::Response>> {
-        let result = validator
-            .write()
-            .await
-            .remove_fingerprint(&req.fingerprint)
-            .await;
+        let permissions = node.permission_manager.read().await;
+        let validator = node.cert_validator.read().await;
+        let result = remove_trusted_device(&permissions, &validator, &req.fingerprint).await;
+        drop(validator);
+        drop(permissions);
         if result.is_ok() {
-            sync_tokens.remove_peer(&req.fingerprint);
+            node.sync_tokens.remove_peer(&req.fingerprint);
+            node.revoke_outgoing_for(&req.fingerprint).await;
         }
         match result {
             Ok(_) => Ok(Some(RemoveTrustedServerResponse {
@@ -662,44 +707,30 @@ impl Signal for RegisterDeviceOnServerRequest {
         req: &Self,
     ) -> Result<Option<Self::Response>> {
         let (config_path, validator) = config;
-        let validator = Arc::new(validator.read().await.clone());
-        let client_config = Arc::new(validator.clone().into_client_config());
+        let validator = validator.read().await.clone();
         let config_path = config_path.to_string();
 
         let certificate_id = req.alias.clone();
         let (fingerprint, cert, _) =
             generate_or_load_certificates(config_path, &certificate_id).await?;
 
-        let host = match select_best_host(req.hosts.clone(), client_config.clone()).await {
-            Ok(x) => x,
-            Err(e) => {
-                return Ok(Some(RegisterDeviceOnServerResponse {
-                    success: false,
-                    error: format!("{e:#?}"),
-                }));
-            }
-        };
+        let host = select_pinned_pair_host(req.hosts.clone(), &validator, &req.fingerprint).await?;
+        let client_config = Arc::new(tls_config(validator, &req.fingerprint));
 
-        match register_device(
+        register_device(
             &host,
-            client_config.clone(),
+            client_config,
             cert,
             fingerprint,
             req.alias.clone(),
             "RuneAudio".to_string(),
             "Desktop".to_string(),
         )
-        .await
-        {
-            Ok(_) => Ok(Some(RegisterDeviceOnServerResponse {
-                success: true,
-                error: String::new(),
-            })),
-            Err(e) => Ok(Some(RegisterDeviceOnServerResponse {
-                success: false,
-                error: format!("{e:#?}"),
-            })),
-        }
+        .await?;
+        Ok(Some(RegisterDeviceOnServerResponse {
+            success: true,
+            error: String::new(),
+        }))
     }
 }
 
@@ -725,21 +756,12 @@ impl Signal for CheckDeviceOnServerRequest {
         req: &Self,
     ) -> Result<Option<Self::Response>> {
         let validator = validator.read().await.clone();
-        let client_config = Arc::new(Arc::new(validator).into_client_config());
 
         let (fingerprint, _, _) =
             generate_or_load_certificates(Path::new(&*config_path), &req.alias).await?;
 
-        let host = match select_best_host(req.hosts.clone(), client_config.clone()).await {
-            Ok(host) => host,
-            Err(e) => {
-                return Ok(Some(CheckDeviceOnServerResponse {
-                    success: false,
-                    error: format!("{e:#?}"),
-                    status: None,
-                }));
-            }
-        };
+        let host = select_pinned_pair_host(req.hosts.clone(), &validator, &req.fingerprint).await?;
+        let client_config = Arc::new(tls_config(validator, &req.fingerprint));
 
         match check_fingerprint(&host, client_config, &fingerprint).await {
             Ok(response) => {
@@ -756,11 +778,7 @@ impl Signal for CheckDeviceOnServerRequest {
                     status: Some(status),
                 }))
             }
-            Err(e) => Ok(Some(CheckDeviceOnServerResponse {
-                success: false,
-                error: format!("{e:#}"),
-                status: Some(ClientStatus::Blocked),
-            })),
+            Err(_) => Err(ExpectedRequestError::CertificateMismatch.into()),
         }
     }
 }
@@ -911,6 +929,37 @@ pub(crate) async fn authorized_get(
     Ok(client.get(url).bearer_auth(refreshed).send().await?)
 }
 
+fn remote_file_cache_path(
+    cache_root: &Path,
+    fingerprint: &str,
+    library_id: Uuid,
+    file_name: &str,
+) -> PathBuf {
+    cache_root
+        .join("remote_files")
+        .join(fingerprint)
+        .join(library_id.to_string())
+        .join(file_name)
+}
+
+fn publish_verified_remote_file(cache_dir: &Path, file_name: &str, body: &[u8]) -> Result<PathBuf> {
+    let digest = blake3::hash(body).to_hex().to_string();
+    if digest != file_name {
+        return Err(anyhow!(
+            "Downloaded file does not match its BLAKE3 digest name"
+        ));
+    }
+    let local_path = cache_dir.join(file_name);
+    let temporary_path = cache_dir.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    if let Err(error) =
+        fs::write(&temporary_path, body).and_then(|()| fs::rename(&temporary_path, &local_path))
+    {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error.into());
+    }
+    Ok(local_path)
+}
+
 impl Signal for FetchRemoteFileRequest {
     type Params = FetchRemoteFileParams;
     type Response = FetchRemoteFileResponse;
@@ -956,12 +1005,25 @@ impl Signal for FetchRemoteFileRequest {
             }));
         }
 
+        let library_id = url
+            .query_pairs()
+            .find(|(name, _)| name == "library_id")
+            .and_then(|(_, value)| Uuid::parse_str(&value).ok());
+        let Some(library_id) = library_id else {
+            return Ok(Some(FetchRemoteFileResponse {
+                success: false,
+                local_path: String::new(),
+                error: "Remote file URL must include a valid library_id".to_string(),
+            }));
+        };
+
         // Extract the file name from the URL path
         let path = url.path();
         let file_name = Path::new(path)
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_owned();
 
         if file_name.is_empty() {
             return Ok(Some(FetchRemoteFileResponse {
@@ -971,8 +1033,32 @@ impl Signal for FetchRemoteFileRequest {
             }));
         }
 
-        // Ensure the cover arts directory exists
-        if let Err(e) = fs::create_dir_all(COVER_TEMP_DIR.clone()) {
+        if file_name.len() != 64 || !file_name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(Some(FetchRemoteFileResponse {
+                success: false,
+                local_path: String::new(),
+                error: "Remote cover file name must be a BLAKE3 digest".to_string(),
+            }));
+        }
+
+        // Authenticate the peer before a cached response can be returned.
+        let server_fingerprint = match trusted_fingerprint(&validator, &host, port).await {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return Ok(Some(FetchRemoteFileResponse {
+                    success: false,
+                    local_path: String::new(),
+                    error: format!("Failed to authorize remote host: {error:#}"),
+                }));
+            }
+        };
+
+        let local_path =
+            remote_file_cache_path(&COVER_TEMP_DIR, &server_fingerprint, library_id, &file_name);
+        let cache_dir = local_path
+            .parent()
+            .context("remote file cache path has no parent")?;
+        if let Err(e) = fs::create_dir_all(cache_dir) {
             return Ok(Some(FetchRemoteFileResponse {
                 success: false,
                 local_path: String::new(),
@@ -980,14 +1066,12 @@ impl Signal for FetchRemoteFileRequest {
             }));
         }
 
-        // Create the local file path
-        let local_path = COVER_TEMP_DIR.clone().join(file_name);
-
-        // Check if the file already exists locally
+        // The host is a trusted peer (checked above) and the name is content-addressed
+        // within that peer and library, so a cached copy needs no new download.
         if local_path.exists() {
             return Ok(Some(FetchRemoteFileResponse {
                 success: true,
-                local_path: local_path.to_str().unwrap_or_default().to_string(),
+                local_path: local_path.to_string_lossy().into_owned(),
                 error: String::new(),
             }));
         }
@@ -1012,7 +1096,6 @@ impl Signal for FetchRemoteFileRequest {
             }
         };
 
-        // Check the response status
         if !res.status().is_success() {
             return Ok(Some(FetchRemoteFileResponse {
                 success: false,
@@ -1033,20 +1116,60 @@ impl Signal for FetchRemoteFileRequest {
             }
         };
 
-        // Write the file to disk
-        if let Err(e) = fs::write(&local_path, &body) {
-            return Ok(Some(FetchRemoteFileResponse {
-                success: false,
-                local_path: String::new(),
-                error: format!("Failed to write file to disk: {e}"),
-            }));
-        }
+        let published_path = match publish_verified_remote_file(cache_dir, &file_name, &body) {
+            Ok(path) => path,
+            Err(error) => {
+                return Ok(Some(FetchRemoteFileResponse {
+                    success: false,
+                    local_path: String::new(),
+                    error: format!("Failed to verify or publish remote file: {error:#}"),
+                }));
+            }
+        };
 
         // Return the successful response with the local file path
         Ok(Some(FetchRemoteFileResponse {
             success: true,
-            local_path: local_path.to_str().unwrap_or_default().to_string(),
+            local_path: published_path.to_string_lossy().into_owned(),
             error: String::new(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod remote_file_cache_tests {
+    use super::{publish_verified_remote_file, remote_file_cache_path};
+    use anyhow::{Context, Result};
+    use std::fs;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    #[test]
+    fn remote_file_cache_is_scoped_to_peer_and_library() -> Result<()> {
+        let temp = TempDir::new()?;
+        let library_id = Uuid::new_v4();
+        let file_name = blake3::hash(b"shared basename").to_hex().to_string();
+        let peer_x = remote_file_cache_path(temp.path(), "peer-x", library_id, &file_name);
+        let peer_y = remote_file_cache_path(temp.path(), "peer-y", library_id, &file_name);
+
+        fs::create_dir_all(peer_x.parent().context("peer X cache directory")?)?;
+        fs::write(&peer_x, b"peer X bytes")?;
+
+        assert_ne!(peer_x, peer_y);
+        assert!(peer_x.exists());
+        assert!(!peer_y.exists());
+        assert!(peer_x.ends_with(format!("peer-x/{library_id}/{file_name}")));
+        assert!(peer_y.ends_with(format!("peer-y/{library_id}/{file_name}")));
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_digest_is_not_published() -> Result<()> {
+        let temp = TempDir::new()?;
+        let file_name = blake3::hash(b"expected").to_hex().to_string();
+        let result = publish_verified_remote_file(temp.path(), &file_name, b"different");
+        assert!(result.is_err());
+        assert!(!temp.path().join(file_name).exists());
+        Ok(())
     }
 }

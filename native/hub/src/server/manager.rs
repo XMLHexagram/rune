@@ -47,12 +47,11 @@ use tower_governor::{
 use ::discovery::{DiscoveryParams, client::parse_certificate, ssl::generate_self_signed_cert};
 
 use crate::{
-    Signal,
     library_pool::LibraryHandle,
-    messages::*,
+    messages::{LibraryContentChanged, PeerLibrary},
     node::NodeContext,
     server::{
-        AppState, ServerState, WebSocketService,
+        AppState, ServerState,
         http::{
             check_fingerprint::check_fingerprint_handler,
             device_info::device_info_handler,
@@ -72,15 +71,7 @@ use crate::{
             websocket::websocket_handler,
         },
     },
-    utils::{ParamsExtractor, RinfRustSignal},
 };
-
-async fn register_request_handlers(
-    websocket_service: Arc<WebSocketService>,
-    node: Arc<NodeContext>,
-) {
-    for_all_remote_request_pairs2!(listen_server_event, websocket_service, node);
-}
 
 fn coalesce_worker_notify(
     notify: Arc<dyn Fn() + Send + Sync>,
@@ -270,8 +261,6 @@ impl ServerManager {
         let mut device_info = discovery_params.device_info.clone();
         let websocket_service = node.websocket_service.clone();
 
-        register_request_handlers(websocket_service.clone(), node.clone()).await;
-
         let app_state = Arc::new(AppState {
             cover_temp_dir: COVER_TEMP_DIR.clone(),
         });
@@ -323,11 +312,17 @@ impl ServerManager {
         let (_, fingerprint) = parse_certificate(&self.certificate)?;
         let auth = {
             let mut sync_auth = self.sync_auth.lock().await;
-            sync_auth
-                .get_or_insert_with(|| {
-                    SyncAuth::new(node.permission_manager.clone(), fingerprint.clone())
-                })
-                .clone()
+            if let Some(auth) = sync_auth.as_ref() {
+                auth.clone()
+            } else {
+                let auth = SyncAuth::new(node.permission_manager.clone(), fingerprint.clone());
+                node.permission_manager
+                    .write()
+                    .await
+                    .add_trust_change_hook(Arc::new(auth.trust_change_hook()));
+                *sync_auth = Some(auth.clone());
+                auth
+            }
         };
         let sync_routes = Router::new()
             .nest(
@@ -469,7 +464,7 @@ impl ServerManager {
                         && let Some(library) = &params.library
                     {
                         node.broadcaster.broadcast(&LibraryContentChanged {
-                            path: library.media_root.clone(),
+                            path: library.descriptor.app_name(),
                         });
                     }
                 });
@@ -851,7 +846,12 @@ mod lifecycle_tests {
     };
     use super::super::utils::device::load_device_info;
     use crate::Signal;
+    use crate::backends::remote::open_remote_library;
+    use crate::macros::dispatch_remote;
+    use crate::messages::*;
     use crate::request_error::classify;
+    use crate::server::WebSocketService;
+    use crate::utils::ParamsExtractor;
     use migration::catalog_identity::{ParentKind, parent};
     use playback::decoder::RuneDecoder;
     use playback::stream_utils::{ManagedStream, create_stream_with_authorizer};
@@ -905,14 +905,18 @@ mod lifecycle_tests {
     use database::connection::StorageMode;
     use database::entities::{media_files, media_files::Column};
     use database::library_registry::{
-        DbPlacement, LibraryAuthority, LibraryDescriptor, LibraryRegistry, LibraryStorage,
-        create_replica, resolve_library,
+        DbPlacement, LibraryAuthority, LibraryDescriptor, LibraryLocation, LibraryRegistry,
+        LibraryStorage, create_replica, resolve_library,
     };
     use database::sync::{
         LibrarySyncStore,
         model::{Album, Collection, MetadataTag, ObjectKey, Payload, Track},
     };
-    use discovery::{capabilities::Capabilities, server::UserStatus, utils::DeviceType};
+    use discovery::{
+        capabilities::Capabilities,
+        server::{PermissionManager, UserStatus},
+        utils::DeviceType,
+    };
     use playback::sfx_player::SfxPlayer;
     use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
     use std::future::Future;
@@ -922,25 +926,33 @@ mod lifecycle_tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
+    use crate::backends::remote::encode_message;
     use crate::backends::remote::{connect_remote, decode_message};
+    use crate::handlers::neighbors::select_pinned_pair_host;
     use crate::library_pool::{LibraryHandle, LibraryPool};
     use crate::messages::{
-        PlaybackStatus, RequestErrorKind, RequestFailureCause, TrustListUpdated,
-        TrustedServerCertificate,
+        DeviceConnectionLevel, DeviceSyncLevel, PlaybackStatus, RequestErrorKind,
+        RequestFailureCause, TrustListUpdated, TrustedServerCertificate,
     };
-    use crate::node::NodeSlot;
-    use crate::request_error::request_failure_cause;
+    use crate::node::{NodeSlot, ReconnectConfig};
+    use crate::request_error::{ExpectedRequestError, request_failure_cause};
     use crate::server::api::{add_trusted_server, edit_trusted_hosts};
     use crate::server::sync::client::sync_library;
     use database::sync::model::RuneModel;
-    use futures::StreamExt;
+    use futures::{SinkExt, StreamExt};
     use reqwest::header::CONNECTION;
     use sync::{CheckpointKey, ReceiveStore, Scope, SyncModel, scope_id};
+    use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::Message;
 
     include!("access_policy_tests.rs");
     mod player_session_tests {
         use super::*;
         include!("player_session_tests.rs");
+    }
+
+    mod gui_listener_tests {
+        include!("gui_listener_tests.rs");
     }
 
     struct Quiet;
@@ -1014,6 +1026,23 @@ mod lifecycle_tests {
         idle_timeout: Duration,
         broadcaster: Arc<dyn Broadcaster>,
     ) -> Result<Fixture> {
+        fixture_with_reconnect_config(
+            dir,
+            library_id,
+            idle_timeout,
+            broadcaster,
+            ReconnectConfig::default(),
+        )
+        .await
+    }
+
+    async fn fixture_with_reconnect_config(
+        dir: &Path,
+        library_id: Uuid,
+        idle_timeout: Duration,
+        broadcaster: Arc<dyn Broadcaster>,
+        reconnect_config: ReconnectConfig,
+    ) -> Result<Fixture> {
         fs::create_dir_all(dir.join(".rune"))?;
         let node = get_or_create_node_id(dir.to_str().context("config path")?).await?;
         let pool = LibraryPool::with_idle_timeout(dir, dir, &node.to_string(), idle_timeout)?;
@@ -1029,6 +1058,7 @@ mod lifecycle_tests {
                 db_placement: DbPlacement::Portable,
                 background_sync: true,
                 access_level: None,
+                connection_access: None,
             });
             Ok(())
         })
@@ -1039,11 +1069,12 @@ mod lifecycle_tests {
             ..SyncSettings::default()
         }
         .save(dir)?;
-        let node_context = NodeContext::new(
+        let node_context = NodeContext::with_reconnect_config(
             dir.to_str().context("config path")?,
             dir.to_str().context("db path")?,
             broadcaster,
             false,
+            reconnect_config,
         )
         .await?;
         fixture_from_library(node_context, library).await
@@ -1051,7 +1082,13 @@ mod lifecycle_tests {
 
     async fn fixture_open_replica(source: &Fixture, root: &Path) -> Result<Fixture> {
         let node = source.global_params.node.clone();
-        let mut registry = LibraryRegistry::load(Path::new(&*node.config_path))?;
+        let config = Path::new(&*node.config_path);
+        let mut registry = LibraryRegistry::load(config)?;
+        // A replica added through the peer flow is named by id, not by folder.
+        let root = match LibraryLocation::parse(root.to_str().context("replica path")?)? {
+            LibraryLocation::Replica(id) => registry.replica(id)?.root(config),
+            LibraryLocation::Path(path) => std::path::PathBuf::from(path),
+        };
         let descriptor = resolve_library(
             &source.global_params.test_library().fsio,
             &mut registry,
@@ -1120,16 +1157,25 @@ mod lifecycle_tests {
         let dir = tempfile::tempdir()?;
         let manager = fixture(dir.path()).await?;
         let service = Arc::new(WebSocketService::new());
-        register_request_handlers(service.clone(), manager.global_params.node.clone()).await;
         assert!(
             service
-                .handle_message("FetchRemoteFileRequest", Vec::new(), None)
+                .handle_message(
+                    "FetchRemoteFileRequest",
+                    Vec::new(),
+                    None,
+                    &manager.global_params.node
+                )
                 .await
                 .is_none()
         );
         let payload = rinf::serialize(&GetMediaFilesCountRequest {})?;
         let (name, response) = service
-            .handle_message("GetMediaFilesCountRequest", payload, None)
+            .handle_message(
+                "GetMediaFilesCountRequest",
+                payload,
+                None,
+                &manager.global_params.node,
+            )
             .await
             .context("forwardable request must be dispatched")?;
         assert_eq!(name, "GetMediaFilesCountResponse");
@@ -1159,16 +1205,36 @@ mod lifecycle_tests {
         Ok(())
     }
 
-    #[test]
-    fn request_gate_owner_requests_are_not_forwardable() {
-        macro_rules! collect_names {
-            ($names:expr, $unused:expr $(, ($request:ident, $response:ident))* $(, $request_only:ident)*) => {{
-                $( $names.push(stringify!($request)); )*
-                $( $names.push(stringify!($request_only)); )*
-            }};
-        }
-        let mut names = Vec::new();
-        for_all_remote_request_pairs2!(collect_names, names, ());
+    #[tokio::test]
+    async fn a_replica_opened_by_its_folder_closes_by_that_folder() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = fixture(dir.path()).await?;
+        let config = Path::new(&*source.global_params.config_path);
+        let id = Uuid::new_v4();
+        let mut registry = LibraryRegistry::load(config)?;
+        create_replica(config, &mut registry, id, "Replica", "owner").await?;
+        let root = registry.replica(id)?.root(config);
+        let opened = fixture_open_replica(&source, &root).await?;
+        let params = &opened.global_params;
+        assert_eq!(params.library_id, Some(id));
+        let close = CloseLibraryRequest {
+            path: root.to_string_lossy().into_owned(),
+        };
+        assert!(
+            close
+                .handle(close.extract_params(params), None, &close)
+                .await?
+                .is_some()
+        );
+        assert!(params.main_token.is_cancelled());
+        source.global_params.node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_gate_owner_requests_are_not_forwardable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let peer = fixture(dir.path()).await?;
         for name in [
             "ListLocalLibrariesRequest",
             "SetLibraryBackgroundSyncRequest",
@@ -1181,8 +1247,15 @@ mod lifecycle_tests {
             "AuthenticateMultipleServiceRequest",
             "LogoutSingleServiceRequest",
         ] {
-            assert!(!names.contains(&name), "{name} must remain local");
+            assert!(
+                dispatch_remote(name, &[], None, None, &peer.global_params.node)
+                    .await
+                    .is_none(),
+                "{name} must remain local"
+            );
         }
+        peer.global_params.node.shutdown().await?;
+        Ok(())
     }
 
     async fn info(manager: &Fixture) -> Result<discovery::utils::DeviceInfo> {
@@ -1228,6 +1301,26 @@ mod lifecycle_tests {
         assert!(stored_hosts.contains(&host));
         assert!(stored_hosts.contains(&unreachable_host));
         server.manager.stop().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pinned_pair_host_reports_a_certificate_mismatch() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server = fixture(server_dir.path()).await?;
+        let client = fixture(client_dir.path()).await?;
+        let (address, _) = start_test_tls_server(&server).await?;
+        let host = format!("127.0.0.1:{}", address.port());
+        let validator = client.global_params.cert_validator.read().await.clone();
+
+        let error = select_pinned_pair_host(vec![host], &validator, "a different fingerprint")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ExpectedRequestError>(),
+            Some(ExpectedRequestError::CertificateMismatch)
+        ));
         Ok(())
     }
 
@@ -1420,7 +1513,11 @@ mod lifecycle_tests {
             .error_for_status()?
             .json()
             .await?;
-        assert_eq!(access, serde_json::json!({ "control": false }));
+        assert_eq!(access["control"], false);
+        assert!(access.get("connection").is_some());
+        assert!(access.get("sync").is_some());
+        assert_eq!(access["connection"]["all_libraries"], "ViewEdit");
+        assert_eq!(access["sync"]["all_libraries"], "PullPush");
 
         let response = client
             .post(format!("https://{address}/cast/preflight"))
@@ -1720,7 +1817,28 @@ mod lifecycle_tests {
     }
 
     async fn paired_full(a: &Fixture, b: &Fixture) -> Result<SocketAddr> {
-        pair(a, b).await?;
+        let a_fingerprint = info(a).await?.fingerprint;
+        let b_fingerprint = info(b).await?.fingerprint;
+        if a.global_params
+            .permission_manager
+            .read()
+            .await
+            .verify_by_fingerprint(&b_fingerprint)
+            .await
+            .is_none()
+        {
+            pair(a, b).await?;
+        }
+        if b.global_params
+            .permission_manager
+            .read()
+            .await
+            .verify_by_fingerprint(&a_fingerprint)
+            .await
+            .is_none()
+        {
+            pair(b, a).await?;
+        }
         a.manager
             .clone()
             .start(
@@ -1731,6 +1849,70 @@ mod lifecycle_tests {
             )
             .await?;
         a.get_address().await.context("missing listener address")
+    }
+
+    async fn assert_websocket_request_is_ignored(name: &str, payload: Vec<u8>) -> Result<()> {
+        let renderer_dir = tempfile::tempdir()?;
+        let controller_dir = tempfile::tempdir()?;
+        let renderer = fixture(renderer_dir.path()).await?;
+        let controller = fixture(controller_dir.path()).await?;
+        let addr = paired_full(&renderer, &controller).await?;
+        let mut socket = connect_remote(
+            "127.0.0.1",
+            addr.port(),
+            &controller.global_params.config_path,
+            controller.global_params.cert_validator.read().await.clone(),
+            &controller.global_params.node.sync_tokens,
+        )
+        .await?;
+        let ignored_id = Uuid::new_v4();
+        let following_id = Uuid::new_v4();
+        socket
+            .send(Message::Binary(
+                encode_message(name, &payload, Some(ignored_id)).into(),
+            ))
+            .await?;
+        let payload = rinf::serialize(&GetMediaFilesCountRequest {})?;
+        socket
+            .send(Message::Binary(
+                encode_message("GetMediaFilesCountRequest", &payload, Some(following_id)).into(),
+            ))
+            .await?;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = socket.next().await.context("socket closed")??;
+                let Message::Binary(bytes) = frame else {
+                    continue;
+                };
+                let (response_name, payload, id) =
+                    decode_message(&bytes).context("response frame")?;
+                assert_ne!(id, ignored_id, "{name} must receive no reply");
+                if id == following_id {
+                    assert_eq!(response_name, "GetMediaFilesCountResponse");
+                    let response: GetMediaFilesCountResponse = rinf::deserialize(&payload)?;
+                    assert_eq!(response.count, 0);
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("following request received no reply")??;
+        drop(socket);
+        renderer.global_params.node.shutdown().await?;
+        controller.global_params.node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn websocket_node_local_request_is_ignored() -> Result<()> {
+        let payload = rinf::serialize(&FetchRemoteFileRequest { url: String::new() })?;
+        assert_websocket_request_is_ignored("FetchRemoteFileRequest", payload).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn websocket_unknown_request_is_ignored() -> Result<()> {
+        assert_websocket_request_is_ignored("UnknownRequest", vec![255]).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1752,7 +1934,7 @@ mod lifecycle_tests {
         let second_entered = Arc::new(Notify::new());
         let second_entered_handler = second_entered.clone();
         service
-            .register_handler("OrderSecond", move |_, _, _| {
+            .override_handler("OrderSecond", move |_, _, _| {
                 let entered = second_entered_handler.clone();
                 async move {
                     entered.notify_one();
@@ -1829,6 +2011,19 @@ mod lifecycle_tests {
         let validator = b.global_params.cert_validator.read().await.clone();
         let fingerprint = info(&b).await?.fingerprint;
         for remove in [false, true] {
+            let auth_token = if remove {
+                None
+            } else {
+                let manager = a.global_params.node.manager()?;
+                let auth = manager
+                    .sync_auth
+                    .lock()
+                    .await
+                    .clone()
+                    .context("sync auth was not initialized")?;
+                let token = auth.issue_token_for_test(&fingerprint).await;
+                Some((auth, token))
+            };
             let mut socket = connect_remote(
                 "127.0.0.1",
                 addr.port(),
@@ -1837,21 +2032,36 @@ mod lifecycle_tests {
                 &b.global_params.node.sync_tokens,
             )
             .await?;
-            let manager = a.global_params.permission_manager.read().await;
             if remove {
-                manager.remove_user(&fingerprint).await?;
+                a.global_params
+                    .permission_manager
+                    .read()
+                    .await
+                    .remove_user(&fingerprint)
+                    .await?;
             } else {
-                manager
+                PermissionManager::new(a.global_params.config_path.as_str())?
                     .change_user_status(&fingerprint, UserStatus::Blocked)
                     .await?;
             }
-            drop(manager);
             let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
                 .await?
                 .context("socket closed without frame")??;
             assert!(
                 matches!(frame, Message::Close(Some(frame)) if u16::from(frame.code) == 4403 && frame.reason == "revoked")
             );
+            if let Some((auth, token)) = auth_token {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if !auth.has_token_for_test(&token).await {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .context("file-driven client block did not purge sync tokens")?;
+            }
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
                     if a.global_params
@@ -1971,7 +2181,7 @@ mod lifecycle_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn addressed_websocket_requests_select_and_authorize_the_named_library() -> Result<()> {
         use crate::Session;
-        use crate::access_policy::{DeviceGrants, LibraryLevel};
+        use crate::access_policy::{ConnectionLevel, DeviceGrants, LibraryGrants};
         use crate::backends::remote::connect_remote;
         use crate::messages::CreatePlaylistRequest;
 
@@ -1990,10 +2200,16 @@ mod lifecycle_tests {
 
         pair(&renderer, &controller).await?;
         let controller_fingerprint = info(&controller).await?.fingerprint;
-        let addressed_grants = |library_id, level| DeviceGrants {
+        let addressed_grants = |library_id, connection| DeviceGrants {
             control: false,
-            all_libraries: None,
-            libraries: [(library_id, level)].into_iter().collect(),
+            connection: LibraryGrants {
+                all_libraries: None,
+                libraries: [(library_id, connection)].into_iter().collect(),
+            },
+            sync: LibraryGrants {
+                all_libraries: None,
+                libraries: Default::default(),
+            },
             administer: false,
         };
         let user = renderer
@@ -2011,7 +2227,7 @@ mod lifecycle_tests {
         };
         renderer.global_params.node.access_policy.set(
             &controller_fingerprint,
-            addressed_grants(other_id, LibraryLevel::Read),
+            addressed_grants(other_id, ConnectionLevel::View),
         )?;
         renderer
             .global_params
@@ -2025,7 +2241,7 @@ mod lifecycle_tests {
             .await?;
         renderer.global_params.node.access_policy.set(
             &controller_fingerprint,
-            addressed_grants(renderer_id, LibraryLevel::Read),
+            addressed_grants(renderer_id, ConnectionLevel::View),
         )?;
         let denied = renderer
             .global_params
@@ -2044,8 +2260,19 @@ mod lifecycle_tests {
             &controller_fingerprint,
             DeviceGrants {
                 control: true,
-                all_libraries: None,
-                libraries: [(other_id, LibraryLevel::Read)].into_iter().collect(),
+                connection: LibraryGrants {
+                    all_libraries: None,
+                    libraries: [
+                        (other_id, ConnectionLevel::View),
+                        (renderer_id, ConnectionLevel::View),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+                sync: LibraryGrants {
+                    all_libraries: None,
+                    libraries: Default::default(),
+                },
                 administer: false,
             },
         )?;
@@ -2103,8 +2330,14 @@ mod lifecycle_tests {
             &controller_fingerprint,
             DeviceGrants {
                 control: true,
-                all_libraries: None,
-                libraries: [(other_id, LibraryLevel::Read)].into_iter().collect(),
+                connection: LibraryGrants {
+                    all_libraries: None,
+                    libraries: [(other_id, ConnectionLevel::View)].into_iter().collect(),
+                },
+                sync: LibraryGrants {
+                    all_libraries: None,
+                    libraries: Default::default(),
+                },
                 administer: false,
             },
         )?;
@@ -2129,7 +2362,8 @@ mod lifecycle_tests {
         .await?;
         assert_eq!(name, "RemoteRequestFailed");
         let failure: RemoteRequestFailed = rinf::deserialize(&payload)?;
-        assert_eq!(failure.kind, RequestErrorKind::NotFound);
+        // An ungranted address is rejected before the server reveals whether it exists.
+        assert_eq!(failure.kind, RequestErrorKind::PermissionDenied);
 
         socket.close(None).await?;
         renderer.manager.stop().await?;
@@ -2140,6 +2374,7 @@ mod lifecycle_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn access_policy_guest_websocket() -> Result<()> {
+        use crate::access_policy::DeviceGrants;
         use crate::backends::remote::connect_remote;
         let first = tempfile::tempdir()?;
         let second = tempfile::tempdir()?;
@@ -2150,12 +2385,21 @@ mod lifecycle_tests {
         fs::write(
             first.path().join("grants.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": 1, "devices": {fingerprint: {
+                "version": 1, "devices": {fingerprint.clone(): {
                     "control": true, "all_libraries": null, "libraries": {}, "administer": false
                 }}
             }))?,
         )?;
         let a = reopen_fixture(&original).await?;
+        // An old-format grants file is reset to the least-privileged preset.
+        assert_eq!(
+            a.global_params.node.access_policy.grants(&fingerprint)?,
+            DeviceGrants::guest()
+        );
+        a.global_params
+            .node
+            .access_policy
+            .set(&fingerprint, DeviceGrants::guest())?;
         let addr = paired_full(&a, &b).await?;
         let validator = b.global_params.cert_validator.read().await.clone();
         let mut socket = connect_remote(
@@ -2665,7 +2909,8 @@ mod lifecycle_tests {
             fingerprint: fingerprint.to_owned(),
             library_id: library.library_id.clone(),
             alias: library.alias.clone(),
-            access_level: library.access_level,
+            connection: library.connection,
+            sync: library.sync,
         };
         let response = request
             .handle(
@@ -2789,7 +3034,7 @@ mod lifecycle_tests {
             &replica.global_params.test_library().fsio,
             &replica.global_params.test_library().main_db,
             &replica.global_params.node_id,
-            Path::new(&path),
+            Path::new(&replica.global_params.test_library().media_root),
             ScanOptions {
                 cleanup: true,
                 force: false,
@@ -2954,7 +3199,6 @@ mod lifecycle_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn node_without_ui_serves_and_syncs_held_libraries_bidirectionally() -> Result<()> {
-        use crate::backends::remote::{WebSocketDartBridge, connect_remote};
         let first = tempfile::tempdir()?;
         let second = tempfile::tempdir()?;
         let a = fixture(first.path()).await?;
@@ -2969,7 +3213,8 @@ mod lifecycle_tests {
                     library_id: id.to_string(),
                     alias: "Held".into(),
                     added: false,
-                    access_level: DeviceLibraryLevel::ReadWrite,
+                    connection: DeviceConnectionLevel::ViewEdit,
+                    sync: DeviceSyncLevel::PullPush,
                 },
             ),
         )
@@ -3040,24 +3285,11 @@ mod lifecycle_tests {
             wait_for_album(&right, &forward)
         )?;
         let worker = b.sync_handle.lock().await.as_ref().context("worker")?.id();
-        let socket = peer_step("connect headless controller", async {
-            Ok(connect_remote(
-                "127.0.0.1",
-                a_addr.port(),
-                &b.global_params.config_path,
-                b.global_params.cert_validator.read().await.clone(),
-                &b.global_params.node.sync_tokens,
-            )
-            .await?)
-        })
-        .await?;
-        let mut bridge = WebSocketDartBridge::new();
-        peer_step(
-            "run headless controller bridge",
-            bridge.run(socket, b.global_params.node.clone()),
+        let remote_ui = peer_step(
+            "open headless controller library",
+            open_remote_library(b.global_params.node.clone(), &format!("@RR|ws://{a_addr}")),
         )
         .await?;
-        let remote_ui = b.global_params.node.current_ui().await?;
         assert!(remote_ui.library_id.is_none());
         assert!(Arc::ptr_eq(
             &remote_ui.permission_manager,
@@ -3172,7 +3404,8 @@ mod lifecycle_tests {
                 library_id: id.to_string(),
                 alias: "Held".into(),
                 added: false,
-                access_level: DeviceLibraryLevel::ReadWrite,
+                connection: DeviceConnectionLevel::ViewEdit,
+                sync: DeviceSyncLevel::PullPush,
             },
         )
         .await?;
@@ -3262,7 +3495,8 @@ mod lifecycle_tests {
             library_id: library_id.to_string(),
             alias: "L2".into(),
             added: false,
-            access_level: DeviceLibraryLevel::ReadWrite,
+            connection: DeviceConnectionLevel::ViewEdit,
+            sync: DeviceSyncLevel::PullPush,
         };
         request_add_library(&b, &fingerprint, &peer_library).await?;
         let original = scan_held_track(&a, library_id, "first.ogg").await?;
@@ -3455,10 +3689,11 @@ mod lifecycle_tests {
         let a_info = peer_step("read first peer identity", info(&a)).await?;
         let b_info = peer_step("read second peer identity", info(&b)).await?;
         peer_step("pair library peers", pair(&a, &b)).await?;
+        peer_step("pair library peers in reverse", pair(&b, &a)).await?;
         let a_reserve = TcpListener::bind("127.0.0.1:0")?;
         let b_reserve = TcpListener::bind("127.0.0.1:0")?;
         let a_addr = a_reserve.local_addr()?;
-        let b_addr = SocketAddr::from(([127, 0, 0, 2], b_reserve.local_addr()?.port()));
+        let b_addr = SocketAddr::from(([127, 0, 0, 1], b_reserve.local_addr()?.port()));
         assert_ne!(a_addr.port(), b_addr.port());
         drop((a_reserve, b_reserve));
         std::fs::copy(
@@ -3673,7 +3908,7 @@ mod lifecycle_tests {
                 .cert_validator
                 .read()
                 .await
-                .add_trusted_domains(["127.0.0.2"], &b_info.fingerprint)
+                .add_trusted_domains(["127.0.0.1", "localhost"], &b_info.fingerprint)
                 .await?;
             Ok(())
         })
@@ -3705,6 +3940,10 @@ mod lifecycle_tests {
         .await
         .context("could not resolve remote audio")?;
         let expected = std::fs::read(second.path().join("source.ogg"))?;
+        let source_path = source
+            .url
+            .strip_prefix(&format!("https://127.0.0.1:{}", b_addr.port()))
+            .context("remote audio URL did not use the announced loopback address")?;
         let full_bytes = peer_step("full audio GET", async {
             let full = source.request.get(None).await?;
             anyhow::ensure!(
@@ -3851,11 +4090,11 @@ mod lifecycle_tests {
                 &a_info.fingerprint,
                 &a.private_key,
                 &b_info.fingerprint,
-                "127.0.0.2",
+                "localhost",
                 b_addr.port(),
-                |_, client| {
+                |base, client| {
                     client
-                        .get(&source.url)
+                        .get(format!("{base}{source_path}"))
                         .header(reqwest::header::RANGE, "bytes=-12")
                 },
             )
@@ -3874,11 +4113,11 @@ mod lifecycle_tests {
                 &a_info.fingerprint,
                 &a.private_key,
                 &b_info.fingerprint,
-                "127.0.0.2",
+                "localhost",
                 b_addr.port(),
-                |_, client| {
+                |base, client| {
                     client
-                        .get(&source.url)
+                        .get(format!("{base}{source_path}"))
                         .header(reqwest::header::RANGE, format!("bytes={}-", expected.len()))
                 },
             )

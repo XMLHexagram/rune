@@ -13,7 +13,7 @@ pub mod library_pool;
 pub mod messages;
 pub mod node;
 pub mod request_error;
-pub(crate) use request_error::request_failure_cause;
+pub mod rpc;
 pub mod session;
 #[macro_use]
 pub mod server;
@@ -30,6 +30,7 @@ use tokio::sync::Mutex;
 use tracing_subscriber::{EnvFilter, fmt};
 
 pub use tokio;
+pub use utils::RinfRustSignal;
 
 use ::scrobbling::manager::ScrobblingManager;
 
@@ -60,7 +61,13 @@ pub trait CallIdentified {
     }
 }
 
-pub(crate) use backends::remote::{forward_control_request, is_control_request};
+/// A request whose wire name and response type are declared in the request catalogue.
+pub trait TypedRequest {
+    type Response;
+
+    fn wire_name() -> &'static str;
+    fn response_name() -> &'static str;
+}
 
 rinf::write_interface!();
 
