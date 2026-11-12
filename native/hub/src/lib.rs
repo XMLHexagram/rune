@@ -9,6 +9,7 @@ mod macros;
 mod handlers;
 #[macro_use]
 pub mod backends;
+mod in_process_servers;
 pub mod library_pool;
 pub mod messages;
 pub mod node;

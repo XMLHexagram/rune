@@ -36,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::access_policy::{Action, Denial, RuneAccessPolicy};
 use crate::backends::remote::{RemoteConnectError, RendererLink, RendererLinkUse};
+use crate::in_process_servers::InProcessServers;
 use crate::macros::{
     RequestAccess, RequestScope, StandaloneRequestReceiver, capability_snapshot, request_access,
     request_scope,
@@ -129,6 +130,7 @@ pub struct NodeContext {
     pub node_id: Arc<String>,
     pub library_pool: Arc<LibraryPool>,
     pub credentials: Arc<CredentialStore>,
+    pub(crate) in_process_servers: InProcessServers,
     pub access_policy: Arc<RuneAccessPolicy>,
     pub permission_manager: Arc<RwLock<PermissionManager>>,
     pub cert_validator: Arc<RwLock<CertValidator>>,
@@ -318,6 +320,7 @@ impl NodeContext {
                 credentials.clone(),
             )?,
             credentials,
+            in_process_servers: InProcessServers::default(),
             node_id,
             permission_manager: Arc::new(RwLock::new(permission_manager)),
             access_policy,

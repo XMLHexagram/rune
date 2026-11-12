@@ -9673,6 +9673,320 @@ async fn subsonic_registration_resolves_mode_stores_secret_and_deduplicates() ->
     Ok(())
 }
 
+/// Aborts the task it holds when dropped, so a failed assertion does not leak a server.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// What the Apple Music mock saw of one request: user token and authorization headers.
+type AppleSeen = Arc<StdMutex<Vec<(Option<String>, Option<String>)>>>;
+
+/// An axum stand-in for the Apple Music API: one library song, no ratings, everything else empty.
+async fn apple_music_mock() -> (String, AppleSeen, AbortOnDrop) {
+    async fn answer(
+        State(seen): State<AppleSeen>,
+        uri: axum::http::Uri,
+        headers: axum::http::HeaderMap,
+    ) -> impl IntoResponse {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        seen.lock()
+            .unwrap()
+            .push((header("music-user-token"), header("authorization")));
+        let body = if uri.path() == "/v1/me/library/songs" {
+            json!({"data": [{
+                "id": "i.lib1",
+                "type": "library-songs",
+                "attributes": {
+                    "name": "First Light",
+                    "albumName": "Dawn Album",
+                    "artistName": "Artist One",
+                    "durationInMillis": 245600,
+                    "playParams": {"id": "i.lib1", "kind": "song", "isLibrary": true}
+                }
+            }]})
+        } else {
+            json!({"data": []})
+        };
+        (StatusCode::OK, axum::Json(body))
+    }
+    let seen: AppleSeen = Arc::new(StdMutex::new(Vec::new()));
+    let app = Router::new().fallback(any(answer)).with_state(seen.clone());
+    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{address}"), seen, AbortOnDrop(task))
+}
+
+async fn register_apple_music(node: &Arc<NodeContext>) -> crate::messages::RegisterLibraryResponse {
+    register_subsonic_library_on_node(
+        &subsonic_registration_request("rune-service://apple-music".into(), "", None),
+        node,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apple_music_record_is_served_in_process_from_registration_to_removal() -> Result<()> {
+    use crate::messages::{
+        CompleteLibraryLoginRequest, GetLyricByTrackIdRequest, LibraryLoginFailure,
+        LibraryLoginMethod, LibraryLoginMethodsRequest, RemoveLibraryRecordOutcome,
+        RemoveLibraryRecordRequest, RemovePlaylistRequest, ReplaceSubsonicCredentialRequest,
+        ReplaceSubsonicCredentialResult,
+    };
+    use crate::rpc::TargetRequest as _;
+    use crate::server::sync_worker::PairedAudioResolver;
+    use crate::utils::{
+        complete_library_login_on_node, library_login_methods_on_node, subsonic_api_for_record,
+        subsonic_binding_for_playback,
+    };
+    use database::library_registry::LibraryRecordId;
+    use playback::player::{PlaybackSourceResolver, SubsonicTarget};
+
+    let dir = tempfile::tempdir()?;
+    let fixture = super::fixture(dir.path()).await?;
+    let node = fixture.global_params.node.clone();
+    let (base_url, seen, _mock) = apple_music_mock().await;
+    node.in_process_servers.set_test_base_url(&base_url);
+
+    // Registration needs neither network nor mode, and a second one finds the first.
+    let registration = register_apple_music(&node).await;
+    assert_eq!(registration.outcome, RegisterLibraryOutcome::Registered);
+    let summary = registration.record.context("registered record")?;
+    let record_id = LibraryRecordId(Uuid::parse_str(&summary.record_id)?);
+    let again = register_apple_music(&node).await;
+    assert_eq!(again.outcome, RegisterLibraryOutcome::Registered);
+    assert_eq!(
+        again.record.context("existing record")?.record_id,
+        summary.record_id
+    );
+    let registry = LibraryRegistry::load(Path::new(&*node.config_path))?;
+    let stored: Vec<_> = registry
+        .libraries
+        .iter()
+        .filter(|record| matches!(record.protocol, ProtocolAdapter::SubsonicTranslate { .. }))
+        .collect();
+    assert_eq!(stored.len(), 1);
+    assert!(matches!(
+        &stored[0].protocol,
+        ProtocolAdapter::SubsonicTranslate {
+            endpoint,
+            mode: SubsonicOpenMode::PlayOnThisDevice,
+            ..
+        } if endpoint == "rune-service://apple-music"
+    ));
+    let unknown = register_subsonic_library_on_node(
+        &subsonic_registration_request("rune-service://nothing".into(), "", None),
+        &node,
+    )
+    .await;
+    assert_eq!(
+        unknown.outcome,
+        RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::SubsonicNotSubsonic)
+    );
+    assert_eq!(
+        replace_subsonic_credential_on_node(
+            &ReplaceSubsonicCredentialRequest {
+                call_id: None,
+                record_id: summary.record_id.clone(),
+                username: "alice".into(),
+                password: "secret".into(),
+            },
+            &node,
+        )
+        .await,
+        ReplaceSubsonicCredentialResult::InvalidRecord
+    );
+
+    // Opening serves the record from the registered instance, minus what Apple cannot do.
+    let instance = node
+        .in_process_servers
+        .get(record_id)
+        .context("registered instance")?;
+    let _ui = open_registered_library_record(node.clone(), summary.record_id.clone()).await?;
+    let binding = node
+        .subsonic_binding_for_record(record_id)?
+        .context("open binding")?;
+    assert!(Arc::ptr_eq(&binding.client, &instance));
+    let slots = binding.slots();
+    for slot in [
+        RemovePlaylistRequest::slot(&slots),
+        GetLyricByTrackIdRequest::slot(&slots),
+    ] {
+        assert!(matches!(slot, Slot::Unsupported { .. }), "{slot:?}");
+    }
+    assert_eq!(FetchAllPlaylistsRequest::slot(&slots), Slot::Translate);
+    assert!(Arc::ptr_eq(
+        &subsonic_binding_for_playback(&node, record_id.0).await?,
+        &binding
+    ));
+
+    // Login reaches the instance the binding uses.
+    let login = library_login_methods_on_node(
+        &LibraryLoginMethodsRequest {
+            record_id: summary.record_id.clone(),
+            call_id: None,
+        },
+        &node,
+    )
+    .await;
+    assert_eq!(login.failure, None);
+    assert_eq!(login.methods, [LibraryLoginMethod::Platform]);
+    assert_eq!(login.hosts, ["appleMusic"]);
+    let item = SubsonicItem {
+        library_id: record_id.0,
+        track_id: "i.lib1".into(),
+    };
+    let resolver = PairedAudioResolver(Arc::downgrade(&node), String::new());
+    let Err(expired) = resolver.resolve_subsonic_target(item.clone()).await else {
+        anyhow::bail!("a signed-out server answered");
+    };
+    assert!(seen.lock().unwrap().is_empty(), "no tokens, no request");
+    assert!(
+        matches!(
+            expired.downcast_ref::<RemoteAudioError>(),
+            Some(RemoteAudioError::CredentialsRejected)
+        ),
+        "{expired:#}"
+    );
+    let complete = |method| CompleteLibraryLoginRequest {
+        record_id: summary.record_id.clone(),
+        method,
+        state: None,
+        code: None,
+        token: Some("user-token".into()),
+        developer_token: Some("developer-token".into()),
+        call_id: None,
+    };
+    assert_eq!(
+        complete_library_login_on_node(&complete(LibraryLoginMethod::Platform), &node).await,
+        Ok(())
+    );
+    let hosted = |target: SubsonicTarget| match target {
+        SubsonicTarget::Hosted(hosted) => Ok((hosted.host, hosted.key)),
+        _ => Err(anyhow::anyhow!("an Apple Music song plays on its host")),
+    };
+    assert_eq!(
+        hosted(resolver.resolve_subsonic_target(item.clone()).await?)?,
+        ("appleMusic".to_owned(), "i.lib1".to_owned())
+    );
+    let requests = seen.lock().unwrap().len();
+    assert!(requests > 0, "the mock saw no request");
+    let expect_tokens = |from: usize| {
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() > from);
+        for (user, authorization) in &seen[from..] {
+            assert_eq!(user.as_deref(), Some("user-token"));
+            assert_eq!(authorization.as_deref(), Some("Bearer developer-token"));
+        }
+    };
+    expect_tokens(0);
+    assert_eq!(
+        complete_library_login_on_node(&complete(LibraryLoginMethod::Password), &node).await,
+        Err(LibraryLoginFailure::Unsupported)
+    );
+
+    // With the library closed, playback and login still reach the signed-in instance.
+    node.close_ui(&fixture.global_params.main_token).await;
+    assert!(node.subsonic_binding_for_record(record_id)?.is_none());
+    let closed = subsonic_binding_for_playback(&node, record_id.0).await?;
+    assert!(!Arc::ptr_eq(&closed, &binding));
+    assert!(Arc::ptr_eq(&closed.client, &instance));
+    assert_eq!(
+        hosted(resolver.resolve_subsonic_target(item).await?)?,
+        ("appleMusic".to_owned(), "i.lib1".to_owned())
+    );
+    expect_tokens(requests);
+    let found = subsonic_api_for_record(&node, &summary.record_id)
+        .await
+        .map_err(|failure| anyhow::anyhow!("{failure:?}"))?;
+    assert!(Arc::ptr_eq(&found.api, &instance));
+
+    // Removing the record drops the instance and refuses a new one.
+    let removed = dispatch_gui_request(
+        &fixture.global_params,
+        &RemoveLibraryRecordRequest {
+            record_id: summary.record_id.clone(),
+            call_id: None,
+        },
+    )
+    .await?
+    .context("removal response")?;
+    assert_eq!(removed.outcome, RemoveLibraryRecordOutcome::Removed);
+    assert!(node.in_process_servers.get(record_id).is_none());
+    assert!(
+        node.in_process_servers
+            .get_or_create(record_id, "rune-service://apple-music")
+            .is_err()
+    );
+    node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restored_apple_music_record_gets_a_signed_out_instance_on_open() -> Result<()> {
+    use database::library_registry::LibraryRecordId;
+
+    let dir = tempfile::tempdir()?;
+    let fixture = super::fixture(dir.path()).await?;
+    let node = fixture.global_params.node.clone();
+    let (base_url, seen, _mock) = apple_music_mock().await;
+    node.in_process_servers.set_test_base_url(&base_url);
+    let summary = register_apple_music(&node).await.record.context("record")?;
+    let record_id = LibraryRecordId(Uuid::parse_str(&summary.record_id)?);
+    // A record read from disk at startup has no instance yet.
+    node.in_process_servers.drop_instance(record_id);
+    assert!(node.in_process_servers.get(record_id).is_none());
+
+    let _ui = open_registered_library_record(node.clone(), summary.record_id.clone()).await?;
+    let instance = node
+        .in_process_servers
+        .get(record_id)
+        .context("lazy instance")?;
+    let binding = node
+        .subsonic_binding_for_record(record_id)?
+        .context("open binding")?;
+    assert!(Arc::ptr_eq(&binding.client, &instance));
+    let error = binding.client.artists().await.unwrap_err();
+    assert!(error.is_rune_credentials_expired(), "{error:?}");
+    assert!(seen.lock().unwrap().is_empty());
+    node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_apple_music_registrations_store_one_record() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = super::fixture(dir.path()).await?;
+    let node = fixture.global_params.node.clone();
+    let responses = futures::future::join_all((0..8).map(|_| register_apple_music(&node))).await;
+    let mut ids = HashSet::new();
+    for response in responses {
+        assert_eq!(response.outcome, RegisterLibraryOutcome::Registered);
+        ids.insert(response.record.context("record")?.record_id);
+    }
+    assert_eq!(ids.len(), 1);
+    let registry = LibraryRegistry::load(Path::new(&*node.config_path))?;
+    assert_eq!(
+        registry
+            .libraries
+            .iter()
+            .filter(|record| matches!(record.protocol, ProtocolAdapter::SubsonicTranslate { .. }))
+            .count(),
+        1
+    );
+    node.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subsonic_visualizer_covers_use_the_bounded_server_cover_cache() -> Result<()> {
     let dir = tempfile::tempdir()?;
