@@ -78,6 +78,7 @@ import 'providers/router_path.dart';
 import 'providers/library_open_state.dart';
 import 'providers/library_registry.dart';
 import 'utils/dialogs/subsonic/subsonic_relogin_dialog.dart';
+import 'utils/hosted_player/apple_music_host.dart';
 import 'utils/hosted_player/hosted_player.dart';
 import 'providers/library_home.dart';
 import 'providers/library_manager.dart';
@@ -621,6 +622,7 @@ class RuneLifecycleState extends State<RuneLifecycle> {
       },
     );
 
+    AppleMusicHost.registerOnPlatform();
     _hostedPlayer = HostedPlayerBridge.attached();
 
     _remoteReconnect = RemoteLibraryReconnectNotice(
