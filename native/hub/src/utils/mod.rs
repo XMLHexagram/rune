@@ -1841,6 +1841,7 @@ fn subsonic_probe_failure(error: SubsonicError) -> RegisterLibraryResponse {
         | SubsonicError::Server { .. }
         | SubsonicError::JukeboxUnsupported
         | SubsonicError::RuneVisualizerFeedUnsupported
+        | SubsonicError::Unsupported { .. }
         | SubsonicError::InvalidJukeboxGain => RegisterLibraryFailureKind::SubsonicNotSubsonic,
     };
     let detail = match kind {
@@ -2102,7 +2103,7 @@ async fn open_subsonic_record(
         }
     };
     let binding = Arc::new(SubsonicBinding::new(
-        client,
+        Arc::new(client),
         probe,
         Path::new(&*node.config_path).to_path_buf(),
         library_id,
@@ -2170,7 +2171,7 @@ pub(crate) async fn subsonic_binding_for_playback(
             _ => anyhow::Error::new(RemoteAudioError::LibraryUnavailable),
         })?;
     Ok(Arc::new(SubsonicBinding::new(
-        client,
+        Arc::new(client),
         probe,
         Path::new(&*node.config_path).to_path_buf(),
         library_id,

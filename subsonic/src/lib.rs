@@ -7,6 +7,10 @@ use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
 
+pub mod api;
+
+pub use api::{ApiFuture, StreamBody, SubsonicApi};
+
 const CLIENT_VERSION: &str = "1.16.1";
 
 /// Credentials supplied by the caller. Secrets are deliberately omitted from Debug.
@@ -65,6 +69,9 @@ pub enum SubsonicError {
     InvalidJukeboxGain,
     #[error("Subsonic server does not support runeVisualizerFeed version 1")]
     RuneVisualizerFeedUnsupported,
+    /// The server implementation does not provide this endpoint.
+    #[error("Subsonic endpoint {endpoint} is not supported")]
+    Unsupported { endpoint: &'static str },
 }
 
 /// Safe classifications for stream failures; these values never contain a URL or credentials.
@@ -78,6 +85,8 @@ pub enum StreamError {
     TrackGone,
     #[error("Subsonic stream was rejected")]
     Rejected,
+    #[error("Subsonic stream is not supported")]
+    Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

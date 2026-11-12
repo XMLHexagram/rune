@@ -23,7 +23,7 @@ use playback::player::{
     AudioPlaybackNote, AudioRequest, AudioSourceMode, PlayingItem, RemoteAudioError,
     RemoteAudioSource, SubsonicItem, UnavailableReason,
 };
-use subsonic::{SubsonicAlbum, SubsonicArtist, SubsonicClient, SubsonicJukebox, SubsonicSong};
+use subsonic::{SubsonicAlbum, SubsonicApi, SubsonicArtist, SubsonicJukebox, SubsonicSong};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::backends::remote::{deliver_visualizer_feed_frame, encode_message};
@@ -82,7 +82,7 @@ impl SubsonicIdMap {
 pub(crate) struct SubsonicBinding {
     pub(crate) library_id: Uuid,
     pub(crate) play_on_this_device: bool,
-    pub(crate) client: Arc<SubsonicClient>,
+    pub(crate) client: Arc<dyn SubsonicApi>,
     pub(crate) probe: subsonic::SubsonicProbe,
     pub(crate) catalog: Mutex<SubsonicCatalog>,
     pub(crate) covers: Arc<SubsonicCoverCache>,
@@ -210,7 +210,7 @@ impl SubsonicCoverCache {
         path.to_str().map(str::to_owned)
     }
 
-    pub(crate) fn schedule(self: &Arc<Self>, client: Arc<SubsonicClient>, cover_id: String) {
+    pub(crate) fn schedule(self: &Arc<Self>, client: Arc<dyn SubsonicApi>, cover_id: String) {
         let cache = Arc::clone(self);
         tokio::spawn(async move {
             let _ = cache.ensure_cached(client, &cover_id).await;
@@ -219,7 +219,7 @@ impl SubsonicCoverCache {
 
     async fn ensure_cached(
         &self,
-        client: Arc<SubsonicClient>,
+        client: Arc<dyn SubsonicApi>,
         cover_id: &str,
     ) -> Result<Option<String>> {
         if let Some(path) = self.cached_path(cover_id) {
@@ -335,7 +335,7 @@ pub(crate) struct SubsonicCatalog {
 
 impl SubsonicBinding {
     pub(crate) fn new(
-        client: SubsonicClient,
+        client: Arc<dyn SubsonicApi>,
         probe: subsonic::SubsonicProbe,
         config_dir: PathBuf,
         library_id: Uuid,
@@ -345,7 +345,7 @@ impl SubsonicBinding {
         Self {
             library_id,
             play_on_this_device,
-            client: Arc::new(client),
+            client,
             probe,
             catalog: Mutex::new(SubsonicCatalog::default()),
             covers: Arc::new(SubsonicCoverCache {
@@ -729,7 +729,7 @@ impl SubsonicBinding {
 }
 
 struct SubsonicAudioRequest {
-    client: Arc<SubsonicClient>,
+    client: Arc<dyn SubsonicApi>,
     track_id: String,
     failure_reason: Arc<std::sync::Mutex<Option<UnavailableReason>>>,
 }
@@ -776,6 +776,7 @@ impl AudioRequest for SubsonicAudioRequest {
             client
                 .stream(&track_id, range)
                 .await
+                .map(subsonic::StreamBody::into_response)
                 .map_err(|error| stream_playback_error(error, &failure_reason))
         })
     }
@@ -797,7 +798,7 @@ fn stream_playback_error(
         subsonic::StreamError::TrackGone => {
             (UnavailableReason::TrackGone, RemoteAudioError::TrackGone)
         }
-        subsonic::StreamError::Rejected => (
+        subsonic::StreamError::Rejected | subsonic::StreamError::Unsupported => (
             UnavailableReason::SourceUnreachable,
             RemoteAudioError::unreachable("Subsonic stream rejected"),
         ),
@@ -1121,7 +1122,7 @@ mod visualizer_feed_tests {
         );
         let probe = client.probe().await.unwrap();
         Arc::new(SubsonicBinding::new(
-            client,
+            Arc::new(client),
             probe,
             root.path().to_path_buf(),
             Uuid::new_v4(),

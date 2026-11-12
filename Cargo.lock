@@ -7925,7 +7925,9 @@ name = "subsonic"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "discovery",
+ "http",
  "md5",
  "rand 0.8.5",
  "reqwest 0.12.18",

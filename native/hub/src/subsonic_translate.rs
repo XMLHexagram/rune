@@ -1727,6 +1727,11 @@ fn subsonic_request_error(error: SubsonicError) -> anyhow::Error {
             reason: UnsupportedReason::NotImplemented,
         }
         .into(),
+        SubsonicError::Unsupported { endpoint } => ExpectedRequestError::Unsupported {
+            request: endpoint,
+            reason: UnsupportedReason::NotImplemented,
+        }
+        .into(),
         SubsonicError::InvalidJukeboxGain => {
             ExpectedRequestError::invalid_input("invalid Subsonic jukebox gain").into()
         }
@@ -2019,7 +2024,7 @@ mod tests {
         );
         let broadcasts = Arc::new(AtomicUsize::new(0));
         let binding = SubsonicBinding::new(
-            client,
+            Arc::new(client),
             SubsonicProbe {
                 api_version: "1.16.1".into(),
                 open_subsonic: false,
@@ -3151,6 +3156,123 @@ mod tests {
             server.state.requests.lock().unwrap().as_slice(),
             ["search3"]
         );
+    }
+
+    struct InMemoryCatalog;
+
+    impl subsonic::api::Browsing for InMemoryCatalog {
+        fn artists<'a>(&'a self) -> subsonic::ApiFuture<'a, Vec<subsonic::SubsonicArtist>> {
+            Box::pin(async {
+                Ok(vec![
+                    subsonic::SubsonicArtist {
+                        id: "artist-1".into(),
+                        name: "Artist One".into(),
+                        ..Default::default()
+                    },
+                    subsonic::SubsonicArtist {
+                        id: "artist-2".into(),
+                        name: "Artist Two".into(),
+                        ..Default::default()
+                    },
+                ])
+            })
+        }
+    }
+
+    impl subsonic::api::Searching for InMemoryCatalog {
+        fn search_with_song_offset<'a>(
+            &'a self,
+            query: &'a str,
+            _limits: subsonic::SearchLimits,
+            _song_offset: u32,
+        ) -> subsonic::ApiFuture<'a, subsonic::SubsonicSearchResult> {
+            Box::pin(async move {
+                Ok(subsonic::SubsonicSearchResult {
+                    songs: vec![subsonic::SubsonicSong {
+                        id: "song-1".into(),
+                        title: format!("match for {query}"),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    impl subsonic::api::System for InMemoryCatalog {}
+    impl subsonic::api::Lists for InMemoryCatalog {}
+    impl subsonic::api::Playlists for InMemoryCatalog {}
+    impl subsonic::api::Annotation for InMemoryCatalog {}
+    impl subsonic::api::MediaRetrieval for InMemoryCatalog {}
+    impl subsonic::api::Jukebox for InMemoryCatalog {}
+    impl subsonic::api::Scanning for InMemoryCatalog {}
+    impl subsonic::api::RuneVisualizerFeed for InMemoryCatalog {}
+
+    #[tokio::test]
+    async fn in_memory_api_serves_browse_and_search_and_reports_missing_facets_as_unsupported() {
+        let root = TempDir::new().unwrap();
+        let binding = SubsonicBinding::new(
+            Arc::new(InMemoryCatalog),
+            SubsonicProbe {
+                api_version: "1.16.1".into(),
+                open_subsonic: false,
+                server_type: None,
+                server_version: None,
+                extensions: Vec::new(),
+                roles: SubsonicRoles::default(),
+                roles_known: true,
+            },
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            false,
+            Arc::new(CountingBroadcaster(Arc::new(AtomicUsize::new(0)))),
+        );
+
+        let groups = fetch_collection_group_summary_request(
+            &binding,
+            &FetchCollectionGroupSummaryRequest {
+                collection_type: CollectionType::Artist,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            groups.groups.iter().map(|group| group.count).sum::<i32>(),
+            2
+        );
+
+        let search = search_for_request(
+            &binding,
+            &SearchForRequest {
+                call_id: None,
+                query_str: "song".into(),
+                fields: vec!["track".into()],
+                n: 10,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(search.tracks.len(), 1);
+        assert_eq!(
+            binding.catalog.lock().unwrap().songs[&search.tracks[0]].title,
+            "match for song"
+        );
+
+        let error =
+            fetch_all_playlists_request(&binding, &FetchAllPlaylistsRequest { call_id: None })
+                .await
+                .err()
+                .expect("playlists are not implemented by the in-memory API");
+        assert!(matches!(
+            error.downcast_ref::<ExpectedRequestError>(),
+            Some(ExpectedRequestError::Unsupported {
+                request: "getPlaylists",
+                reason: UnsupportedReason::NotImplemented,
+            })
+        ));
     }
 
     fn assert_secret_free(value: &str) {
