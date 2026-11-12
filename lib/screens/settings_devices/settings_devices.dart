@@ -17,9 +17,7 @@ import '../../widgets/navigation_bar/page_content_frame.dart';
 import '../../bindings/bindings.dart';
 import '../../providers/broadcast.dart';
 import '../../providers/controllers.dart';
-import '../../providers/library_path.dart';
 import '../../utils/router/navigation.dart';
-import '../settings_server/widgets/peer_libraries_dialog.dart';
 import '../settings_neighbors/widgets/edit_device_information_setting_button.dart';
 import '../settings_neighbors/widgets/search_remote_device_setting_button.dart';
 import '../settings_neighbors/widgets/add_neighbor_manually_setting_button.dart';
@@ -31,6 +29,8 @@ import '../settings_server/utils/show_confirm_remove_device_dialog.dart';
 import '../settings_server/utils/show_review_connection_dialog.dart';
 import '../settings_server/widgets/server_control_setting_button.dart';
 import '../settings_server/widgets/enable_broadcast_setting_button.dart';
+import '../../utils/api/request_failure.dart';
+import '../../utils/dialogs/information/error.dart';
 
 class SettingsDevicesPage extends StatefulWidget {
   const SettingsDevicesPage({super.key});
@@ -57,7 +57,8 @@ class _SettingsDevicesPageState extends State<SettingsDevicesPage> {
     do {
       refreshGrantsAgain = false;
       final clients = Provider.of<BroadcastProvider>(
-        context, listen: false,
+        context,
+        listen: false,
       ).users;
       for (final client in clients.where(
         (c) => c.status == ClientStatus.approved,
@@ -112,7 +113,13 @@ class _SettingsDevicesPageState extends State<SettingsDevicesPage> {
           if (mounted) setState(() => syncSettings = value);
         })
         .catchError((Object error) {
-          debugPrint('Could not load sync settings: $error');
+          if (mounted) {
+            showErrorDialog(
+              context: context,
+              title: S.of(context).allowPairedSync,
+              errorMessage: requestErrorText(S.of(context), error),
+            );
+          }
         });
   }
 
@@ -131,9 +138,9 @@ class _SettingsDevicesPageState extends State<SettingsDevicesPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _sectionTitle(context, S.of(context).thisDevice),
-                  const EditDeviceInformationSettingButton(),
-                  const EnableBroadcastSetting(),
                   const ServerControlSetting(),
+                  const EnableBroadcastSetting(),
+                  const EditDeviceInformationSettingButton(),
                   if (syncSettings case final settings?)
                     SettingsBoxToggle(
                       title: S.of(context).allowPairedSync,
@@ -148,7 +155,15 @@ class _SettingsDevicesPageState extends State<SettingsDevicesPage> {
                           final updated = await getSyncSettings();
                           if (mounted) setState(() => syncSettings = updated);
                         } catch (error) {
-                          debugPrint('Could not update sync settings: $error');
+                          if (!context.mounted) return;
+                          await showErrorDialog(
+                            context: context,
+                            title: S.of(context).allowPairedSync,
+                            errorMessage: requestErrorText(
+                              S.of(context),
+                              error,
+                            ),
+                          );
                         }
                       },
                     ),
@@ -164,8 +179,10 @@ class _SettingsDevicesPageState extends State<SettingsDevicesPage> {
                       );
                     },
                   ),
-                  _sectionTitle(context, S.of(context).devicesThatCanConnect),
-                  _buildUserListView(users, context),
+                  if (users.isNotEmpty) ...[
+                    _sectionTitle(context, S.of(context).devicesThatCanConnect),
+                    _buildUserListView(users, context),
+                  ],
                   _sectionTitle(context, S.of(context).otherDevices),
                   const SearchRemoteDeviceSettingButton(
                     tryClose: true,
@@ -186,8 +203,8 @@ class _SettingsDevicesPageState extends State<SettingsDevicesPage> {
   }
 
   Widget _sectionTitle(BuildContext context, String title) => Padding(
-    padding: const EdgeInsets.only(top: 24, bottom: 8),
-    child: Text(title, style: FluentTheme.of(context).typography.subtitle),
+    padding: const EdgeInsets.only(top: 8, bottom: 2, left: 6, right: 6),
+    child: Text(title),
   );
 
   Widget _buildUserListView(List<ClientSummary> clients, BuildContext context) {
@@ -206,6 +223,14 @@ class _SettingsDevicesPageState extends State<SettingsDevicesPage> {
             client.status,
             S.of(context),
           );
+          final status = deviceRowSubtitle(
+            status: client.status,
+            grants: grants[client.fingerprint],
+            isControlling: controllersProvider.isControlling(
+              client.fingerprint,
+            ),
+            strings: S.of(context),
+          );
           return ListTile.selectable(
             title: SettingsTileTitle(
               icon: Symbols.devices,
@@ -218,23 +243,17 @@ class _SettingsDevicesPageState extends State<SettingsDevicesPage> {
                   : null,
               badgeColor: _getStatusColor(client.status),
               title: client.alias,
-              subtitle: deviceRowSubtitle(
-                status: client.status,
-                grants: grants[client.fingerprint],
-                isControlling: controllersProvider.isControlling(
-                  client.fingerprint,
-                ),
-                strings: S.of(context),
-              ),
+              subtitle: status,
               showActions: selectedUserId == client.fingerprint,
-              actionsBuilder: (context) => Wrap(
-                crossAxisAlignment: WrapCrossAlignment.center,
+              actionsBuilder: (context) => Row(
                 children: [
+                  DisconnectControllerAction(fingerprint: client.fingerprint),
                   if (client.status == ClientStatus.approved) ...[
                     Button(
                       onPressed: () async {
                         await $push(
-                          '/settings/device-access', arguments: client,
+                          '/settings/device-access',
+                          arguments: client,
                         );
                         if (mounted) _refreshGrants();
                       },
@@ -250,23 +269,6 @@ class _SettingsDevicesPageState extends State<SettingsDevicesPage> {
                     child: Text(S.of(context).review),
                   ),
                   const SizedBox(width: 12),
-                  if (client.status == ClientStatus.approved &&
-                      !(Provider.of<LibraryPathProvider>(
-                            context,
-                          ).currentPath?.startsWith('@RR|') ??
-                          false)) ...[
-                    Button(
-                      onPressed: () => $showModal<void>(
-                        context,
-                        (context, close) => PeerLibrariesDialog(
-                          client: client,
-                          close: () => close(null),
-                        ),
-                      ),
-                      child: Text(S.of(context).deviceLibraries),
-                    ),
-                    const SizedBox(width: 12),
-                  ],
                   Button(
                     onPressed: () async {
                       await showConfirmRemoveDeviceDialog(context, client);
@@ -307,5 +309,40 @@ class _SettingsDevicesPageState extends State<SettingsDevicesPage> {
       case ClientStatus.blocked:
         return Colors.red;
     }
+  }
+}
+
+class DisconnectControllerAction extends StatelessWidget {
+  const DisconnectControllerAction({required this.fingerprint, super.key});
+
+  final String fingerprint;
+
+  @override
+  Widget build(BuildContext context) {
+    final controllersProvider = Provider.of<ControllersProvider>(context);
+    if (!controllersProvider.isControlling(fingerprint)) {
+      return const SizedBox.shrink();
+    }
+
+    return Row(
+      children: [
+        Button(
+          onPressed: () async {
+            try {
+              await controllersProvider.disconnect(fingerprint);
+            } catch (error) {
+              if (!context.mounted) return;
+              showErrorDialog(
+                context: context,
+                title: S.of(context).disconnect,
+                errorMessage: requestErrorText(S.of(context), error),
+              );
+            }
+          },
+          child: Text(S.of(context).disconnect),
+        ),
+        const SizedBox(width: 12),
+      ],
+    );
   }
 }

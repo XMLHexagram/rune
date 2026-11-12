@@ -14,6 +14,7 @@ use rinf::{DartSignal, RustSignal};
 use sea_orm::sqlx::{ConnectOptions, Connection, sqlite::SqliteConnectOptions};
 use uuid::Uuid;
 
+use crate::macros::StandaloneRequestReceiver;
 use crate::messages::*;
 
 const LAYER_SAF_INIT: &str = "L1 SAF initialization (AndroidFsIo)";
@@ -268,6 +269,7 @@ pub async fn receive_fs_self_test() {
         };
 
         RunFsSelfTestResponse {
+            call_id: None,
             success,
             report_json,
             wal_probe,
@@ -275,6 +277,12 @@ pub async fn receive_fs_self_test() {
         .send_signal_to_dart();
 
         info!("Filesystem self-test finished, success: {success}");
+    }
+}
+
+impl StandaloneRequestReceiver for RunFsSelfTestRequest {
+    fn start() {
+        tokio::spawn(receive_fs_self_test());
     }
 }
 

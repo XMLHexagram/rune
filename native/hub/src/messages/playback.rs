@@ -1,9 +1,8 @@
-use playback::player::LibraryItem;
-use playback::player::UnavailableReason;
+use crate::request_error::ExpectedRequestError;
+use playback::player::{HandoffBlockId as PlaybackHandoffBlockId, UnavailableReason};
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
-
-use super::mix::MixQuery;
+use uuid::Uuid;
 
 #[derive(Clone, Deserialize, Serialize, RustSignal)]
 pub struct PlaybackStatus {
@@ -17,7 +16,7 @@ pub struct PlaybackStatus {
     pub duration: f64,
     pub index: Option<i32>,
     pub item: Option<String>,
-    pub item_request: Option<PlayingItemRequest>,
+    pub item_request: Option<PlayingItemRef>,
     pub playback_mode: u32,
     pub ready: bool,
     pub cover_art_path: Option<String>,
@@ -27,23 +26,39 @@ pub struct PlaybackStatus {
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct LoadRequest {
     pub index: i32,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct PlayRequest {}
+pub struct PlayRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct PauseRequest {}
+pub struct PauseRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct NextRequest {}
+pub struct NextRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct PreviousRequest {}
+pub struct PreviousRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetPlaybackModeRequest {
     pub mode: u32,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
@@ -51,11 +66,15 @@ pub struct SwitchRequest {
     pub index: u32,
     #[serde(default)]
     pub expected_revision: Option<u64>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SeekRequest {
     pub position_seconds: f64,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
@@ -63,6 +82,8 @@ pub struct RemoveRequest {
     pub index: u32,
     #[serde(default)]
     pub expected_revision: Option<u64>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
@@ -71,12 +92,14 @@ pub struct MovePlaylistItemRequest {
     pub new_index: u32,
     #[serde(default)]
     pub expected_revision: Option<u64>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, SignalPiece)]
 pub struct PlaylistItem {
     pub unavailable: Option<PlaylistUnavailableReason>,
-    pub item: PlayingItemRequest,
+    pub item: PlayingItemRef,
     pub artist: String,
     pub album: String,
     pub title: String,
@@ -97,7 +120,8 @@ impl From<UnavailableReason> for PlaylistUnavailableReason {
             UnavailableReason::AccessRevoked => Self::AccessRevoked,
             UnavailableReason::LibraryUnavailable => Self::LibraryUnavailable,
             UnavailableReason::SourceUnreachable => Self::SourceUnreachable,
-            UnavailableReason::Unreadable => Self::Unreadable,
+            UnavailableReason::Unreadable | UnavailableReason::TrackGone => Self::Unreadable,
+            UnavailableReason::CredentialsRejected => Self::AccessRevoked,
         }
     }
 }
@@ -112,17 +136,23 @@ pub struct PlaylistUpdate {
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetRealtimeFFTEnabledRequest {
     pub enabled: bool,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetAdaptiveSwitchingEnabledRequest {
     pub enabled: bool,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// Lets other apps keep playing while this device plays (iOS only; other platforms ignore it).
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetMixWithOthersRequest {
     pub enabled: bool,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, RustSignal)]
@@ -130,14 +160,33 @@ pub struct RealtimeFFT {
     pub value: Vec<f32>,
 }
 
+/// A completed track analysis from the renderer, keyed by the portable item identity.
+#[derive(Deserialize, Serialize, RustSignal)]
+pub struct VisualizerFeedChart {
+    pub item: PlayingItemRef,
+    pub chart: Vec<u8>,
+}
+
+/// The playing item's artwork and the bounded cover wall selection from the renderer.
+#[derive(Deserialize, Serialize, RustSignal)]
+pub struct VisualizerFeedCovers {
+    pub item: PlayingItemRef,
+    pub playing: Option<Vec<u8>>,
+    pub random: Vec<Vec<u8>>,
+}
+
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct VolumeRequest {
     pub volume: f32,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct VolumeResponse {
     pub volume: f32,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +207,8 @@ pub enum CastLibraryState {
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct CastPreflightRequest {
     pub library_ids: Vec<String>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, SignalPiece)]
@@ -169,12 +220,103 @@ pub struct CastLibraryStatus {
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct CastPreflightResponse {
     pub libraries: Vec<CastLibraryStatus>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
-#[derive(Clone, Serialize, Deserialize, DartSignal)]
-pub struct CastLoadRequest {
-    pub items: Vec<LibraryItemRequest>,
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct SessionSnapshotRequest {
     #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+/// Re-send the renderer's current player bar and queue after attachment.
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct RefreshSessionRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, RustSignal)]
+pub struct SessionSnapshotResponse {
+    pub items: Vec<PlayingItemRef>,
+    pub index: Option<u32>,
+    pub position_seconds: f64,
+    pub playback_mode: u32,
+    pub playing: bool,
+    pub revision: u64,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct PlaylistRevisionRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct RemotePlaylistRevisionRequest {
+    pub fingerprint: String,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, RustSignal)]
+pub struct RemotePlaylistRevisionResponse {
+    pub revision: u64,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, RustSignal)]
+pub struct PlaylistRevisionResponse {
+    pub revision: u64,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct HandoffRequest {
+    pub target: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, RustSignal, Debug)]
+pub struct HandoffResponse {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, SignalPiece)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayingItemRef {
+    LibraryTrack { library_id: String, track: String },
+    IndependentFile { path: String },
+}
+
+impl From<playback::player::LibraryItem> for PlayingItemRef {
+    fn from(item: playback::player::LibraryItem) -> Self {
+        Self::LibraryTrack {
+            library_id: item.library_id.to_string(),
+            track: item.file_uuid.to_string(),
+        }
+    }
+}
+
+impl From<playback::player::SubsonicItem> for PlayingItemRef {
+    fn from(item: playback::player::SubsonicItem) -> Self {
+        Self::LibraryTrack {
+            library_id: item.library_id.to_string(),
+            track: item.track_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SignalPiece, DartSignal)]
+pub struct LoadResolvedItemsRequest {
+    pub items: Vec<PlayingItemRef>,
     pub start_index: Option<u32>,
     pub mode: PlaylistOperateMode,
     #[serde(default)]
@@ -185,90 +327,86 @@ pub struct CastLoadRequest {
     pub position_seconds: Option<f64>,
     #[serde(default)]
     pub play: Option<bool>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, DartSignal)]
+pub struct CastResolvedItemsRequest {
+    pub fingerprint: String,
+    pub load: LoadResolvedItemsRequest,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, RustSignal)]
-pub struct CastLoadResponse {}
-
-#[derive(Serialize, Deserialize, DartSignal)]
-pub struct SessionSnapshotRequest {}
-
-/// Re-send the renderer's current player bar and queue after attachment.
-#[derive(Serialize, Deserialize, DartSignal)]
-pub struct RefreshSessionRequest {}
+pub struct CastResolvedItemsResponse {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+    pub result: ResolvedItemsLoadResult,
+}
 
 #[derive(Deserialize, Serialize, RustSignal)]
-pub struct SessionSnapshotResponse {
-    pub items: Vec<LibraryItemRequest>,
-    pub index: Option<u32>,
-    pub position_seconds: f64,
-    pub playback_mode: u32,
-    pub playing: bool,
-    pub revision: u64,
+pub struct LoadResolvedItemsResponse {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+    pub result: ResolvedItemsLoadResult,
 }
 
-#[derive(Serialize, Deserialize, DartSignal)]
-pub struct HandoffRequest {
-    pub target: Option<String>,
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
+pub struct ResolvedItemsLoadResult {
+    pub left_out_items: Vec<PlayingItemRef>,
 }
 
-#[derive(Deserialize, Serialize, RustSignal, Debug)]
-pub struct HandoffResponse {}
-
-#[derive(Debug, Clone, Serialize, Deserialize, SignalPiece)]
-pub struct InLibraryPlayingItem {
-    pub file_id: i32,
+#[derive(Deserialize, Serialize, RustSignal)]
+pub struct HandoffLoadResponse {
+    pub handoff_item: PlayingItemRef,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SignalPiece)]
-pub struct IndependentFilePlayingItem {
-    pub raw_path: String,
+/// The id of a handed-off queue block on the wire: a UUID in text form, like the
+/// other ids that cross the Dart boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SignalPiece)]
+pub struct HandoffBlockId {
+    pub uuid: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SignalPiece)]
-pub struct LibraryItemRequest {
-    pub library_id: String,
-    pub file_uuid: String,
-}
-
-impl From<LibraryItem> for LibraryItemRequest {
-    fn from(item: LibraryItem) -> Self {
+impl From<PlaybackHandoffBlockId> for HandoffBlockId {
+    fn from(block: PlaybackHandoffBlockId) -> Self {
         Self {
-            library_id: item.library_id.to_string(),
-            file_uuid: item.file_uuid.to_string(),
+            uuid: block.0.to_string(),
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, SignalPiece)]
-pub struct PlayingItemRequest {
-    pub in_library: Option<InLibraryPlayingItem>,
-    pub independent_file: Option<IndependentFilePlayingItem>,
-    pub library_item: Option<LibraryItemRequest>,
+impl TryFrom<&HandoffBlockId> for PlaybackHandoffBlockId {
+    type Error = ExpectedRequestError;
+
+    fn try_from(block: &HandoffBlockId) -> Result<Self, Self::Error> {
+        Uuid::parse_str(&block.uuid).map(Self).map_err(|error| {
+            ExpectedRequestError::invalid_input(format!("Invalid handoff block id: {error}"))
+        })
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize, DartSignal)]
-pub struct OperatePlaybackWithMixQueryRequest {
-    pub queries: Vec<MixQuery>,
-    pub playback_mode: u32,
-    pub hint_position: i32,
-    pub initial_playback_item: Option<PlayingItemRequest>,
-    pub instantly_play: bool,
-    pub operate_mode: PlaylistOperateMode,
-    pub fallback_playing_items: Vec<PlayingItemRequest>,
+#[derive(Debug, Clone, Serialize, Deserialize, DartSignal)]
+pub struct HandoffLoadRequest {
+    pub block: HandoffBlockId,
+    pub load: LoadResolvedItemsRequest,
     #[serde(default)]
-    pub expected_revision: Option<u64>,
+    pub call_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, DartSignal)]
+pub struct TakeBackHandoffBlockRequest {
+    pub block: HandoffBlockId,
     #[serde(default)]
-    pub cast_to: Option<CastTarget>,
+    pub call_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SignalPiece)]
 pub struct CastTarget {
     pub fingerprint: String,
     pub attach: bool,
-}
-
-#[derive(Deserialize, Serialize, RustSignal)]
-pub struct OperatePlaybackWithMixQueryResponse {
-    pub playing_items: Vec<PlayingItemRequest>,
 }

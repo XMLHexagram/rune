@@ -1,5 +1,5 @@
+use crate::node::NodeContext;
 use crate::utils::{GlobalParams, TaskTokens};
-use crate::{node::NodeContext, utils::RunningMode};
 #[macro_use]
 pub(crate) mod gui_request;
 
@@ -29,11 +29,10 @@ pub async fn local_player_loop(
     let node_id = node.node_id.clone();
     let broadcaster = node.broadcaster.clone();
     let main_cancel_token = node.token.child_token();
-    let task_tokens: Arc<Mutex<TaskTokens>> = Arc::new(Mutex::new(TaskTokens::default()));
+    let task_tokens: Arc<Mutex<TaskTokens>> = node.task_tokens.clone();
 
     info!("Initializing player");
     let session = node.session()?;
-    session.migrate_legacy(&library).await?;
     let player = session.player.clone();
     let scrobbler = session.scrobbler.clone();
 
@@ -49,7 +48,7 @@ pub async fn local_player_loop(
     let global_params = GlobalParams {
         node: node.clone(),
         sync_settings: node.sync_settings.clone(),
-        library_id: Some(library.descriptor.library_id),
+        library_id: Some(library.library_id),
         library_pool: node.library_pool.clone(),
         library: Some(library.clone()),
         ui_library: Arc::new(Mutex::new(Some(library))),
@@ -57,6 +56,7 @@ pub async fn local_player_loop(
         node_id,
         main_token: Arc::clone(&main_cancel_token),
         task_tokens,
+        library_tasks: node.library_tasks.clone(),
         player,
         sfx_player,
         scrobbler,
@@ -65,7 +65,6 @@ pub async fn local_player_loop(
         cert_validator,
         permission_manager,
         server_manager: OnceLock::new(),
-        running_mode: RunningMode::Client,
     };
 
     let global_params = Arc::new(global_params);

@@ -1,24 +1,39 @@
 use crate::messages::*;
 use rinf::RustSignal;
+use std::any::TypeId;
 
-implement_rinf_rust_signal_trait!(ScanAudioLibraryProgress, ScanAudioLibraryResponse);
-implement_rinf_rust_signal_trait!(SetMediaLibraryPathResponse, ControllersUpdated);
-implement_rinf_rust_signal_trait!(AnalyzeAudioLibraryProgress, AnalyzeAudioLibraryResponse);
-implement_rinf_rust_signal_trait!(
-    DeduplicateAudioLibraryProgress,
-    DeduplicateAudioLibraryResponse
-);
+implement_rinf_rust_signal_trait!(ControllersUpdated);
+
 implement_rinf_rust_signal_trait!(
     PlaybackStatus,
+    PlaylistUpdate,
+    RealtimeFFT,
+    VisualizerFeedChart,
+    VisualizerFeedCovers,
+    LibraryContentChanged,
+    ScanAudioLibraryProgress,
+    ScanAudioLibraryResponse,
+    LibraryTaskStateChanged,
     ScrobbleServiceStatusUpdated,
-    CrashResponse,
-    RealtimeFFT
+    CrashResponse
 );
-implement_rinf_rust_signal_trait!(PlaylistUpdate);
-implement_rinf_rust_signal_trait!(LibraryContentChanged);
 implement_rinf_rust_signal_trait!(TrustListUpdated);
 implement_rinf_rust_signal_trait!(IncommingClientPermissionNotification);
 
 implement_rinf_rust_signal_trait!(TrustedClientsChanged);
 
 implement_rinf_rust_signal_trait!(RequestFailedResponse);
+
+crate::declare_remote_events!(
+    RequestCapabilities => Library,
+    PlaybackStatus => Session,
+    PlaylistUpdate => Session,
+    RealtimeFFT => Session,
+    VisualizerFeedChart => Session,
+    VisualizerFeedCovers => Session,
+    LibraryContentChanged => Library,
+    ScanAudioLibraryProgress => Library,
+    ScanAudioLibraryResponse => Library,
+    LibraryTaskStateChanged => Library,
+    RequestCapabilities => Session,
+);

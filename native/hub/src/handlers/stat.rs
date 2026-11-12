@@ -4,51 +4,117 @@ use ::database::actions::{
     file::file_ids_by_uuid,
     stats::{get_liked, set_liked},
 };
+use ::database::library_registry::LibraryAccess;
 use ::playback::player::PlayingItem;
+
+use std::{path::Path, sync::Arc};
 
 use crate::{
     Session, Signal,
     handlers::playback::{playing_item_from_request, reject_remote_independent_item},
-    library_pool::LibraryHandle,
+    library_pool::{LibraryHandle, LibraryPool},
     messages::*,
-    utils::{GlobalParams, ParamsExtractor, require_library},
+    node::NodeContext,
+    request_error::ExpectedRequestError,
+    subsonic_binding::SubsonicBinding,
+    subsonic_translate::{get_liked_request, set_liked_request},
+    utils::{GlobalParams, ParamsExtractor, require_library, subsonic_binding_for_playback},
 };
+use ::database::library_registry::{LibraryRecordId, LibraryRegistry, ProtocolAdapter};
+
+type LikedParams = (Arc<NodeContext>, Arc<LibraryPool>, Option<LibraryHandle>);
+
+fn liked_params(all_params: &GlobalParams) -> LikedParams {
+    (
+        all_params.node.clone(),
+        all_params.library_pool.clone(),
+        all_params.library.clone(),
+    )
+}
+
+async fn item_subsonic_binding(
+    node: &Arc<NodeContext>,
+    item: &PlayingItemRef,
+) -> Result<Option<Arc<SubsonicBinding>>> {
+    let PlayingItemRef::LibraryTrack { library_id, .. } = item else {
+        return Ok(None);
+    };
+    let library_id = uuid::Uuid::parse_str(library_id).map_err(|error| {
+        ExpectedRequestError::invalid_input(format!("Invalid library id: {error}"))
+    })?;
+    let registry = LibraryRegistry::load(Path::new(&*node.config_path))?;
+    let Ok(record) = registry.record(LibraryRecordId(library_id)) else {
+        return Ok(None);
+    };
+    if !matches!(&record.protocol, ProtocolAdapter::SubsonicTranslate { .. }) {
+        return Ok(None);
+    }
+    if let Some(binding) = node.subsonic_binding(library_id)? {
+        return Ok(Some(binding));
+    }
+    subsonic_binding_for_playback(node, library_id)
+        .await
+        .map(Some)
+}
+
+async fn item_library(pool: &Arc<LibraryPool>, item: &PlayingItemRef) -> Result<LibraryHandle> {
+    let PlayingItemRef::LibraryTrack { library_id, .. } = item else {
+        anyhow::bail!("Liked state requires a library track");
+    };
+    let library_id = uuid::Uuid::parse_str(library_id).map_err(|error| {
+        ExpectedRequestError::invalid_input(format!("Invalid library id: {error}"))
+    })?;
+    pool.acquire_for_request(library_id).await
+}
 
 impl ParamsExtractor for SetLikedRequest {
-    type Params = Option<LibraryHandle>;
+    type Params = LikedParams;
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        all_params.library.clone()
+        liked_params(all_params)
     }
 }
 
 impl Signal for SetLikedRequest {
-    type Params = Option<LibraryHandle>;
+    type Params = LikedParams;
     type Response = SetLikedResponse;
 
     async fn handle(
         &self,
-        library: Self::Params,
+        (node, pool, ui_library): Self::Params,
         session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let request = dart_signal;
-        let library = require_library(library)?;
-
         if let Some(item) = &request.item {
             reject_remote_independent_item(session.as_ref(), item)?;
+            if let Some(binding) = item_subsonic_binding(&node, item).await? {
+                return set_liked_request(&binding, request).await;
+            }
+            let library = match item {
+                PlayingItemRef::LibraryTrack { .. } => item_library(&pool, item).await?,
+                PlayingItemRef::IndependentFile { .. } => require_library(ui_library)?,
+            };
             let parsed_item = playing_item_from_request(item.clone(), Some(&library)).await?;
 
             let response = match parsed_item {
-                PlayingItem::InLibrary(identity)
-                    if identity.library_id == library.descriptor.library_id =>
+                PlayingItem::LibraryTrack { library_id, track }
+                    if library_id == library.library_id
+                        && let Ok(file_uuid) = uuid::Uuid::parse_str(&track) =>
                 {
-                    let file_id = file_ids_by_uuid(&library.main_db, &[identity.file_uuid])
+                    if library.descriptor.access_level() == Some(LibraryAccess::Read) {
+                        return Err(ExpectedRequestError::Unavailable {
+                            what: "write access to liked state",
+                        }
+                        .into());
+                    }
+                    let file_id = file_ids_by_uuid(&library.main_db, &[file_uuid])
                         .await?
-                        .get(&identity.file_uuid)
+                        .get(&file_uuid)
                         .copied();
                     let Some(file_id) = file_id else {
                         return Ok(Some(SetLikedResponse {
+                            call_id: None,
                             item: item.clone(),
                             liked: false,
                             success: false,
@@ -69,22 +135,26 @@ impl Signal for SetLikedRequest {
                     })?;
 
                     SetLikedResponse {
+                        call_id: None,
                         item: item.clone(),
                         liked: request.liked,
                         success: true,
                     }
                 }
                 PlayingItem::IndependentFile(_) => SetLikedResponse {
+                    call_id: None,
                     item: item.clone(),
                     liked: false,
                     success: false,
                 },
-                PlayingItem::InLibrary(_) | PlayingItem::Online(_, _) => SetLikedResponse {
+                PlayingItem::LibraryTrack { .. } | PlayingItem::Online(_, _) => SetLikedResponse {
+                    call_id: None,
                     item: item.clone(),
                     liked: false,
                     success: false,
                 },
                 PlayingItem::Unknown => SetLikedResponse {
+                    call_id: None,
                     item: item.clone(),
                     liked: false,
                     success: false,
@@ -99,40 +169,47 @@ impl Signal for SetLikedRequest {
 }
 
 impl ParamsExtractor for GetLikedRequest {
-    type Params = Option<LibraryHandle>;
+    type Params = LikedParams;
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        all_params.library.clone()
+        liked_params(all_params)
     }
 }
 
 impl Signal for GetLikedRequest {
-    type Params = Option<LibraryHandle>;
+    type Params = LikedParams;
     type Response = GetLikedResponse;
 
     async fn handle(
         &self,
-        library: Self::Params,
+        (node, pool, ui_library): Self::Params,
         session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let request = dart_signal;
-        let library = require_library(library)?;
-
         if let Some(item) = &request.item {
             reject_remote_independent_item(session.as_ref(), item)?;
+            if let Some(binding) = item_subsonic_binding(&node, item).await? {
+                return get_liked_request(&binding, request).await;
+            }
+            let library = match item {
+                PlayingItemRef::LibraryTrack { .. } => item_library(&pool, item).await?,
+                PlayingItemRef::IndependentFile { .. } => require_library(ui_library)?,
+            };
             let parsed_item = playing_item_from_request(item.clone(), Some(&library)).await?;
 
             let response = match parsed_item {
-                PlayingItem::InLibrary(identity)
-                    if identity.library_id == library.descriptor.library_id =>
+                PlayingItem::LibraryTrack { library_id, track }
+                    if library_id == library.library_id
+                        && let Ok(file_uuid) = uuid::Uuid::parse_str(&track) =>
                 {
-                    let Some(file_id) = file_ids_by_uuid(&library.main_db, &[identity.file_uuid])
+                    let Some(file_id) = file_ids_by_uuid(&library.main_db, &[file_uuid])
                         .await?
-                        .get(&identity.file_uuid)
+                        .get(&file_uuid)
                         .copied()
                     else {
                         return Ok(Some(GetLikedResponse {
+                            call_id: None,
                             item: item.clone(),
                             liked: false,
                         }));
@@ -142,19 +219,23 @@ impl Signal for GetLikedRequest {
                         .with_context(|| format!("Failed to get liked: file_id={file_id}"))?;
 
                     GetLikedResponse {
+                        call_id: None,
                         item: item.clone(),
                         liked,
                     }
                 }
                 PlayingItem::IndependentFile(_) => GetLikedResponse {
+                    call_id: None,
                     item: item.clone(),
                     liked: false,
                 },
-                PlayingItem::InLibrary(_) | PlayingItem::Online(_, _) => GetLikedResponse {
+                PlayingItem::LibraryTrack { .. } | PlayingItem::Online(_, _) => GetLikedResponse {
+                    call_id: None,
                     item: item.clone(),
                     liked: false,
                 },
                 PlayingItem::Unknown => GetLikedResponse {
+                    call_id: None,
                     item: item.clone(),
                     liked: false,
                 },

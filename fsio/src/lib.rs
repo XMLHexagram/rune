@@ -27,6 +27,8 @@ pub enum FileIoError {
     NotSupported(String),
     #[error("unknown error")]
     Unknown,
+    #[error("remote storage error: {0}")]
+    Remote(String),
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +85,11 @@ pub trait FileIo: Send + Sync {
     fn canonicalize_str(&self, path: &str) -> Result<FsNode, FileIoError>;
     /// Seconds since the UNIX epoch of the last modification.
     fn modified_time(&self, path: &Path) -> Result<u64, FileIoError>;
+    /// Stable backend-provided signal used to skip unchanged files during scans.
+    /// Backends without a stronger signal use modification time.
+    fn change_token(&self, path: &Path) -> Result<String, FileIoError> {
+        self.modified_time(path).map(|time| time.to_string())
+    }
     async fn ensure_file(&self, path: &Path) -> Result<FsNode, FileIoError>;
     async fn ensure_directory(&self, path: &Path) -> Result<FsNode, FileIoError>;
 
@@ -124,6 +131,16 @@ impl FsIo {
             inner: Arc::new(NoOpFsIo::new()),
         }
     }
+
+    /// Create a read-only WebDAV or S3 filesystem using the supplied runtime.
+    pub fn new_opendal(
+        config: OpenDalConfig,
+        handle: tokio::runtime::Handle,
+    ) -> Result<Self, FileIoError> {
+        Ok(Self {
+            inner: Arc::new(OpenDalFsIo::new(config, handle)?),
+        })
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -151,6 +168,14 @@ impl std::ops::Deref for FsIo {
 
 mod std_fs;
 use std_fs::StdFsIo;
+
+mod opendal_fs;
+pub use opendal_fs::OpenDalConfig;
+mod opendal_object_store;
+pub use opendal_object_store::{ObjectStoreCapabilities, OpenDalObjectStore};
+#[cfg(feature = "test-fixtures")]
+pub mod test_fixtures;
+use opendal_fs::OpenDalFsIo;
 
 #[cfg(target_os = "android")]
 mod android_fs;

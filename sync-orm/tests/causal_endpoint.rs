@@ -4,14 +4,22 @@ mod fixtures;
 use anyhow::{Context, Result, ensure};
 use sea_orm::sea_query::Condition;
 use sea_orm::sea_query::Func;
-use std::collections::BTreeMap;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+};
 use sync::causal;
 use sync::causal::Dot;
+use sync::share::{
+    self, BaseRef, FloorBase, Head, LibraryFile, MemoryObjectStore, ObjectStore, SharePeer,
+    decode_chunk,
+};
+use sync_orm::base_exporter::{BaseExportOptions, canonical_manifest, export_base};
 use sync_orm::maintenance::Maintenance;
 
 struct CompactAfterHistory<'a> {
@@ -103,11 +111,18 @@ async fn synchronize(
     source: &CausalEndpoint<Notes>,
     target: &CausalEndpoint<Notes>,
 ) -> Result<usize> {
+    synchronize_with_limits(source, target, session_limits()).await
+}
+async fn synchronize_with_limits(
+    source: &CausalEndpoint<Notes>,
+    target: &CausalEndpoint<Notes>,
+    limits: p::SessionLimits,
+) -> Result<usize> {
     let mut coordinator = p::Coordinator::new(
         p::Scope {
             collections: [1].into_iter().collect(),
         },
-        session_limits(),
+        limits,
     )?;
     for step in 0..20000 {
         match coordinator
@@ -407,6 +422,7 @@ async fn single_key_write_does_not_read_neighboring_candidate_bodies() -> Result
         CausalReplica::open(db, namespace, original.store().author()).await?,
         projection,
     );
+    reads.store(0, Ordering::SeqCst);
     endpoint
         .write_local(
             p::ObjectKey {
@@ -773,6 +789,153 @@ async fn sql_coordinator_reconciles_split_ranges_then_journal_and_reaches_stabil
 }
 
 #[tokio::test]
+async fn relayed_journal_origin_is_the_immediate_source_and_stays_local_only() -> Result<()> {
+    let namespace = Uuid::new_v4();
+    let (_a_db, a, _) = setup(namespace).await?;
+    let (b_db, b, _) = setup(namespace).await?;
+    let (c_db, c, _) = setup(namespace).await?;
+    let key = p::ObjectKey {
+        collection: 1,
+        id: Uuid::new_v4(),
+    };
+    a.write_local(key, Some(Note("A authored".into()))).await?;
+    let a_identity = p::SyncPeer::identity(&a).await?;
+    let genesis = p::ReceiveProgress {
+        sequence: 0,
+        anchor: p::initial_anchor(&a_identity)?,
+    };
+    let local_page = a
+        .store()
+        .read_page_with_origins(p::PageRequest {
+            source: a_identity.clone(),
+            scope: p::Scope {
+                collections: [1].into_iter().collect(),
+            },
+            after: genesis.clone(),
+            through: p::SyncPeer::head(&a).await?,
+            limits: p::PageLimits {
+                max_scanned: 8,
+                max_bytes: 65536,
+            },
+        })
+        .await?;
+    assert_eq!(local_page.origins.len(), 1);
+    assert_eq!(local_page.origins[0].origin, None);
+    assert!(matches!(local_page.read, p::PageRead::Page(_)));
+
+    synchronize(&a, &b).await?;
+    let b_identity = p::SyncPeer::identity(&b).await?;
+    let b_origin = b_db
+        .query_one(
+            &Query::select()
+                .columns(["origin_replica", "origin_generation"].map(Alias::new))
+                .from(Alias::new("sync_journal"))
+                .to_owned(),
+        )
+        .await?
+        .context("B did not relay an event")?;
+    assert_eq!(
+        b_origin.try_get_by_index::<Option<Vec<u8>>>(0)?,
+        Some(a_identity.replica.as_bytes().to_vec())
+    );
+    assert_eq!(
+        b_origin.try_get_by_index::<Option<Vec<u8>>>(1)?,
+        Some(a_identity.generation.as_bytes().to_vec())
+    );
+
+    a.write_local(
+        p::ObjectKey {
+            collection: 1,
+            id: Uuid::new_v4(),
+        },
+        Some(Note("key page relay".into())),
+    )
+    .await?;
+    synchronize(&a, &b).await?;
+    let b_key_origin = b_db
+        .query_one(
+            &Query::select()
+                .columns(["origin_replica", "origin_generation"].map(Alias::new))
+                .from(Alias::new("sync_journal"))
+                .order_by(Alias::new("sequence"), Order::Desc)
+                .to_owned(),
+        )
+        .await?
+        .context("B did not relay the key page event")?;
+    assert_eq!(
+        b_key_origin.try_get_by_index::<Option<Vec<u8>>>(0)?,
+        Some(a_identity.replica.as_bytes().to_vec())
+    );
+
+    a.write_local(
+        p::ObjectKey {
+            collection: 1,
+            id: Uuid::new_v4(),
+        },
+        Some(Note("fragmented event ".repeat(3000))),
+    )
+    .await?;
+    let mut fragmented_limits = session_limits();
+    fragmented_limits.pages.max_bytes = 16 * 1024;
+    synchronize_with_limits(&a, &b, fragmented_limits).await?;
+    let b_fragment_origin = b_db
+        .query_one(
+            &Query::select()
+                .columns(["origin_replica", "origin_generation"].map(Alias::new))
+                .from(Alias::new("sync_journal"))
+                .order_by(Alias::new("sequence"), Order::Desc)
+                .to_owned(),
+        )
+        .await?
+        .context("B did not relay the fragmented event")?;
+    assert_eq!(
+        b_fragment_origin.try_get_by_index::<Option<Vec<u8>>>(0)?,
+        Some(a_identity.replica.as_bytes().to_vec())
+    );
+
+    synchronize(&b, &c).await?;
+    let c_origin = c_db
+        .query_one(
+            &Query::select()
+                .columns(["origin_replica", "origin_generation"].map(Alias::new))
+                .from(Alias::new("sync_journal"))
+                .order_by(Alias::new("sequence"), Order::Desc)
+                .to_owned(),
+        )
+        .await?
+        .context("C did not relay an event")?;
+    assert_eq!(
+        c_origin.try_get_by_index::<Option<Vec<u8>>>(0)?,
+        Some(b_identity.replica.as_bytes().to_vec())
+    );
+    assert_eq!(
+        c_origin.try_get_by_index::<Option<Vec<u8>>>(1)?,
+        Some(b_identity.generation.as_bytes().to_vec())
+    );
+    let wire_page = p::SyncPeer::read_page(
+        &a,
+        p::PageRequest {
+            source: a_identity,
+            scope: p::Scope {
+                collections: [1].into_iter().collect(),
+            },
+            after: p::ReceiveProgress {
+                sequence: 0,
+                anchor: genesis.anchor,
+            },
+            through: p::SyncPeer::head(&a).await?,
+            limits: p::PageLimits {
+                max_scanned: 8,
+                max_bytes: 65536,
+            },
+        },
+    )
+    .await?;
+    assert!(matches!(wire_page, p::PageRead::Page(_)));
+    Ok(())
+}
+
+#[tokio::test]
 async fn sql_snapshot_build_resumes_after_restart_and_cancels_after_lost_reply() -> Result<()> {
     use p::SnapshotSource;
     let namespace = Uuid::new_v4();
@@ -867,10 +1030,10 @@ async fn sql_snapshot_build_resumes_after_restart_and_cancels_after_lost_reply()
 use async_trait::async_trait;
 use sea_orm::{
     ConnectionTrait, DatabaseTransaction, ExprTrait, TransactionTrait,
-    sea_query::{Alias, ColumnDef, Expr, OnConflict, Query, Table},
+    sea_query::{Alias, ColumnDef, Expr, OnConflict, Order, Query, Table},
 };
 use serde::{Deserialize, Serialize};
-use sync::protocol::{self as p, ReceiveStore, SnapshotSink, SyncStore};
+use sync::protocol::{self as p, ReceiveStore, SnapshotSink, SnapshotSource, SyncStore};
 use sync_orm::{
     causal_capabilities::{CausalEndpoint, TransactionProjection},
     causal_progress,
@@ -892,13 +1055,17 @@ impl p::SyncModel for Notes {
         "1"
     }
     fn collections() -> Vec<u8> {
-        vec![1]
+        vec![1, 2]
     }
-    fn collection_tag(_: &u8) -> &'static str {
-        "notes"
+    fn collection_tag(collection: &u8) -> &'static str {
+        if *collection == 1 { "notes" } else { "other" }
     }
     fn collection_from_tag(value: &str) -> Option<u8> {
-        (value == "notes").then_some(1)
+        match value {
+            "notes" => Some(1),
+            "other" => Some(2),
+            _ => None,
+        }
     }
     fn validate(_: &p::ObjectKey<Self>, _: &Option<Note>) -> p::Result<()> {
         Ok(())
@@ -990,6 +1157,12 @@ async fn text(db: &sea_orm::DatabaseConnection) -> Result<Option<String>> {
         .await?
         .map(|row| row.try_get_by_index(0))
         .transpose()?)
+}
+fn wallclock_ms() -> Result<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
 }
 fn limits() -> p::ApplyLimits {
     p::ApplyLimits {
@@ -1367,6 +1540,165 @@ async fn floor_respects_pins_and_commits_atomically() -> Result<()> {
 }
 
 #[tokio::test]
+async fn export_cursor_pins_floor_until_advanced_or_removed() -> Result<()> {
+    use sync_orm::causal_compaction::{FloorStep, maintenance_step_on};
+    use sync_orm::causal_export_cursors::{advance_on, create_on, remove_on};
+
+    let ns = Uuid::new_v4();
+    let (db, source, _) = setup(ns).await?;
+    let key = p::ObjectKey {
+        collection: 1,
+        id: Uuid::from_u128(1),
+    };
+    source
+        .write_local(key.clone(), Some(Note("one".into())))
+        .await?;
+    let now = wallclock_ms()?;
+    let tx = db.begin().await?;
+    create_on(&tx, ns, b"share", 0, now).await?;
+    tx.commit().await?;
+    source.write_local(key, Some(Note("two".into()))).await?;
+
+    let tx = db.begin().await?;
+    assert_eq!(
+        maintenance_step_on::<Notes>(&tx, ns, 64, 64, 65536).await?,
+        FloorStep::Pinned
+    );
+    tx.commit().await?;
+    let tx = db.begin().await?;
+    advance_on(&tx, ns, b"share", 2, now + 1).await?;
+    tx.commit().await?;
+    let tx = db.begin().await?;
+    assert_eq!(
+        maintenance_step_on::<Notes>(&tx, ns, 64, 64, 65536).await?,
+        FloorStep::Advanced { state_seq: 2 }
+    );
+    tx.commit().await?;
+    let tx = db.begin().await?;
+    remove_on(&tx, ns, b"share").await?;
+    tx.commit().await?;
+    source
+        .write_local(
+            p::ObjectKey {
+                collection: 1,
+                id: Uuid::from_u128(2),
+            },
+            Some(Note("three".into())),
+        )
+        .await?;
+    let tx = db.begin().await?;
+    assert_eq!(
+        maintenance_step_on::<Notes>(&tx, ns, 64, 64, 65536).await?,
+        FloorStep::Advanced { state_seq: 3 }
+    );
+    tx.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn thirty_one_day_export_cursor_requires_base() -> Result<()> {
+    use sync_orm::causal_compaction::{FloorStep, maintenance_step_on};
+    use sync_orm::causal_export_cursors::{create_on, read_on};
+
+    let ns = Uuid::new_v4();
+    let (db, source, _) = setup(ns).await?;
+    source
+        .write_local(
+            p::ObjectKey {
+                collection: 1,
+                id: Uuid::from_u128(1),
+            },
+            Some(Note("old".into())),
+        )
+        .await?;
+    let tx = db.begin().await?;
+    create_on(&tx, ns, b"old", 0, 1).await?;
+    tx.commit().await?;
+    source
+        .write_local(
+            p::ObjectKey {
+                collection: 1,
+                id: Uuid::from_u128(2),
+            },
+            Some(Note("new".into())),
+        )
+        .await?;
+    let tx = db.begin().await?;
+    assert_eq!(
+        maintenance_step_on::<Notes>(&tx, ns, 64, 64, 65536).await?,
+        FloorStep::Advanced { state_seq: 2 }
+    );
+    assert!(read_on(&tx, ns, b"old").await?.unwrap().needs_base());
+    tx.commit().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn backwards_clock_restarts_export_cursor_timer() -> Result<()> {
+    use sync_orm::causal_compaction::{FloorStep, maintenance_step_on};
+    use sync_orm::causal_export_cursors::{create_on, read_on};
+
+    let ns = Uuid::new_v4();
+    let (db, source, _) = setup(ns).await?;
+    let tx = db.begin().await?;
+    create_on(&tx, ns, b"backwards", 0, i64::MAX).await?;
+    tx.commit().await?;
+    source
+        .write_local(
+            p::ObjectKey {
+                collection: 1,
+                id: Uuid::from_u128(1),
+            },
+            Some(Note("event".into())),
+        )
+        .await?;
+    let tx = db.begin().await?;
+    assert_eq!(
+        maintenance_step_on::<Notes>(&tx, ns, 64, 64, 65536).await?,
+        FloorStep::Pinned
+    );
+    let cursor = read_on(&tx, ns, b"backwards").await?.unwrap();
+    assert!(!cursor.needs_base());
+    assert!(cursor.advanced_at_ms < i64::MAX);
+    tx.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_export_cursor_requires_base_and_survives_restart() -> Result<()> {
+    use sync_orm::causal_export_cursors::{create_on, read_on};
+    use sync_orm::causal_leases::minimum_pins_on;
+
+    let ns = Uuid::new_v4();
+    let (db, source, _) = setup(ns).await?;
+    source
+        .write_local(
+            p::ObjectKey {
+                collection: 1,
+                id: Uuid::from_u128(1),
+            },
+            Some(Note("event".into())),
+        )
+        .await?;
+    let now = wallclock_ms()?;
+    let tx = db.begin().await?;
+    create_on(&tx, ns, b"large", 0, now).await?;
+    tx.commit().await?;
+    db.execute_unprepared("UPDATE sync_manifests SET encoded_bytes = 67108865 WHERE digest = (SELECT event_manifest FROM sync_journal WHERE namespace = (SELECT namespace FROM sync_meta LIMIT 1) LIMIT 1)").await?;
+    let tx = db.begin().await?;
+    assert_eq!(minimum_pins_on(&tx, ns).await?, None);
+    assert!(read_on(&tx, ns, b"large").await?.unwrap().needs_base());
+    tx.commit().await?;
+    drop(source);
+    let _reopened = CausalReplica::<Notes>::open(db.clone(), ns, Uuid::new_v4()).await?;
+    let tx = db.begin().await?;
+    assert!(read_on(&tx, ns, b"large").await?.unwrap().needs_base());
+    tx.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn maintenance_recovers_abandoned_and_competing_builds_without_reviving_removals()
 -> Result<()> {
     let namespace = Uuid::new_v4();
@@ -1704,7 +2036,8 @@ async fn post_snapshot_arrival_is_removed_by_sql_promotion() -> Result<()> {
 async fn sql_promotion_chunks_resume_and_are_idempotent() -> Result<()> {
     let ns = Uuid::new_v4();
     let (db, a, _) = setup(ns).await?;
-    let (_, b, _) = setup(ns).await?;
+    let (b_db, b, _) = setup(ns).await?;
+    let a_identity = p::SyncPeer::identity(&a).await?;
     let writer = Uuid::new_v4();
     let mut context = causal::Context::default();
     for n in 1..=3000 {
@@ -1721,6 +2054,7 @@ async fn sql_promotion_chunks_resume_and_are_idempotent() -> Result<()> {
                 added: vec![],
                 observed: p::exact_context(&context),
             },
+            &a_identity,
             apply,
             &mut 16384,
         )
@@ -1758,6 +2092,24 @@ async fn sql_promotion_chunks_resume_and_are_idempotent() -> Result<()> {
     );
     assert_eq!(b.head().await?, head);
     assert_eq!(b.complete_reconciliation(session).await?, remote.head);
+    let promotion_origin = b_db
+        .query_one(
+            &Query::select()
+                .columns(["origin_replica", "origin_generation"].map(Alias::new))
+                .from(Alias::new("sync_journal"))
+                .order_by(Alias::new("sequence"), Order::Desc)
+                .to_owned(),
+        )
+        .await?
+        .context("promotion did not journal its relay")?;
+    assert_eq!(
+        promotion_origin.try_get_by_index::<Option<Vec<u8>>>(0)?,
+        Some(a_identity.replica.as_bytes().to_vec())
+    );
+    assert_eq!(
+        promotion_origin.try_get_by_index::<Option<Vec<u8>>>(1)?,
+        Some(a_identity.generation.as_bytes().to_vec())
+    );
     let snapshot = open_sql(&b).await?;
     assert_eq!(snapshot.contexts, remote.contexts);
     Ok(())
@@ -2209,5 +2561,431 @@ async fn oversize_leaf_reports_work_limit_and_splits_when_allowed() -> Result<()
             "key {n}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn base_export_round_trips_chunks_deduplicates_and_excludes_local_state() -> Result<()> {
+    let (db, endpoint, _) = setup(Uuid::new_v4()).await?;
+    endpoint
+        .write_local(
+            p::ObjectKey {
+                collection: 1,
+                id: Uuid::from_u128(1),
+            },
+            Some(Note("replicated value".into())),
+        )
+        .await?;
+    db.execute(
+        &Table::create()
+            .table(Alias::new("private_settings"))
+            .col(ColumnDef::new(Alias::new("secret")).text().not_null())
+            .to_owned(),
+    )
+    .await?;
+    db.execute(
+        &Query::insert()
+            .into_table(Alias::new("private_settings"))
+            .columns([Alias::new("secret")])
+            .values_panic(["fixture-device-credential".into()])
+            .to_owned(),
+    )
+    .await?;
+
+    let own_prefix = format!("{}.{}", Uuid::new_v4(), Uuid::new_v4());
+    let first_options = BaseExportOptions {
+        own_prefix,
+        ..BaseExportOptions::default()
+    };
+    let first = export_base(&endpoint, first_options.clone()).await?;
+    let verification_request = Uuid::new_v4();
+    let mut resume = None;
+    let verification = loop {
+        match endpoint
+            .open_snapshot_with_ttl(
+                verification_request,
+                p::Scope {
+                    collections: <Notes as p::SyncModel>::collections().into_iter().collect(),
+                },
+                first_options.work,
+                resume.take(),
+                p::MAX_SNAPSHOT_TTL_MS,
+            )
+            .await?
+        {
+            p::WorkOutcome::Ready(snapshot) => break snapshot,
+            p::WorkOutcome::Incomplete { cursor } => resume = Some(cursor),
+        }
+    };
+    let manifest_collection = first
+        .manifest
+        .collections
+        .get("notes")
+        .context("notes summary")?;
+    let live_root = verification.roots.first().context("snapshot root")?;
+    assert_eq!(manifest_collection.root.range, live_root.range);
+    assert_eq!(
+        manifest_collection.root.candidate_count,
+        live_root.candidate_count
+    );
+    assert_eq!(
+        manifest_collection.root.candidate_bytes,
+        live_root.candidate_bytes
+    );
+    assert_eq!(manifest_collection.root.aggregate, live_root.aggregate);
+    for bucket in &manifest_collection.buckets {
+        let summary = match endpoint
+            .summarize(
+                verification.snapshot_id,
+                bucket.range.clone(),
+                first_options.work,
+                None,
+            )
+            .await?
+        {
+            p::WorkOutcome::Ready(summary) => summary,
+            p::WorkOutcome::Incomplete { .. } => {
+                anyhow::bail!("test bucket summary unexpectedly incomplete")
+            }
+        };
+        assert_eq!(bucket.range, summary.range);
+        assert_eq!(bucket.candidate_count, summary.candidate_count);
+        assert_eq!(bucket.candidate_bytes, summary.candidate_bytes);
+        assert_eq!(bucket.aggregate, summary.aggregate);
+    }
+    endpoint.close_snapshot(verification.snapshot_id).await?;
+    let first_chunks: BTreeSet<_> = first
+        .manifest
+        .collections
+        .values()
+        .flat_map(|collection| collection.buckets.iter().map(|bucket| bucket.chunk.clone()))
+        .collect();
+    let first_chunk_objects: Vec<_> = first
+        .objects
+        .iter()
+        .filter(|object| first_chunks.contains(&object.name))
+        .collect();
+    assert_eq!(first_chunk_objects.len(), first_chunks.len());
+    assert_eq!(
+        first.objects.last().context("first manifest object")?.name,
+        first.base_id
+    );
+    let chunk_positions: Vec<_> = first
+        .objects
+        .iter()
+        .enumerate()
+        .filter(|(_, object)| first_chunks.contains(&object.name))
+        .map(|(index, _)| index)
+        .collect();
+    let context_positions: Vec<_> = first
+        .objects
+        .iter()
+        .enumerate()
+        .filter(|(_, object)| !first_chunks.contains(&object.name) && object.name != first.base_id)
+        .map(|(index, _)| index)
+        .collect();
+    if let (Some(last_chunk), Some(first_context)) =
+        (chunk_positions.last(), context_positions.first())
+    {
+        assert!(last_chunk < first_context);
+    }
+    let mut decoded_candidates = Vec::new();
+    for object in first_chunk_objects {
+        let verified = decode_chunk(&object.name, &object.bytes)?;
+        let wire: serde_json::Value = serde_json::from_slice(&verified.canonical_bytes)?;
+        let candidates: Vec<p::Candidate<Notes>> = serde_json::from_value(
+            wire.get("candidates")
+                .context("chunk candidate list")?
+                .clone(),
+        )?;
+        assert!(!candidates.is_empty());
+        decoded_candidates.extend(candidates);
+        assert!(
+            !String::from_utf8_lossy(&verified.canonical_bytes)
+                .contains("fixture-device-credential")
+        );
+    }
+    for object in &first.objects {
+        if first_chunks.contains(&object.name) || object.name == first.base_id {
+            continue;
+        }
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(&object.bytes[..]).read_to_end(&mut decoded)?;
+        assert_eq!(blake3::hash(&decoded).to_hex().as_str(), object.name);
+        assert!(!String::from_utf8_lossy(&decoded).contains("fixture-device-credential"));
+    }
+    let memory = p::MemorySyncStore::<Notes>::new(
+        endpoint.identity().await?,
+        endpoint.local_author().await?,
+    )?;
+    for candidate in decoded_candidates {
+        memory
+            .write_local(candidate.key, Some(candidate.payload))
+            .await?;
+    }
+    let key = p::ObjectKey {
+        collection: 1,
+        id: Uuid::from_u128(1),
+    };
+    assert_eq!(memory.get(&key).await?, endpoint.get(&key).await?);
+
+    endpoint
+        .write_local(
+            p::ObjectKey {
+                collection: 1,
+                id: Uuid::from_u128(1),
+            },
+            Some(Note("changed replicated value".into())),
+        )
+        .await?;
+    let options = BaseExportOptions {
+        own_prefix: first
+            .manifest
+            .covers
+            .keys()
+            .next()
+            .context("own prefix")?
+            .clone(),
+        retained_chunk_names: first_chunks.clone(),
+        previous_bucket_bits: first.bucket_bits.clone(),
+        ..BaseExportOptions::default()
+    };
+    let second = export_base(&endpoint, options).await?;
+    let second_chunks: BTreeSet<_> = second
+        .manifest
+        .collections
+        .values()
+        .flat_map(|collection| collection.buckets.iter().map(|bucket| bucket.chunk.clone()))
+        .collect();
+    assert_eq!(first_chunks.difference(&second_chunks).count(), 1);
+    assert_eq!(second_chunks.difference(&first_chunks).count(), 1);
+    assert_eq!(
+        second
+            .objects
+            .iter()
+            .filter(|object| !first_chunks.contains(&object.name)
+                && second_chunks.contains(&object.name))
+            .count(),
+        1
+    );
+    assert_ne!(first.base_id, second.base_id);
+    assert_eq!(
+        second.objects.last().context("manifest object")?.name,
+        second.base_id
+    );
+    for object in &second.objects {
+        let content = if second_chunks.contains(&object.name) {
+            decode_chunk(&object.name, &object.bytes)?.canonical_bytes
+        } else if object.name == second.base_id {
+            object.bytes.clone()
+        } else {
+            let mut decoded = Vec::new();
+            flate2::read::GzDecoder::new(&object.bytes[..]).read_to_end(&mut decoded)?;
+            decoded
+        };
+        assert!(!String::from_utf8_lossy(&content).contains("fixture-device-credential"));
+    }
+    let mut changed_manifest = second.manifest.clone();
+    changed_manifest.covers.insert(
+        "changed-prefix".into(),
+        share::Checkpoint {
+            seq: 1,
+            anchor: [1; 32],
+        },
+    );
+    assert_ne!(canonical_manifest(&changed_manifest)?.0, second.base_id);
+    let mut changed_root = second.manifest.clone();
+    changed_root
+        .collections
+        .get_mut("notes")
+        .context("notes root")?
+        .root
+        .aggregate[0] ^= 1;
+    assert_ne!(canonical_manifest(&changed_root)?.0, second.base_id);
+    let mut changed_bucket = second.manifest.clone();
+    changed_bucket
+        .collections
+        .get_mut("notes")
+        .context("notes bucket")?
+        .buckets[0]
+        .candidate_bytes += 1;
+    assert_ne!(canonical_manifest(&changed_bucket)?.0, second.base_id);
+    let mut changed_contexts = second.manifest.clone();
+    changed_contexts
+        .collections
+        .get_mut("notes")
+        .context("notes contexts")?
+        .context_fragments
+        .push("a".repeat(64));
+    assert_ne!(canonical_manifest(&changed_contexts)?.0, second.base_id);
+    let mut changed_bucket_count = second.manifest.clone();
+    let collection = changed_bucket_count
+        .collections
+        .get_mut("notes")
+        .context("notes buckets")?;
+    collection.buckets.push(collection.buckets[0].clone());
+    collection.bucket_count += 1;
+    assert_ne!(canonical_manifest(&changed_bucket_count)?.0, second.base_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn exported_base_round_trips_through_share_peer() -> Result<()> {
+    let namespace = Uuid::new_v4();
+    let (_db, endpoint, _) = setup(namespace).await?;
+    for id in 1..=3 {
+        endpoint
+            .write_local(
+                p::ObjectKey {
+                    collection: 1,
+                    id: Uuid::from_u128(id),
+                },
+                Some(Note(format!("exported {id}"))),
+            )
+            .await?;
+    }
+    let identity = p::SyncPeer::identity(&endpoint).await?;
+    let prefix = format!("{}.{}", identity.replica, identity.generation);
+    let export = export_base(
+        &endpoint,
+        BaseExportOptions {
+            own_prefix: prefix.clone(),
+            ..BaseExportOptions::default()
+        },
+    )
+    .await?;
+    let store = Arc::new(MemoryObjectStore::default());
+    let library = LibraryFile {
+        format: share::FORMAT_VERSION,
+        library_id: namespace,
+        model: "endpoint-notes".to_owned(),
+        schema: "1".to_owned(),
+    };
+    store
+        .put(&share::library_key(), &share::encode_library(&library)?)
+        .await
+        .map_err(|error| anyhow::anyhow!("put library metadata: {error:?}"))?;
+    for object in &export.objects {
+        let key = if object.name == export.base_id {
+            share::base_key(&prefix, &object.name)?
+        } else {
+            share::chunk_key(&prefix, &object.name)?
+        };
+        store
+            .put(&key, &object.bytes)
+            .await
+            .map_err(|error| anyhow::anyhow!("put base object: {error:?}"))?;
+    }
+    let cover = export
+        .manifest
+        .covers
+        .get(&prefix)
+        .context("exported base did not cover its owner")?;
+    let head = Head {
+        format: share::FORMAT_VERSION,
+        library_id: namespace,
+        stream: identity.replica,
+        generation: identity.generation,
+        local_replica: identity.replica,
+        writer_session: Uuid::new_v4(),
+        counter: 1,
+        head: cover.clone(),
+        floor: cover.clone(),
+        floor_base: FloorBase {
+            owner_prefix: prefix.clone(),
+            base_id: export.base_id.clone(),
+            covers_seq: cover.seq,
+            covers_anchor: cover.anchor,
+        },
+        segments: Vec::new(),
+        bases: vec![BaseRef {
+            base_id: export.base_id,
+            covers: export.manifest.covers.clone(),
+        }],
+        acks: BTreeMap::new(),
+        local_cursor: 0,
+        retired: Vec::new(),
+        updated_ms: 1,
+    };
+    store
+        .put(&share::head_key(&prefix, 0)?, &share::encode_head(&head)?)
+        .await
+        .map_err(|error| anyhow::anyhow!("put share head: {error:?}"))?;
+    let peer = SharePeer::<Notes>::new(
+        store,
+        namespace,
+        prefix,
+        std::env::temp_dir().join(format!("share-export-{}", Uuid::new_v4())),
+    )?;
+    assert!(matches!(
+        peer.open_snapshot(
+            Uuid::new_v4(),
+            p::Scope {
+                collections: [1].into_iter().collect(),
+            },
+            session_limits().work,
+            None,
+        )
+        .await,
+        Err(p::SyncError::Invalid(_))
+    ));
+    let scope = p::Scope {
+        collections: <Notes as p::SyncModel>::collections().into_iter().collect(),
+    };
+    let request = Uuid::new_v4();
+    let mut resume = None;
+    let source_descriptor = loop {
+        match endpoint
+            .open_snapshot(request, scope.clone(), session_limits().work, resume.take())
+            .await?
+        {
+            p::WorkOutcome::Ready(descriptor) => break descriptor,
+            p::WorkOutcome::Incomplete { cursor } => resume = Some(cursor),
+        }
+    };
+    let share_descriptor = match peer
+        .open_snapshot(Uuid::new_v4(), scope, session_limits().work, None)
+        .await?
+    {
+        p::WorkOutcome::Ready(descriptor) => descriptor,
+        p::WorkOutcome::Incomplete { .. } => anyhow::bail!("share snapshot was incomplete"),
+    };
+    assert_eq!(share_descriptor.roots[0].candidate_count, 3);
+    let source_page = endpoint
+        .leaf(
+            source_descriptor.snapshot_id,
+            source_descriptor.roots[0].range.clone(),
+            None,
+            session_limits().pages,
+        )
+        .await?;
+    let share_page = peer
+        .leaf(
+            share_descriptor.snapshot_id,
+            share_descriptor.roots[0].range.clone(),
+            None,
+            session_limits().pages,
+        )
+        .await?;
+    assert_eq!(share_page.candidates, source_page.candidates);
+    assert_eq!(
+        peer.read_fragment(
+            share_descriptor.snapshot_id,
+            share_descriptor.contexts[0].context.manifest.clone(),
+            0,
+            p::MAX_PAGE_BYTES,
+        )
+        .await?
+        .bytes,
+        SnapshotSource::read_fragment(
+            &endpoint,
+            source_descriptor.snapshot_id,
+            source_descriptor.contexts[0].context.manifest.clone(),
+            0,
+            p::MAX_PAGE_BYTES,
+        )
+        .await?
+        .bytes
+    );
     Ok(())
 }

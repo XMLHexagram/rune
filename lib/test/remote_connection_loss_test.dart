@@ -22,6 +22,10 @@ void main() {
       remoteLossMessage(s, RemoteLossKind.networkLost),
       s.remoteLossNetworkLost,
     );
+    expect(
+      remoteLossMessage(s, RemoteLossKind.protocolIncompatible),
+      'Update Rune on both devices to reconnect.',
+    );
   });
 
   test('remote open error kinds map to localized messages', () {
@@ -84,7 +88,7 @@ void main() {
     );
     expect(
       await noticed.future.timeout(const Duration(seconds: 1)),
-      'Connection to Bedroom lost',
+      'Connection to Bedroom was lost.',
     );
     handler.dispose();
     await losses.close();

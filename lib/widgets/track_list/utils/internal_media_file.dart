@@ -1,10 +1,9 @@
-import 'package:fluent_ui/fluent_ui.dart';
-
 import '../../../bindings/bindings.dart';
-import '../../../utils/l10n.dart';
 
 class InternalMediaFile {
   final int id;
+  final String libraryId;
+  final String track;
   final String path;
   final String artist;
   final String album;
@@ -19,6 +18,8 @@ class InternalMediaFile {
 
   InternalMediaFile({
     required this.id,
+    this.libraryId = '',
+    this.track = '',
     required this.path,
     required this.artist,
     required this.album,
@@ -35,22 +36,4 @@ class InternalMediaFile {
   bool get canPlay =>
       audioAvailability == AudioAvailability.local ||
       audioAvailability == AudioAvailability.remoteOnly;
-
-  String? availabilityLabel(BuildContext context) =>
-      switch (audioAvailability) {
-        AudioAvailability.local => null,
-        AudioAvailability.remoteOnly => S.of(context).audioRemoteReference,
-        AudioAvailability.unavailable => S.of(context).audioUnavailable,
-        AudioAvailability.importPending => S.of(context).audioImportPending,
-      };
-
-  String? originLabel(BuildContext context) => switch (audioOrigin) {
-    AudioOrigin.host || AudioOrigin.remote => null,
-    AudioOrigin.syncedCopy => S.of(context).audioSyncedCopy,
-  };
-
-  String artistWithAvailability(BuildContext context) {
-    final label = availabilityLabel(context) ?? originLabel(context);
-    return label == null ? artist : '$artist • $label';
-  }
 }

@@ -1,20 +1,45 @@
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
 
+/// Inputs available from the current source to installed scenes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualizerInputs {
+    #[default]
+    None,
+    SpectrumOnly,
+    Full,
+}
+
+/// Inputs required by a scene to produce the picture it was designed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualizerSceneInputs {
+    Spectrum,
+    SpectrumAndChart,
+}
+
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct StartVisualizerRequest {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct StopVisualizerRequest {}
+pub struct StopVisualizerRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct ResizeVisualizerRequest {
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// Directories with scenes (folders with a `scene.toml`) listed beside the built-in ones: the
@@ -23,18 +48,24 @@ pub struct ResizeVisualizerRequest {
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetVisualizerPresetDirsRequest {
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// The app's accent colour as 0xAARRGGBB, for scenes that draw in it.
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetVisualizerAccentRequest {
     pub argb: u32,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// Whether the app's window can be seen. While it cannot, the visualizer stands still.
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetVisualizerVisibleRequest {
     pub visible: bool,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// Shows the scene at `path`: a scene folder, or `builtin:<name>` for a built-in scene (as the
@@ -42,16 +73,27 @@ pub struct SetVisualizerVisibleRequest {
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct LoadVisualizerPresetRequest {
     pub path: String,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct NextVisualizerPresetRequest {}
+pub struct NextVisualizerPresetRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct PreviousVisualizerPresetRequest {}
+pub struct PreviousVisualizerPresetRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct RandomVisualizerPresetRequest {}
+pub struct RandomVisualizerPresetRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 /// How the scenes are picked (paths in the form of `VisualizerPresetEntry::path`), replacing what
 /// was set before. "Next" goes through the scenes in `order`, and the visualizer begins with its
@@ -64,6 +106,8 @@ pub struct SetVisualizerScenesRequest {
     /// The scene on screen when the app last ran, which a visualizer that starts resumes unless
     /// another scene was shown since the app started.
     pub last: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// Unpack the scene file `file` (a `.runescene`, see `visualizer::package`) into a folder of its
@@ -73,6 +117,8 @@ pub struct SetVisualizerScenesRequest {
 pub struct ImportVisualizerSceneRequest {
     pub file: String,
     pub dir: String,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// `path` is the folder of the imported scene, or `error` says why the file is not one.
@@ -81,6 +127,8 @@ pub struct ImportVisualizerSceneResponse {
     pub file: String,
     pub path: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// Delete the imported scene at `path`, which must be a folder directly in `dir`. The scenes of
@@ -89,12 +137,16 @@ pub struct ImportVisualizerSceneResponse {
 pub struct RemoveVisualizerSceneRequest {
     pub path: String,
     pub dir: String,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, RustSignal)]
 pub struct RemoveVisualizerSceneResponse {
     pub path: String,
     pub error: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// Whether the visualizer's diagnostics (the GPU it runs on, how frames reach the screen) go to the
@@ -103,11 +155,16 @@ pub struct RemoveVisualizerSceneResponse {
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetVisualizerLogRequest {
     pub enabled: bool,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// Whether this machine can run the visualizer, asked before starting it.
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct VisualizerSupportRequest {}
+pub struct VisualizerSupportRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 /// `supported`: there is a GPU (`adapter` names it). Otherwise `problem` says why not: no GPU
 /// adapter, or only a software renderer, which would draw the scenes on the CPU; then only the
@@ -117,10 +174,16 @@ pub struct VisualizerSupportResponse {
     pub supported: bool,
     pub adapter: String,
     pub problem: Option<String>,
+    pub inputs: VisualizerInputs,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct VisualizerStatusRequest {}
+pub struct VisualizerStatusRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 #[derive(Serialize, Deserialize, RustSignal)]
 pub struct VisualizerStatusResponse {
@@ -134,12 +197,15 @@ pub struct VisualizerStatusResponse {
     /// `app:cover-wall` while the cover wall is on and nothing is drawn.
     pub preset_path: String,
     pub preset_count: u32,
+    pub inputs: VisualizerInputs,
     pub adapter: String,
     /// How frames reach the screen: "iosurface" (no copies, macOS), "dxgi-shared" (no copies,
     /// Windows), "vulkan-shared" (no copies, Linux), "surface" (no copies, Android: presented
     /// into the texture's window), "readback", or empty before the render thread runs.
     pub transport: String,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// The texture that shows the visualizer (macOS), sent once it started and whenever another one
@@ -153,13 +219,21 @@ pub struct VisualizerTextureResponse {
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct VisualizerTextureShownRequest {
     pub texture_id: i64,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct ListVisualizerPresetsRequest {}
+pub struct ListVisualizerPresetsRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct ListVisualizerCreditsRequest {}
+pub struct ListVisualizerCreditsRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 /// What the assets of one built-in scene owe their makers.
 #[derive(Serialize, Deserialize, SignalPiece)]
@@ -175,6 +249,8 @@ pub struct VisualizerCredit {
 #[derive(Serialize, Deserialize, RustSignal)]
 pub struct ListVisualizerCreditsResponse {
     pub credits: Vec<VisualizerCredit>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, SignalPiece)]
@@ -185,6 +261,8 @@ pub struct VisualizerPresetEntry {
     pub group: String,
     /// Whether the scene is compiled into the program (its `path` is `builtin:<name>`).
     pub builtin: bool,
+    /// Inputs required by the scene: chart-dependent scenes are unavailable with spectrum alone.
+    pub inputs: VisualizerSceneInputs,
 }
 
 /// Every scene, the built-in ones, the cover wall (path `app:cover-wall`, which the app draws and
@@ -192,6 +270,8 @@ pub struct VisualizerPresetEntry {
 #[derive(Serialize, Deserialize, RustSignal)]
 pub struct ListVisualizerPresetsResponse {
     pub presets: Vec<VisualizerPresetEntry>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// Whether the visualizer copies what it sees in each frame for the in-app lab
@@ -202,6 +282,8 @@ pub struct ListVisualizerPresetsResponse {
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetVisualizerLabRequest {
     pub enabled: bool,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// The fallback level the music is at: A has a chart and a followed beat, B a chart alone, C
@@ -257,6 +339,8 @@ pub enum VisualizerLabCommand {
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct VisualizerLabCommandRequest {
     pub command: VisualizerLabCommand,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// What the visualizer decided or was told to do, at the song time it happened (seconds).
@@ -354,6 +438,8 @@ pub struct VisualizerLabNow {
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct VisualizerLabRequest {
     pub columns_version: u64,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// `inspecting` says whether the lab is on (see `SetVisualizerLabRequest`); `now` is none until a
@@ -371,6 +457,8 @@ pub struct VisualizerLabResponse {
     pub columns: Option<VisualizerLabColumns>,
     /// The buckets of song time finished since the last response, oldest first.
     pub samples: Vec<VisualizerLabSample>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 /// The columns a lab draws as series, for the scene on screen: the same ones for the live samples
@@ -420,7 +508,10 @@ pub struct VisualizerLabSample {
 
 /// Asked for when the `plan_version` of the lab's response changes.
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct VisualizerPlanRequest {}
+pub struct VisualizerPlanRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 /// One section of the planned song.
 #[derive(Serialize, Deserialize, SignalPiece, Clone, Debug, PartialEq)]
@@ -501,4 +592,6 @@ pub struct VisualizerPlanSeries {
 pub struct VisualizerPlanResponse {
     pub version: u64,
     pub plan: Option<VisualizerPlan>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }

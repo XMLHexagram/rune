@@ -4,6 +4,7 @@
 //! history requires an explicit import and cannot manufacture causal knowledge.
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr, ExprTrait,
+    Statement,
     sea_query::{Alias, ColumnDef, Expr, Index, Query, Table},
 };
 
@@ -39,6 +40,11 @@ const TABLES: &[Layout] = &[
             Field("floor_state_seq", I, false),
             Field("retained_bytes", I, false),
             Field("initialized_at", T, true),
+            Field("writer_incarnation", B, true),
+            Field("writer_author", B, true),
+            Field("writer_reserved_counter", I, true),
+            Field("writer_file_token", B, true),
+            Field("writer_clean_counter", I, true),
         ],
         &["namespace"],
     ),
@@ -71,6 +77,8 @@ const TABLES: &[Layout] = &[
             Field("event_digest", B, false),
             Field("event_manifest", B, false),
             Field("anchor_after", B, false),
+            Field("origin_replica", B, true),
+            Field("origin_generation", B, true),
         ],
         &["namespace", "generation", "sequence"],
     ),
@@ -159,6 +167,17 @@ const TABLES: &[Layout] = &[
             Field("build_state", B, true),
         ],
         &["namespace", "id"],
+    ),
+    (
+        "sync_export_cursors",
+        &[
+            Field("namespace", B, false),
+            Field("export_id", B, false),
+            Field("sequence", I, false),
+            Field("advanced_at_ms", I, false),
+            Field("needs_base", I, false),
+        ],
+        &["namespace", "export_id"],
     ),
 ];
 
@@ -270,6 +289,72 @@ pub async fn install_fresh(db: &DatabaseConnection) -> Result<(), DbErr> {
     let tx = crate::causal_leases::begin_write(db).await?;
     install_on(&tx).await?;
     tx.commit().await
+}
+
+/// Add nullable relay-origin columns to replicas created before origin tracking.
+/// Existing journal rows remain NULL because their source cannot be recovered.
+pub async fn ensure_journal_origin_on<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
+    let columns = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA table_info(sync_journal)",
+        ))
+        .await?;
+    let names = columns
+        .iter()
+        .map(|row| row.try_get_by_index::<String>(1))
+        .collect::<Result<Vec<_>, _>>()?;
+    for name in ["origin_replica", "origin_generation"] {
+        if !names.iter().any(|column| column == name) {
+            let statement = Table::alter()
+                .table(Alias::new("sync_journal"))
+                .add_column(ColumnDef::new(Alias::new(name)).binary())
+                .to_owned();
+            db.execute(&statement).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Add durable export cursors to replicas created before share export support.
+pub async fn ensure_export_cursors_on<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
+    let exists = Query::select()
+        .expr(Expr::val(1))
+        .from(Alias::new("sqlite_master"))
+        .and_where(Expr::col(Alias::new("type")).eq("table"))
+        .and_where(Expr::col(Alias::new("name")).eq("sync_export_cursors"))
+        .limit(1)
+        .to_owned();
+    if db.query_one(&exists).await?.is_some() {
+        return Ok(());
+    }
+    let mut primary_key = Index::create();
+    primary_key
+        .col(Alias::new("namespace"))
+        .col(Alias::new("export_id"));
+    let statement = Table::create()
+        .table(Alias::new("sync_export_cursors"))
+        .col(ColumnDef::new(Alias::new("namespace")).binary().not_null())
+        .col(ColumnDef::new(Alias::new("export_id")).binary().not_null())
+        .col(
+            ColumnDef::new(Alias::new("sequence"))
+                .big_integer()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(Alias::new("advanced_at_ms"))
+                .big_integer()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(Alias::new("needs_base"))
+                .big_integer()
+                .not_null(),
+        )
+        .primary_key(&mut primary_key)
+        .to_owned();
+    db.execute(&statement).await?;
+    Ok(())
 }
 
 /// Install on the migration runner's transaction.

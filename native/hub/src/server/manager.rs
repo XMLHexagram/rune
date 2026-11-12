@@ -413,7 +413,7 @@ impl ServerManager {
                 _ = watch_stop.cancelled() => {},
                 _ = lifetime_token.cancelled() => {
                     session_stop.cancel();
-                    lifetime_handle.shutdown();
+                    lifetime_handle.graceful_shutdown(Some(Duration::from_secs(5)));
                     lifetime_scanner.stop_announcements().await;
                     lifetime_scanner.stop_listening().await;
                 }
@@ -464,7 +464,7 @@ impl ServerManager {
                         && let Some(library) = &params.library
                     {
                         node.broadcaster.broadcast(&LibraryContentChanged {
-                            path: library.descriptor.app_name(),
+                            path: library.display_name.clone(),
                         });
                     }
                 });
@@ -527,7 +527,7 @@ impl ServerManager {
             first_error = Some(anyhow::Error::from(error));
         }
         if let Some(handle) = self.shutdown_handle.lock().await.as_ref() {
-            handle.shutdown();
+            handle.graceful_shutdown(Some(Duration::from_secs(5)));
         }
 
         if let Some(handle) = self.server_handle.lock().await.take()
@@ -846,12 +846,11 @@ mod lifecycle_tests {
     };
     use super::super::utils::device::load_device_info;
     use crate::Signal;
-    use crate::backends::remote::open_remote_library;
-    use crate::macros::dispatch_remote;
+    use crate::macros::{RequestScope, dispatch_remote, request_scope};
     use crate::messages::*;
     use crate::request_error::classify;
     use crate::server::WebSocketService;
-    use crate::utils::ParamsExtractor;
+    use crate::utils::{ParamsExtractor, register_local_library_on_node};
     use migration::catalog_identity::{ParentKind, parent};
     use playback::decoder::RuneDecoder;
     use playback::stream_utils::{ManagedStream, create_stream_with_authorizer};
@@ -891,22 +890,21 @@ mod lifecycle_tests {
         cancel.cancel();
     }
 
+    use super::super::libraries::ListedLibrary;
     use super::*;
     use crate::utils::nid::get_or_create_node_id;
-    use crate::utils::{
-        Broadcaster, GlobalParams, RinfRustSignal, RunningMode, TaskTokens,
-        sync_settings::SyncSettings,
-    };
+    use crate::utils::{Broadcaster, GlobalParams, RinfRustSignal, sync_settings::SyncSettings};
     use database::actions::downloads::{prepare_download, set_download_rule};
     use database::actions::file::{attach_download, catalog_track, hash_file, is_materialized};
     use database::actions::metadata::{
         MissingHostFilePolicy, ScanOptions, scan_audio_file, scan_audio_library,
     };
     use database::connection::StorageMode;
+    use database::credentials::CredentialRef;
     use database::entities::{media_files, media_files::Column};
     use database::library_registry::{
-        DbPlacement, LibraryAuthority, LibraryDescriptor, LibraryLocation, LibraryRegistry,
-        LibraryStorage, create_replica, resolve_library,
+        CatalogPlacement, FsAdapter, LibraryRecord, LibraryRecordId, LibraryRegistry,
+        ProtocolAdapter, RuneForwardMode, SubsonicOpenMode, create_replica, resolve_library,
     };
     use database::sync::{
         LibrarySyncStore,
@@ -920,7 +918,7 @@ mod lifecycle_tests {
     use playback::sfx_player::SfxPlayer;
     use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
     use std::future::Future;
-    use std::{fs, ops::Deref, sync::OnceLock};
+    use std::{fs, ops::Deref, sync::OnceLock, thread};
     use tokio::net::TcpStream;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
     use tokio_util::sync::CancellationToken;
@@ -931,8 +929,10 @@ mod lifecycle_tests {
     use crate::handlers::neighbors::select_pinned_pair_host;
     use crate::library_pool::{LibraryHandle, LibraryPool};
     use crate::messages::{
-        DeviceConnectionLevel, DeviceSyncLevel, PlaybackStatus, RequestErrorKind,
-        RequestFailureCause, TrustListUpdated, TrustedServerCertificate,
+        DeviceConnectionLevel, DeviceSyncLevel, LibraryInitializeMode, OpenLibraryRequest,
+        OpenLibraryResult, PlaybackStatus, RegisterLocalLibraryRequest,
+        RegisterRemoteControlRequest, RequestErrorKind, RequestFailureCause, TrustListUpdated,
+        TrustedServerCertificate,
     };
     use crate::node::{NodeSlot, ReconnectConfig};
     use crate::request_error::{ExpectedRequestError, request_failure_cause};
@@ -965,11 +965,79 @@ mod lifecycle_tests {
         global_params: Arc<GlobalParams>,
     }
 
+    async fn open_remote_control_record(
+        node: Arc<NodeContext>,
+        fingerprint: &str,
+    ) -> Result<Arc<GlobalParams>> {
+        use crate::utils::register_remote_control_on_node;
+
+        let registered = register_remote_control_on_node(
+            &RegisterRemoteControlRequest {
+                call_id: None,
+                fingerprint: fingerprint.to_owned(),
+                alias: "Test remote".into(),
+            },
+            &node,
+        )
+        .await;
+        let record = registered.record.context("remote record")?;
+        open_registered_library_record(node, record.record_id).await
+    }
+
+    async fn open_registered_library_record(
+        node: Arc<NodeContext>,
+        record_id: String,
+    ) -> Result<Arc<GlobalParams>> {
+        use crate::utils::open_library_by_record_on_node;
+        use scrobbling::manager::ScrobblingManager;
+        use tokio::sync::Mutex;
+
+        let opened = open_library_by_record_on_node(
+            &OpenLibraryRequest {
+                call_id: Some(1),
+                record_id: record_id.clone(),
+            },
+            node.clone(),
+            Arc::new(Mutex::new(ScrobblingManager::new(
+                10,
+                Duration::from_secs(5),
+            ))),
+        )
+        .await;
+        match opened.result {
+            OpenLibraryResult::Opened => node.current_ui().await,
+            OpenLibraryResult::Failed(failure) => Err(anyhow::anyhow!(failure.detail)),
+        }
+    }
+
     async fn peer_step<T>(
         name: &'static str,
         future: impl Future<Output = Result<T>>,
     ) -> Result<T> {
         peer_step_with_timeout(name, Duration::from_secs(15), future).await
+    }
+
+    /// A diagnostic watchdog: it names the step a hung test is stuck in. The limit is far
+    /// above any normal step, even on a loaded host, and still well below the suite limit.
+    async fn step<T>(name: &'static str, future: impl Future<Output = T>) -> T {
+        step_with_timeout(name, Duration::from_secs(300), future).await
+    }
+
+    async fn step_with_timeout<T>(
+        name: &'static str,
+        limit: Duration,
+        future: impl Future<Output = T>,
+    ) -> T {
+        // The test thread carries the test's name, so interleaved --nocapture output stays attributable.
+        let test = thread::current().name().unwrap_or("?").to_owned();
+        eprintln!("test step started: {test}: {name}");
+        match tokio::time::timeout(limit, future).await {
+            Ok(result) => {
+                eprintln!("test step finished: {test}: {name}");
+                result
+            }
+            Err(_) => panic!("test step did not finish: {test}: {name}"),
+        }
     }
 
     async fn peer_step_with_timeout<T>(
@@ -1043,22 +1111,30 @@ mod lifecycle_tests {
         broadcaster: Arc<dyn Broadcaster>,
         reconnect_config: ReconnectConfig,
     ) -> Result<Fixture> {
+        use database::credentials::CredentialStore;
+
         fs::create_dir_all(dir.join(".rune"))?;
         let node = get_or_create_node_id(dir.to_str().context("config path")?).await?;
-        let pool = LibraryPool::with_idle_timeout(dir, dir, &node.to_string(), idle_timeout)?;
+        let credentials = Arc::new(CredentialStore::open(dir));
+        let pool = LibraryPool::with_idle_timeout_and_credentials(
+            dir,
+            dir,
+            &node.to_string(),
+            idle_timeout,
+            credentials,
+        )?;
         let _ = migration::initialize_node_id(node.to_string());
         LibraryRegistry::update(dir, |registry| {
-            registry.libraries.push(LibraryDescriptor {
-                library_id,
+            registry.libraries.push(LibraryRecord {
+                record_id: LibraryRecordId(Uuid::new_v4()),
                 alias: "Owned".into(),
-                authority: LibraryAuthority::Owned,
-                storage: LibraryStorage::Local {
+                library_id: Some(library_id),
+                protocol: ProtocolAdapter::Native,
+                fs: vec![FsAdapter::Local {
                     path: dir.to_string_lossy().into_owned(),
-                },
-                db_placement: DbPlacement::Portable,
+                }],
+                catalog: CatalogPlacement::InMediaRoot,
                 background_sync: true,
-                access_level: None,
-                connection_access: None,
             });
             Ok(())
         })
@@ -1080,28 +1156,33 @@ mod lifecycle_tests {
         fixture_from_library(node_context, library).await
     }
 
-    async fn fixture_open_replica(source: &Fixture, root: &Path) -> Result<Fixture> {
+    async fn fixture_open_record(source: &Fixture, record_id: String) -> Result<Fixture> {
         let node = source.global_params.node.clone();
-        let config = Path::new(&*node.config_path);
-        let mut registry = LibraryRegistry::load(config)?;
-        // A replica added through the peer flow is named by id, not by folder.
-        let root = match LibraryLocation::parse(root.to_str().context("replica path")?)? {
-            LibraryLocation::Replica(id) => registry.replica(id)?.root(config),
-            LibraryLocation::Path(path) => std::path::PathBuf::from(path),
-        };
-        let descriptor = resolve_library(
-            &source.global_params.test_library().fsio,
-            &mut registry,
-            root.to_str().context("replica path")?,
-            "",
-            StorageMode::Portable,
+        let params = open_registered_library_record(node, record_id).await?;
+        fixture_from_params(params)
+    }
+
+    async fn fixture_open_local_library(source: &Fixture, path: &Path) -> Result<Fixture> {
+        let node = source.global_params.node.clone();
+        let response = register_local_library_on_node(
+            &RegisterLocalLibraryRequest {
+                call_id: None,
+                path: path.to_str().context("test library path")?.to_owned(),
+                alias: "Test local".into(),
+                mode: Some(LibraryInitializeMode::Portable),
+            },
+            &node,
         )
-        .await?;
-        fixture_from_library(
-            node.clone(),
-            node.library_pool.acquire_ui(descriptor.library_id).await?,
-        )
-        .await
+        .await;
+        let record = response.record.context("registered local record")?;
+        fixture_open_record(source, record.record_id).await
+    }
+
+    async fn fixture_open_replica(source: &Fixture, library_id: Uuid) -> Result<Fixture> {
+        let node = source.global_params.node.clone();
+        let registry = LibraryRegistry::load(Path::new(&*node.config_path))?;
+        let record_id = registry.catalog(library_id)?.record_id.0.to_string();
+        fixture_open_record(source, record_id).await
     }
 
     async fn reopen_fixture(original: &Fixture) -> Result<Fixture> {
@@ -1122,7 +1203,7 @@ mod lifecycle_tests {
         let token = Arc::new(node_context.token.child_token());
         let params = Arc::new(GlobalParams {
             node: node_context.clone(),
-            library_id: Some(library.descriptor.library_id),
+            library_id: Some(library.library_id),
             library_pool: node_context.library_pool.clone(),
             sync_settings: node_context.sync_settings.clone(),
             config_path: node_context.config_path.clone(),
@@ -1130,7 +1211,8 @@ mod lifecycle_tests {
             library: Some(library.clone()),
             ui_library: Arc::new(Mutex::new(Some(library))),
             main_token: token.clone(),
-            task_tokens: Arc::new(Mutex::new(TaskTokens::default())),
+            task_tokens: node_context.task_tokens.clone(),
+            library_tasks: node_context.library_tasks.clone(),
             player: node_context.session()?.player.clone(),
             sfx_player: Arc::new(Mutex::new(SfxPlayer::new(Some((*token).clone())))),
             scrobbler: node_context.session()?.scrobbler.clone(),
@@ -1139,7 +1221,6 @@ mod lifecycle_tests {
             cert_validator: node_context.cert_validator.clone(),
             permission_manager: node_context.permission_manager.clone(),
             server_manager: OnceLock::new(),
-            running_mode: RunningMode::Client,
         });
         let manager = node_context.manager()?;
         node_context.attach_ui(&params).await;
@@ -1150,6 +1231,14 @@ mod lifecycle_tests {
         Ok(Fixture {
             manager,
             global_params: params,
+        })
+    }
+
+    fn fixture_from_params(global_params: Arc<GlobalParams>) -> Result<Fixture> {
+        let manager = global_params.node.manager()?;
+        Ok(Fixture {
+            manager,
+            global_params,
         })
     }
     #[tokio::test]
@@ -1168,12 +1257,17 @@ mod lifecycle_tests {
                 .await
                 .is_none()
         );
-        let payload = rinf::serialize(&GetMediaFilesCountRequest {})?;
+        let payload = rinf::serialize(&GetMediaFilesCountRequest { call_id: None })?;
+        let library_id = manager
+            .global_params
+            .library_id
+            .context("current library")?;
         let (name, response) = service
-            .handle_message(
+            .handle_addressed_message(
                 "GetMediaFilesCountRequest",
                 payload,
                 None,
+                Some(library_id),
                 &manager.global_params.node,
             )
             .await
@@ -1191,9 +1285,7 @@ mod lifecycle_tests {
             &params.test_library().main_db
         ));
         assert!(params.ui_library.lock().await.is_some());
-        let close = CloseLibraryRequest {
-            path: params.test_library().media_root.clone(),
-        };
+        let close = CloseLibraryRequest { call_id: None };
         assert!(
             close
                 .handle(close.extract_params(params), None, &close)
@@ -1206,20 +1298,17 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn a_replica_opened_by_its_folder_closes_by_that_folder() -> Result<()> {
+    async fn closing_a_replica_closes_the_open_record() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let source = fixture(dir.path()).await?;
         let config = Path::new(&*source.global_params.config_path);
         let id = Uuid::new_v4();
         let mut registry = LibraryRegistry::load(config)?;
         create_replica(config, &mut registry, id, "Replica", "owner").await?;
-        let root = registry.replica(id)?.root(config);
-        let opened = fixture_open_replica(&source, &root).await?;
+        let opened = fixture_open_replica(&source, id).await?;
         let params = &opened.global_params;
         assert_eq!(params.library_id, Some(id));
-        let close = CloseLibraryRequest {
-            path: root.to_string_lossy().into_owned(),
-        };
+        let close = CloseLibraryRequest { call_id: None };
         assert!(
             close
                 .handle(close.extract_params(params), None, &close)
@@ -1368,19 +1457,27 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn add_trusted_server_rejects_when_no_host_is_reachable() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let client = fixture(dir.path()).await?;
+        let client = step("fixture", fixture(dir.path())).await?;
         let validator = client.global_params.cert_validator.read().await.clone();
-        let error = add_trusted_server(
-            &validator,
-            Some(&TrustedServerCertificate {
-                fingerprint: "expected fingerprint".into(),
-                hosts: vec!["127.0.0.1:1".into()],
-            }),
+        let error = step(
+            "verify unreachable certificate host",
+            add_trusted_server(
+                &validator,
+                Some(&TrustedServerCertificate {
+                    fingerprint: "expected fingerprint".into(),
+                    hosts: vec!["127.0.0.1:1".into()],
+                }),
+            ),
         )
         .await
         .expect_err("unreachable hosts must be refused");
         assert_eq!(classify(&error), RequestErrorKind::Unavailable);
         assert!(validator.list_trusted_fingerprints().await.is_empty());
+        step(
+            "shutdown client fixture",
+            client.global_params.node.shutdown(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1471,6 +1568,7 @@ mod lifecycle_tests {
             .error_for_status()?;
         let body: serde_json::Value = response.json().await?;
 
+        assert!(body.get("active_library_id").is_none());
         let capabilities: discovery::capabilities::Capabilities =
             serde_json::from_value(body["capabilities"].clone())?;
         assert_eq!(capabilities, Capabilities::rune_native());
@@ -1531,10 +1629,8 @@ mod lifecycle_tests {
     }
 
     async fn close_ui(params: &GlobalParams) -> Result<()> {
-        if let Some(library) = &params.library {
-            let request = CloseLibraryRequest {
-                path: library.media_root.clone(),
-            };
+        if params.library.is_some() {
+            let request = CloseLibraryRequest { call_id: None };
             request
                 .handle(request.extract_params(params), None, &request)
                 .await?;
@@ -1654,6 +1750,135 @@ mod lifecycle_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn removing_owned_record_revokes_serving_and_sync_and_preserves_files() -> Result<()> {
+        let owner_dir = tempfile::tempdir()?;
+        let peer_dir = tempfile::tempdir()?;
+        let owner = fixture(owner_dir.path()).await?;
+        let peer = fixture(peer_dir.path()).await?;
+        let address = paired_full(&owner, &peer).await?;
+        let owner_info = info(&owner).await?;
+        let peer_info = info(&peer).await?;
+        let (_, client) = authenticated_client(
+            &peer.global_params.node,
+            &peer_info.fingerprint,
+            &peer.private_key,
+            &owner_info.fingerprint,
+            "127.0.0.1",
+            address.port(),
+        )
+        .await?;
+        let root = owner_dir.path().join("removable-owned");
+        std::fs::create_dir_all(&root)?;
+        let registered = register_local_library_on_node(
+            &RegisterLocalLibraryRequest {
+                call_id: None,
+                path: root.to_string_lossy().into_owned(),
+                alias: "Removable".into(),
+                mode: Some(LibraryInitializeMode::Portable),
+            },
+            &owner.global_params.node,
+        )
+        .await;
+        anyhow::ensure!(registered.outcome == RegisterLibraryOutcome::Registered);
+        let summary = registered.record.context("registered owned library")?;
+        let library_id = match &summary.kind {
+            LibraryRecordKindSummary::Local { library_id, .. } => Uuid::parse_str(library_id)?,
+            _ => anyhow::bail!("expected local owned library record"),
+        };
+        let record = LibraryRegistry::load(owner_dir.path())?
+            .catalog(library_id)?
+            .clone();
+        let root = record.root(owner_dir.path()).context("owned root")?;
+        let marker = root.join(".rune");
+        anyhow::ensure!(marker.is_dir(), "library metadata directory missing");
+        let before: Vec<ListedLibrary> = client
+            .get(format!("https://{address}/libraries"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::ensure!(before.iter().any(|entry| entry.library_id == library_id));
+
+        let worker_token = owner
+            .global_params
+            .node
+            .sync_library_token(library_id)
+            .await;
+        let request = RemoveLibraryRecordRequest {
+            call_id: None,
+            record_id: record.record_id.0.to_string(),
+        };
+        let response = request
+            .handle(owner.global_params.node.clone(), None, &request)
+            .await?
+            .context("remove response")?;
+        anyhow::ensure!(response.outcome == RemoveLibraryRecordOutcome::Removed);
+        anyhow::ensure!(worker_token.is_cancelled(), "sync worker was not cancelled");
+        let after: Vec<ListedLibrary> = client
+            .get(format!("https://{address}/libraries"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::ensure!(!after.iter().any(|entry| entry.library_id == library_id));
+        anyhow::ensure!(
+            !owner
+                .global_params
+                .node
+                .library_pool
+                .served_library_ids()
+                .await?
+                .contains(&library_id),
+            "removed library remained eligible for background work"
+        );
+        anyhow::ensure!(
+            owner
+                .global_params
+                .node
+                .library_pool
+                .acquire_for_request(library_id)
+                .await
+                .is_err(),
+            "removed library could still be acquired for sync"
+        );
+        anyhow::ensure!(
+            owner
+                .global_params
+                .node
+                .library_pool
+                .acquire_served(library_id)
+                .await?
+                .is_none(),
+            "background sync could still acquire the removed library"
+        );
+        anyhow::ensure!(
+            root.is_dir() && marker.is_dir(),
+            "removal deleted library files"
+        );
+
+        let registered = register_local_library_on_node(
+            &RegisterLocalLibraryRequest {
+                call_id: None,
+                path: root.to_string_lossy().into_owned(),
+                alias: "Removable".into(),
+                mode: Some(LibraryInitializeMode::Portable),
+            },
+            &owner.global_params.node,
+        )
+        .await;
+        let summary = registered.record.context("re-registered record")?;
+        anyhow::ensure!(
+            matches!(summary.kind, LibraryRecordKindSummary::Local { library_id: ref id, .. } if id == &library_id.to_string()),
+            "re-registering folder did not restore the same library id"
+        );
+        owner.global_params.node.shutdown().await?;
+        peer.global_params.node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn node_dispatch_requires_current_ui_library() -> Result<()> {
         use crate::backends::remote::connect_remote;
         let first = tempfile::tempdir()?;
@@ -1674,18 +1899,18 @@ mod lifecycle_tests {
         .await?;
         let id = a.global_params.library_id.context("library")?;
         close_ui(&a.global_params).await?;
-        let payload = rinf::serialize(&GetMediaFilesCountRequest {})?;
+        let payload = rinf::serialize(&GetMediaFilesCountRequest { call_id: None })?;
         let (name, bytes) =
             socket_request(&mut socket, "GetMediaFilesCountRequest", &payload).await?;
         assert_eq!(name, "RemoteRequestFailed");
         let failure: RemoteRequestFailed = rinf::deserialize(&bytes)?;
         assert_eq!(failure.kind, RequestErrorKind::Unavailable);
-        assert!(failure.detail.contains("no library is open on this device"));
         let node = a.global_params.node.clone();
         let reopened =
             fixture_from_library(node.clone(), node.library_pool.acquire_ui(id).await?).await?;
         let (name, bytes) =
-            socket_request(&mut socket, "GetMediaFilesCountRequest", &payload).await?;
+            socket_request_for_library(&mut socket, "GetMediaFilesCountRequest", &payload, id)
+                .await?;
         assert_eq!(name, "GetMediaFilesCountResponse");
         assert_eq!(
             rinf::deserialize::<GetMediaFilesCountResponse>(&bytes)?.count,
@@ -1709,6 +1934,7 @@ mod lifecycle_tests {
         .save(first.path())?;
         let slot = NodeSlot::new();
         let request = InitializeNodeRequest {
+            call_id: None,
             config_path: first.path().to_string_lossy().into_owned(),
         };
         let node = slot
@@ -1744,6 +1970,7 @@ mod lifecycle_tests {
         let response = slot
             .handle(
                 &InitializeNodeRequest {
+                    call_id: None,
                     config_path: second.path().to_string_lossy().into_owned(),
                 },
                 Arc::new(Quiet),
@@ -1813,10 +2040,53 @@ mod lifecycle_tests {
             .await
             .add_trusted_domains(["127.0.0.1"], &a_info.fingerprint)
             .await?;
+        if let Some(address) = a.manager.get_address().await {
+            b.global_params
+                .cert_validator
+                .read()
+                .await
+                .replace_hosts_for_fingerprint(
+                    &a_info.fingerprint,
+                    vec![format!("127.0.0.1:{}", address.port())],
+                )
+                .await?;
+        }
         Ok(())
     }
 
     async fn paired_full(a: &Fixture, b: &Fixture) -> Result<SocketAddr> {
+        paired_full_with_protocol_version(a, b, discovery::protocol_version::PROTOCOL_VERSION).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_availability_test_accepts_reachable_typed_host() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server = fixture_with_library(server_dir.path(), Uuid::new_v4()).await?;
+        let client = fixture_with_library(client_dir.path(), Uuid::new_v4()).await?;
+        let address = paired_full(&server, &client).await?;
+        let request = ServerAvailabilityTestRequest {
+            hosts: vec![format!("127.0.0.1:{}", address.port())],
+            call_id: None,
+        };
+
+        let response = request
+            .handle(
+                Arc::clone(&client.global_params.cert_validator),
+                None,
+                &request,
+            )
+            .await?
+            .context("availability response")?;
+        assert_eq!(response.outcome, ServerAvailabilityTestOutcome::Success);
+        Ok(())
+    }
+
+    async fn paired_full_with_protocol_version(
+        a: &Fixture,
+        b: &Fixture,
+        protocol_version: discovery::protocol_version::ProtocolVersion,
+    ) -> Result<SocketAddr> {
         let a_fingerprint = info(a).await?.fingerprint;
         let b_fingerprint = info(b).await?.fingerprint;
         if a.global_params
@@ -1844,14 +2114,105 @@ mod lifecycle_tests {
             .start(
                 ([127, 0, 0, 1], 0).into(),
                 DiscoveryParams {
-                    device_info: info(a).await?,
+                    device_info: {
+                        let mut info = info(a).await?;
+                        info.protocol_version = Some(protocol_version);
+                        info
+                    },
                 },
             )
             .await?;
-        a.get_address().await.context("missing listener address")
+        let address = a.get_address().await.context("missing listener address")?;
+        b.global_params
+            .cert_validator
+            .read()
+            .await
+            .replace_hosts_for_fingerprint(
+                &a_fingerprint,
+                vec![format!("127.0.0.1:{}", address.port())],
+            )
+            .await?;
+        Ok(address)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn websocket_handshake_rejects_major_mismatch_in_both_directions() -> Result<()> {
+        use crate::messages::{ProtocolUpdateSide, RequestErrorKind};
+        use crate::request_error::{ExpectedRequestError, classify};
+        use discovery::protocol_version::ProtocolVersion;
+
+        for (client_version, server_version, expected_side) in [
+            ("1.0.0", "2.0.0", ProtocolUpdateSide::ThisDevice),
+            ("2.0.0", "1.0.0", ProtocolUpdateSide::Peer),
+        ] {
+            let server_dir = tempfile::tempdir()?;
+            let client_dir = tempfile::tempdir()?;
+            let server = step("create handshake server", fixture(server_dir.path())).await?;
+            let client = step("create handshake client", fixture(client_dir.path())).await?;
+            client
+                .global_params
+                .node
+                .set_protocol_version_for_test(ProtocolVersion::parse(client_version)?);
+            let address = step(
+                "pair handshake fixtures",
+                paired_full_with_protocol_version(
+                    &server,
+                    &client,
+                    ProtocolVersion::parse(server_version)?,
+                ),
+            )
+            .await?;
+            let server_info = step("read handshake server identity", info(&server)).await?;
+            step("store handshake endpoint", async {
+                client
+                    .global_params
+                    .cert_validator
+                    .read()
+                    .await
+                    .replace_hosts_for_fingerprint(
+                        &server_info.fingerprint,
+                        vec![format!("127.0.0.1:{}", address.port())],
+                    )
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
+
+            let error = step(
+                "reject incompatible websocket peer",
+                client
+                    .global_params
+                    .node
+                    .attach_renderer(&server_info.fingerprint),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(classify(&error), RequestErrorKind::PeerNeedsUpdate);
+            assert!(
+                matches!(
+                    error.downcast_ref::<ExpectedRequestError>(),
+                Some(ExpectedRequestError::PeerNeedsUpdate { update_side, peer_alias: Some(alias), .. })
+                    if *update_side == expected_side && !alias.is_empty()
+                ),
+                "unexpected typed handshake error: {error:#?}"
+            );
+            step(
+                "shutdown handshake client",
+                client.global_params.node.shutdown(),
+            )
+            .await?;
+            step(
+                "shutdown handshake server",
+                server.global_params.node.shutdown(),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn assert_websocket_request_is_ignored(name: &str, payload: Vec<u8>) -> Result<()> {
+        use crate::backends::remote::encode_request;
+
         let renderer_dir = tempfile::tempdir()?;
         let controller_dir = tempfile::tempdir()?;
         let renderer = fixture(renderer_dir.path()).await?;
@@ -1867,15 +2228,25 @@ mod lifecycle_tests {
         .await?;
         let ignored_id = Uuid::new_v4();
         let following_id = Uuid::new_v4();
+        let library_id = renderer
+            .global_params
+            .library_id
+            .context("renderer library id")?;
         socket
             .send(Message::Binary(
                 encode_message(name, &payload, Some(ignored_id)).into(),
             ))
             .await?;
-        let payload = rinf::serialize(&GetMediaFilesCountRequest {})?;
+        let payload = rinf::serialize(&GetMediaFilesCountRequest { call_id: None })?;
         socket
             .send(Message::Binary(
-                encode_message("GetMediaFilesCountRequest", &payload, Some(following_id)).into(),
+                encode_request(
+                    "GetMediaFilesCountRequest",
+                    &payload,
+                    following_id,
+                    library_id,
+                )
+                .into(),
             ))
             .await?;
         timeout(Duration::from_secs(5), async {
@@ -1906,7 +2277,10 @@ mod lifecycle_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn websocket_node_local_request_is_ignored() -> Result<()> {
-        let payload = rinf::serialize(&FetchRemoteFileRequest { url: String::new() })?;
+        let payload = rinf::serialize(&FetchRemoteFileRequest {
+            call_id: None,
+            url: String::new(),
+        })?;
         assert_websocket_request_is_ignored("FetchRemoteFileRequest", payload).await
     }
 
@@ -2046,7 +2420,9 @@ mod lifecycle_tests {
             }
             let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
                 .await?
-                .context("socket closed without frame")??;
+                .context("socket closed without a revocation close frame")?
+                .map_err(anyhow::Error::new)
+                .context("reading the revocation close frame")?;
             assert!(
                 matches!(frame, Message::Close(Some(frame)) if u16::from(frame.code) == 4403 && frame.reason == "revoked")
             );
@@ -2106,10 +2482,18 @@ mod lifecycle_tests {
             &b.global_params.node.sync_tokens,
         )
         .await?;
-        a.stop().await?;
-        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
-            .await?
-            .context("socket closed without frame")??;
+        let close_frame = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .context("server-stop close frame timed out")?
+                .context("socket closed without a server-stop close frame")?
+                .map_err(anyhow::Error::new)
+                .context("reading the server-stop close frame")
+        });
+        a.stop()
+            .await
+            .context("stopping server after revocation checks")?;
+        let frame = close_frame.await??;
         assert!(
             matches!(frame, Message::Close(Some(frame)) if u16::from(frame.code) == 1001 && frame.reason == "server stopping")
         );
@@ -2134,8 +2518,8 @@ mod lifecycle_tests {
         name: &str,
         payload: &[u8],
     ) -> Result<(String, Vec<u8>)> {
-        use crate::backends::remote::{decode_message, encode_message};
-        use futures::{SinkExt, StreamExt};
+        use crate::backends::remote::encode_message;
+        use futures::SinkExt;
         use tokio_tungstenite::tungstenite::Message;
 
         let id = Uuid::new_v4();
@@ -2144,13 +2528,30 @@ mod lifecycle_tests {
                 encode_message(name, payload, Some(id)).into(),
             ))
             .await?;
-        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
-            .await?
-            .context("socket closed")??;
-        let (response_name, payload, response_id) =
-            decode_message(&frame.into_data()).context("invalid frame")?;
-        assert_eq!(response_id, id);
-        Ok((response_name, payload))
+        next_socket_response(socket, id).await
+    }
+
+    async fn next_socket_response(
+        socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+        request_id: Uuid,
+    ) -> Result<(String, Vec<u8>)> {
+        use crate::backends::remote::decode_message;
+        use anyhow::Context;
+        use futures::StreamExt;
+
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await?
+                .context("socket closed")??;
+            let (response_name, payload, response_id) =
+                decode_message(&frame.into_data()).context("invalid frame")?;
+            if response_name == "RequestCapabilities" {
+                continue;
+            }
+            if response_id == request_id {
+                return Ok((response_name, payload));
+            }
+        }
     }
 
     async fn socket_request_for_library(
@@ -2159,8 +2560,8 @@ mod lifecycle_tests {
         payload: &[u8],
         library_id: Uuid,
     ) -> Result<(String, Vec<u8>)> {
-        use crate::backends::remote::{decode_message, encode_request};
-        use futures::{SinkExt, StreamExt};
+        use crate::backends::remote::encode_request;
+        use futures::SinkExt;
         use tokio_tungstenite::tungstenite::Message;
 
         let id = Uuid::new_v4();
@@ -2169,13 +2570,20 @@ mod lifecycle_tests {
                 encode_request(name, payload, id, library_id).into(),
             ))
             .await?;
-        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
-            .await?
-            .context("socket closed")??;
-        let (response_name, payload, response_id) =
-            decode_message(&frame.into_data()).context("invalid frame")?;
-        assert_eq!(response_id, id);
-        Ok((response_name, payload))
+        next_socket_response(socket, id).await
+    }
+
+    async fn socket_request_for_catalogue_scope(
+        socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+        name: &str,
+        payload: &[u8],
+        library_id: Uuid,
+    ) -> Result<(String, Vec<u8>)> {
+        if request_scope(name) == Some(RequestScope::Library) {
+            socket_request_for_library(socket, name, payload, library_id).await
+        } else {
+            socket_request(socket, name, payload).await
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2183,7 +2591,9 @@ mod lifecycle_tests {
         use crate::Session;
         use crate::access_policy::{ConnectionLevel, DeviceGrants, LibraryGrants};
         use crate::backends::remote::connect_remote;
-        use crate::messages::CreatePlaylistRequest;
+        use crate::messages::{
+            CreatePlaylistRequest, RemotePlaylistRevisionRequest, SessionSnapshotRequest,
+        };
 
         let first = tempfile::tempdir()?;
         let second = tempfile::tempdir()?;
@@ -2287,7 +2697,7 @@ mod lifecycle_tests {
             &controller.global_params.node.sync_tokens,
         )
         .await?;
-        let count_request = rinf::serialize(&GetMediaFilesCountRequest {})?;
+        let count_request = rinf::serialize(&GetMediaFilesCountRequest { call_id: None })?;
 
         // With the UI on the renderer's first library, the explicit address serves the other.
         let (name, payload) = socket_request_for_library(
@@ -2301,29 +2711,48 @@ mod lifecycle_tests {
         let response: GetMediaFilesCountResponse = rinf::deserialize(&payload)?;
         assert_eq!(response.count, 1);
 
-        // Legacy frames still use the currently open UI library until C6.
+        // A library-scoped frame without an address is rejected before decoding or dispatch.
         let (name, payload) =
             socket_request(&mut socket, "GetMediaFilesCountRequest", &count_request).await?;
-        assert_eq!(name, "GetMediaFilesCountResponse");
-        let response: GetMediaFilesCountResponse = rinf::deserialize(&payload)?;
-        assert_eq!(response.count, 2);
+        assert_eq!(name, "RemoteRequestFailed");
+        let failure: RemoteRequestFailed = rinf::deserialize(&payload)?;
+        assert_eq!(failure.kind, RequestErrorKind::Unavailable);
+        let (name, payload) = socket_request(&mut socket, "GetMediaFilesCountRequest", &[]).await?;
+        assert_eq!(name, "RemoteRequestFailed");
+        let failure: RemoteRequestFailed = rinf::deserialize(&payload)?;
+        assert_eq!(failure.kind, RequestErrorKind::Unavailable);
 
-        // With no UI attached, the renderer still serves its explicitly addressed held library.
-        renderer
-            .global_params
-            .node
-            .close_ui(&renderer.global_params.main_token)
-            .await;
-        let (name, payload) = socket_request_for_library(
-            &mut socket,
-            "GetMediaFilesCountRequest",
-            &count_request,
-            other_id,
+        let session_request = rinf::serialize(&SessionSnapshotRequest { call_id: None })?;
+        let (name, session_result) = dispatch_remote(
+            "SessionSnapshotRequest",
+            &session_request,
+            Some(Session {
+                fingerprint: peer_session.fingerprint.clone(),
+                public_key: peer_session.public_key.clone(),
+                host: peer_session.host.clone(),
+            }),
+            None,
+            &renderer.global_params.node,
         )
-        .await?;
-        assert_eq!(name, "GetMediaFilesCountResponse");
-        let response: GetMediaFilesCountResponse = rinf::deserialize(&payload)?;
-        assert_eq!(response.count, 1);
+        .await
+        .context("session-scoped request dispatch")?;
+        assert_eq!(name, "SessionSnapshotResponse");
+        session_result?;
+        let node_request = rinf::serialize(&RemotePlaylistRevisionRequest {
+            fingerprint: "not-a-trusted-device".into(),
+            call_id: None,
+        })?;
+        let (_, node_result) = dispatch_remote(
+            "RemotePlaylistRevisionRequest",
+            &node_request,
+            None,
+            None,
+            &renderer.global_params.node,
+        )
+        .await
+        .context("node-scoped request dispatch")?;
+        let node_error = node_result.expect_err("unknown renderer must fail normally");
+        assert_eq!(classify(&node_error), RequestErrorKind::NotFound);
 
         // A write against a read-only addressed library is denied.
         renderer.global_params.node.access_policy.set(
@@ -2342,6 +2771,7 @@ mod lifecycle_tests {
             },
         )?;
         let write = rinf::serialize(&CreatePlaylistRequest {
+            call_id: None,
             name: "denied".into(),
             group: "test".into(),
         })?;
@@ -2410,17 +2840,19 @@ mod lifecycle_tests {
             &b.global_params.node.sync_tokens,
         )
         .await?;
-        let (name, _) = socket_request(
+        let renderer_id = a.global_params.library_id.context("renderer library")?;
+        let (name, _) = socket_request_for_library(
             &mut socket,
             "GetMediaFilesCountRequest",
-            &rinf::serialize(&GetMediaFilesCountRequest {})?,
+            &rinf::serialize(&GetMediaFilesCountRequest { call_id: None })?,
+            renderer_id,
         )
         .await?;
         assert_eq!(name, "GetMediaFilesCountResponse");
         let (name, _) = socket_request(
             &mut socket,
             "PauseRequest",
-            &rinf::serialize(&PauseRequest {})?,
+            &rinf::serialize(&PauseRequest { call_id: None })?,
         )
         .await?;
         assert_eq!(name, "");
@@ -2428,6 +2860,7 @@ mod lifecycle_tests {
             (
                 "CreatePlaylistRequest",
                 rinf::serialize(&CreatePlaylistRequest {
+                    call_id: None,
                     name: "forbidden".into(),
                     group: "test".into(),
                 })?,
@@ -2435,13 +2868,15 @@ mod lifecycle_tests {
             (
                 "ScanAudioLibraryRequest",
                 rinf::serialize(&ScanAudioLibraryRequest {
+                    call_id: None,
                     scan_id: "forbidden".into(),
-                    path: first.path().to_string_lossy().into_owned(),
                     force: false,
                 })?,
             ),
         ] {
-            let (name, payload) = socket_request(&mut socket, request, &payload).await?;
+            let (name, payload) =
+                socket_request_for_catalogue_scope(&mut socket, request, &payload, renderer_id)
+                    .await?;
             assert_eq!(name, "RemoteRequestFailed");
             let failure: RemoteRequestFailed = rinf::deserialize(&payload)?;
             assert_eq!(
@@ -2460,7 +2895,10 @@ mod lifecycle_tests {
     async fn missing_playlist_handler_is_not_found() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let manager = fixture(dir.path()).await?;
-        let request = GetPlaylistByIdRequest { playlist_id: -1 };
+        let request = GetPlaylistByIdRequest {
+            call_id: None,
+            playlist_id: -1,
+        };
         let result = request
             .handle(
                 Some(manager.global_params.test_library().clone()),
@@ -2480,7 +2918,10 @@ mod lifecycle_tests {
     async fn missing_mix_handler_is_not_found() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let manager = fixture(dir.path()).await?;
-        let request = GetMixByIdRequest { mix_id: -1 };
+        let request = GetMixByIdRequest {
+            call_id: None,
+            mix_id: -1,
+        };
         let result = request
             .handle(
                 Some(manager.global_params.test_library().clone()),
@@ -2512,18 +2953,23 @@ mod lifecycle_tests {
             &b.global_params.node.sync_tokens,
         )
         .await?;
+        let library_id = a.global_params.library_id.context("library")?;
         for (name, payload) in [
             ("FetchParsedMediaFileRequest", vec![]),
             (
                 "GetPlaylistByIdRequest",
-                rinf::serialize(&GetPlaylistByIdRequest { playlist_id: -1 })?,
+                rinf::serialize(&GetPlaylistByIdRequest {
+                    call_id: None,
+                    playlist_id: -1,
+                })?,
             ),
             (
                 "GetMediaFilesCountRequest",
-                rinf::serialize(&GetMediaFilesCountRequest {})?,
+                rinf::serialize(&GetMediaFilesCountRequest { call_id: None })?,
             ),
         ] {
-            let (response_name, payload) = socket_request(&mut socket, name, &payload).await?;
+            let (response_name, payload) =
+                socket_request_for_catalogue_scope(&mut socket, name, &payload, library_id).await?;
             if name == "GetMediaFilesCountRequest" {
                 assert_eq!(response_name, "GetMediaFilesCountResponse");
                 let response: GetMediaFilesCountResponse = rinf::deserialize(&payload)?;
@@ -2571,17 +3017,27 @@ mod lifecycle_tests {
             &b.global_params.node.sync_tokens,
         )
         .await?;
-        async fn count(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<()> {
-            let payload = rinf::serialize(&GetMediaFilesCountRequest {})?;
-            let (name, payload) =
-                socket_request(socket, "GetMediaFilesCountRequest", &payload).await?;
+        let library_id = a.global_params.library_id.context("library")?;
+        async fn count(
+            socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+            library_id: Uuid,
+        ) -> Result<()> {
+            let payload = rinf::serialize(&GetMediaFilesCountRequest { call_id: None })?;
+            let (name, payload) = socket_request_for_library(
+                socket,
+                "GetMediaFilesCountRequest",
+                &payload,
+                library_id,
+            )
+            .await?;
             assert_eq!(name, "GetMediaFilesCountResponse");
             let response: GetMediaFilesCountResponse = rinf::deserialize(&payload)?;
             assert_eq!(response.count, 0);
             Ok(())
         }
-        count(&mut socket).await?;
+        count(&mut socket, library_id).await?;
         let request = FetchRemoteFileRequest {
+            call_id: None,
             url: "http://example.invalid/file".into(),
         };
         socket
@@ -2599,7 +3055,7 @@ mod lifecycle_tests {
                 .await
                 .is_err()
         );
-        count(&mut socket).await?;
+        count(&mut socket, library_id).await?;
 
         let name = format!("{}.txt", Uuid::new_v4());
         let bytes = b"remote file contents";
@@ -2623,7 +3079,7 @@ mod lifecycle_tests {
             format!("http://127.0.0.1:{}/files/library/{name}", addr.port()),
             format!("https://untrusted.invalid/files/library/{name}"),
         ] {
-            let request = FetchRemoteFileRequest { url };
+            let request = FetchRemoteFileRequest { call_id: None, url };
             let response = request
                 .handle(request.extract_params(&b.global_params), None, &request)
                 .await?
@@ -2647,7 +3103,13 @@ mod lifecycle_tests {
             .await
             .is_err()
         );
-        socket.close(None).await?;
+        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await?
+            .context("revocation close frame missing")??;
+        assert!(
+            matches!(&frame, Message::Close(Some(frame)) if u16::from(frame.code) == 4403),
+            "expected the server's revocation close frame, got {frame:?}"
+        );
         a.stop().await?;
         a.global_params.node.token.cancel();
         b.global_params.node.token.cancel();
@@ -2863,7 +3325,7 @@ mod lifecycle_tests {
             &endpoint.fingerprint,
             &endpoint.host,
             endpoint.port,
-        );
+        )?;
         let (_, fresh_client) = authenticated_client(
             &client.global_params.node,
             &own,
@@ -2888,6 +3350,7 @@ mod lifecycle_tests {
         // Forced passes and listings share the challenge endpoint's rate limit.
         tokio::time::sleep(Duration::from_secs(1)).await;
         let request = ListPeerLibrariesRequest {
+            call_id: None,
             fingerprint: fingerprint.to_owned(),
         };
         request
@@ -2906,6 +3369,7 @@ mod lifecycle_tests {
         library: &PeerLibrary,
     ) -> Result<String> {
         let request = AddRemoteLibraryRequest {
+            call_id: None,
             fingerprint: fingerprint.to_owned(),
             library_id: library.library_id.clone(),
             alias: library.alias.clone(),
@@ -2921,7 +3385,7 @@ mod lifecycle_tests {
             .await?
             .context("add response")?;
         anyhow::ensure!(response.error.is_none(), "add failed: {:?}", response.error);
-        Ok(response.path)
+        Ok(response.record_id)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2942,6 +3406,54 @@ mod lifecycle_tests {
             "third",
         )
         .await?;
+        let remote_control_id = LibraryRecordId(Uuid::new_v4());
+        let subsonic_id = LibraryRecordId(Uuid::new_v4());
+        LibraryRegistry::update(first.path(), |registry| {
+            registry.libraries.extend([
+                LibraryRecord {
+                    record_id: remote_control_id,
+                    alias: "Remote control".into(),
+                    library_id: None,
+                    protocol: ProtocolAdapter::RuneForward {
+                        owner_fingerprint: "remote".into(),
+                        mode: RuneForwardMode::RemoteControl,
+                    },
+                    fs: Vec::new(),
+                    catalog: CatalogPlacement::None,
+                    background_sync: false,
+                },
+                LibraryRecord {
+                    record_id: subsonic_id,
+                    alias: "Subsonic".into(),
+                    library_id: None,
+                    protocol: ProtocolAdapter::SubsonicTranslate {
+                        endpoint: "https://music.example".into(),
+                        credential: CredentialRef(Uuid::new_v4()),
+                        mode: SubsonicOpenMode::RemoteControl,
+                    },
+                    fs: Vec::new(),
+                    catalog: CatalogPlacement::None,
+                    background_sync: false,
+                },
+            ]);
+            Ok(())
+        })
+        .await?;
+        let held_ids = a
+            .global_params
+            .node
+            .library_pool
+            .served_library_ids()
+            .await?;
+        let registry = LibraryRegistry::load(first.path())?;
+        anyhow::ensure!(registry.record(remote_control_id).is_ok());
+        anyhow::ensure!(registry.record(subsonic_id).is_ok());
+        let catalog_ids = registry
+            .catalogs()
+            .filter_map(LibraryRecord::catalog_library_id)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(catalog_ids.len() == 2);
+        anyhow::ensure!(held_ids.iter().all(|id| catalog_ids.contains(id)));
         let source = first.path().join("source.ogg");
         std::fs::copy(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/startup_0.ogg"),
@@ -2995,12 +3507,12 @@ mod lifecycle_tests {
         assert_eq!(libraries[0].alias, "Owned");
         assert!(!libraries[0].added);
         assert_ne!(b.global_params.library_id, Some(library_id));
-        let path = request_add_library(&b, &fingerprint, &libraries[0]).await?;
+        let record_id = request_add_library(&b, &fingerprint, &libraries[0]).await?;
         assert_eq!(
-            path,
+            record_id,
             request_add_library(&b, &fingerprint, &libraries[0]).await?
         );
-        let replica = fixture_open_replica(&b, Path::new(&path)).await?;
+        let replica = fixture_open_replica(&b, library_id).await?;
         assert_eq!(replica.global_params.library_id, Some(library_id));
         let endpoint = PeerEndpoint {
             fingerprint: fingerprint.clone(),
@@ -3060,22 +3572,16 @@ mod lifecycle_tests {
         let libraries = listed.libraries;
         assert_eq!(libraries.len(), 1);
         assert!(libraries[0].added);
+        let replica_record_id = request_add_library(&replica, &fingerprint, &libraries[0]).await?;
         assert_eq!(
-            path,
+            replica_record_id,
             request_add_library(&replica, &fingerprint, &libraries[0]).await?
         );
         let registry = LibraryRegistry::load(second.path())?;
         assert_eq!(registry.libraries.len(), 2);
         assert_eq!(
-            registry
-                .libraries
-                .iter()
-                .find(|entry| entry.library_id == library_id)
-                .unwrap()
-                .authority,
-            LibraryAuthority::Hosted {
-                fingerprint: fingerprint.clone()
-            }
+            registry.catalog(library_id).unwrap().owner_fingerprint(),
+            Some(fingerprint.as_str())
         );
         let registry_path = first.path().join("libraries.json");
         let saved = std::fs::read(&registry_path)?;
@@ -3120,7 +3626,9 @@ mod lifecycle_tests {
             StorageMode::Portable,
         )
         .await?;
-        Ok(descriptor.library_id)
+        descriptor
+            .catalog_library_id()
+            .context("held library catalog")
     }
 
     async fn scan_held_track(
@@ -3153,6 +3661,7 @@ mod lifecycle_tests {
 
     async fn set_library_background(manager: &Fixture, id: Uuid, enabled: bool) -> Result<()> {
         let request = SetLibraryBackgroundSyncRequest {
+            call_id: None,
             library_id: id.to_string(),
             enabled,
         };
@@ -3285,9 +3794,10 @@ mod lifecycle_tests {
             wait_for_album(&right, &forward)
         )?;
         let worker = b.sync_handle.lock().await.as_ref().context("worker")?.id();
+        let remote_fingerprint = info(&a).await?.fingerprint;
         let remote_ui = peer_step(
             "open headless controller library",
-            open_remote_library(b.global_params.node.clone(), &format!("@RR|ws://{a_addr}")),
+            open_remote_control_record(b.global_params.node.clone(), &remote_fingerprint),
         )
         .await?;
         assert!(remote_ui.library_id.is_none());
@@ -3690,10 +4200,11 @@ mod lifecycle_tests {
         let b_info = peer_step("read second peer identity", info(&b)).await?;
         peer_step("pair library peers", pair(&a, &b)).await?;
         peer_step("pair library peers in reverse", pair(&b, &a)).await?;
-        let a_reserve = TcpListener::bind("127.0.0.1:0")?;
+        let a_reserve = TcpListener::bind("127.0.0.1:9999")?;
         let b_reserve = TcpListener::bind("127.0.0.1:0")?;
         let a_addr = a_reserve.local_addr()?;
         let b_addr = SocketAddr::from(([127, 0, 0, 1], b_reserve.local_addr()?.port()));
+        assert_eq!(a_addr.port(), 9999);
         assert_ne!(a_addr.port(), b_addr.port());
         drop((a_reserve, b_reserve));
         std::fs::copy(
@@ -3831,6 +4342,49 @@ mod lifecycle_tests {
         })
         .await
         .context("peers did not learn advertised ports")?;
+        for (receiver, fingerprint, expected_address) in [
+            (
+                &a,
+                &b_info.fingerprint,
+                format!("127.0.0.1:{}", b_addr.port()),
+            ),
+            (
+                &b,
+                &a_info.fingerprint,
+                format!("127.0.0.1:{}", a_addr.port()),
+            ),
+        ] {
+            receiver
+                .global_params
+                .cert_validator
+                .read()
+                .await
+                .remove_fingerprint(fingerprint)
+                .await?;
+            let request = GetDiscoveredDeviceRequest { call_id: None };
+            let response = request
+                .handle(
+                    Arc::clone(&receiver.global_params.device_scanner),
+                    None,
+                    &request,
+                )
+                .await?
+                .context("discovered device response")?;
+            let device = response
+                .devices
+                .iter()
+                .find(|device| device.fingerprint == *fingerprint)
+                .context("announced peer missing from discovered devices")?;
+            assert_eq!(device.addresses, [expected_address]);
+            add_trusted_server(
+                &*receiver.global_params.cert_validator.read().await,
+                Some(&TrustedServerCertificate {
+                    fingerprint: fingerprint.clone(),
+                    hosts: device.addresses.clone(),
+                }),
+            )
+            .await?;
+        }
         let pinned = peer_step(
             "build pinned anonymous client",
             pinned_anonymous_client(&b.global_params, None),
@@ -3908,13 +4462,17 @@ mod lifecycle_tests {
                 .cert_validator
                 .read()
                 .await
-                .add_trusted_domains(["127.0.0.1", "localhost"], &b_info.fingerprint)
+                .replace_hosts_for_fingerprint(
+                    &b_info.fingerprint,
+                    vec![
+                        format!("127.0.0.1:{}", b_addr.port()),
+                        format!("localhost:{}", b_addr.port()),
+                    ],
+                )
                 .await?;
             Ok(())
         })
         .await?;
-        // Let the background workers finish their shared per-IP auth burst.
-        tokio::time::sleep(Duration::from_secs(1)).await;
         let audio_library = peer_step(
             "acquire audio library",
             a.global_params
@@ -3985,7 +4543,7 @@ mod lifecycle_tests {
             &b_info.fingerprint,
             "127.0.0.2",
             b_addr.port(),
-        );
+        )?;
         let renewed_ranges = tokio::join!(
             peer_step("first concurrent renewed ranged audio GET", async {
                 let response = source.request.get(Some((0, Some(15)))).await?;
@@ -4183,7 +4741,11 @@ mod lifecycle_tests {
             ),
         )
         .await?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        peer_step(
+            "stop background worker before direct full-listener auth",
+            async { a.stop_worker().await },
+        )
+        .await?;
         let (_, full_authorized) = peer_step("authenticate full listener client", async {
             authenticated_client(
                 &b.global_params.node,
@@ -4414,7 +4976,7 @@ mod lifecycle_tests {
         )
         .await?;
         assert!(
-            matches!(&queued[..], [(PlayingItem::InLibrary(item), PlaybackSource::LibraryStream)] if item.file_uuid.to_string() == file.hlc_uuid)
+            matches!(&queued[..], [(PlayingItem::LibraryTrack { track, .. }, PlaybackSource::LibraryStream)] if *track == file.hlc_uuid)
         );
         let summaries = get_metadata_summary_by_files(
             params.test_library().main_db.as_ref(),
@@ -4425,6 +4987,7 @@ mod lifecycle_tests {
             &params.test_library().fsio,
             &params.test_library().main_db,
             &params.node_id,
+            &params.test_library().library_id.to_string(),
             summaries,
             Arc::new(params.test_library().media_root.clone()),
         )

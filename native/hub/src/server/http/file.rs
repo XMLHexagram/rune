@@ -17,10 +17,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use tower::ServiceExt;
 use tower_http::services::ServeDir;
 
-use crate::{
-    Session,
-    server::{ServerState, access::AuthorizedLibrary},
-};
+use crate::server::{ServerState, access::AuthorizedLibrary};
 use futures::StreamExt;
 
 /// Canonicalize a requested media path and require it to remain within the library root.
@@ -51,18 +48,6 @@ pub fn canonicalize_media_path(
         return Err(invalid_media_path().into());
     }
     Ok(canonical)
-}
-
-pub fn validate_remote_media_path(
-    session: Option<&Session>,
-    fsio: &FsIo,
-    media_root: &FilePath,
-    requested: &FilePath,
-) -> Result<()> {
-    if session.is_some() {
-        canonicalize_media_path(fsio, media_root, requested)?;
-    }
-    Ok(())
 }
 
 fn invalid_media_path() -> ExpectedError {
@@ -125,7 +110,7 @@ pub async fn file_handler(
     let requested_path = root_dir.join(relative_path);
     let canonical_root = match library.as_ref() {
         Some(library) => library.fsio.canonicalize_path(root_dir).ok(),
-        None => root_dir.canonicalize().ok(),
+        None => dunce::canonicalize(root_dir).ok(),
     };
     let Some(canonical_root) = canonical_root else {
         return StatusCode::FORBIDDEN.into_response();
@@ -137,7 +122,7 @@ pub async fn file_handler(
             FilePath::new(relative_path),
         )
         .ok(),
-        None => requested_path.canonicalize().ok(),
+        None => dunce::canonicalize(&requested_path).ok(),
     };
     let Some(canonical_path) = canonical_path else {
         return StatusCode::FORBIDDEN.into_response();

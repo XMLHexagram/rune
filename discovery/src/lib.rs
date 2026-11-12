@@ -7,9 +7,9 @@ pub mod config;
 pub mod endpoint;
 pub mod persistent;
 pub mod protocol;
+pub mod protocol_version;
 pub mod server;
 pub mod ssl;
-pub mod url;
 pub mod utils;
 
 pub struct DiscoveryParams {

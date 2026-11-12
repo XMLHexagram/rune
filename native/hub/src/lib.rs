@@ -13,8 +13,13 @@ pub mod library_pool;
 pub mod messages;
 pub mod node;
 pub mod request_error;
+mod request_owner;
 pub mod rpc;
 pub mod session;
+mod subsonic_binding;
+mod subsonic_translate;
+#[cfg(test)]
+mod test_wait;
 #[macro_use]
 pub mod server;
 pub mod utils;
@@ -30,11 +35,12 @@ use tokio::sync::Mutex;
 use tracing_subscriber::{EnvFilter, fmt};
 
 pub use tokio;
-pub use utils::RinfRustSignal;
+pub use utils::{RemoteEventDeclaration, RemoteEventScope, RinfRustSignal};
 
 use ::scrobbling::manager::ScrobblingManager;
 
-use utils::{TaskTokens, diagnostics::receive_fs_self_test, receive_media_library_path};
+use macros::{receive_node_requests, start_standalone_request_receivers};
+use utils::TaskTokens;
 
 use crate::utils::init_logging;
 
@@ -55,10 +61,16 @@ pub trait Signal: Sized {
     ) -> impl Future<Output = Result<Option<Self::Response>>> + Send;
 }
 
-pub trait CallIdentified {
-    fn call_id(&self) -> Option<u64> {
-        None
-    }
+pub trait RequestCallId {
+    fn call_id(&self) -> Option<u64>;
+}
+
+pub trait ResponseCallId {
+    fn set_call_id(&mut self, call_id: Option<u64>);
+}
+
+impl ResponseCallId for () {
+    fn set_call_id(&mut self, _call_id: Option<u64>) {}
 }
 
 /// A request whose wire name and response type are declared in the request catalogue.
@@ -103,19 +115,15 @@ async fn main() {
         None
     };
 
-    // The self-test listener must stay alive even when the media library is
-    // not initialized, so it runs as an independent task instead of going
-    // through the handler dispatch.
-    tokio::spawn(receive_fs_self_test());
-    tokio::spawn(node::receive_initialize_node());
+    start_standalone_request_receivers();
+    tokio::spawn(receive_node_requests(
+        node::node_slot(),
+        utils::ProductionNodeRequestHandlers::new(Arc::clone(&scrobbler)),
+    ));
 
-    // Start receiving the media library path
-    tokio::select! {
-        result = receive_media_library_path(scrobbler) => {
-            if let Err(error) = result { error!("Failed to receive media library path: {error:?}"); }
-        }
-        _ = rinf::dart_shutdown() => {}
-    }
+    // Every receiver runs as a spawned task on this runtime, so main must stay alive until
+    // Dart shuts down; returning earlier drops the runtime and every receiver with it.
+    rinf::dart_shutdown().await;
 
     if let Err(error) = node::shutdown_node().await {
         error!("Node shutdown failed: {error:#}");

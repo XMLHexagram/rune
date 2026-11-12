@@ -38,6 +38,7 @@ flutter-texture = { path = "../../flutter-texture" }
 scrobbling = { path = "../../scrobbling" }
 metadata = { path = "../../metadata" }
 discovery = { path = "../../discovery" }
+subsonic = { path = "../../subsonic" }
 lazy_static = "1.5.0"
 log = "0.4.22"
 tracing-subscriber = { version = "0.3.20", features = ["chrono", "registry"] }
@@ -76,6 +77,7 @@ term_size = "0.3.2"
 colored = "3.0.0"
 unicode-width = "0.2.0"
 clean-path = "0.2.1"
+dunce = "1.0.5"
 serde = "1.0.219"
 tower_governor = "0.6.0"
 rand = "0.8.0"
@@ -119,6 +121,7 @@ tracing-logcat = "0.1.0"
 swift-rs = { version = "1.0.7", features = ["build"] }
 
 [dev-dependencies]
+fsio = { path = "../../fsio", features = ["test-fixtures"] }
 playback = { path = "../../playback", features = ["test-output"] }
 tokio = { version = "1.44.2", features = ["test-util"] }
 hyper = "1.6.0"

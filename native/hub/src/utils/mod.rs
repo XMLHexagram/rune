@@ -1,5 +1,8 @@
 use database::sync::LibrarySyncStore;
-use tokio::time::Duration;
+use tokio::{
+    runtime::Handle,
+    time::{Duration, timeout},
+};
 use uuid::Uuid;
 pub mod broadcastable;
 pub mod diagnostics;
@@ -11,22 +14,27 @@ use database::actions::file::{
     AudioAvailability, audio_availability, audio_origin, remote_content_ids,
 };
 use std::{
+    any::{Any, TypeId},
     collections::HashMap,
     fmt::Debug,
+    future::Future,
+    io::ErrorKind,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
+    result::Result as StdResult,
     sync::{Arc, OnceLock},
 };
 
-use crate::macros::listen_local_gui;
-use crate::node::{NodeContext, initialize_node};
+use crate::handlers::local_libraries::publish_library_records_changed;
+use crate::node::{NodeContext, NodeSlot};
 use anyhow::{Context, Result};
-use fsio::FsIo;
-use log::{error, info};
-use rinf::{DartSignal, DartSignalPack};
+use fsio::{FileIoError, FsIo, OpenDalConfig, OpenDalObjectStore};
+use log::info;
 use scrobbling::manager::ScrobblingServiceManager;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use ::database::sync::model::RuneModel;
 use ::database::{
     actions::{
         cover_art::bake_cover_art_by_media_files, metadata::MetadataSummary,
@@ -34,27 +42,40 @@ use ::database::{
     },
     connection::{
         LibraryState, MainDbConnection, RecommendationDbConnection, check_library_state,
-        check_storage_mode, connect_main_db, connect_recommendation_db, create_redirect,
+        check_storage_mode, connect_main_db, connect_main_db_redirected, connect_recommendation_db,
+        connect_recommendation_db_redirected, create_redirect,
     },
+    credentials::{Credential, CredentialRef, CredentialStore, Secret},
     entities::media_files,
-    library_registry::{LibraryLocation, LibraryRegistry, resolve_library},
-    playing_item::MediaFileHandle,
+    library_registry::{
+        CatalogPlacement, FsAdapter, InvalidRecord, LibraryRecord, LibraryRecordId,
+        LibraryRegistry, ProtocolAdapter, RuneForwardMode, SubsonicOpenMode, resolve_library,
+    },
+    playing_item::{MediaFileHandle, PlayingItemMetadataSummary},
 };
 use ::discovery::{client::CertValidator, protocol::DiscoveryService, server::PermissionManager};
 use ::playback::{
-    player::{Playable, PlaybackSource, PlayingItem},
+    player::{Playable, PlaybackSource, PlayingItem, RemoteAudioError},
     sfx_player::SfxPlayer,
 };
 use ::scrobbling::manager::ScrobblingManager;
+use ::sync::protocol::SyncModel;
+use ::sync::share::{ObjectStore, ObjectValue, StoreError, decode_library};
 
+use crate::Signal;
 use crate::backends::{
     local::local_player_loop,
-    remote::{RemoteConnectError, open_remote_library},
+    remote::{RemoteConnectError, open_remote_library_for_fingerprint},
 };
 use crate::library_pool::{LibraryHandle, LibraryPool};
+use crate::macros::NodeRequestHandlers;
 use crate::messages::*;
 use crate::request_error::ExpectedRequestError;
+use crate::request_owner::Implementation;
 use crate::server::ServerManager;
+use crate::subsonic_binding::SubsonicBinding;
+use subsonic::{SubsonicClient, SubsonicCredentials, SubsonicError, SubsonicServerError};
+use url::Url;
 
 #[cfg(target_os = "android")]
 use tracing_logcat::{LogcatMakeWriter, LogcatTag};
@@ -90,18 +111,33 @@ pub async fn initialize_databases(
     })
 }
 
-#[derive(Debug, Default)]
-pub struct TaskTokens {
-    pub scan_token: Option<CancellationToken>,
-    pub scan_id: Option<String>,
-    pub analyze_token: Option<CancellationToken>,
-    pub deduplicate_token: Option<CancellationToken>,
+pub async fn initialize_opendal_databases(
+    db_dir: &Path,
+    storage_key: Uuid,
+    node_id: &str,
+) -> Result<DatabaseConnections> {
+    let db_dir = db_dir.join(storage_key.to_string());
+    let main_db = connect_main_db_redirected(&db_dir, storage_key, node_id)
+        .await
+        .context("Failed to connect to main DB")?;
+    let recommend_db = connect_recommendation_db_redirected(&db_dir, &main_db)
+        .await
+        .context("Failed to connect to recommendation DB")?;
+    Ok(DatabaseConnections {
+        main_db: Arc::new(main_db),
+        recommend_db: Arc::new(recommend_db),
+    })
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum RunningMode {
-    Server,
-    Client,
+#[derive(Debug, Default)]
+pub struct TaskTokens {
+    pub scans: HashMap<String, ScanTask>,
+}
+
+#[derive(Debug)]
+pub struct ScanTask {
+    pub token: CancellationToken,
+    pub scan_id: String,
 }
 
 /// The current UI library for a request, or the expected `Unavailable` error
@@ -129,6 +165,7 @@ pub struct GlobalParams {
     pub node_id: Arc<String>,
     pub main_token: Arc<CancellationToken>,
     pub task_tokens: Arc<Mutex<TaskTokens>>,
+    pub library_tasks: Arc<std::sync::Mutex<LibraryTaskOwner>>,
     pub player: Arc<Mutex<dyn Playable>>,
     pub sfx_player: Arc<Mutex<SfxPlayer>>,
     pub scrobbler: Arc<Mutex<dyn ScrobblingServiceManager>>,
@@ -137,13 +174,12 @@ pub struct GlobalParams {
     pub cert_validator: Arc<RwLock<CertValidator>>,
     pub permission_manager: Arc<RwLock<PermissionManager>>,
     pub server_manager: OnceLock<Arc<ServerManager>>,
-    pub running_mode: RunningMode,
 }
 
 impl GlobalParams {
     /// Construct request parameters scoped to the addressed library.
     pub fn for_library(&self, library: LibraryHandle) -> Self {
-        let library_id = library.descriptor.library_id;
+        let library_id = library.library_id;
         let mut params = self.clone();
         params.library_id = Some(library_id);
         params.library = Some(library);
@@ -157,9 +193,35 @@ pub async fn initialize_library_replica(
     db: &MainDbConnection,
     device_id: &str,
     library_id: Uuid,
+    config_dir: &Path,
 ) -> Result<LibrarySyncStore> {
     let device_id = Uuid::parse_str(device_id)?;
-    let library = LibrarySyncStore::open(db.clone(), device_id, Some(library_id)).await?;
+    let token_dir = config_dir.join("causal-writer-identities");
+    std::fs::create_dir_all(&token_dir).context("Create causal writer identity directory")?;
+    let token_path = token_dir.join(format!("{library_id}.token"));
+    let file_token = match std::fs::read_to_string(&token_path) {
+        Ok(value) => Uuid::parse_str(value.trim()).context("Read causal writer identity")?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let token = Uuid::new_v4();
+            let temporary = token_dir.join(format!("{library_id}.{}.tmp", Uuid::new_v4()));
+            std::fs::write(&temporary, token.to_string())
+                .context("Write causal writer identity")?;
+            std::fs::rename(&temporary, &token_path).context("Install causal writer identity")?;
+            Uuid::parse_str(
+                std::fs::read_to_string(&token_path)
+                    .context("Read installed causal writer identity")?
+                    .trim(),
+            )?
+        }
+        Err(error) => return Err(error).context("Read causal writer identity"),
+    };
+    let library = LibrarySyncStore::open_with_file_token(
+        db.clone(),
+        device_id,
+        Some(library_id),
+        Some(file_token),
+    )
+    .await?;
     library.import_existing(device_id).await?;
     Ok(library)
 }
@@ -188,14 +250,37 @@ pub trait ParamsExtractor {
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params;
 }
 
-pub trait RinfRustSignal {
+pub trait RinfRustSignal: 'static {
+    fn as_any(&self) -> &dyn Any;
+
     fn name(&self) -> String;
+
+    fn remote_event(&self) -> Option<RemoteEventScope> {
+        let type_id = TypeId::of::<Self>();
+        broadcastable::REMOTE_EVENT_DECLARATIONS
+            .iter()
+            .find(|declaration| declaration.type_id == type_id)
+            .map(|declaration| declaration.scope)
+    }
 
     /// Encodes the message into a byte vector.
     fn encode_to_vec(&self) -> Result<Vec<u8>>;
 
     /// Sends the message to Dart.
     fn send_to_dart(&self);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteEventScope {
+    Session,
+    Library,
+}
+
+pub struct RemoteEventDeclaration {
+    pub name: &'static str,
+    pub type_id: TypeId,
+    pub scope: RemoteEventScope,
+    pub decode: fn(&[u8]) -> Result<Box<dyn RinfRustSignal>>,
 }
 
 pub trait Broadcaster: Send + Sync {
@@ -210,280 +295,2024 @@ impl Broadcaster for LocalGuiBroadcaster {
     }
 }
 
-pub async fn receive_media_library_path(scrobbler: Arc<Mutex<ScrobblingManager>>) -> Result<()> {
-    let receiver = SetMediaLibraryPathRequest::get_dart_signal_receiver();
-    let broadcaster: Arc<dyn Broadcaster> = Arc::new(LocalGuiBroadcaster);
+pub(crate) struct ProductionNodeRequestHandlers {
+    scrobbler: Arc<Mutex<ScrobblingManager>>,
+}
 
-    info!("Receive media library path loop started");
-
-    loop {
-        while let Some(dart_signal) = receiver.recv().await {
-            let path = dart_signal.message.path.clone();
-            // A panic while handling one message must not wedge the whole rinf
-            // channel (the process stays alive but every Dart signal goes
-            // unanswered). Catch it, report, keep listening.
-            let handling = std::panic::AssertUnwindSafe(handle_media_library_path(
-                dart_signal,
-                Arc::clone(&scrobbler),
-                Arc::clone(&broadcaster),
-            ));
-            if let Err(panic) = futures::FutureExt::catch_unwind(handling).await {
-                error!("Panicked while handling media library path {path}: {panic:?}");
-                broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                    restore_last_index: false,
-                    error_kind: None,
-                    path,
-                    success: false,
-                    error: Some(
-                        "Internal error while opening the library; details are in the logs"
-                            .to_string(),
-                    ),
-                    not_ready: false,
-                });
-            }
-        }
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
+impl ProductionNodeRequestHandlers {
+    pub(crate) fn new(scrobbler: Arc<Mutex<ScrobblingManager>>) -> Self {
+        Self { scrobbler }
     }
 }
 
-async fn handle_media_library_path(
-    dart_signal: DartSignalPack<SetMediaLibraryPathRequest>,
-    scrobbler: Arc<Mutex<ScrobblingManager>>,
-    broadcaster: Arc<dyn Broadcaster>,
-) {
-    {
-        info!("Received media library path message");
-        let media_library_path = &dart_signal.message.path;
+// Explicit `Send` futures let the generated receiver loop run in a Tokio task.
+#[allow(clippy::manual_async_fn)]
+impl NodeRequestHandlers for ProductionNodeRequestHandlers {
+    fn handle_get_open_library_request(
+        &self,
+        node: &NodeSlot,
+        request: &GetOpenLibraryRequest,
+    ) -> impl Future<Output = Result<Option<GetOpenLibraryResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            Ok(Some(GetOpenLibraryResponse {
+                library_id: node
+                    .current_ui()
+                    .await
+                    .ok()
+                    .and_then(|params| params.library_id)
+                    .map(|library_id| library_id.to_string()),
+                call_id: request.call_id,
+            }))
+        }
+    }
 
-        info!("Received media library {media_library_path}");
+    fn handle_list_controllers_request(
+        &self,
+        node: &NodeSlot,
+        request: &ListControllersRequest,
+    ) -> impl Future<Output = Result<Option<ListControllersResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request.handle(node, None, request).await
+        }
+    }
 
-        let config_path = &dart_signal.message.config_path;
-        let alias = &dart_signal.message.alias;
-        // A replica is named by its library id; it lives in the data directory, which can
-        // move, so its folder comes from the registry rather than from Dart.
-        let replica_root =
-            match LibraryLocation::parse(media_library_path).and_then(|location| match location {
-                LibraryLocation::Replica(id) => {
-                    let registry = LibraryRegistry::load(Path::new(config_path))?;
-                    let descriptor = registry.replica(id)?;
-                    let root = descriptor.root(Path::new(config_path));
-                    Ok(Some((
-                        id,
-                        root.to_str()
-                            .context("Replica path is not UTF-8")?
-                            .to_owned(),
-                    )))
+    fn handle_list_local_libraries_request(
+        &self,
+        node: &NodeSlot,
+        request: &ListLocalLibrariesRequest,
+    ) -> impl Future<Output = Result<Option<ListLocalLibrariesResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(node.config_path.clone(), None, request)
+                .await
+        }
+    }
+
+    fn handle_get_device_grants_request(
+        &self,
+        node: &NodeSlot,
+        request: &GetDeviceGrantsRequest,
+    ) -> impl Future<Output = Result<Option<GetDeviceGrantsResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request.handle(node, None, request).await
+        }
+    }
+
+    fn handle_set_device_grants_request(
+        &self,
+        node: &NodeSlot,
+        request: &SetDeviceGrantsRequest,
+    ) -> impl Future<Output = Result<Option<SetDeviceGrantsResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request.handle(node, None, request).await
+        }
+    }
+
+    fn handle_set_library_background_sync_request(
+        &self,
+        node: &NodeSlot,
+        request: &SetLibraryBackgroundSyncRequest,
+    ) -> impl Future<Output = Result<Option<SetLibraryBackgroundSyncResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request.handle(node, None, request).await
+        }
+    }
+
+    fn handle_list_peer_libraries_request(
+        &self,
+        node: &NodeSlot,
+        request: &ListPeerLibrariesRequest,
+    ) -> impl Future<Output = Result<Option<ListPeerLibrariesResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(node.server_manager.get().cloned(), None, request)
+                .await
+        }
+    }
+
+    fn handle_add_remote_library_request(
+        &self,
+        node: &NodeSlot,
+        request: &AddRemoteLibraryRequest,
+    ) -> impl Future<Output = Result<Option<AddRemoteLibraryResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(node.config_path.clone(), None, request)
+                .await
+        }
+    }
+
+    fn handle_register_license_request(
+        &self,
+        node: &NodeSlot,
+        request: &RegisterLicenseRequest,
+    ) -> impl Future<Output = Result<Option<RegisterLicenseResponse>>> + Send {
+        async move {
+            node.current().await?;
+            request.handle((), None, request).await
+        }
+    }
+
+    fn handle_validate_license_request(
+        &self,
+        node: &NodeSlot,
+        request: &ValidateLicenseRequest,
+    ) -> impl Future<Output = Result<Option<ValidateLicenseResponse>>> + Send {
+        async move {
+            node.current().await?;
+            request.handle((), None, request).await
+        }
+    }
+
+    fn handle_get_discovered_device_request(
+        &self,
+        node: &NodeSlot,
+        request: &GetDiscoveredDeviceRequest,
+    ) -> impl Future<Output = Result<Option<GetDiscoveredDeviceResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(Arc::clone(&node.device_scanner), None, request)
+                .await
+        }
+    }
+
+    fn handle_list_clients_request(
+        &self,
+        node: &NodeSlot,
+        request: &ListClientsRequest,
+    ) -> impl Future<Output = Result<Option<ListClientsResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(Arc::clone(&node.permission_manager), None, request)
+                .await
+        }
+    }
+
+    fn handle_start_server_request(
+        &self,
+        node: &NodeSlot,
+        request: &StartServerRequest,
+    ) -> impl Future<Output = Result<Option<StartServerResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            let manager = node
+                .server_manager
+                .get()
+                .cloned()
+                .context("Server manager is not initialized")?;
+            request
+                .handle((node.config_path.clone(), manager), None, request)
+                .await
+        }
+    }
+
+    fn handle_stop_server_request(
+        &self,
+        node: &NodeSlot,
+        request: &StopServerRequest,
+    ) -> impl Future<Output = Result<Option<StopServerResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            let manager = node
+                .server_manager
+                .get()
+                .cloned()
+                .context("Server manager is not initialized")?;
+            request.handle(manager, None, request).await
+        }
+    }
+
+    fn handle_start_broadcast_request(
+        &self,
+        node: &NodeSlot,
+        request: &StartBroadcastRequest,
+    ) -> impl Future<Output = Result<Option<()>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(
+                    (Arc::clone(&node.device_scanner), node.config_path.clone()),
+                    None,
+                    request,
+                )
+                .await
+        }
+    }
+
+    fn handle_stop_broadcast_request(
+        &self,
+        node: &NodeSlot,
+        request: &StopBroadcastRequest,
+    ) -> impl Future<Output = Result<Option<()>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle((Arc::clone(&node.device_scanner),), None, request)
+                .await
+        }
+    }
+
+    fn handle_start_listening_request(
+        &self,
+        node: &NodeSlot,
+        request: &StartListeningRequest,
+    ) -> impl Future<Output = Result<Option<()>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(
+                    (Arc::clone(&node.device_scanner), node.config_path.clone()),
+                    None,
+                    request,
+                )
+                .await
+        }
+    }
+
+    fn handle_stop_listening_request(
+        &self,
+        node: &NodeSlot,
+        request: &StopListeningRequest,
+    ) -> impl Future<Output = Result<Option<()>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle((Arc::clone(&node.device_scanner),), None, request)
+                .await
+        }
+    }
+
+    fn handle_set_visualizer_preset_dirs_request(
+        &self,
+        node: &NodeSlot,
+        request: &SetVisualizerPresetDirsRequest,
+    ) -> impl Future<Output = Result<Option<()>>> + Send {
+        async move {
+            node.current().await?;
+            request.handle((), None, request).await
+        }
+    }
+
+    fn handle_set_visualizer_scenes_request(
+        &self,
+        node: &NodeSlot,
+        request: &SetVisualizerScenesRequest,
+    ) -> impl Future<Output = Result<Option<()>>> + Send {
+        async move {
+            node.current().await?;
+            request.handle((), None, request).await
+        }
+    }
+
+    fn handle_get_ssl_certificate_fingerprint_request(
+        &self,
+        node: &NodeSlot,
+        request: &GetSslCertificateFingerprintRequest,
+    ) -> impl Future<Output = Result<Option<GetSslCertificateFingerprintResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(node.config_path.clone(), None, request)
+                .await
+        }
+    }
+
+    fn handle_visualizer_support_request(
+        &self,
+        node: &NodeSlot,
+        request: &VisualizerSupportRequest,
+    ) -> impl Future<Output = Result<Option<VisualizerSupportResponse>>> + Send {
+        async move {
+            node.current().await?;
+            request.handle((), None, request).await
+        }
+    }
+
+    fn handle_list_visualizer_presets_request(
+        &self,
+        node: &NodeSlot,
+        request: &ListVisualizerPresetsRequest,
+    ) -> impl Future<Output = Result<Option<ListVisualizerPresetsResponse>>> + Send {
+        async move {
+            node.current().await?;
+            request.handle((), None, request).await
+        }
+    }
+
+    fn handle_test_library_initialized_request(
+        &self,
+        node: &NodeSlot,
+        request: &TestLibraryInitializedRequest,
+    ) -> impl Future<Output = Result<Option<TestLibraryInitializedResponse>>> + Send {
+        async move {
+            node.current().await?;
+            request.handle((), None, request).await
+        }
+    }
+
+    fn handle_set_mix_with_others_request(
+        &self,
+        node: &NodeSlot,
+        request: &SetMixWithOthersRequest,
+    ) -> impl Future<Output = Result<Option<()>>> + Send {
+        async move {
+            let node = node.current().await?;
+            let session = node.session()?;
+            request
+                .handle((Arc::clone(&session.player),), None, request)
+                .await
+        }
+    }
+
+    fn handle_get_sync_settings_request(
+        &self,
+        node: &NodeSlot,
+        request: &GetSyncSettingsRequest,
+    ) -> impl Future<Output = Result<Option<GetSyncSettingsResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(Arc::clone(&node.sync_settings), None, request)
+                .await
+        }
+    }
+
+    fn handle_set_sync_settings_request(
+        &self,
+        node: &NodeSlot,
+        request: &SetSyncSettingsRequest,
+    ) -> impl Future<Output = Result<Option<SetSyncSettingsResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(
+                    (
+                        Arc::clone(&node.sync_settings),
+                        node.config_path.clone(),
+                        node.server_manager.get().cloned(),
+                    ),
+                    None,
+                    request,
+                )
+                .await
+        }
+    }
+
+    fn handle_system_info_request(
+        &self,
+        node: &NodeSlot,
+        request: &SystemInfoRequest,
+    ) -> impl Future<Output = Result<Option<SystemInfoResponse>>> + Send {
+        async move {
+            node.current().await?;
+            request.handle((), None, request).await
+        }
+    }
+
+    fn handle_add_trusted_server_request(
+        &self,
+        node: &NodeSlot,
+        request: &AddTrustedServerRequest,
+    ) -> impl Future<Output = Result<Option<AddTrustedServerResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(Arc::clone(&node.cert_validator), None, request)
+                .await
+        }
+    }
+
+    fn handle_remove_trusted_client_request(
+        &self,
+        node: &NodeSlot,
+        request: &RemoveTrustedClientRequest,
+    ) -> impl Future<Output = Result<Option<RemoveTrustedClientResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request.handle(node, None, request).await
+        }
+    }
+
+    fn handle_update_client_status_request(
+        &self,
+        node: &NodeSlot,
+        request: &UpdateClientStatusRequest,
+    ) -> impl Future<Output = Result<Option<UpdateClientStatusResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request.handle(node, None, request).await
+        }
+    }
+
+    fn handle_remove_trusted_server_request(
+        &self,
+        node: &NodeSlot,
+        request: &RemoveTrustedServerRequest,
+    ) -> impl Future<Output = Result<Option<RemoveTrustedServerResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request.handle(node, None, request).await
+        }
+    }
+
+    fn handle_server_availability_test_request(
+        &self,
+        node: &NodeSlot,
+        request: &ServerAvailabilityTestRequest,
+    ) -> impl Future<Output = Result<Option<ServerAvailabilityTestResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(Arc::clone(&node.cert_validator), None, request)
+                .await
+        }
+    }
+
+    fn handle_register_device_on_server_request(
+        &self,
+        node: &NodeSlot,
+        request: &RegisterDeviceOnServerRequest,
+    ) -> impl Future<Output = Result<Option<RegisterDeviceOnServerResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(
+                    (node.config_path.clone(), Arc::clone(&node.cert_validator)),
+                    None,
+                    request,
+                )
+                .await
+        }
+    }
+
+    fn handle_check_device_on_server_request(
+        &self,
+        node: &NodeSlot,
+        request: &CheckDeviceOnServerRequest,
+    ) -> impl Future<Output = Result<Option<CheckDeviceOnServerResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(
+                    (Arc::clone(&node.cert_validator), node.config_path.clone()),
+                    None,
+                    request,
+                )
+                .await
+        }
+    }
+
+    fn handle_connect_request(
+        &self,
+        node: &NodeSlot,
+        request: &ConnectRequest,
+    ) -> impl Future<Output = Result<Option<ConnectResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request
+                .handle(Arc::clone(&node.cert_validator), None, request)
+                .await
+        }
+    }
+
+    fn handle_fetch_server_certificate_request(
+        &self,
+        node: &NodeSlot,
+        request: &FetchServerCertificateRequest,
+    ) -> impl Future<Output = Result<Option<FetchServerCertificateResponse>>> + Send {
+        async move {
+            node.current().await?;
+            request.handle((), None, request).await
+        }
+    }
+
+    fn handle_list_library_records_request(
+        &self,
+        node: &NodeSlot,
+        request: &ListLibraryRecordsRequest,
+    ) -> impl Future<Output = Result<Option<ListLibraryRecordsResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request.handle(node, None, request).await
+        }
+    }
+
+    fn handle_remove_library_record_request(
+        &self,
+        node: &NodeSlot,
+        request: &RemoveLibraryRecordRequest,
+    ) -> impl Future<Output = Result<Option<RemoveLibraryRecordResponse>>> + Send {
+        async move {
+            let node = node.current().await?;
+            request.handle(node, None, request).await
+        }
+    }
+
+    fn handle_register_local_library_request(
+        &self,
+        node: &NodeSlot,
+        request: &RegisterLocalLibraryRequest,
+    ) -> impl Future<Output = Result<Option<RegisterLibraryResponse>>> + Send {
+        async move { Ok(Some(register_local_library(node, request).await)) }
+    }
+
+    fn handle_register_remote_control_request(
+        &self,
+        node: &NodeSlot,
+        request: &RegisterRemoteControlRequest,
+    ) -> impl Future<Output = Result<Option<RegisterLibraryResponse>>> + Send {
+        async move { Ok(Some(register_remote_control(node, request).await)) }
+    }
+
+    fn handle_register_subsonic_library_request(
+        &self,
+        node: &NodeSlot,
+        request: &RegisterSubsonicLibraryRequest,
+    ) -> impl Future<Output = Result<Option<RegisterLibraryResponse>>> + Send {
+        async move { Ok(Some(register_subsonic_library(node, request).await)) }
+    }
+
+    fn handle_replace_subsonic_credential_request(
+        &self,
+        node: &NodeSlot,
+        request: &ReplaceSubsonicCredentialRequest,
+    ) -> impl Future<Output = Result<Option<ReplaceSubsonicCredentialResponse>>> + Send {
+        async move {
+            let result = match node.current().await {
+                Ok(node) => replace_subsonic_credential_on_node(request, &node).await,
+                Err(_) => ReplaceSubsonicCredentialResult::Storage,
+            };
+            Ok(Some(ReplaceSubsonicCredentialResponse {
+                result,
+                call_id: request.call_id,
+            }))
+        }
+    }
+
+    fn handle_register_open_dal_library_request(
+        &self,
+        node: &NodeSlot,
+        request: &RegisterOpenDalLibraryRequest,
+    ) -> impl Future<Output = Result<Option<RegisterLibraryResponse>>> + Send {
+        async move { Ok(Some(register_opendal_library(node, request).await)) }
+    }
+
+    fn handle_detect_open_dal_share_data_request(
+        &self,
+        node: &NodeSlot,
+        request: &DetectOpenDalShareDataRequest,
+    ) -> impl Future<Output = Result<Option<DetectOpenDalShareDataResponse>>> + Send {
+        async move {
+            let result = match node.current().await {
+                Ok(_) => detect_opendal_share_data(&request.service).await,
+                Err(_) => OpenDalShareDataDetection::Failed(RegisterLibraryFailureKind::Storage),
+            };
+            Ok(Some(DetectOpenDalShareDataResponse {
+                result,
+                call_id: request.call_id,
+            }))
+        }
+    }
+
+    fn handle_open_library_request(
+        &self,
+        node: &NodeSlot,
+        request: &OpenLibraryRequest,
+    ) -> impl Future<Output = Result<Option<OpenLibraryResponse>>> + Send {
+        let scrobbler = Arc::clone(&self.scrobbler);
+        async move { Ok(Some(open_library_by_record(node, request, scrobbler).await)) }
+    }
+}
+
+async fn register_opendal_library(
+    node_slot: &NodeSlot,
+    request: &RegisterOpenDalLibraryRequest,
+) -> RegisterLibraryResponse {
+    match node_slot.current().await {
+        Ok(node) => register_opendal_library_on_node(request, &node).await,
+        Err(_) => opendal_registration_failure(
+            RegisterLibraryFailureKind::Storage,
+            "Could not access library storage",
+        ),
+    }
+}
+
+async fn detect_opendal_share_data(service: &OpenDalLibraryService) -> OpenDalShareDataDetection {
+    let config = match service {
+        OpenDalLibraryService::WebDav {
+            endpoint,
+            root,
+            username,
+            password,
+        } => OpenDalConfig::WebDav {
+            endpoint: endpoint.clone(),
+            root: root.clone(),
+            username: username.clone(),
+            password: password.clone(),
+        },
+        OpenDalLibraryService::S3 {
+            endpoint,
+            bucket,
+            region,
+            root,
+            access_key_id,
+            secret_access_key,
+        } => OpenDalConfig::S3 {
+            endpoint: endpoint.clone(),
+            bucket: bucket.clone(),
+            region: region.clone(),
+            root: root.clone(),
+            access_key_id: access_key_id.clone(),
+            secret_access_key: secret_access_key.clone(),
+        },
+    };
+    let store = match OpenDalObjectStore::new(config) {
+        Ok(store) => store,
+        Err(_) => {
+            return OpenDalShareDataDetection::Failed(
+                RegisterLibraryFailureKind::OpenDalUnreachable,
+            );
+        }
+    };
+    let library = ObjectStore::get(&store, "library.json").await;
+    let probe = if matches!(library, Err(StoreError::NotFound)) {
+        let prefix = format!("devices/{}.1", Uuid::new_v4());
+        store.probe(&prefix).await
+    } else {
+        Ok(fsio::ObjectStoreCapabilities::default())
+    };
+    classify_opendal_share_data(library, probe)
+}
+
+fn classify_opendal_share_data(
+    library: Result<ObjectValue, StoreError>,
+    probe: Result<fsio::ObjectStoreCapabilities, StoreError>,
+) -> OpenDalShareDataDetection {
+    match library {
+        Ok(value) => match decode_library(&value.bytes) {
+            Ok(library)
+                if library.library_id != Uuid::nil()
+                    && library.model == RuneModel::model_id()
+                    && library.schema == RuneModel::schema_id() =>
+            {
+                OpenDalShareDataDetection::ExistingLibrary {
+                    library_id: library.library_id.to_string(),
                 }
-                LibraryLocation::Path(_) => Ok(None),
-            }) {
-                Ok(replica) => replica,
-                Err(error) => {
-                    broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                        restore_last_index: false,
-                        error_kind: None,
-                        path: media_library_path.to_string(),
-                        success: false,
-                        error: Some(format!("{error:#}")),
-                        not_ready: false,
-                    });
-                    return;
+            }
+            _ => OpenDalShareDataDetection::Failed(RegisterLibraryFailureKind::OpenDalShareInvalid),
+        },
+        Err(StoreError::PermissionDenied) => OpenDalShareDataDetection::ReadOnly,
+        Err(StoreError::Unauthorized) => OpenDalShareDataDetection::Failed(
+            RegisterLibraryFailureKind::OpenDalAuthenticationRejected,
+        ),
+        Err(StoreError::NotFound) => match probe {
+            Ok(capabilities) if capabilities.write_probe => {
+                OpenDalShareDataDetection::WritableEmpty
+            }
+            Ok(_) | Err(StoreError::PermissionDenied) => OpenDalShareDataDetection::ReadOnly,
+            Err(StoreError::Unauthorized) => OpenDalShareDataDetection::Failed(
+                RegisterLibraryFailureKind::OpenDalAuthenticationRejected,
+            ),
+            Err(_) => {
+                OpenDalShareDataDetection::Failed(RegisterLibraryFailureKind::OpenDalUnreachable)
+            }
+        },
+        Err(_) => OpenDalShareDataDetection::Failed(RegisterLibraryFailureKind::OpenDalUnreachable),
+    }
+}
+
+async fn read_share_library_id(
+    config: OpenDalConfig,
+) -> Result<Option<Uuid>, RegisterLibraryFailureKind> {
+    let store = OpenDalObjectStore::new(config)
+        .map_err(|_| RegisterLibraryFailureKind::OpenDalUnreachable)?;
+    match ObjectStore::get(&store, "library.json").await {
+        Ok(value) => {
+            let library = decode_library(&value.bytes)
+                .map_err(|_| RegisterLibraryFailureKind::OpenDalShareInvalid)?;
+            if library.library_id == Uuid::nil()
+                || library.model != RuneModel::model_id()
+                || library.schema != RuneModel::schema_id()
+            {
+                return Err(RegisterLibraryFailureKind::OpenDalShareInvalid);
+            }
+            Ok(Some(library.library_id))
+        }
+        Err(StoreError::NotFound | StoreError::PermissionDenied) => Ok(None),
+        Err(StoreError::Unauthorized) => {
+            Err(RegisterLibraryFailureKind::OpenDalAuthenticationRejected)
+        }
+        Err(_) => Err(RegisterLibraryFailureKind::OpenDalUnreachable),
+    }
+}
+
+pub(crate) async fn register_opendal_library_on_node(
+    request: &RegisterOpenDalLibraryRequest,
+    node: &Arc<NodeContext>,
+) -> RegisterLibraryResponse {
+    let (config, username) = match &request.service {
+        OpenDalLibraryService::WebDav {
+            endpoint,
+            root,
+            username,
+            password,
+        } => (
+            OpenDalConfig::WebDav {
+                endpoint: endpoint.clone(),
+                root: root.clone(),
+                username: username.clone(),
+                password: password.clone(),
+            },
+            username.clone(),
+        ),
+        OpenDalLibraryService::S3 {
+            endpoint,
+            bucket,
+            region,
+            root,
+            access_key_id,
+            secret_access_key,
+        } => (
+            OpenDalConfig::S3 {
+                endpoint: endpoint.clone(),
+                bucket: bucket.clone(),
+                region: region.clone(),
+                root: root.clone(),
+                access_key_id: access_key_id.clone(),
+                secret_access_key: secret_access_key.clone(),
+            },
+            access_key_id.clone(),
+        ),
+    };
+    let is_webdav = matches!(&request.service, OpenDalLibraryService::WebDav { .. });
+    let fs_config = config.clone();
+    let handle = Handle::current();
+    let probe = tokio::task::spawn_blocking(move || {
+        catch_unwind(AssertUnwindSafe(|| -> Result<usize, FileIoError> {
+            let fsio = FsIo::new_opendal(fs_config, handle)?;
+            let nodes = fsio.walk_dir(Path::new(""), false)?;
+            match fsio.canonicalize(Path::new("")) {
+                Ok(root) if root.is_dir => {}
+                Ok(_) => {
+                    return Err(FileIoError::NotSupported(
+                        "remote root is not a folder".into(),
+                    ));
+                }
+                Err(FileIoError::PathNotFound(_)) if !is_webdav => {}
+                Err(error) => return Err(error),
+            }
+            Ok(nodes.len())
+        }))
+        .unwrap_or_else(|_| {
+            Err(FileIoError::NotSupported(
+                "remote root is not a folder".into(),
+            ))
+        })
+    })
+    .await;
+    let count = match probe {
+        Err(_) => {
+            return opendal_registration_failure(
+                RegisterLibraryFailureKind::OpenDalUnreachable,
+                "Could not reach the remote library",
+            );
+        }
+        Ok(Err(FileIoError::PermissionDenied(_))) => {
+            return opendal_registration_failure(
+                RegisterLibraryFailureKind::OpenDalAuthenticationRejected,
+                "The remote credentials were rejected",
+            );
+        }
+        Ok(Err(FileIoError::Remote(_))) => {
+            return opendal_registration_failure(
+                RegisterLibraryFailureKind::OpenDalUnreachable,
+                "Could not reach the remote library",
+            );
+        }
+        Ok(Err(_)) => {
+            return opendal_registration_failure(
+                RegisterLibraryFailureKind::OpenDalNotFolder,
+                "The selected remote root is not a folder",
+            );
+        }
+        Ok(Ok(count)) => count,
+    };
+    if is_webdav && count == 0 {
+        return opendal_registration_failure(
+            RegisterLibraryFailureKind::OpenDalNotFolder,
+            "The selected remote root is not a folder",
+        );
+    }
+    let config_dir = Path::new(&*node.config_path);
+    let existing_share_id = match read_share_library_id(config.clone()).await {
+        Ok(library_id) => library_id,
+        Err(kind) => {
+            return opendal_registration_failure(kind, "Could not inspect Rune share data");
+        }
+    };
+    if existing_share_id.is_none() && request.share_data_choice == ShareDataChoice::KeepInShare {
+        let store = match OpenDalObjectStore::new(config) {
+            Ok(store) => store,
+            Err(_) => {
+                return opendal_registration_failure(
+                    RegisterLibraryFailureKind::OpenDalUnreachable,
+                    "Could not reach the remote library",
+                );
+            }
+        };
+        let prefix = format!("devices/{}.1", Uuid::new_v4());
+        match store.probe(&prefix).await {
+            Ok(capabilities) if capabilities.write_probe => {}
+            Ok(_) | Err(StoreError::PermissionDenied) => {
+                return opendal_registration_failure(
+                    RegisterLibraryFailureKind::OpenDalReadOnly,
+                    "Choose a writable folder to keep the index in the share",
+                );
+            }
+            Err(StoreError::Unauthorized) => {
+                return opendal_registration_failure(
+                    RegisterLibraryFailureKind::OpenDalAuthenticationRejected,
+                    "The remote credentials were rejected",
+                );
+            }
+            Err(_) => {
+                return opendal_registration_failure(
+                    RegisterLibraryFailureKind::OpenDalUnreachable,
+                    "Could not reach the remote library",
+                );
+            }
+        }
+    }
+    let registry = match LibraryRegistry::load(config_dir) {
+        Ok(registry) => registry,
+        Err(_) => {
+            return opendal_registration_failure(
+                RegisterLibraryFailureKind::Storage,
+                "Could not read library storage",
+            );
+        }
+    };
+    let existing = registry
+        .libraries
+        .iter()
+        .find(|record| match (&request.service, record.fs.first()) {
+            (
+                OpenDalLibraryService::WebDav {
+                    endpoint,
+                    root,
+                    username,
+                    ..
+                },
+                Some(FsAdapter::WebDav {
+                    endpoint: e,
+                    root: r,
+                    username: u,
+                    ..
+                }),
+            ) => endpoint == e && root == r && username == u,
+            (
+                OpenDalLibraryService::S3 {
+                    endpoint,
+                    bucket,
+                    root,
+                    access_key_id,
+                    ..
+                },
+                Some(FsAdapter::S3 {
+                    endpoint: e,
+                    bucket: b,
+                    root: r,
+                    access_key_id: k,
+                    ..
+                }),
+            ) => endpoint == e && bucket == b && root == r && access_key_id == k,
+            _ => false,
+        })
+        .cloned();
+    if let Some(library_id) = existing_share_id {
+        let conflicts_with_record = registry.libraries.iter().any(|record| {
+            record.library_id == Some(library_id)
+                && existing
+                    .as_ref()
+                    .is_none_or(|existing| existing.record_id != record.record_id)
+        });
+        let conflicts_with_invalid = registry
+            .invalid_records()
+            .any(|(record, _)| record.library_id == Some(library_id));
+        let changed_existing_share = existing.as_ref().is_some_and(|record| {
+            matches!(&record.catalog, CatalogPlacement::InShare(_))
+                && record.library_id != Some(library_id)
+        });
+        if conflicts_with_record || conflicts_with_invalid || changed_existing_share {
+            return opendal_registration_failure(
+                RegisterLibraryFailureKind::OpenDalShareChanged,
+                "The share belongs to another library",
+            );
+        }
+    }
+    if let Some(mut record) = existing {
+        if let Some(library_id) = existing_share_id {
+            let storage_key = match &record.catalog {
+                CatalogPlacement::InShare(key) | CatalogPlacement::Redirected(key) => *key,
+                _ => Uuid::new_v4(),
+            };
+            record.library_id = Some(library_id);
+            record.catalog = CatalogPlacement::InShare(storage_key);
+            record = match LibraryRegistry::update(config_dir, |registry| {
+                let stored = registry
+                    .libraries
+                    .iter_mut()
+                    .find(|stored| stored.record_id == record.record_id)
+                    .context("OpenDAL library record disappeared")?;
+                *stored = record.clone();
+                Ok(record.clone())
+            })
+            .await
+            {
+                Ok(record) => record,
+                Err(_) => {
+                    return opendal_registration_failure(
+                        RegisterLibraryFailureKind::Storage,
+                        "Could not update library storage",
+                    );
                 }
             };
-        #[cfg(not(target_os = "android"))]
-        let fsio = Arc::new(FsIo::new());
-        #[cfg(target_os = "android")]
-        let fsio = match FsIo::new(
-            Path::new(".rune/.android-fs.db"),
-            replica_root
-                .as_ref()
-                .map_or(media_library_path, |(_, root)| root),
-        ) {
-            Ok(fsio) => Arc::new(fsio),
-            Err(e) => {
-                error!("Failed to initialize Android SAF filesystem: {e:#?}");
-                broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                    restore_last_index: false,
-                    error_kind: None,
-                    path: media_library_path.to_string(),
-                    success: false,
-                    error: Some(format!("Failed to access the selected directory: {e:#?}")),
-                    not_ready: false,
-                });
-                return;
-            }
-        };
-        let node = match initialize_node(
-            config_path,
-            &dart_signal.message.db_path,
-            broadcaster.clone(),
-        )
-        .await
-        {
-            Ok(node) => node,
-            Err(error) => {
-                broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                    restore_last_index: false,
-                    error_kind: None,
-                    path: media_library_path.to_string(),
-                    success: false,
-                    error: Some(format!("Failed to initialize node: {error:#}")),
-                    not_ready: false,
-                });
-                return;
-            }
-        };
-
-        match &dart_signal.message.hosted_on {
-            OperationDestination::Local => {
-                let database_mode = dart_signal.message.mode;
-                info!("Received path: {media_library_path}");
-
-                if let Some((id, _)) = replica_root {
-                    let opened = node.library_pool.acquire_ui(id).await;
-                    finish_local_open(opened, &node, &scrobbler, &broadcaster, media_library_path)
-                        .await;
-                    return;
-                }
-
-                let library_test = match check_library_state(&fsio, media_library_path) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        error!("Failed to check library state: {e:#?}");
-                        broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                            restore_last_index: false,
-                            error_kind: None,
-                            path: media_library_path.to_string(),
-                            success: false,
-                            error: Some(format!("{e:#?}")),
-                            not_ready: false,
-                        });
-                        return;
-                    }
-                };
-
-                if database_mode.is_none() {
-                    match &library_test {
-                        LibraryState::Uninitialized => {
-                            broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                                restore_last_index: false,
-                                error_kind: None,
-                                path: media_library_path.to_string(),
-                                success: true,
-                                error: None,
-                                not_ready: true,
-                            });
-                            return;
-                        }
-                        LibraryState::Initialized(_) => {}
-                    }
-                }
-
-                if let Some(mode) = database_mode
-                    && mode == LibraryInitializeMode::Redirected
-                    && let Err(e) = create_redirect(&fsio, media_library_path).await
-                {
-                    broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                        restore_last_index: false,
-                        error_kind: None,
-                        path: media_library_path.to_string(),
-                        success: false,
-                        error: Some(format!("{e:#?}")),
-                        not_ready: false,
-                    });
-                    return;
-                }
-
-                let opened = async {
-                    let mode = check_storage_mode(&fsio, media_library_path)?;
-                    let mut registry = LibraryRegistry::load(Path::new(config_path))?;
-                    let descriptor =
-                        resolve_library(&fsio, &mut registry, media_library_path, alias, mode)
-                            .await?;
-                    node.library_pool.acquire_ui(descriptor.library_id).await
-                }
-                .await;
-                finish_local_open(opened, &node, &scrobbler, &broadcaster, media_library_path)
-                    .await;
-            }
-            OperationDestination::Remote => {
-                match open_remote_library(node, media_library_path).await {
-                    Ok(params) => {
-                        listen_local_gui(&params, &params.main_token);
-                        broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                            restore_last_index: false,
-                            error_kind: None,
-                            path: media_library_path.to_string(),
-                            success: true,
-                            error: None,
-                            not_ready: false,
-                        });
-                    }
-                    Err(e) => {
-                        error!("Failed to open remote library: {e:#?}");
-                        broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                            restore_last_index: false,
-                            error_kind: Some(
-                                e.downcast_ref::<RemoteConnectError>()
-                                    .map_or(LibraryOpenErrorKind::RemoteProtocol, |error| {
-                                        error.kind()
-                                    }),
-                            ),
-                            path: media_library_path.to_string(),
-                            success: false,
-                            error: Some(format!("{e:#?}")),
-                            not_ready: false,
-                        });
-                    }
-                }
-            }
         }
+        return RegisterLibraryResponse {
+            call_id: None,
+            record: Some((&record).into()),
+            outcome: RegisterLibraryOutcome::Registered,
+            detail: None,
+        };
+    }
+    let (library_id, catalog) = if let Some(library_id) = existing_share_id {
+        (library_id, CatalogPlacement::InShare(Uuid::new_v4()))
+    } else {
+        let storage_key = Uuid::new_v4();
+        let catalog = match request.share_data_choice {
+            ShareDataChoice::KeepInShare => CatalogPlacement::InShare(storage_key),
+            ShareDataChoice::ThisDeviceOnly => CatalogPlacement::Redirected(storage_key),
+        };
+        (Uuid::new_v4(), catalog)
+    };
+    let secret = match &request.service {
+        OpenDalLibraryService::WebDav { password, .. } => password.as_bytes(),
+        OpenDalLibraryService::S3 {
+            secret_access_key, ..
+        } => secret_access_key.as_bytes(),
+    };
+    let credential = match node
+        .credentials
+        .put(Credential {
+            username,
+            secret: Secret::new(secret.to_vec()),
+        })
+        .await
+    {
+        Ok(reference) => reference,
+        Err(_) => {
+            return opendal_registration_failure(
+                RegisterLibraryFailureKind::Storage,
+                "Could not store credentials",
+            );
+        }
+    };
+    let record = LibraryRecord {
+        record_id: LibraryRecordId(Uuid::new_v4()),
+        alias: request.alias.clone(),
+        library_id: Some(library_id),
+        protocol: ProtocolAdapter::Native,
+        fs: vec![match &request.service {
+            OpenDalLibraryService::WebDav {
+                endpoint,
+                root,
+                username,
+                ..
+            } => FsAdapter::WebDav {
+                endpoint: endpoint.clone(),
+                root: root.clone(),
+                username: username.clone(),
+                credential,
+            },
+            OpenDalLibraryService::S3 {
+                endpoint,
+                bucket,
+                region,
+                root,
+                access_key_id,
+                ..
+            } => FsAdapter::S3 {
+                endpoint: endpoint.clone(),
+                bucket: bucket.clone(),
+                region: region.clone(),
+                root: root.clone(),
+                access_key_id: access_key_id.clone(),
+                credential,
+            },
+        }],
+        catalog,
+        background_sync: true,
+    };
+    let stored = if record.validate().is_err() {
+        Err(anyhow::anyhow!("invalid record"))
+    } else {
+        LibraryRegistry::update(config_dir, |registry| {
+            registry.libraries.push(record.clone());
+            Ok(record.clone())
+        })
+        .await
+    };
+    let record = match stored {
+        Ok(record) => record,
+        Err(_) => {
+            let _ = node.credentials.remove(credential).await;
+            return opendal_registration_failure(
+                RegisterLibraryFailureKind::Storage,
+                "Could not write library storage",
+            );
+        }
+    };
+    if let Err(error) = publish_library_records_changed(node).await {
+        log::warn!("Could not publish library record change: {error:#}");
+    }
+    RegisterLibraryResponse {
+        call_id: None,
+        record: Some((&record).into()),
+        outcome: RegisterLibraryOutcome::Registered,
+        detail: None,
     }
 }
 
-/// Run the local player loop for an opened library and report the result to Dart.
-async fn finish_local_open(
-    opened: Result<LibraryHandle>,
-    node: &Arc<NodeContext>,
-    scrobbler: &Arc<Mutex<ScrobblingManager>>,
-    broadcaster: &Arc<dyn Broadcaster>,
-    media_library_path: &str,
-) {
-    match opened {
-        Ok(library) => {
-            info!("Resolved library id: {}", library.descriptor.library_id);
-            let result = local_player_loop(library, node.clone(), Arc::clone(scrobbler)).await;
-            broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                restore_last_index: result.is_ok()
-                    && node
-                        .session()
-                        .is_ok_and(|session| session.take_legacy_restore()),
-                error_kind: None,
-                path: media_library_path.to_string(),
-                success: result.is_ok(),
-                error: result.err().map(|error| format!("{error:#}")),
-                not_ready: false,
-            });
+fn opendal_registration_failure(
+    kind: RegisterLibraryFailureKind,
+    detail: &str,
+) -> RegisterLibraryResponse {
+    RegisterLibraryResponse {
+        call_id: None,
+        record: None,
+        outcome: RegisterLibraryOutcome::Failed(kind),
+        detail: Some(detail.into()),
+    }
+}
+
+async fn register_local_library(
+    node_slot: &NodeSlot,
+    request: &RegisterLocalLibraryRequest,
+) -> RegisterLibraryResponse {
+    let node = match node_slot.current().await {
+        Ok(node) => node,
+        Err(error) => {
+            return RegisterLibraryResponse {
+                call_id: None,
+                record: None,
+                outcome: RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::Storage),
+                detail: Some(format!("{error:#}")),
+            };
         }
-        Err(e) => {
-            error!("Library initialization failed: {e:#?}");
-            broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                restore_last_index: false,
-                error_kind: None,
-                path: media_library_path.to_string(),
-                success: false,
-                error: Some(format!("{e:#?}")),
-                not_ready: false,
-            });
+    };
+    register_local_library_on_node(request, &node).await
+}
+
+pub(crate) async fn register_local_library_on_node(
+    request: &RegisterLocalLibraryRequest,
+    node: &Arc<NodeContext>,
+) -> RegisterLibraryResponse {
+    let fail = |kind, error: anyhow::Error| RegisterLibraryResponse {
+        call_id: None,
+        record: None,
+        outcome: RegisterLibraryOutcome::Failed(kind),
+        detail: Some(format!("{error:#}")),
+    };
+    let config = node.config_path.clone();
+    let path = &request.path;
+    #[cfg(not(target_os = "android"))]
+    let fsio = FsIo::new();
+    #[cfg(target_os = "android")]
+    let fsio = match FsIo::new(Path::new(".rune/.android-fs.db"), path) {
+        Ok(fsio) => fsio,
+        Err(error) => return fail(RegisterLibraryFailureKind::Storage, error.into()),
+    };
+    let state = match check_library_state(&fsio, path) {
+        Ok(state) => state,
+        Err(error) => return fail(RegisterLibraryFailureKind::InvalidSource, error),
+    };
+    if matches!(state, LibraryState::Uninitialized) && request.mode.is_none() {
+        return RegisterLibraryResponse {
+            call_id: None,
+            record: None,
+            outcome: RegisterLibraryOutcome::NeedsInitializeMode,
+            detail: None,
+        };
+    }
+    let result = async {
+        if request.mode == Some(LibraryInitializeMode::Redirected) {
+            create_redirect(&fsio, path).await?;
+        }
+        let mode = check_storage_mode(&fsio, path)?;
+        let mut registry = LibraryRegistry::load(Path::new(&*config))?;
+        resolve_library(&fsio, &mut registry, path, &request.alias, mode).await
+    }
+    .await;
+    match result {
+        Ok(record) => {
+            if let Err(error) = publish_library_records_changed(node).await {
+                log::warn!("Could not publish library record change: {error:#}");
+            }
+            RegisterLibraryResponse {
+                call_id: None,
+                record: Some((&record).into()),
+                outcome: RegisterLibraryOutcome::Registered,
+                detail: None,
+            }
+        }
+        Err(error) if error.downcast_ref::<InvalidRecord>().is_some() => {
+            fail(RegisterLibraryFailureKind::InvalidRecord, error)
+        }
+        Err(error) => fail(RegisterLibraryFailureKind::Storage, error),
+    }
+}
+
+async fn register_remote_control(
+    node_slot: &NodeSlot,
+    request: &RegisterRemoteControlRequest,
+) -> RegisterLibraryResponse {
+    let node = match node_slot.current().await {
+        Ok(node) => node,
+        Err(error) => {
+            return RegisterLibraryResponse {
+                call_id: None,
+                record: None,
+                outcome: RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::Storage),
+                detail: Some(format!("{error:#}")),
+            };
+        }
+    };
+    register_remote_control_on_node(request, &node).await
+}
+
+pub(crate) async fn register_remote_control_on_node(
+    request: &RegisterRemoteControlRequest,
+    node: &Arc<NodeContext>,
+) -> RegisterLibraryResponse {
+    let hosts = node
+        .cert_validator
+        .read()
+        .await
+        .get_hosts_for_fingerprint(&request.fingerprint)
+        .await;
+    if hosts.is_empty() {
+        return RegisterLibraryResponse {
+            call_id: None,
+            record: None,
+            outcome: RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::Untrusted),
+            detail: Some("Fingerprint is not trusted".into()),
+        };
+    }
+    match LibraryRegistry::register_remote_control(
+        Path::new(&*node.config_path),
+        &request.fingerprint,
+        &request.alias,
+    )
+    .await
+    {
+        Ok(record) => {
+            if let Err(error) = publish_library_records_changed(node).await {
+                log::warn!("Could not publish library record change: {error:#}");
+            }
+            RegisterLibraryResponse {
+                call_id: None,
+                record: Some((&record).into()),
+                outcome: RegisterLibraryOutcome::Registered,
+                detail: None,
+            }
+        }
+        Err(error) if error.downcast_ref::<InvalidRecord>().is_some() => RegisterLibraryResponse {
+            call_id: None,
+            record: None,
+            outcome: RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::InvalidRecord),
+            detail: Some(format!("{error:#}")),
+        },
+        Err(error) => RegisterLibraryResponse {
+            call_id: None,
+            record: None,
+            outcome: RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::Storage),
+            detail: Some(format!("{error:#}")),
+        },
+    }
+}
+
+async fn register_subsonic_library(
+    node_slot: &NodeSlot,
+    request: &RegisterSubsonicLibraryRequest,
+) -> RegisterLibraryResponse {
+    match node_slot.current().await {
+        Ok(node) => register_subsonic_library_with_node(request, &node).await,
+        Err(_) => subsonic_registration_failure(
+            RegisterLibraryFailureKind::Storage,
+            "Could not access library storage",
+        ),
+    }
+}
+
+pub(crate) async fn register_subsonic_library_with_node(
+    request: &RegisterSubsonicLibraryRequest,
+    node: &Arc<NodeContext>,
+) -> RegisterLibraryResponse {
+    register_subsonic_library_on_node(request, node).await
+}
+
+pub(crate) async fn register_subsonic_library_on_node(
+    request: &RegisterSubsonicLibraryRequest,
+    node: &Arc<NodeContext>,
+) -> RegisterLibraryResponse {
+    let endpoint = match validate_subsonic_endpoint(&request.endpoint) {
+        Ok(endpoint) => endpoint,
+        Err(()) => {
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::SubsonicNotSubsonic,
+                "The endpoint must be a valid HTTP or HTTPS URL",
+            );
+        }
+    };
+    let http = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(http) => http,
+        Err(_) => {
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::Storage,
+                "Could not create the Subsonic client",
+            );
+        }
+    };
+    let client = SubsonicClient::new(
+        endpoint.clone(),
+        SubsonicCredentials::Password {
+            user: request.username.clone(),
+            password: request.password.clone(),
+        },
+        http,
+    );
+    let probe = match tokio::time::timeout(Duration::from_secs(5), client.probe()).await {
+        Err(_) => {
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::SubsonicUnreachable,
+                "The Subsonic server did not respond in time",
+            );
+        }
+        Ok(Err(error)) => return subsonic_probe_failure(error),
+        Ok(Ok(probe)) => probe,
+    };
+    let allowed = if probe.roles_known {
+        let mut allowed = Vec::with_capacity(2);
+        if probe.roles.stream_role {
+            allowed.push(SubsonicOpenMode::PlayOnThisDevice);
+        }
+        if probe.roles.jukebox_role {
+            allowed.push(SubsonicOpenMode::RemoteControl);
+        }
+        allowed
+    } else {
+        vec![SubsonicOpenMode::PlayOnThisDevice]
+    };
+    if allowed.is_empty() {
+        return subsonic_registration_failure(
+            RegisterLibraryFailureKind::SubsonicRoleMissing,
+            "The account has no supported Subsonic role",
+        );
+    }
+    let mode = match request.mode.map(SubsonicOpenMode::from) {
+        Some(mode) if allowed.contains(&mode) => mode,
+        Some(_) => {
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::SubsonicRoleMissing,
+                "The account does not have the role required by that mode",
+            );
+        }
+        None => {
+            return RegisterLibraryResponse {
+                call_id: None,
+                record: None,
+                outcome: RegisterLibraryOutcome::NeedsSubsonicMode {
+                    allowed: allowed.into_iter().map(Into::into).collect(),
+                },
+                detail: None,
+            };
+        }
+    };
+
+    let config = Path::new(&*node.config_path);
+    match existing_subsonic_record(
+        config,
+        &node.credentials,
+        endpoint.as_str(),
+        &request.username,
+        mode,
+    )
+    .await
+    {
+        Ok(Some(record)) => {
+            return RegisterLibraryResponse {
+                call_id: None,
+                record: Some((&record).into()),
+                outcome: RegisterLibraryOutcome::Registered,
+                detail: None,
+            };
+        }
+        Ok(None) => {}
+        Err(_) => {
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::Storage,
+                "Could not read library storage",
+            );
         }
     }
+
+    let credential = match node
+        .credentials
+        .put(Credential {
+            username: request.username.clone(),
+            secret: Secret::new(request.password.as_bytes().to_vec()),
+        })
+        .await
+    {
+        Ok(credential) => credential,
+        Err(_) => {
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::Storage,
+                "Could not store credentials",
+            );
+        }
+    };
+    let record = LibraryRecord {
+        record_id: LibraryRecordId(Uuid::new_v4()),
+        alias: request.alias.clone(),
+        library_id: None,
+        protocol: ProtocolAdapter::SubsonicTranslate {
+            endpoint: endpoint.to_string(),
+            credential,
+            mode,
+        },
+        fs: Vec::new(),
+        catalog: CatalogPlacement::None,
+        background_sync: false,
+    };
+    if record.validate().is_err() {
+        let _ = node.credentials.remove(credential).await;
+        return subsonic_registration_failure(
+            RegisterLibraryFailureKind::InvalidRecord,
+            "The library record is invalid",
+        );
+    }
+    let stored = LibraryRegistry::update(config, |registry| {
+        registry.libraries.push(record.clone());
+        Ok(record.clone())
+    })
+    .await;
+    let record = match stored {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = node.credentials.remove(credential).await;
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::Storage,
+                "Could not write library storage",
+            );
+        }
+    };
+    if let Err(error) = publish_library_records_changed(node).await {
+        log::warn!("Could not publish library record change: {error:#}");
+    }
+    RegisterLibraryResponse {
+        call_id: None,
+        record: Some((&record).into()),
+        outcome: RegisterLibraryOutcome::Registered,
+        detail: None,
+    }
+}
+
+pub(crate) async fn replace_subsonic_credential_on_node(
+    request: &ReplaceSubsonicCredentialRequest,
+    node: &Arc<NodeContext>,
+) -> ReplaceSubsonicCredentialResult {
+    let Ok(record_id) = Uuid::parse_str(&request.record_id).map(LibraryRecordId) else {
+        return ReplaceSubsonicCredentialResult::InvalidRecord;
+    };
+    let record = match LibraryRegistry::load(Path::new(&*node.config_path))
+        .and_then(|registry| registry.record(record_id).cloned())
+    {
+        Ok(record) => record,
+        Err(_) => return ReplaceSubsonicCredentialResult::InvalidRecord,
+    };
+    let ProtocolAdapter::SubsonicTranslate {
+        endpoint,
+        credential,
+        ..
+    } = &record.protocol
+    else {
+        return ReplaceSubsonicCredentialResult::InvalidRecord;
+    };
+    let endpoint = match validate_subsonic_endpoint(endpoint) {
+        Ok(endpoint) => endpoint,
+        Err(()) => return ReplaceSubsonicCredentialResult::InvalidRecord,
+    };
+    let http = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(http) => http,
+        Err(_) => return ReplaceSubsonicCredentialResult::Storage,
+    };
+    let client = SubsonicClient::new(
+        endpoint,
+        SubsonicCredentials::Password {
+            user: request.username.clone(),
+            password: request.password.clone(),
+        },
+        http,
+    );
+    match timeout(Duration::from_secs(5), client.probe()).await {
+        Err(_) => return ReplaceSubsonicCredentialResult::Unreachable,
+        Ok(Err(SubsonicError::Transport(_) | SubsonicError::HttpStatus(_))) => {
+            return ReplaceSubsonicCredentialResult::Unreachable;
+        }
+        Ok(Err(SubsonicError::Server {
+            kind:
+                SubsonicServerError::WrongCredentials
+                | SubsonicServerError::NotAuthorized
+                | SubsonicServerError::InvalidApiKey,
+            ..
+        })) => return ReplaceSubsonicCredentialResult::Rejected,
+        Ok(Err(_)) => return ReplaceSubsonicCredentialResult::Rejected,
+        Ok(Ok(_)) => {}
+    }
+    match node
+        .credentials
+        .replace(
+            *credential,
+            Credential {
+                username: request.username.clone(),
+                secret: Secret::new(request.password.as_bytes().to_vec()),
+            },
+        )
+        .await
+    {
+        Ok(()) => {
+            if let Err(error) = publish_library_records_changed(node).await {
+                log::warn!("Could not publish library record change: {error:#}");
+            }
+            ReplaceSubsonicCredentialResult::Updated
+        }
+        Err(_) => ReplaceSubsonicCredentialResult::Storage,
+    }
+}
+
+fn validate_subsonic_endpoint(raw: &str) -> Result<Url, ()> {
+    let endpoint = Url::parse(raw).map_err(|_| ())?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(());
+    }
+    Ok(endpoint)
+}
+
+async fn existing_subsonic_record(
+    config: &Path,
+    credentials: &CredentialStore,
+    endpoint: &str,
+    username: &str,
+    mode: SubsonicOpenMode,
+) -> anyhow::Result<Option<LibraryRecord>> {
+    let registry = LibraryRegistry::load(config)?;
+    for record in &registry.libraries {
+        if let ProtocolAdapter::SubsonicTranslate {
+            endpoint: stored_endpoint,
+            credential,
+            mode: stored_mode,
+        } = &record.protocol
+            && stored_endpoint == endpoint
+            && *stored_mode == mode
+            && credentials
+                .get(*credential)
+                .await
+                .is_ok_and(|stored| stored.username == username)
+        {
+            return Ok(Some(record.clone()));
+        }
+    }
+    Ok(None)
+}
+
+fn subsonic_probe_failure(error: SubsonicError) -> RegisterLibraryResponse {
+    let kind = match error {
+        SubsonicError::Transport(_) | SubsonicError::HttpStatus(_) => {
+            RegisterLibraryFailureKind::SubsonicUnreachable
+        }
+        SubsonicError::Server {
+            kind: SubsonicServerError::WrongCredentials | SubsonicServerError::NotAuthorized,
+            ..
+        } => RegisterLibraryFailureKind::SubsonicWrongCredentials,
+        SubsonicError::Server {
+            kind: SubsonicServerError::ServerTooOld,
+            ..
+        } => RegisterLibraryFailureKind::SubsonicServerTooOld,
+        SubsonicError::Server {
+            kind: SubsonicServerError::ClientTooOld,
+            ..
+        } => RegisterLibraryFailureKind::SubsonicClientTooOld,
+        SubsonicError::Malformed(_)
+        | SubsonicError::Server { .. }
+        | SubsonicError::JukeboxUnsupported
+        | SubsonicError::RuneVisualizerFeedUnsupported
+        | SubsonicError::InvalidJukeboxGain => RegisterLibraryFailureKind::SubsonicNotSubsonic,
+    };
+    let detail = match kind {
+        RegisterLibraryFailureKind::SubsonicUnreachable => "Could not reach the Subsonic server",
+        RegisterLibraryFailureKind::SubsonicWrongCredentials => {
+            "The Subsonic credentials were rejected"
+        }
+        RegisterLibraryFailureKind::SubsonicServerTooOld => "The Subsonic server is too old",
+        RegisterLibraryFailureKind::SubsonicClientTooOld => {
+            "The Subsonic server requires a newer client"
+        }
+        _ => "The endpoint did not return a valid Subsonic response",
+    };
+    subsonic_registration_failure(kind, detail)
+}
+
+fn subsonic_registration_failure(
+    kind: RegisterLibraryFailureKind,
+    detail: &'static str,
+) -> RegisterLibraryResponse {
+    RegisterLibraryResponse {
+        call_id: None,
+        record: None,
+        outcome: RegisterLibraryOutcome::Failed(kind),
+        detail: Some(detail.into()),
+    }
+}
+
+async fn open_library_by_record(
+    node_slot: &NodeSlot,
+    request: &OpenLibraryRequest,
+    scrobbler: Arc<Mutex<ScrobblingManager>>,
+) -> OpenLibraryResponse {
+    let node = match node_slot.current().await {
+        Ok(node) => node,
+        Err(error) => {
+            return OpenLibraryResponse {
+                call_id: request.call_id,
+                record_id: request.record_id.clone(),
+                generation: 0,
+                result: OpenLibraryResult::Failed(OpenLibraryFailure {
+                    kind: OpenLibraryFailureKind::Storage,
+                    detail: format!("{error:#}"),
+                }),
+            };
+        }
+    };
+    open_library_by_record_on_node(request, node, scrobbler).await
+}
+
+pub(crate) async fn open_library_by_record_on_node(
+    request: &OpenLibraryRequest,
+    node: Arc<NodeContext>,
+    scrobbler: Arc<Mutex<ScrobblingManager>>,
+) -> OpenLibraryResponse {
+    let failed = |kind, error: anyhow::Error| OpenLibraryResponse {
+        call_id: request.call_id,
+        record_id: request.record_id.clone(),
+        generation: 0,
+        result: OpenLibraryResult::Failed(OpenLibraryFailure {
+            kind,
+            detail: format!("{error:#}"),
+        }),
+    };
+    let record_id = match Uuid::parse_str(&request.record_id) {
+        Ok(id) => LibraryRecordId(id),
+        Err(error) => return failed(OpenLibraryFailureKind::RecordNotFound, error.into()),
+    };
+    let record = match LibraryRegistry::load(Path::new(&*node.config_path))
+        .and_then(|registry| registry.record(record_id).cloned())
+    {
+        Ok(record) => record,
+        Err(error) if error.downcast_ref::<InvalidRecord>().is_some() => {
+            return failed(OpenLibraryFailureKind::InvalidRecord, error);
+        }
+        Err(error) => return failed(OpenLibraryFailureKind::RecordNotFound, error),
+    };
+    let result = match &record.protocol {
+        ProtocolAdapter::Native => {
+            open_catalog_record(
+                &node,
+                &record,
+                record.library_id.unwrap_or_default(),
+                record.local_folder_path(),
+                Arc::clone(&scrobbler),
+            )
+            .await
+        }
+        ProtocolAdapter::RuneForward {
+            mode: RuneForwardMode::Replica { .. },
+            ..
+        } => {
+            let owned_path;
+            let path = if let Some(path) = record.local_folder_path() {
+                path
+            } else {
+                owned_path = match record.root(Path::new(&*node.config_path)) {
+                    Some(path) => path,
+                    None => {
+                        return failed(
+                            OpenLibraryFailureKind::Storage,
+                            anyhow::anyhow!("Replica has no storage root"),
+                        );
+                    }
+                };
+                if !owned_path.join(".rune/library.json").is_file() {
+                    return failed(
+                        OpenLibraryFailureKind::MediaFolderMissing,
+                        anyhow::anyhow!("Replica folder is missing: {}", owned_path.display()),
+                    );
+                }
+                match owned_path.to_str() {
+                    Some(path) => path,
+                    None => {
+                        return failed(
+                            OpenLibraryFailureKind::Storage,
+                            anyhow::anyhow!("Replica path is not UTF-8"),
+                        );
+                    }
+                }
+            };
+            open_catalog_record(
+                &node,
+                &record,
+                record.library_id.unwrap_or_default(),
+                Some(path),
+                Arc::clone(&scrobbler),
+            )
+            .await
+        }
+        ProtocolAdapter::RuneForward {
+            owner_fingerprint: fingerprint,
+            mode: RuneForwardMode::RemoteControl,
+        } => {
+            let hosts = node
+                .cert_validator
+                .read()
+                .await
+                .get_hosts_for_fingerprint(fingerprint)
+                .await;
+            if hosts.is_empty() {
+                Err((
+                    OpenLibraryFailureKind::RemoteUntrusted,
+                    anyhow::anyhow!("Fingerprint is no longer trusted"),
+                ))
+            } else {
+                match open_remote_library_for_fingerprint(
+                    node.clone(),
+                    fingerprint,
+                    hosts,
+                    Some(record.record_id),
+                )
+                .await
+                {
+                    Ok((_, generation)) => Ok(generation),
+                    Err(error) => Err((remote_open_failure(&error), error)),
+                }
+            }
+        }
+        ProtocolAdapter::SubsonicTranslate {
+            endpoint,
+            credential,
+            mode,
+        } => {
+            open_subsonic_record(
+                &node,
+                record.record_id,
+                record.catalog_library_id().unwrap_or(record.record_id.0),
+                endpoint,
+                *credential,
+                *mode == SubsonicOpenMode::PlayOnThisDevice,
+            )
+            .await
+        }
+    };
+    match result {
+        Ok(generation) => {
+            if let Err(error) = LibraryRegistry::update(Path::new(&*node.config_path), |registry| {
+                registry.last_open_record = Some(record_id);
+                Ok(())
+            })
+            .await
+            {
+                log::error!("Could not persist last open library record: {error:#}");
+            }
+            OpenLibraryResponse {
+                call_id: request.call_id,
+                record_id: request.record_id.clone(),
+                generation,
+                result: OpenLibraryResult::Opened,
+            }
+        }
+        Err((kind, error)) => failed(kind, error),
+    }
+}
+
+async fn open_subsonic_record(
+    node: &Arc<NodeContext>,
+    record_id: LibraryRecordId,
+    library_id: Uuid,
+    endpoint: &str,
+    credential_ref: CredentialRef,
+    play_on_this_device: bool,
+) -> StdResult<u64, (OpenLibraryFailureKind, anyhow::Error)> {
+    let credential = node
+        .credentials
+        .get(credential_ref)
+        .await
+        .map_err(|error| (OpenLibraryFailureKind::Storage, anyhow::Error::new(error)))?;
+    let password = String::from_utf8(credential.secret.as_bytes().to_vec())
+        .map_err(|error| (OpenLibraryFailureKind::Storage, error.into()))?;
+    let endpoint = Url::parse(endpoint)
+        .map_err(|error| (OpenLibraryFailureKind::RemoteProtocol, error.into()))?;
+    let client = SubsonicClient::new(
+        endpoint,
+        SubsonicCredentials::Password {
+            user: credential.username,
+            password,
+        },
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| {
+                (
+                    OpenLibraryFailureKind::Storage,
+                    anyhow::anyhow!("Could not create Subsonic client"),
+                )
+            })?,
+    );
+    let probe = match timeout(Duration::from_secs(10), client.probe()).await {
+        Err(_) => {
+            return Err((
+                OpenLibraryFailureKind::RemoteUnreachable,
+                anyhow::anyhow!("Subsonic server timed out"),
+            ));
+        }
+        Ok(Ok(probe)) => probe,
+        Ok(Err(error)) => {
+            let kind = match error {
+                SubsonicError::Transport(_) => OpenLibraryFailureKind::RemoteUnreachable,
+                SubsonicError::Server {
+                    kind:
+                        SubsonicServerError::WrongCredentials
+                        | SubsonicServerError::NotAuthorized
+                        | SubsonicServerError::InvalidApiKey,
+                    ..
+                } => OpenLibraryFailureKind::RemoteNotAuthorized,
+                _ => OpenLibraryFailureKind::RemoteProtocol,
+            };
+            let detail = match kind {
+                OpenLibraryFailureKind::RemoteUnreachable => "Could not reach the Subsonic server",
+                OpenLibraryFailureKind::RemoteNotAuthorized => {
+                    "The Subsonic credentials were rejected"
+                }
+                _ => "The Subsonic server returned an invalid response",
+            };
+            return Err((kind, anyhow::anyhow!(detail)));
+        }
+    };
+    let binding = Arc::new(SubsonicBinding::new(
+        client,
+        probe,
+        Path::new(&*node.config_path).to_path_buf(),
+        library_id,
+        play_on_this_device,
+        Arc::clone(&node.gui_broadcaster),
+    ));
+    node.set_open_subsonic_catalog(Some(record_id), binding)
+        .map_err(|error| (OpenLibraryFailureKind::Storage, error))
+}
+
+pub(crate) async fn subsonic_binding_for_playback(
+    node: &NodeContext,
+    library_id: Uuid,
+) -> Result<Arc<SubsonicBinding>> {
+    if let Some(binding) = node.subsonic_binding(library_id)? {
+        return Ok(binding);
+    }
+    let registry = LibraryRegistry::load(Path::new(&*node.config_path))?;
+    let record = registry
+        .record(LibraryRecordId(library_id))
+        .map_err(|_| anyhow::Error::new(RemoteAudioError::LibraryUnavailable))?;
+    let ProtocolAdapter::SubsonicTranslate {
+        endpoint,
+        credential,
+        mode,
+    } = &record.protocol
+    else {
+        return Err(anyhow::Error::new(RemoteAudioError::LibraryUnavailable));
+    };
+    let credential = node
+        .credentials
+        .get(*credential)
+        .await
+        .map_err(|_| anyhow::Error::new(RemoteAudioError::CredentialsRejected))?;
+    let password = String::from_utf8(credential.secret.as_bytes().to_vec())
+        .map_err(|_| anyhow::Error::new(RemoteAudioError::CredentialsRejected))?;
+    let endpoint = Url::parse(endpoint)
+        .map_err(|_| anyhow::Error::new(RemoteAudioError::LibraryUnavailable))?;
+    let client = SubsonicClient::new(
+        endpoint,
+        SubsonicCredentials::Password {
+            user: credential.username,
+            password,
+        },
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| anyhow::Error::new(RemoteAudioError::LibraryUnavailable))?,
+    );
+    let probe = tokio::time::timeout(Duration::from_secs(10), client.probe())
+        .await
+        .map_err(|_| anyhow::Error::new(RemoteAudioError::unreachable("Subsonic server timeout")))?
+        .map_err(|error| match error {
+            SubsonicError::Transport(_) | SubsonicError::HttpStatus(_) => {
+                anyhow::Error::new(RemoteAudioError::unreachable("Subsonic server unreachable"))
+            }
+            SubsonicError::Server {
+                kind:
+                    SubsonicServerError::WrongCredentials
+                    | SubsonicServerError::NotAuthorized
+                    | SubsonicServerError::InvalidApiKey,
+                ..
+            } => anyhow::Error::new(RemoteAudioError::CredentialsRejected),
+            _ => anyhow::Error::new(RemoteAudioError::LibraryUnavailable),
+        })?;
+    Ok(Arc::new(SubsonicBinding::new(
+        client,
+        probe,
+        Path::new(&*node.config_path).to_path_buf(),
+        library_id,
+        *mode == SubsonicOpenMode::PlayOnThisDevice,
+        Arc::clone(&node.gui_broadcaster),
+    )))
+}
+
+pub(crate) async fn playback_implementation_for_library(
+    node: &NodeContext,
+    library: &LibraryHandle,
+) -> Result<Implementation> {
+    match &library.descriptor.protocol {
+        ProtocolAdapter::SubsonicTranslate { .. } => Ok(Implementation::Subsonic(
+            subsonic_binding_for_playback(node, library.library_id).await?,
+        )),
+        _ => Ok(Implementation::Local),
+    }
+}
+
+pub(crate) async fn playback_implementation_for_item(
+    node: &NodeContext,
+    library_id: Uuid,
+) -> Result<Implementation> {
+    if let Some(binding) = node.subsonic_binding(library_id)? {
+        return Ok(Implementation::Subsonic(binding));
+    }
+    let registry = LibraryRegistry::load(Path::new(&*node.config_path))?;
+    if let Ok(record) = registry.record(LibraryRecordId(library_id))
+        && matches!(&record.protocol, ProtocolAdapter::SubsonicTranslate { .. })
+    {
+        return Ok(Implementation::Subsonic(
+            subsonic_binding_for_playback(node, library_id).await?,
+        ));
+    }
+    let library = node.library_pool.acquire(library_id).await?;
+    playback_implementation_for_library(node, &library).await
+}
+
+pub(crate) async fn library_item_metadata(
+    node: &NodeContext,
+    item: &PlayingItem,
+    with_cover: bool,
+) -> Result<(PlayingItemMetadataSummary, Option<String>)> {
+    let PlayingItem::LibraryTrack { library_id, .. } = item else {
+        anyhow::bail!("Item does not belong to a library");
+    };
+    let library = node.library_pool.acquire(*library_id).await?;
+    let implementation = playback_implementation_for_library(node, &library).await?;
+    implementation
+        .item_metadata(item, with_cover, &library)
+        .await
+}
+
+pub(crate) async fn record_library_item_played(
+    node: &NodeContext,
+    item: &PlayingItem,
+) -> Result<()> {
+    let PlayingItem::LibraryTrack { library_id, .. } = item else {
+        return Ok(());
+    };
+    let library = node.library_pool.acquire(*library_id).await?;
+    let implementation = playback_implementation_for_library(node, &library).await?;
+    implementation.record_played(item, &library).await
+}
+
+pub(crate) async fn report_item_played_through(
+    node: &NodeContext,
+    item: &PlayingItem,
+) -> Result<()> {
+    let PlayingItem::LibraryTrack { library_id, .. } = item else {
+        return Ok(());
+    };
+    let library = node.library_pool.acquire(*library_id).await?;
+    let implementation = playback_implementation_for_library(node, &library).await?;
+    implementation.track_played_through(item).await;
+    Ok(())
+}
+
+async fn open_catalog_record(
+    node: &Arc<NodeContext>,
+    record: &LibraryRecord,
+    library_id: Uuid,
+    path: Option<&str>,
+    scrobbler: Arc<Mutex<ScrobblingManager>>,
+) -> std::result::Result<u64, (OpenLibraryFailureKind, anyhow::Error)> {
+    if let Some(path) = path {
+        #[cfg(not(target_os = "android"))]
+        let fsio = FsIo::new();
+        #[cfg(target_os = "android")]
+        let fsio = FsIo::new(Path::new(".rune/.android-fs.db"), path)
+            .map_err(|error| (OpenLibraryFailureKind::Storage, error.into()))?;
+        if !path.starts_with("content://") && !Path::new(path).is_dir() {
+            return Err((
+                OpenLibraryFailureKind::MediaFolderMissing,
+                anyhow::anyhow!("Media folder is missing: {path}"),
+            ));
+        }
+        check_library_state(&fsio, path)
+            .map_err(|error| (OpenLibraryFailureKind::Storage, error))?;
+    }
+    let opened = node
+        .library_pool
+        .acquire_ui(library_id)
+        .await
+        .map_err(|error| (OpenLibraryFailureKind::Storage, error))?;
+    let generation = run_local_open(Ok(opened), Some(record.record_id), node, &scrobbler)
+        .await
+        .map_err(|error| (OpenLibraryFailureKind::Storage, error))?;
+    Ok(generation)
+}
+
+fn remote_open_failure(error: &anyhow::Error) -> OpenLibraryFailureKind {
+    match error.downcast_ref::<RemoteConnectError>() {
+        Some(RemoteConnectError::UntrustedEndpoint) => OpenLibraryFailureKind::RemoteUntrusted,
+        Some(RemoteConnectError::NotAuthorized) => OpenLibraryFailureKind::RemoteNotAuthorized,
+        Some(RemoteConnectError::Unreachable) => OpenLibraryFailureKind::RemoteUnreachable,
+        Some(RemoteConnectError::PeerNeedsUpdate { .. }) => {
+            OpenLibraryFailureKind::ProtocolIncompatible
+        }
+        Some(RemoteConnectError::Protocol(_)) => OpenLibraryFailureKind::RemoteProtocol,
+        None => OpenLibraryFailureKind::RemoteProtocol,
+    }
+}
+
+async fn run_local_open(
+    opened: Result<LibraryHandle>,
+    record_id: Option<LibraryRecordId>,
+    node: &Arc<NodeContext>,
+    scrobbler: &Arc<Mutex<ScrobblingManager>>,
+) -> Result<u64> {
+    let library = opened?;
+    let library_id = library.library_id;
+    info!("Resolved library id: {library_id}");
+    local_player_loop(library, node.clone(), Arc::clone(scrobbler)).await?;
+    node.set_open_local_catalog(record_id, library_id)
 }
 
 pub struct CollectionCoverOptions<'a> {
     pub bake: bool,
     pub library_id: uuid::Uuid,
-    pub running_mode: &'a RunningMode,
-    pub remote_host: &'a Option<String>,
+    pub session: Option<&'a crate::Session>,
     pub playback_queue: &'a [i32],
 }
 
@@ -515,13 +2344,9 @@ pub async fn inject_cover_art_map(
     // Get the base cover art paths
     let raw_cover_art_map = bake_cover_art_by_media_files(fsio, main_db, files).await?;
 
-    // Process the cover art paths based on the running mode
-    let cover_art_map = process_cover_art_map(
-        raw_cover_art_map,
-        options.library_id,
-        options.running_mode,
-        options.remote_host,
-    );
+    // Process cover art paths for this request's caller.
+    let cover_art_map =
+        process_cover_art_map(raw_cover_art_map, options.library_id, options.session);
 
     Ok(Collection {
         id: collection.id,
@@ -536,17 +2361,11 @@ pub async fn inject_cover_art_map(
 pub fn process_cover_art_map(
     cover_art_map: HashMap<i32, String>,
     library_id: uuid::Uuid,
-    running_mode: &RunningMode,
-    remote_host: &Option<String>,
+    session: Option<&crate::Session>,
 ) -> HashMap<i32, String> {
     cover_art_map
         .into_iter()
-        .map(|(id, path)| {
-            (
-                id,
-                process_cover_art_path(&path, library_id, running_mode, remote_host),
-            )
-        })
+        .map(|(id, path)| (id, process_cover_art_path(&path, library_id, session)))
         .collect()
 }
 
@@ -593,42 +2412,30 @@ pub fn determine_batch_size(workload_factor: f32) -> usize {
 pub fn process_cover_art_path(
     path: &str,
     library_id: uuid::Uuid,
-    running_mode: &RunningMode,
-    remote_host: &Option<String>,
+    session: Option<&crate::Session>,
 ) -> String {
-    match running_mode {
-        RunningMode::Server => {
-            // Path is from server, we need to convert to a remote URL
-            if path.is_empty() {
-                path.to_string()
-            } else {
-                // If we have a remote host, we need to construct a URL for the file
-                if let Some(host) = remote_host {
-                    // Extract the filename from the path, as we only need the cache part
-                    let file_name = Path::new(path)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default();
-
-                    // Construct the URL using the host and cache prefix
-                    format!("{host}/files/cache/{file_name}?library_id={library_id}")
-                } else {
-                    // No host available, return the original path
-                    path.to_string()
-                }
-            }
-        }
-        RunningMode::Client => {
-            // We're running as a client, so the path is already correct
-            path.to_string()
-        }
+    let Some(session) = session else {
+        return path.to_string();
+    };
+    if path.is_empty() {
+        return path.to_string();
     }
+
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    format!(
+        "{}/files/cache/{file_name}?library_id={library_id}",
+        session.host
+    )
 }
 
 pub async fn parse_media_files(
     fsio: &FsIo,
     db: &MainDbConnection,
     _node_id: &str,
+    library_id: &str,
     media_summaries: Vec<MetadataSummary>,
     lib_path: Arc<String>,
 ) -> Result<Vec<MediaFile>> {
@@ -679,6 +2486,8 @@ pub async fn parse_media_files(
         );
         let media_file = MediaFile {
             id: file.id,
+            library_id: library_id.to_owned(),
+            track: file.file_uuid.to_string(),
             path: media_path
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("Media path is None"))?
@@ -722,9 +2531,29 @@ pub async fn files_to_playback_request<P: AsRef<Path>>(
     let library_uuid = library_id.parse::<uuid::Uuid>()?;
     let availability = audio_availability(db, fsio, lib_path.as_ref(), &ids).await?;
     let remote_content = remote_content_ids(db, &ids).await?;
+    let fsio_for_paths = fsio.clone();
+    let root = lib_path.as_ref().to_path_buf();
+    let files_for_paths = files.to_vec();
+    let local_paths = tokio::task::spawn_blocking(move || {
+        files_for_paths
+            .iter()
+            .map(|file| match file.file_id {
+                Some(_) => fsio_for_paths
+                    .canonicalize_path(&root.join(&file.directory).join(&file.file_name))
+                    .ok(),
+                None if let PlayingItem::IndependentFile(path) = &file.item => {
+                    fsio_for_paths.canonicalize_path_str(path).ok()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .context("playback source path task failed")?;
     Ok(files
         .iter()
-        .filter_map(|file| {
+        .zip(local_paths)
+        .filter_map(|(file, local_path)| {
             let source = match file.file_id {
                 Some(id)
                     if matches!(
@@ -738,27 +2567,22 @@ pub async fn files_to_playback_request<P: AsRef<Path>>(
                 Some(id) if !matches!(availability.get(&id), Some(AudioAvailability::Local)) => {
                     return None;
                 }
-                Some(_) => match fsio.canonicalize_path(
-                    &lib_path
-                        .as_ref()
-                        .join(&file.directory)
-                        .join(&file.file_name),
-                ) {
-                    Ok(path) => PlaybackSource::Local(path),
-                    Err(_) => return None,
-                },
-                None if let PlayingItem::IndependentFile(path) = &file.item => {
-                    PlaybackSource::Local(fsio.canonicalize_path_str(path).ok()?)
+                Some(_) => PlaybackSource::Local(local_path?),
+                None if matches!(&file.item, PlayingItem::IndependentFile(_)) => {
+                    PlaybackSource::Local(local_path?)
                 }
                 None => return None,
             };
             let item = match &file.item {
-                PlayingItem::InLibrary(identity) => PlayingItem::InLibrary(*identity),
+                PlayingItem::LibraryTrack { library_id, track } => PlayingItem::LibraryTrack {
+                    library_id: *library_id,
+                    track: track.clone(),
+                },
                 PlayingItem::IndependentFile(path) => PlayingItem::IndependentFile(path.clone()),
-                _ => PlayingItem::InLibrary(playback::player::LibraryItem {
+                _ => PlayingItem::LibraryTrack {
                     library_id: library_uuid,
-                    file_uuid: file.file_uuid?,
-                }),
+                    track: file.file_uuid?.to_string(),
+                },
             };
             Some((item, source))
         })
@@ -812,23 +2636,118 @@ pub fn init_logging() {
 }
 
 #[cfg(test)]
+mod moved_node_request_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use anyhow::Result;
+    use database::library_registry::{
+        CatalogPlacement, FsAdapter, LibraryRecord, LibraryRecordId, LibraryRegistry,
+        ProtocolAdapter,
+    };
+    use scrobbling::manager::ScrobblingManager;
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+
+    use super::{Broadcaster, ProductionNodeRequestHandlers, RinfRustSignal};
+    use crate::{
+        macros::NodeRequestHandlers,
+        messages::{GetSyncSettingsRequest, MissingHostFilePolicy},
+        node::NodeSlot,
+    };
+
+    struct Quiet;
+
+    impl Broadcaster for Quiet {
+        fn broadcast(&self, _: &dyn RinfRustSignal) {}
+    }
+
+    #[tokio::test]
+    async fn get_sync_settings_succeeds_with_and_without_an_open_library() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().to_string_lossy().into_owned();
+        let node_slot = NodeSlot::new();
+        let node = node_slot.initialize(&path, &path, Arc::new(Quiet)).await?;
+        let handlers = ProductionNodeRequestHandlers::new(Arc::new(Mutex::new(
+            ScrobblingManager::new(10, Duration::from_secs(5)),
+        )));
+        let request = GetSyncSettingsRequest {
+            request_id: "sync-settings-test".into(),
+            call_id: None,
+        };
+
+        let closed_response = handlers
+            .handle_get_sync_settings_request(&node_slot, &request)
+            .await?
+            .expect("sync settings response with no UI library");
+
+        let library_id = Uuid::new_v4();
+        LibraryRegistry::update(directory.path(), |registry| {
+            registry.libraries.push(LibraryRecord {
+                record_id: LibraryRecordId(Uuid::new_v4()),
+                alias: "Test library".into(),
+                library_id: Some(library_id),
+                protocol: ProtocolAdapter::Native,
+                fs: vec![FsAdapter::Local { path: path.clone() }],
+                catalog: CatalogPlacement::InMediaRoot,
+                background_sync: true,
+            });
+            Ok(())
+        })
+        .await?;
+        let library = node.library_pool.acquire_ui(library_id).await?;
+        let params = Arc::new(node.params_for_ui()?.for_library(library.clone()));
+        *params.ui_library.lock().await = Some(library);
+        node.attach_ui(&params).await;
+        node.set_open_local_catalog(None, library_id)?;
+
+        let open_response = handlers
+            .handle_get_sync_settings_request(&node_slot, &request)
+            .await?
+            .expect("sync settings response with a UI library");
+        assert_eq!(open_response.request_id, closed_response.request_id);
+        assert_eq!(open_response.listen, closed_response.listen);
+        assert!(matches!(
+            (
+                open_response.missing_host_file,
+                closed_response.missing_host_file
+            ),
+            (
+                MissingHostFilePolicy::RemoveEverywhere,
+                MissingHostFilePolicy::RemoveEverywhere
+            ) | (
+                MissingHostFilePolicy::KeepAsRemote,
+                MissingHostFilePolicy::KeepAsRemote
+            )
+        ));
+        assert_eq!(open_response.error, closed_response.error);
+        assert!(open_response.error.is_none());
+
+        node.close_ui(&params.main_token).await;
+        node.shutdown().await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod cover_art_url_tests {
-    use super::{RunningMode, process_cover_art_path};
+    use super::process_cover_art_path;
+    use crate::Session;
     use uuid::Uuid;
 
     #[test]
     fn remote_cover_url_names_its_library() {
         let library_id = Uuid::new_v4();
         let path = "/tmp/rune/cover_arts/cover-digest";
-        let remote_host = Some("https://peer.example".to_string());
+        let remote_session = Session {
+            public_key: "key".to_string(),
+            fingerprint: "fingerprint".to_string(),
+            host: "https://peer.example".to_string(),
+        };
 
+        assert_eq!(process_cover_art_path(path, library_id, None), path);
         assert_eq!(
-            process_cover_art_path(path, library_id, &RunningMode::Server, &remote_host),
+            process_cover_art_path(path, library_id, Some(&remote_session)),
             format!("https://peer.example/files/cache/cover-digest?library_id={library_id}")
-        );
-        assert_eq!(
-            process_cover_art_path(path, library_id, &RunningMode::Client, &remote_host),
-            path
         );
     }
 }
@@ -852,3 +2771,81 @@ pub fn init_logging() {
         .with_ansi(false)
         .try_init();
 }
+
+#[cfg(test)]
+mod opendal_share_data_detection_tests {
+    use super::{OpenDalShareDataDetection, classify_opendal_share_data};
+    use crate::messages::RegisterLibraryFailureKind;
+    use database::sync::model::RuneModel;
+    use fsio::ObjectStoreCapabilities;
+    use sync::{
+        protocol::SyncModel,
+        share::{FORMAT_VERSION, LibraryFile, ObjectTag, ObjectValue, StoreError, encode_library},
+    };
+    use uuid::Uuid;
+
+    fn library_value(id: Uuid) -> ObjectValue {
+        let bytes = encode_library(&LibraryFile {
+            format: FORMAT_VERSION,
+            library_id: id,
+            model: RuneModel::model_id().to_owned(),
+            schema: RuneModel::schema_id().to_owned(),
+        })
+        .unwrap();
+        ObjectValue {
+            bytes,
+            tag: ObjectTag::new("tag"),
+        }
+    }
+
+    #[test]
+    fn detects_existing_share_library_id() {
+        let id = Uuid::new_v4();
+        assert_eq!(
+            classify_opendal_share_data(
+                Ok(library_value(id)),
+                Ok(ObjectStoreCapabilities::default())
+            ),
+            OpenDalShareDataDetection::ExistingLibrary {
+                library_id: id.to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn detects_writable_empty_share() {
+        let capabilities = ObjectStoreCapabilities {
+            write_probe: true,
+            ..ObjectStoreCapabilities::default()
+        };
+        assert_eq!(
+            classify_opendal_share_data(Err(StoreError::NotFound), Ok(capabilities)),
+            OpenDalShareDataDetection::WritableEmpty,
+        );
+    }
+
+    #[test]
+    fn detects_read_only_empty_share() {
+        assert_eq!(
+            classify_opendal_share_data(
+                Err(StoreError::NotFound),
+                Err(StoreError::PermissionDenied)
+            ),
+            OpenDalShareDataDetection::ReadOnly,
+        );
+    }
+
+    #[test]
+    fn detects_typed_share_probe_failure() {
+        assert_eq!(
+            classify_opendal_share_data(
+                Err(StoreError::NotFound),
+                Err(StoreError::Transient("offline".into()))
+            ),
+            OpenDalShareDataDetection::Failed(RegisterLibraryFailureKind::OpenDalUnreachable),
+        );
+    }
+}
+
+mod library_tasks;
+pub use library_tasks::LibraryTaskOwner;

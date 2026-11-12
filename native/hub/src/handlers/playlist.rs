@@ -16,9 +16,7 @@ use uuid::Uuid;
 use anyhow::{Context, Result};
 
 use crate::library_pool::LibraryHandle;
-use crate::utils::{
-    GlobalParams, ParamsExtractor, RunningMode, process_cover_art_map, require_library,
-};
+use crate::utils::{GlobalParams, ParamsExtractor, process_cover_art_map, require_library};
 use crate::{Session, Signal, messages::*};
 use ::database::actions::playlists::{get_all_playlists, get_playlist_by_id};
 
@@ -51,6 +49,7 @@ impl Signal for FetchAllPlaylistsRequest {
             .with_context(|| "Failed to fetch all playlists")?;
 
         Ok(Some(FetchAllPlaylistsResponse {
+            call_id: None,
             playlists: playlists
                 .into_iter()
                 .map(|playlist| Playlist {
@@ -96,9 +95,10 @@ impl Signal for CreatePlaylistRequest {
         .with_context(|| format!("Failed to create playlist: name={name}, group={group}"))?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: library.descriptor.app_name(),
+            path: library.display_name.clone(),
         });
         Ok(Some(CreatePlaylistResponse {
+            call_id: None,
             playlist: Playlist {
                 id: playlist.id,
                 name: playlist.name,
@@ -147,9 +147,10 @@ impl Signal for UpdatePlaylistRequest {
         })?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: library.descriptor.app_name(),
+            path: library.display_name.clone(),
         });
         Ok(Some(UpdatePlaylistResponse {
+            call_id: None,
             playlist: Playlist {
                 id: playlist.id,
                 name: playlist.name,
@@ -188,9 +189,10 @@ impl Signal for RemovePlaylistRequest {
         .with_context(|| format!("Removing playlist: id={}", request.playlist_id))?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: library.descriptor.app_name(),
+            path: library.display_name.clone(),
         });
         Ok(Some(RemovePlaylistResponse {
+            call_id: None,
             playlist_id: request.playlist_id,
             success: true,
         }))
@@ -233,9 +235,10 @@ impl Signal for AddItemToPlaylistRequest {
         })?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: library.descriptor.app_name(),
+            path: library.display_name.clone(),
         });
         Ok(Some(AddItemToPlaylistResponse {
+            call_id: None,
             success: true,
             occurrence_id: entry.hlc_uuid,
         }))
@@ -276,9 +279,12 @@ impl Signal for ReorderPlaylistItemPositionRequest {
         })?;
 
         broadcaster.broadcast(&LibraryContentChanged {
-            path: library.descriptor.app_name(),
+            path: library.display_name.clone(),
         });
-        Ok(Some(ReorderPlaylistItemPositionResponse { success: true }))
+        Ok(Some(ReorderPlaylistItemPositionResponse {
+            call_id: None,
+            success: true,
+        }))
     }
 }
 
@@ -309,6 +315,7 @@ impl Signal for GetPlaylistByIdRequest {
             .with_context(|| format!("Playlist not found with id: {}", request.playlist_id))?;
 
         Ok(Some(GetPlaylistByIdResponse {
+            call_id: None,
             playlist: Playlist {
                 id: playlist.id,
                 name: playlist.name,
@@ -356,7 +363,7 @@ impl Signal for CreateM3u8PlaylistRequest {
         };
         let lines = parse_m3u8_lines(&content);
 
-        match create_m3u8_playlist_from_lines(
+        let (playlist, import_result) = create_m3u8_playlist_from_lines(
             &library.main_db,
             &library.library_sync.record_store(),
             name.clone(),
@@ -364,31 +371,20 @@ impl Signal for CreateM3u8PlaylistRequest {
             lines,
         )
         .await
-        {
-            Ok((playlist, import_result)) => {
-                broadcaster.broadcast(&LibraryContentChanged {
-                    path: library.descriptor.app_name(),
-                });
-                Ok(Some(CreateM3u8PlaylistResponse {
-                    playlist: Some(Playlist {
-                        id: playlist.id,
-                        name: playlist.name,
-                        group: playlist.group,
-                    }),
-                    imported_count: Some(import_result.matched_ids.len() as i32),
-                    not_found_paths: import_result.unmatched_paths,
-                    success: true,
-                    error: String::new(),
-                }))
-            }
-            Err(e) => Ok(Some(CreateM3u8PlaylistResponse {
-                playlist: None,
-                imported_count: Some(0),
-                not_found_paths: vec![],
-                success: false,
-                error: e.to_string(),
-            })),
-        }
+        .context("Failed to import M3U8 playlist")?;
+        broadcaster.broadcast(&LibraryContentChanged {
+            path: library.display_name.clone(),
+        });
+        Ok(Some(CreateM3u8PlaylistResponse {
+            call_id: None,
+            playlist: Some(Playlist {
+                id: playlist.id,
+                name: playlist.name,
+                group: playlist.group,
+            }),
+            imported_count: Some(import_result.matched_ids.len() as i32),
+            not_found_paths: import_result.unmatched_paths,
+        }))
     }
 }
 
@@ -413,48 +409,33 @@ impl Signal for RemoveItemFromPlaylistRequest {
         let library = require_library(library)?;
         let request = dart_signal;
 
-        match remove_item_from_playlist(
+        remove_item_from_playlist(
             &library.main_db,
             &library.library_sync.record_store(),
             request.playlist_id,
             parse_occurrence_id(&request.occurrence_id)?,
         )
-        .await
-        {
-            Ok(_) => {
-                broadcaster.broadcast(&LibraryContentChanged {
-                    path: library.descriptor.app_name(),
-                });
-                Ok(Some(RemoveItemFromPlaylistResponse {
-                    success: true,
-                    error: String::new(),
-                }))
-            }
-            Err(e) => Ok(Some(RemoveItemFromPlaylistResponse {
-                success: false,
-                error: e.to_string(),
-            })),
-        }
+        .await?;
+        broadcaster.broadcast(&LibraryContentChanged {
+            path: library.display_name.clone(),
+        });
+        Ok(Some(RemoveItemFromPlaylistResponse { call_id: None }))
     }
 }
 
 impl ParamsExtractor for FetchPlaylistOccurrencesRequest {
-    type Params = (Option<LibraryHandle>, Arc<String>, RunningMode);
+    type Params = (Option<LibraryHandle>, Arc<String>);
     fn extract_params(&self, params: &GlobalParams) -> Self::Params {
-        (
-            params.library.clone(),
-            params.node_id.clone(),
-            params.running_mode,
-        )
+        (params.library.clone(), params.node_id.clone())
     }
 }
 
 impl Signal for FetchPlaylistOccurrencesRequest {
-    type Params = (Option<LibraryHandle>, Arc<String>, RunningMode);
+    type Params = (Option<LibraryHandle>, Arc<String>);
     type Response = FetchPlaylistOccurrencesResponse;
     async fn handle(
         &self,
-        (library, node, running_mode): Self::Params,
+        (library, node): Self::Params,
         session: Option<Session>,
         request: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -481,6 +462,7 @@ impl Signal for FetchPlaylistOccurrencesRequest {
             &library.fsio,
             &library.main_db,
             &node,
+            &library.library_id.to_string(),
             summaries,
             root,
         )
@@ -492,14 +474,10 @@ impl Signal for FetchPlaylistOccurrencesRequest {
         } else {
             HashMap::new()
         };
-        let remote_host = session.map(|session| session.host);
-        let cover_art_map = process_cover_art_map(
-            cover_art_map,
-            library.descriptor.library_id,
-            &running_mode,
-            &remote_host,
-        );
+        let cover_art_map =
+            process_cover_art_map(cover_art_map, library.library_id, session.as_ref());
         Ok(Some(FetchPlaylistOccurrencesResponse {
+            call_id: None,
             request_id: request.request_id.clone(),
             entries: page
                 .entries

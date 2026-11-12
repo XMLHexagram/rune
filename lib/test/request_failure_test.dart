@@ -52,6 +52,33 @@ void main() {
     await failures.close();
   });
 
+  test('playlist request failure shows the existing localized message', () async {
+    final responses = StreamController<int>();
+    final failures = StreamController<RequestFailedResponse>();
+    final result = awaitResponse(
+      'RemoveItemFromPlaylistRequest',
+      responses.stream,
+      failures: failures.stream,
+    );
+    failures.add(
+      const RequestFailedResponse(
+        request: 'RemoveItemFromPlaylistRequest',
+        kind: RequestErrorKind.notFound,
+        detail: 'playlist',
+      ),
+    );
+    final failure = await result.then<RequestFailure>(
+      (_) => fail('expected a playlist request failure'),
+      onError: (Object error) => error as RequestFailure,
+    );
+    expect(
+      requestFailureMessage(AppLocalizationsEn(), failure),
+      AppLocalizationsEn().requestItemMissing,
+    );
+    await responses.close();
+    await failures.close();
+  });
+
   test('unrelated failure is ignored', () async {
     final responses = StreamController<int>();
     final failures = StreamController<RequestFailedResponse>();
@@ -90,15 +117,108 @@ void main() {
     final s = AppLocalizationsEn();
     String message(RequestErrorKind kind) =>
         requestFailureMessage(s, RequestFailure('Wanted', kind, 'detail'));
-    expect(message(RequestErrorKind.notFound), 'This item no longer exists');
-    expect(message(RequestErrorKind.invalidInput), 'The request was not valid');
+    expect(message(RequestErrorKind.notFound), 'This item no longer exists.');
+    expect(message(RequestErrorKind.invalidInput), 'The request is invalid.');
     expect(
       message(RequestErrorKind.unavailable),
-      "This isn't available right now",
+      "This is not available right now.",
     );
-    expect(message(RequestErrorKind.permissionDenied), "This device isn't allowed to do that");
-    expect(message(RequestErrorKind.conflict), 'The queue changed; try again');
+    expect(message(RequestErrorKind.permissionDenied), "This device is not allowed to do that.");
+    expect(message(RequestErrorKind.conflict), 'The queue changed. Try again.');
+    expect(
+      message(RequestErrorKind.peerNeedsUpdate),
+      'Update Rune on both devices to connect.',
+    );
     expect(message(RequestErrorKind.internal), s.unknownError);
+  });
+
+  test('running library task failure names the task in localized text', () {
+    final s = AppLocalizationsEn();
+    expect(
+      requestFailureMessage(
+        s,
+        const RequestFailure(
+          'AnalyzeAudioLibraryRequest',
+          RequestErrorKind.conflict,
+          'Cannot start a library task while scan is running',
+          RequestFailureCauseLibraryTaskAlreadyRunning(
+            task: LibraryTaskKind.scan,
+          ),
+        ),
+      ),
+      'Scanning: This is not available right now.',
+    );
+  });
+
+  test('peer update failures name the device that must update', () {
+    final s = AppLocalizationsEn();
+    const kind = RequestErrorKind.peerNeedsUpdate;
+    expect(
+      requestFailureMessage(
+        s,
+        const RequestFailure(
+          'Connect',
+          kind,
+          'incompatible',
+          RequestFailureCausePeerNeedsUpdate(
+            updateSide: ProtocolUpdateSide.peer,
+            peerAlias: 'Bedroom',
+            localVersion: '1',
+            peerVersion: '0',
+          ),
+        ),
+      ),
+      'Bedroom needs a Rune update to connect.',
+    );
+    expect(
+      requestFailureMessage(
+        s,
+        const RequestFailure(
+          'Connect',
+          kind,
+          'incompatible',
+          RequestFailureCausePeerNeedsUpdate(
+            updateSide: ProtocolUpdateSide.peer,
+            localVersion: '1',
+            peerVersion: '0',
+          ),
+        ),
+      ),
+      'the other device needs a Rune update to connect.',
+    );
+    expect(
+      requestFailureMessage(
+        s,
+        const RequestFailure(
+          'Connect',
+          kind,
+          'incompatible',
+          RequestFailureCausePeerNeedsUpdate(
+            updateSide: ProtocolUpdateSide.thisDevice,
+            peerAlias: 'Studio',
+            localVersion: '0',
+            peerVersion: '1',
+          ),
+        ),
+      ),
+      'Update Rune on this device to connect to Studio.',
+    );
+    expect(
+      requestFailureMessage(
+        s,
+        const RequestFailure(
+          'Connect',
+          kind,
+          'incompatible',
+          RequestFailureCausePeerNeedsUpdate(
+            updateSide: ProtocolUpdateSide.thisDevice,
+            localVersion: '0',
+            peerVersion: '1',
+          ),
+        ),
+      ),
+      'Update Rune on this device to connect to the other device.',
+    );
   });
 
   test('storage busy cause has its localized retry message', () {
@@ -122,7 +242,7 @@ void main() {
     );
     expect(
       requestFailureMessage(s, failure),
-      "This device's certificate does not match",
+      "This device's certificate does not match.",
     );
   });
 
@@ -161,7 +281,7 @@ void main() {
         s,
         const RequestFailure('Wanted', RequestErrorKind.notFound, 'gone'),
       ),
-      'This item no longer exists',
+      'This item no longer exists.',
     );
     expect(
       requestErrorText(s, StateError('broken')),

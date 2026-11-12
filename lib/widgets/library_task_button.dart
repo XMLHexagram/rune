@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:provider/provider.dart';
 import 'package:fluent_ui/fluent_ui.dart';
 
@@ -7,7 +9,9 @@ import '../utils/router/navigation.dart';
 import '../screens/settings_library/widgets/progress_button.dart';
 import '../bindings/bindings.dart';
 import '../providers/library_manager.dart';
-import '../providers/library_path.dart';
+import '../providers/library_open_state.dart';
+import '../utils/dialogs/information/error.dart';
+import '../utils/api/request_failure.dart';
 
 Future<bool?> showCancelDialog(BuildContext context) {
   return $showModal<bool>(
@@ -33,9 +37,10 @@ Future<bool?> showCancelDialog(BuildContext context) {
   );
 }
 
-class LibraryTaskButton extends StatelessWidget {
+class LibraryTaskButton extends StatefulWidget {
   final String title;
   final String progressTitle;
+  final String requestName;
   final Future<void> Function(LibraryManagerProvider, String) onPressedStart;
   final Future<void> Function(LibraryManagerProvider, String)? onContextMenu;
   final void Function(LibraryManagerProvider, String) onPressedCancel;
@@ -45,6 +50,7 @@ class LibraryTaskButton extends StatelessWidget {
   const LibraryTaskButton({
     required this.title,
     required this.progressTitle,
+    required this.requestName,
     required this.onPressedStart,
     required this.onPressedCancel,
     required this.isTaskWorking,
@@ -54,11 +60,43 @@ class LibraryTaskButton extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
-    final libraryPath = Provider.of<LibraryPathProvider>(context, listen: true);
-    final itemPath = libraryPath.currentPath;
+  State<LibraryTaskButton> createState() => _LibraryTaskButtonState();
+}
 
-    if (itemPath == null) {
+class _LibraryTaskButtonState extends State<LibraryTaskButton> {
+  StreamSubscription<RequestFailure>? _failureSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    _failureSubscription = context
+        .read<LibraryManagerProvider>()
+        .failureFeedback
+        .listen((failure) {
+          if (!mounted || failure.request != widget.requestName) return;
+          showErrorDialog(
+            context: context,
+            title: S.of(context).unavailable,
+            errorMessage: requestFailureMessage(S.of(context), failure),
+          );
+        });
+  }
+
+  @override
+  void dispose() {
+    _failureSubscription?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final libraryPath = Provider.of<LibraryOpenStateProvider>(
+      context,
+      listen: true,
+    );
+    final recordId = libraryPath.openRecord?.recordId;
+
+    if (!libraryPath.hasCatalog || recordId == null) {
       return Container();
     }
 
@@ -67,10 +105,10 @@ class LibraryTaskButton extends StatelessWidget {
       listen: true,
     );
 
-    final scanProgress = libraryManager.getScanTaskProgress(itemPath);
-    final analyzeProgress = libraryManager.getAnalyzeTaskProgress(itemPath);
+    final scanProgress = libraryManager.getScanTaskProgress(recordId);
+    final analyzeProgress = libraryManager.getAnalyzeTaskProgress(recordId);
     final deduplicateProgress = libraryManager.getDeduplicateTaskProgress(
-      itemPath,
+      recordId,
     );
 
     final scanWorking = scanProgress?.status == TaskStatus.working;
@@ -81,31 +119,31 @@ class LibraryTaskButton extends StatelessWidget {
     final isWorking = scanWorking || analyzeWorking || deduplicateWorking;
 
     return isWorking &&
-            isTaskWorking(scanWorking, analyzeWorking, deduplicateWorking)
+            widget.isTaskWorking(scanWorking, analyzeWorking, deduplicateWorking)
         ? ProgressButton(
-            title: progressTitle,
-            onPressed: () => onPressedCancel(libraryManager, itemPath),
-            progress: progress,
+            title: widget.progressTitle,
+            onPressed: () => widget.onPressedCancel(libraryManager, recordId),
+            progress: widget.progress,
             filled: false,
           )
         : GestureDetector(
             onSecondaryTapUp: (details) {
-              if (onContextMenu != null) {
-                onContextMenu!(libraryManager, itemPath);
+              if (widget.onContextMenu != null) {
+                widget.onContextMenu!(libraryManager, recordId);
               }
             },
             onLongPressEnd: isDesktop
                 ? null
                 : (details) {
-                    if (onContextMenu != null) {
-                      onContextMenu!(libraryManager, itemPath);
+                    if (widget.onContextMenu != null) {
+                      widget.onContextMenu!(libraryManager, recordId);
                     }
                   },
             child: Button(
               onPressed: isWorking
                   ? null
-                  : () => onPressedStart(libraryManager, itemPath),
-              child: Text(title),
+                  : () => widget.onPressedStart(libraryManager, recordId),
+              child: Text(widget.title),
             ),
           );
   }
@@ -122,66 +160,45 @@ class ScanLibraryButton extends StatelessWidget {
     return LibraryTaskButton(
       title: title ?? S.of(context).scan,
       progressTitle: S.of(context).scanning,
+      requestName: 'ScanAudioLibraryRequest',
       progress: null,
-      onPressedCancel: (libraryManager, itemPath) async {
+      onPressedCancel: (libraryManager, recordId) async {
         final confirm = await showCancelDialog(context);
 
         if (confirm == true) {
-          libraryManager.cancelTask(itemPath, CancelTaskType.scanAudioLibrary);
+          libraryManager.cancelTask(recordId, CancelTaskType.scanAudioLibrary);
         }
       },
-      onPressedStart: (libraryManager, itemPath) async {
-        libraryManager.scanLibrary(itemPath, isInitializeTask: false);
-        final status = await libraryManager.waitForScanToComplete(itemPath);
+      onPressedStart: (libraryManager, recordId) async {
+        libraryManager.scanLibrary(recordId, isInitializeTask: false);
+        final status = await libraryManager.waitForScanToComplete(recordId);
         if (status == TaskStatus.failed && context.mounted) {
-          await $showModal<void>(
-            context,
-            (context, close) => ContentDialog(
-              title: Text(
-                S
-                    .of(context)
-                    .error(
-                      libraryManager.getScanTaskProgress(itemPath)?.error ?? '',
-                    ),
-              ),
-              actions: [
-                Button(
-                  onPressed: () => close(null),
-                  child: Text(S.of(context).back),
-                ),
-              ],
-            ),
+          await showErrorDialog(
+            context: context,
+            title: S.of(context).scanLibrary,
+            errorMessage:
+                libraryManager.getScanTaskProgress(recordId)?.error ??
+                S.of(context).unknownError,
           );
         }
         if (status == TaskStatus.finished && onFinished != null) {
           onFinished!();
         }
       },
-      onContextMenu: (libraryManager, itemPath) async {
+      onContextMenu: (libraryManager, recordId) async {
         libraryManager.scanLibrary(
-          itemPath,
+          recordId,
           isInitializeTask: false,
           force: true,
         );
-        final status = await libraryManager.waitForScanToComplete(itemPath);
+        final status = await libraryManager.waitForScanToComplete(recordId);
         if (status == TaskStatus.failed && context.mounted) {
-          await $showModal<void>(
-            context,
-            (context, close) => ContentDialog(
-              title: Text(
-                S
-                    .of(context)
-                    .error(
-                      libraryManager.getScanTaskProgress(itemPath)?.error ?? '',
-                    ),
-              ),
-              actions: [
-                Button(
-                  onPressed: () => close(null),
-                  child: Text(S.of(context).back),
-                ),
-              ],
-            ),
+          await showErrorDialog(
+            context: context,
+            title: S.of(context).scanLibrary,
+            errorMessage:
+                libraryManager.getScanTaskProgress(recordId)?.error ??
+                S.of(context).unknownError,
           );
         }
         if (status == TaskStatus.finished && onFinished != null) {
@@ -202,17 +219,13 @@ class AnalyzeLibraryButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final libraryPath = Provider.of<LibraryPathProvider>(context, listen: true);
-    final itemPath = libraryPath.currentPath;
-
-    if (itemPath == null) return Container();
-
-    final libraryManager = Provider.of<LibraryManagerProvider>(
+    final libraryManager = Provider.of<LibraryManagerProvider>(context);
+    final recordId = Provider.of<LibraryOpenStateProvider>(
       context,
-      listen: true,
-    );
-
-    final analyzeProgress = libraryManager.getAnalyzeTaskProgress(itemPath);
+    ).openRecord?.recordId;
+    final analyzeProgress = recordId == null
+        ? null
+        : libraryManager.getAnalyzeTaskProgress(recordId);
 
     final progress = analyzeProgress == null
         ? null
@@ -221,19 +234,20 @@ class AnalyzeLibraryButton extends StatelessWidget {
     return LibraryTaskButton(
       title: title ?? S.of(context).analyze,
       progressTitle: S.of(context).analyzing,
-      onPressedCancel: (libraryManager, itemPath) async {
+      requestName: 'AnalyzeAudioLibraryRequest',
+      onPressedCancel: (libraryManager, recordId) async {
         final confirm = await showCancelDialog(context);
 
         if (confirm == true) {
           libraryManager.cancelTask(
-            itemPath,
+            recordId,
             CancelTaskType.analyzeAudioLibrary,
           );
         }
       },
-      onPressedStart: (libraryManager, itemPath) async {
-        libraryManager.analyzeLibrary(itemPath, false);
-        await libraryManager.waitForAnalyzeToComplete(itemPath);
+      onPressedStart: (libraryManager, recordId) async {
+        libraryManager.analyzeLibrary(recordId, false);
+        await libraryManager.waitForAnalyzeToComplete(recordId);
 
         if (onFinished != null) {
           onFinished!();
@@ -254,19 +268,13 @@ class DeduplicateLibraryButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final libraryPath = Provider.of<LibraryPathProvider>(context, listen: true);
-    final itemPath = libraryPath.currentPath;
-
-    if (itemPath == null) return Container();
-
-    final libraryManager = Provider.of<LibraryManagerProvider>(
+    final libraryManager = Provider.of<LibraryManagerProvider>(context);
+    final recordId = Provider.of<LibraryOpenStateProvider>(
       context,
-      listen: true,
-    );
-
-    final deduplicateProgress = libraryManager.getDeduplicateTaskProgress(
-      itemPath,
-    );
+    ).openRecord?.recordId;
+    final deduplicateProgress = recordId == null
+        ? null
+        : libraryManager.getDeduplicateTaskProgress(recordId);
 
     final progress = deduplicateProgress == null
         ? null
@@ -275,19 +283,20 @@ class DeduplicateLibraryButton extends StatelessWidget {
     return LibraryTaskButton(
       title: title ?? S.of(context).deduplicate,
       progressTitle: S.of(context).deduplicating,
-      onPressedCancel: (libraryManager, itemPath) async {
+      requestName: 'DeduplicateAudioLibraryRequest',
+      onPressedCancel: (libraryManager, recordId) async {
         final confirm = await showCancelDialog(context);
 
         if (confirm == true) {
           libraryManager.cancelTask(
-            itemPath,
+            recordId,
             CancelTaskType.deduplicateAudioLibrary,
           );
         }
       },
-      onPressedStart: (libraryManager, itemPath) async {
-        libraryManager.deduplicateLibrary(itemPath);
-        await libraryManager.waitForDeduplicateToComplete(itemPath);
+      onPressedStart: (libraryManager, recordId) async {
+        libraryManager.deduplicateLibrary(recordId);
+        await libraryManager.waitForDeduplicateToComplete(recordId);
 
         if (onFinished != null) {
           onFinished!();

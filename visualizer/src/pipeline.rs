@@ -1091,6 +1091,14 @@ impl Pipeline {
         self.scene.push_pcm(interleaved, channels);
     }
 
+    pub fn set_feed_spectrum(&mut self, values: &[f32]) {
+        self.scene.set_feed_spectrum(values);
+    }
+
+    pub fn clear_feed_spectrum(&mut self) {
+        self.scene.clear_feed_spectrum();
+    }
+
     /// Show the scene in the folder `dir`, waiting until it is built. The render loop builds
     /// scenes on another thread instead (see [`Pipeline::scene_build_dir`]); tests wait.
     #[cfg(test)]
@@ -1986,8 +1994,8 @@ mod tests {
     /// The frames drawn at `times`, as the mean of their bytes (0 to 255) in the middle of the
     /// picture, in order.
     fn means(pipeline: &mut Pipeline, times: &[f64]) -> Vec<f32> {
-        let mut means = Vec::new();
-        let render = |pipeline: &mut Pipeline, time: f64| {
+        const MAX_READBACK_POLLS: usize = 50;
+        let render = |pipeline: &mut Pipeline, time: f64| -> Option<f32> {
             let mean = if let Rendered::Mapped(frame) = pipeline.render(time).unwrap() {
                 let (w, h) = pipeline.size();
                 let at = (h as usize / 2) * frame.stride() + (w as usize / 2) * 4;
@@ -2006,18 +2014,33 @@ mod tests {
                 .unwrap();
             mean
         };
+        let frame_at = |pipeline: &mut Pipeline, time: f64| {
+            (0..MAX_READBACK_POLLS)
+                .find_map(|_| render(pipeline, time))
+                .unwrap_or_else(|| panic!("no readback frame became available at {time:.3}s"))
+        };
+        let mut means = Vec::new();
+        if let Some(&first_time) = times.first()
+            && matches!(
+                pipeline.transitions.running.as_ref(),
+                Some(running) if running.kind == Transition::Dissolve && running.pending.is_some()
+            )
+        {
+            // The dissolve first captures the old picture; include that held frame before sampling
+            // its timed blend, and poll at the same timestamp until readback returns it.
+            means.push(frame_at(pipeline, first_time));
+        }
+        if let Some(&first_time) = times.first()
+            && pipeline.transitions.forced == Forced::Wanted(Transition::Flash)
+        {
+            // A dressed cut waits for a held frame before the director cuts. Keep that frame in
+            // the sampled sequence before advancing the synthetic time.
+            means.push(frame_at(pipeline, first_time));
+            means.push(frame_at(pipeline, first_time));
+        }
         for &time in times {
-            means.extend(render(pipeline, time));
+            means.push(frame_at(pipeline, time));
         }
-        // The frames come out some calls after they were drawn.
-        for _ in 0..50 {
-            if means.len() >= times.len() {
-                break;
-            }
-            means.extend(render(pipeline, times[times.len() - 1]));
-        }
-        means.truncate(times.len());
-        assert_eq!(means.len(), times.len(), "frames did not come out");
         means
     }
 

@@ -12,7 +12,9 @@ use database::{
         metadata::get_metadata_summary_by_files,
     },
     entities::media_files,
-    library_registry::{DbPlacement, LibraryAuthority, LibraryDescriptor, LibraryStorage},
+    library_registry::{
+        CatalogPlacement, FsAdapter, LibraryRecord, LibraryRecordId, ProtocolAdapter,
+    },
     sync::LibrarySyncStore,
     sync::model::BlobRef,
 };
@@ -38,19 +40,20 @@ async fn request_library(
     let library_id = Uuid::new_v4();
     let library_sync = LibrarySyncStore::open(db.clone(), actor, Some(library_id)).await?;
     let pool = LibraryPool::new(config_path, config_path, &actor.to_string())?;
-    let descriptor = LibraryDescriptor {
-        library_id,
+    let descriptor = LibraryRecord {
+        record_id: LibraryRecordId(Uuid::new_v4()),
         alias: "Test library".into(),
-        authority: LibraryAuthority::Owned,
-        storage: LibraryStorage::Local {
+        library_id: Some(library_id),
+        protocol: ProtocolAdapter::Native,
+        fs: vec![FsAdapter::Local {
             path: media_root.clone(),
-        },
-        db_placement: DbPlacement::Portable,
+        }],
+        catalog: CatalogPlacement::InMediaRoot,
         background_sync: false,
-        access_level: None,
-        connection_access: None,
     };
     pool.register_ui(LibraryResources {
+        library_id,
+        display_name: media_root.clone(),
         main_db: Arc::new(db),
         library_sync,
         recommend_db: Arc::new(RecommendationDbConnection::new()),
@@ -111,8 +114,15 @@ async fn pending_rows_are_returned_and_reported_without_becoming_playable() -> R
         let page = get_media_files(&db, cursor, 1).await?;
         assert_eq!(page.len(), 1, "pending rows must not shorten a page");
         let summaries = get_metadata_summary_by_files(&db, page.clone()).await?;
-        let parsed =
-            parse_media_files(&fsio, &db, &node.to_string(), summaries, root.clone()).await?;
+        let parsed = parse_media_files(
+            &fsio,
+            &db,
+            &node.to_string(),
+            &node.to_string(),
+            summaries,
+            root.clone(),
+        )
+        .await?;
         assert_eq!(parsed.len(), 1);
         states.push((
             parsed[0].id,
@@ -133,7 +143,10 @@ async fn pending_rows_are_returned_and_reported_without_becoming_playable() -> R
     assert_eq!(states[2].1, AudioAvailability::Unavailable);
     assert!(states[1].2.is_empty());
     assert!(states[2].2.is_empty());
-    let request = SearchMediaFileSummaryRequest { n: 50 };
+    let request = SearchMediaFileSummaryRequest {
+        call_id: None,
+        n: 50,
+    };
     let library = request_library(
         db.clone(),
         Arc::new(fsio.clone()),
@@ -254,6 +267,7 @@ async fn queued_downloads_with_content_remain_streamable() -> Result<()> {
             &fsio,
             &db,
             &actor.to_string(),
+            &library.library_id.to_string(),
             summaries,
             Arc::new(root.path().to_string_lossy().into_owned()),
         )
@@ -263,7 +277,10 @@ async fn queued_downloads_with_content_remain_streamable() -> Result<()> {
             AudioAvailability::RemoteOnly,
             "the client must retain its remote playback action while download is pending"
         );
-        let request = SearchMediaFileSummaryRequest { n: 10 };
+        let request = SearchMediaFileSummaryRequest {
+            call_id: None,
+            n: 10,
+        };
         let response = request
             .handle((Some(library.clone()),), None, &request)
             .await?

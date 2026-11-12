@@ -12,15 +12,17 @@ use tokio_util::sync::CancellationToken;
 
 use super::fixture;
 use crate::backends::local::gui_request::{GuiRequest, listen_gui_with_io};
-use crate::macros::{RequestScope, RequestSlots};
+use crate::macros::{RequestAccess, RequestScope, RequestSlots};
 use crate::messages::{
     CrashResponse, RequestErrorKind, RequestFailedResponse, RequestFailureCause, SearchForRequest,
     VolumeRequest, VolumeResponse,
 };
 use crate::request_error::ExpectedRequestError;
-use crate::rpc::{Slot, TargetRequest};
+use crate::rpc::{
+    Slot, TargetRequest,
+};
 use crate::utils::{GlobalParams, ParamsExtractor, RinfRustSignal};
-use crate::{CallIdentified, Session, Signal, TypedRequest};
+use crate::{RequestCallId, ResponseCallId, Session, Signal, TypedRequest};
 
 pub(super) struct Listener<R> {
     sender: SignalSender<DartSignalPack<R>>,
@@ -42,7 +44,14 @@ impl<R> Listener<R> {
             .await
             .unwrap()
             .expect("listener closed without a response");
-        assert_eq!(actual, name);
+        assert_eq!(
+            actual,
+            name,
+            "unexpected GUI response: {}",
+            rinf::deserialize::<RequestFailedResponse>(&bytes)
+                .map(|response| format!(" {:?}: {}", response.kind, response.detail))
+                .unwrap_or_default()
+        );
         rinf::deserialize(&bytes).unwrap()
     }
 
@@ -61,7 +70,7 @@ where
         + TargetRequest
         + Signal<Response = <R as TypedRequest>::Response, Params = <R as ParamsExtractor>::Params>
         + ParamsExtractor
-        + CallIdentified
+        + RequestCallId
         + DartSignal
         + Serialize
         + Send
@@ -108,12 +117,13 @@ impl TypedRequest for DelayedRequest {
 }
 impl TargetRequest for DelayedRequest {
     const SCOPE: RequestScope = RequestScope::Node;
-    const USES_CONTROLLER_LIBRARY: bool = false;
+    const ACCESS: RequestAccess = RequestAccess::NodeLocal;
+    const INTRODUCED_MINOR: u32 = 0;
     fn slot(_: &RequestSlots) -> Slot {
         Slot::Native
     }
 }
-impl CallIdentified for DelayedRequest {
+impl RequestCallId for DelayedRequest {
     fn call_id(&self) -> Option<u64> {
         Some(91)
     }
@@ -135,13 +145,18 @@ impl Signal for DelayedRequest {
         match self.failure {
             1 => Err(ExpectedRequestError::CertificateMismatch.into()),
             2 => Err(anyhow!("listener internal failure")),
-            _ => Ok(Some(VolumeResponse { volume: self.value })),
+            _ => Ok(Some(VolumeResponse { call_id: None, volume: self.value })),
         }
     }
 }
 impl GuiRequest for DelayedRequest {
-    fn emit_response(response: Option<VolumeResponse>, emit: &impl Fn(&dyn RinfRustSignal)) {
-        if let Some(response) = response {
+    fn emit_response(
+        request: &Self,
+        response: Option<VolumeResponse>,
+        emit: &impl Fn(&dyn RinfRustSignal),
+    ) {
+        if let Some(mut response) = response {
+            response.set_call_id(request.call_id());
             emit(&response);
         }
     }
@@ -160,7 +175,8 @@ async fn gui_listener_dispatches_catalogue_request_and_emits_response() -> Resul
     let dir = tempfile::tempdir()?;
     let fixture = fixture(dir.path()).await?;
     let mut listener = start::<VolumeRequest>(&fixture.global_params);
-    listener.send(VolumeRequest { volume: 0.37 });
+    listener.send(VolumeRequest {
+            call_id: None, volume: 0.37 });
     let response: VolumeResponse = listener.receive("VolumeResponse").await;
     assert_eq!(response.volume, 0.37);
     timeout(Duration::from_secs(10), async {
@@ -194,7 +210,8 @@ async fn gui_listener_orders_same_type_without_blocking_other_types() -> Result<
     pause();
     slow.send(delayed(1.0, 1000, 0));
     slow.send(delayed(2.0, 0, 0));
-    fast.send(VolumeRequest { volume: 0.63 });
+    fast.send(VolumeRequest {
+            call_id: None, volume: 0.63 });
     let response: VolumeResponse =
         timeout(Duration::from_millis(500), fast.receive("VolumeResponse")).await?;
     assert_eq!(response.volume, 0.63);
@@ -219,7 +236,7 @@ async fn gui_listener_failure_preserves_call_id_kind_and_cause() -> Result<()> {
     params.library = None;
     let mut search = start::<SearchForRequest>(&Arc::new(params));
     search.send(SearchForRequest {
-        call_id: 73,
+        call_id: Some(73),
         query_str: "missing".into(),
         fields: Vec::new(),
         n: 30,
@@ -283,7 +300,8 @@ async fn gui_listener_cancels_idle_pending_and_queued_requests() -> Result<()> {
     assert!(listener.output.try_recv().is_err());
     // Cancellation is biased even when a request is already queued.
     let mut listener = start::<VolumeRequest>(&fixture.global_params);
-    listener.send(VolumeRequest { volume: 0.12 });
+    listener.send(VolumeRequest {
+            call_id: None, volume: 0.12 });
     fixture.global_params.main_token.cancel();
     timeout(Duration::from_secs(5), &mut listener.task).await??;
     assert!(listener.output.try_recv().is_err());

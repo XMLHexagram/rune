@@ -8,26 +8,34 @@ use super::sync_auth::{Authorization, Challenge, TOKEN_TTL, Token, message};
 #[cfg(test)]
 use super::utils::device::load_device_info;
 use crate::access_policy::{Action, ConnectionLevel, SyncLevel};
+use crate::messages::{LibrarySyncStatusUpdated, ShareSyncFailure};
 #[cfg(test)]
 use crate::utils::GlobalParams;
+use crate::utils::subsonic_binding_for_playback;
 use crate::{library_pool::LibraryHandle, node::NodeContext};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use database::actions::file::{ManagedAudioVerifier, file_ids_by_uuid, materialized_path};
 use database::actions::library::clean_local_orphans;
+use database::credentials::CredentialStore;
 use database::library_registry::{
-    LibraryAccess, LibraryAuthority, LibraryConnectionAccess, LibraryRegistry,
+    CatalogPlacement, FsAdapter, LibraryAccess, LibraryConnectionAccess, LibraryRecord,
+    LibraryRecordId, LibraryRegistry, ProtocolAdapter, RuneForwardMode,
 };
 use database::sync::Maintenance;
 use database::sync::model::RuneModel;
+use database::sync::share::{ShareCapabilities, SharePullError, SharePushError};
+use database::sync::{LibrarySyncStore, replica::PendingShareChange};
 use discovery::access_policy::{AccessPolicy, PeerIdentity};
-use discovery::endpoint::endpoint_host_port;
+use discovery::endpoint::{DeviceAddress, device_url};
 use discovery::server::UserStatus;
+use fsio::{OpenDalConfig, OpenDalObjectStore};
 use futures::future::BoxFuture;
 use futures::future::{AbortHandle, Abortable, Aborted};
 use http_request::sync::PageCursor;
 use playback::player::{
-    LibraryPlaybackSource, PlaybackSourceResolver, RemoteAudioError, RemoteAudioSource,
+    LibraryPlaybackSource, LibraryTrackKey, PlaybackSourceResolver, RemoteAudioError,
+    RemoteAudioSource, SubsonicItem,
 };
 use rand::rngs::OsRng;
 use reqwest::header::HeaderMap;
@@ -38,7 +46,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time as std_time;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     future::Future,
     hash::Hash,
     path::Path,
@@ -49,16 +57,227 @@ use std::{
 };
 use sync::SyncPeer;
 use sync::protocol::SyncError;
+use sync::share::{ObjectStore, StoreError};
 use tokio::time as tokio_time;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio::{sync::Mutex, task::JoinSet};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const DEFAULT_PEER_PORT: u16 = 7863;
 const PEER_CONCURRENCY: usize = 4;
 const PEER_RETRY_START: Duration = Duration::from_secs(1);
 const PEER_RETRY_CAP: Duration = Duration::from_secs(30);
 const TOKEN_SAFETY_MARGIN: Duration = Duration::from_secs(30);
+const SHARE_RETRY_START: Duration = Duration::from_secs(1);
+const SHARE_RETRY_CAP: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug)]
+struct ShareWorkerTimers {
+    tick: Duration,
+    foreground_pull: Duration,
+    background_pull: Duration,
+    push_debounce: Duration,
+    statistics_push: Duration,
+    idle_push: Duration,
+}
+
+impl Default for ShareWorkerTimers {
+    fn default() -> Self {
+        Self {
+            tick: Duration::from_secs(1),
+            foreground_pull: Duration::from_secs(60),
+            background_pull: Duration::from_secs(15 * 60),
+            push_debounce: Duration::from_secs(10),
+            statistics_push: Duration::from_secs(30 * 60),
+            idle_push: Duration::from_secs(24 * 60 * 60),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ShareStoreSession {
+    store: Arc<dyn ObjectStore>,
+    capabilities: ShareCapabilities,
+}
+
+trait ShareStoreFactory: Send + Sync {
+    fn open<'a>(
+        &'a self,
+        record: &'a LibraryRecord,
+        prefix: &'a str,
+        credentials: &'a CredentialStore,
+    ) -> futures::future::BoxFuture<'a, Result<ShareStoreSession, ShareSyncFailure>>;
+}
+
+struct OpenDalShareStoreFactory;
+
+impl ShareStoreFactory for OpenDalShareStoreFactory {
+    fn open<'a>(
+        &'a self,
+        record: &'a LibraryRecord,
+        prefix: &'a str,
+        credentials: &'a CredentialStore,
+    ) -> futures::future::BoxFuture<'a, Result<ShareStoreSession, ShareSyncFailure>> {
+        Box::pin(async move {
+            let config = match record.fs.as_slice() {
+                [
+                    FsAdapter::WebDav {
+                        endpoint,
+                        root,
+                        username,
+                        credential,
+                    },
+                ] => {
+                    let credential = credentials
+                        .get(*credential)
+                        .await
+                        .map_err(|_| ShareSyncFailure::CredentialsRejected)?;
+                    if credential.username != *username {
+                        return Err(ShareSyncFailure::CredentialsRejected);
+                    }
+                    let password = String::from_utf8(credential.secret.as_bytes().to_vec())
+                        .map_err(|_| ShareSyncFailure::CredentialsRejected)?;
+                    OpenDalConfig::WebDav {
+                        endpoint: endpoint.clone(),
+                        root: root.clone(),
+                        username: username.clone(),
+                        password,
+                    }
+                }
+                [
+                    FsAdapter::S3 {
+                        endpoint,
+                        bucket,
+                        region,
+                        root,
+                        access_key_id,
+                        credential,
+                    },
+                ] => {
+                    let credential = credentials
+                        .get(*credential)
+                        .await
+                        .map_err(|_| ShareSyncFailure::CredentialsRejected)?;
+                    if credential.username != *access_key_id {
+                        return Err(ShareSyncFailure::CredentialsRejected);
+                    }
+                    let secret_access_key =
+                        String::from_utf8(credential.secret.as_bytes().to_vec())
+                            .map_err(|_| ShareSyncFailure::CredentialsRejected)?;
+                    OpenDalConfig::S3 {
+                        endpoint: endpoint.clone(),
+                        bucket: bucket.clone(),
+                        region: region.clone(),
+                        root: root.clone(),
+                        access_key_id: access_key_id.clone(),
+                        secret_access_key,
+                    }
+                }
+                _ => return Err(ShareSyncFailure::ProbeFailed),
+            };
+            let store =
+                OpenDalObjectStore::new(config).map_err(|_| ShareSyncFailure::ProbeFailed)?;
+            let probed = store
+                .probe(prefix)
+                .await
+                .map_err(classify_share_store_error)?;
+            Ok(ShareStoreSession {
+                store: Arc::new(store),
+                capabilities: ShareCapabilities {
+                    conditional_create: probed.conditional_create,
+                    conditional_head_write: probed.conditional_put,
+                },
+            })
+        })
+    }
+}
+
+async fn share_sync_pass(
+    library_sync: &LibrarySyncStore,
+    library_id: Uuid,
+    cache_path: PathBuf,
+    session: &ShareStoreSession,
+    pass: SharePass,
+    notify: impl Fn(),
+) -> Result<bool, ShareSyncFailure> {
+    let pulled = library_sync
+        .pull_share(
+            session.store.clone(),
+            library_id,
+            cache_path.clone(),
+            session.capabilities,
+        )
+        .await
+        .map_err(share_pull_failure)?;
+    if !pulled.is_empty() {
+        notify();
+    }
+    if pass == SharePass::PullAndPush {
+        library_sync
+            .push_share(
+                session.store.clone(),
+                library_id,
+                cache_path,
+                session.capabilities,
+            )
+            .await
+            .map_err(share_push_failure)?;
+    }
+    Ok(!pulled.is_empty())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharePass {
+    PullOnly,
+    PullAndPush,
+}
+
+struct ShareSchedule {
+    last_pull: Option<Instant>,
+    observed_head: Option<u64>,
+    last_change: Option<Instant>,
+    last_push: Instant,
+    pending_change: Option<PendingShareChange>,
+}
+
+impl Default for ShareSchedule {
+    fn default() -> Self {
+        Self {
+            last_pull: None,
+            observed_head: None,
+            last_change: None,
+            last_push: Instant::now(),
+            pending_change: None,
+        }
+    }
+}
+
+async fn select_share_cancellation<T>(
+    cancel: CancellationToken,
+    operation: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        _ = cancel.cancelled() => None,
+        result = operation => Some(result),
+    }
+}
+
+fn next_share_backoff(previous: Option<Duration>) -> (Duration, Duration) {
+    let wait = previous.unwrap_or(SHARE_RETRY_START);
+    (wait, wait.saturating_mul(2).min(SHARE_RETRY_CAP))
+}
+
+fn classify_share_store_error(error: StoreError) -> ShareSyncFailure {
+    match error {
+        StoreError::PermissionDenied => ShareSyncFailure::ReadOnlyShare,
+        StoreError::Unauthorized => ShareSyncFailure::CredentialsRejected,
+        StoreError::NotFound => ShareSyncFailure::ObjectMissing,
+        StoreError::Transient(_) => ShareSyncFailure::StoreUnavailable,
+        StoreError::Permanent(_) | StoreError::ClockSkew | StoreError::PreconditionFailed => {
+            ShareSyncFailure::ProbeFailed
+        }
+    }
+}
 
 /// A peer endpoint: its fingerprint and base URL.
 type PeerKey = (String, String);
@@ -148,9 +367,9 @@ pub(crate) async fn trusted_fingerprint(
         hosts
             .iter()
             .any(|candidate| {
-                endpoint_host_port(candidate).is_some_and(|(name, trusted_port)| {
-                    name == host && trusted_port.is_none_or(|p| p == port)
-                })
+                candidate
+                    .parse::<DeviceAddress>()
+                    .is_ok_and(|address| address.host() == host && address.port() == port)
             })
             .then_some(fingerprint)
     });
@@ -171,7 +390,6 @@ pub(super) async fn peer_endpoints(global: &NodeContext, own: &str) -> Vec<Vec<P
         .await
         .clone_trusted_entries()
         .await;
-    let discovered = global.device_scanner.get_all_devices();
     let mut peers = Vec::new();
     for (fingerprint, hosts) in trusted {
         if fingerprint == own {
@@ -187,19 +405,15 @@ pub(super) async fn peer_endpoints(global: &NodeContext, own: &str) -> Vec<Vec<P
         if !outbound_eligible(status) {
             continue;
         }
-        let advertised = discovered
-            .iter()
-            .find(|device| device.fingerprint == fingerprint)
-            .and_then(|device| device.api_port);
         let endpoints: Vec<_> = hosts
             .into_iter()
             .filter_map(|trusted_host| {
-                let (host, explicit) = endpoint_host_port(&trusted_host)?;
+                let address = trusted_host.parse::<DeviceAddress>().ok()?;
                 Some(PeerEndpoint {
                     fingerprint: fingerprint.clone(),
                     trusted_host,
-                    host,
-                    port: explicit.or(advertised).unwrap_or(DEFAULT_PEER_PORT),
+                    host: address.host().to_owned(),
+                    port: address.port(),
                 })
             })
             .collect();
@@ -253,7 +467,7 @@ pub async fn run(
     notify: Arc<dyn Fn() + Send + Sync>,
     own_fingerprint: String,
     private_key: String,
-    cancel: tokio_util::sync::CancellationToken,
+    cancel: CancellationToken,
 ) {
     let locks: ReplicaLocks = Arc::default();
     let credentials = LocalCredentials {
@@ -278,10 +492,248 @@ pub async fn run(
     );
     tokio::join!(
         join_workers(metadata, audio),
-        verify_managed_audio(global.clone(), notify, cancel.clone()),
-        maintain_metadata(global, cancel)
+        verify_managed_audio(global.clone(), notify.clone(), cancel.clone()),
+        maintain_metadata(global.clone(), cancel.clone()),
+        run_share_worker(
+            global,
+            notify,
+            cancel,
+            Arc::new(OpenDalShareStoreFactory),
+            ShareWorkerTimers::default(),
+        )
     );
 }
+
+async fn run_share_worker(
+    global: Weak<NodeContext>,
+    notify: Arc<dyn Fn() + Send + Sync>,
+    cancel: CancellationToken,
+    factory: Arc<dyn ShareStoreFactory>,
+    timers: ShareWorkerTimers,
+) {
+    let mut sessions = HashMap::<Uuid, ShareStoreSession>::new();
+    let mut retry = HashMap::<Uuid, (Duration, Instant)>::new();
+    let mut schedules = HashMap::<Uuid, ShareSchedule>::new();
+    let mut interval = tokio::time::interval(timers.tick);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                flush_share_worker(&global, &sessions, &notify).await;
+                return;
+            },
+            _ = interval.tick() => (),
+        }
+        let Some(global) = global.upgrade() else {
+            return;
+        };
+        let ids = match global.library_pool.served_library_ids().await {
+            Ok(ids) => ids,
+            Err(error) => {
+                log::warn!("Could not discover share libraries: {error:#}");
+                continue;
+            }
+        };
+        sessions.retain(|id, _| ids.contains(id));
+        retry.retain(|id, _| ids.contains(id));
+        schedules.retain(|id, _| ids.contains(id));
+        for id in ids {
+            if retry.get(&id).is_some_and(|(_, due)| *due > Instant::now()) {
+                continue;
+            }
+            let operation = async {
+                let Some(library) = global
+                    .library_pool
+                    .acquire_served(id)
+                    .await
+                    .map_err(|_| ShareSyncFailure::StoreUnavailable)?
+                else {
+                    sessions.remove(&id);
+                    retry.remove(&id);
+                    schedules.remove(&id);
+                    return Ok::<_, ShareSyncFailure>(false);
+                };
+                if !matches!(library.descriptor.catalog, CatalogPlacement::InShare(_)) {
+                    sessions.remove(&id);
+                    retry.remove(&id);
+                    schedules.remove(&id);
+                    return Ok(false);
+                }
+                let cache_path = PathBuf::from(global.config_path.as_str())
+                    .join("share-cache")
+                    .join(id.to_string());
+                let prefix = library
+                    .library_sync
+                    .share_prefix(cache_path.clone())
+                    .await
+                    .map_err(|_| ShareSyncFailure::ProbeFailed)?;
+                if let Entry::Vacant(entry) = sessions.entry(id) {
+                    let session = factory
+                        .open(&library.descriptor, &prefix, &global.credentials)
+                        .await?;
+                    entry.insert(session);
+                }
+                let session = sessions
+                    .get(&id)
+                    .cloned()
+                    .ok_or(ShareSyncFailure::ProbeFailed)?;
+                let pending = library
+                    .library_sync
+                    .share_pending_changes(cache_path.clone())
+                    .await
+                    .map_err(|_| ShareSyncFailure::StoreUnavailable)?;
+                let schedule = schedules.entry(id).or_default();
+                let now = Instant::now();
+                if let Some(pending) = pending {
+                    if schedule.observed_head != Some(pending.journal_head) {
+                        schedule.observed_head = Some(pending.journal_head);
+                        schedule.last_change = Some(now);
+                    }
+                    schedule.pending_change = Some(pending.change);
+                }
+                let foreground = global
+                    .current_ui()
+                    .await
+                    .ok()
+                    .and_then(|params| params.library_id)
+                    == Some(id);
+                let poll_interval = if foreground {
+                    timers.foreground_pull
+                } else {
+                    timers.background_pull
+                };
+                let pull_due = schedule
+                    .last_pull
+                    .is_none_or(|last| last.elapsed() >= poll_interval);
+                let push_due = schedule.last_pull.is_none()
+                    || schedule.last_push.elapsed() >= timers.idle_push
+                    || pending.is_some_and(|_| match schedule.pending_change {
+                        Some(PendingShareChange::StatisticsOnly) => {
+                            schedule.last_push.elapsed() >= timers.statistics_push
+                        }
+                        Some(PendingShareChange::Content) => schedule
+                            .last_change
+                            .is_some_and(|last| last.elapsed() >= timers.push_debounce),
+                        None => false,
+                    });
+                if !pull_due && !push_due {
+                    return Ok(false);
+                }
+                let pass_notify = pass_notification(&global, &library, &notify).await;
+                let pulled = share_sync_pass(
+                    &library.library_sync,
+                    library.library_id,
+                    cache_path,
+                    &session,
+                    if push_due {
+                        SharePass::PullAndPush
+                    } else {
+                        SharePass::PullOnly
+                    },
+                    || pass_notify(),
+                )
+                .await?;
+                schedule.last_pull = Some(now);
+                if push_due {
+                    schedule.last_push = now;
+                }
+                Ok(pulled || push_due)
+            };
+            let Some(result) = select_share_cancellation(cancel.clone(), operation).await else {
+                return;
+            };
+            match result {
+                Ok(did_work) => {
+                    retry.remove(&id);
+                    if did_work {
+                        global.gui_broadcaster.broadcast(&LibrarySyncStatusUpdated {
+                            library_id: id.to_string(),
+                            share_failure: None,
+                        });
+                    }
+                }
+                Err(failure) => {
+                    let previous = retry.get(&id).map(|(delay, _)| *delay);
+                    let (wait, next_delay) = next_share_backoff(previous);
+                    retry.insert(id, (next_delay, Instant::now() + wait));
+                    global.gui_broadcaster.broadcast(&LibrarySyncStatusUpdated {
+                        library_id: id.to_string(),
+                        share_failure: Some(failure),
+                    });
+                }
+            }
+        }
+    }
+}
+
+async fn flush_share_worker(
+    global: &Weak<NodeContext>,
+    sessions: &HashMap<Uuid, ShareStoreSession>,
+    notify: &Arc<dyn Fn() + Send + Sync>,
+) {
+    let Some(global) = global.upgrade() else {
+        return;
+    };
+    let Ok(ids) = global.library_pool.served_library_ids().await else {
+        return;
+    };
+    for id in ids {
+        let Some(session) = sessions.get(&id) else {
+            continue;
+        };
+        let Ok(Some(library)) = global.library_pool.acquire_served(id).await else {
+            continue;
+        };
+        if !matches!(library.descriptor.catalog, CatalogPlacement::InShare(_)) {
+            continue;
+        }
+        let cache_path = PathBuf::from(global.config_path.as_str())
+            .join("share-cache")
+            .join(id.to_string());
+        let pass_notify = pass_notification(&global, &library, notify).await;
+        if let Err(error) = share_sync_pass(
+            &library.library_sync,
+            library.library_id,
+            cache_path,
+            session,
+            SharePass::PullAndPush,
+            || pass_notify(),
+        )
+        .await
+        {
+            log::warn!("Final share publication failed: {error:?}");
+        }
+    }
+}
+
+fn share_pull_failure(error: SharePullError) -> ShareSyncFailure {
+    match error {
+        SharePullError::ShareChanged => ShareSyncFailure::ShareChanged,
+        SharePullError::ReadOnly => ShareSyncFailure::ReadOnlyShare,
+        SharePullError::CredentialsRejected => ShareSyncFailure::CredentialsRejected,
+        SharePullError::MissingObject(_) => ShareSyncFailure::ObjectMissing,
+        SharePullError::Transient(_) | SharePullError::Store(_) => {
+            ShareSyncFailure::StoreUnavailable
+        }
+        SharePullError::Invalid(_) | SharePullError::Cancelled => ShareSyncFailure::ProbeFailed,
+    }
+}
+
+fn share_push_failure(error: SharePushError) -> ShareSyncFailure {
+    match error {
+        SharePushError::ShareChanged => ShareSyncFailure::ShareChanged,
+        SharePushError::ReadOnly => ShareSyncFailure::ReadOnlyShare,
+        SharePushError::CredentialsRejected => ShareSyncFailure::CredentialsRejected,
+        SharePushError::MissingObject => ShareSyncFailure::ObjectMissing,
+        SharePushError::Failed(_) | SharePushError::NeedsBase | SharePushError::StaleHead => {
+            ShareSyncFailure::StoreUnavailable
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "sync_worker_tests.rs"]
+mod share_worker_tests;
 
 async fn eligible_libraries(global: &NodeContext) -> Vec<Uuid> {
     match global.library_pool.served_library_ids().await {
@@ -307,7 +759,7 @@ async fn maintain_metadata(global: Weak<NodeContext>, cancel: tokio_util::sync::
         for id in ids {
             let library = tokio::select! {
                 _ = cancel.cancelled() => return,
-                library = global.library_pool.acquire_served(id) => library,
+                library = global.library_pool.acquire_served_background(id) => library,
             };
             let library = match library {
                 Ok(Some(library)) => library,
@@ -347,11 +799,11 @@ async fn pass_notification(
         .await
         .ok()
         .and_then(|params| params.library_id)
-        == Some(library.descriptor.library_id)
+        == Some(library.library_id)
     {
         ui_notify.clone()
     } else {
-        library_notification(global, &library.descriptor.app_name())
+        library_notification(global, &library.display_name.clone())
     }
 }
 
@@ -372,7 +824,7 @@ async fn verify_managed_audio(
         verifiers.retain(|id, _| ids.contains(id));
         for id in ids {
             let result = async {
-                let Some(library) = global.library_pool.acquire_served(id).await? else {
+                let Some(library) = global.library_pool.acquire_served_background(id).await? else {
                     return Ok(());
                 };
                 let step = verifiers
@@ -438,9 +890,11 @@ async fn run_loop(
             let Some(global) = global.upgrade() else {
                 return (key, Duration::from_secs(30), false);
             };
+            let library_cancel = global.sync_library_token(id).await;
             let library = tokio::select! {
                 _ = cancel.cancelled() => return (key, Duration::from_secs(30), false),
-                library = global.library_pool.acquire_served(id) => library,
+                _ = library_cancel.cancelled() => return (key, Duration::from_secs(30), false),
+                library = global.library_pool.acquire_served_background(id) => library,
             };
             let library = match library {
                 Ok(Some(library)) => library,
@@ -454,6 +908,10 @@ async fn run_loop(
             for endpoint in hosts {
                 let result = tokio::select! {
                     _ = cancel.cancelled() => return (key, Duration::from_secs(30), false),
+                    _ = library_cancel.cancelled() => {
+                        locks.lock().await.remove(&(endpoint.fingerprint.clone(), id));
+                        return (key, Duration::from_secs(30), false);
+                    },
                     _ = wait_for_revocation(Arc::downgrade(&global), &endpoint.fingerprint, &endpoint.trusted_host) => Err(anyhow::anyhow!("peer permission revoked")),
                     result = async {
                         let options = PassOptions { credentials: &credentials, metadata, locks: &locks, cancel: &cancel };
@@ -642,8 +1100,8 @@ async fn peer_may_sync(
     action: Action,
 ) -> bool {
     let is_authority = matches!(
-        &library.descriptor.authority,
-        LibraryAuthority::Hosted { fingerprint: authority } if authority == fingerprint
+        &library.descriptor.protocol,
+        ProtocolAdapter::RuneForward { owner_fingerprint: authority, mode: RuneForwardMode::Replica { .. } } if authority == fingerprint
     );
     let peer = global
         .permission_manager
@@ -735,7 +1193,7 @@ impl TestPeerSession {
         };
         let library = global
             .library_pool
-            .acquire(params.library_id.unwrap())
+            .acquire_background(params.library_id.unwrap())
             .await?;
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
         classify_peer_pass(
@@ -792,13 +1250,13 @@ async fn sync_one(
         let lock = {
             let mut locks = locks.lock().await;
             locks
-                .entry((endpoint.fingerprint.clone(), library.descriptor.library_id))
+                .entry((endpoint.fingerprint.clone(), library.library_id))
                 .or_insert_with(|| Arc::new(Mutex::new(PeerSession::default())))
                 .clone()
         };
         let mut state = lock.lock().await;
         state.last_used = std_time::Instant::now();
-        let expected_base = peer_base(&endpoint.host, endpoint.port);
+        let expected_base = peer_base(&endpoint.host, endpoint.port)?;
         if state
             .client
             .as_ref()
@@ -838,7 +1296,7 @@ async fn sync_one(
             {
                 return Ok(true);
             }
-            let library_id = library.descriptor.library_id;
+            let library_id = library.library_id;
             // Their changes are applied here only from the authority or a SyncPush grant;
             // ours are sent only to the authority or a peer granted SyncPull.
             let may_receive = peer_may_sync(
@@ -869,7 +1327,12 @@ async fn sync_one(
                 result = operation => result,
             };
             if result.as_ref().err().is_some_and(metadata_unauthorized) {
-                invalidate_sync_token(global, &endpoint.fingerprint, &endpoint.host, endpoint.port);
+                invalidate_sync_token(
+                    global,
+                    &endpoint.fingerprint,
+                    &endpoint.host,
+                    endpoint.port,
+                )?;
                 state.client = None;
                 if attempt == 0 {
                     continue;
@@ -880,9 +1343,7 @@ async fn sync_one(
         unreachable!()
     } else {
         let local = library.library_sync.identity().await?;
-        let playback_queue = global
-            .session_queue_for_library(library.descriptor.library_id)
-            .await?;
+        let playback_queue = global.session_queue_for_library(library.library_id).await?;
         for attempt in 0..2 {
             let (base, client) = authenticated_client(
                 global,
@@ -919,7 +1380,12 @@ async fn sync_one(
             }
             .await;
             if result.as_ref().err().is_some_and(metadata_unauthorized) {
-                invalidate_sync_token(global, &endpoint.fingerprint, &endpoint.host, endpoint.port);
+                invalidate_sync_token(
+                    global,
+                    &endpoint.fingerprint,
+                    &endpoint.host,
+                    endpoint.port,
+                )?;
                 if attempt == 0 {
                     continue;
                 }
@@ -1155,13 +1621,15 @@ pub(super) async fn authenticated_client(
     let validator = global.cert_validator.read().await.clone();
     let trusted = validator.get_hosts_for_fingerprint(fingerprint).await;
     ensure!(
-        trusted.iter().any(|candidate| endpoint_host_port(candidate)
-            .is_some_and(|(trusted_host, trusted_port)| trusted_host == host
-                && trusted_port.is_none_or(|port| port == peer_port))),
+        trusted.iter().any(|candidate| {
+            candidate
+                .parse::<DeviceAddress>()
+                .is_ok_and(|address| address.host() == host && address.port() == peer_port)
+        }),
         "peer endpoint is not trusted"
     );
     let tls = tls_config(validator, fingerprint);
-    let base = peer_base(host, peer_port);
+    let base = peer_base(host, peer_port)?;
     let client = reqwest::Client::builder()
         .use_preconfigured_tls(tls)
         .connect_timeout(Duration::from_secs(10))
@@ -1214,7 +1682,7 @@ where
         return Ok(response);
     }
 
-    invalidate_sync_token(global, fingerprint, host, peer_port);
+    invalidate_sync_token(global, fingerprint, host, peer_port)?;
     let (base, client) =
         authenticated_client(global, own, private_key, fingerprint, host, peer_port).await?;
     Ok(request(&base, &client).send().await?)
@@ -1251,19 +1719,16 @@ pub(crate) fn invalidate_sync_token(
     fingerprint: &str,
     host: &str,
     port: u16,
-) {
-    global
-        .sync_tokens
-        .invalidate(fingerprint, &peer_base(host, port));
+) -> Result<()> {
+    let base = peer_base(host, port)?;
+    global.sync_tokens.invalidate(fingerprint, &base);
+    Ok(())
 }
 
 /// The base URL of a peer's HTTPS server, bracketing IPv6 hosts.
-pub(crate) fn peer_base(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("https://[{host}]:{port}")
-    } else {
-        format!("https://{host}:{port}")
-    }
+pub(crate) fn peer_base(host: &str, port: u16) -> Result<String> {
+    let url = device_url(host, port, "https", "/").map_err(anyhow::Error::msg)?;
+    Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
 pub(crate) async fn obtain_token(
@@ -1443,7 +1908,7 @@ impl RenewableAudio {
             &self.endpoint.fingerprint,
             &self.endpoint.host,
             self.endpoint.port,
-        );
+        )?;
         let result = tokio::select! {
             _ = self.cancel.cancelled() => anyhow::bail!(RemoteAudioError::AccessRevoked),
             result = authenticated_client(&global, &self.own, &self.private_key, &self.endpoint.fingerprint, &self.endpoint.host, self.endpoint.port) => result,
@@ -1770,71 +2235,99 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ready = reqwest::get(format!("{base}/sync/metadata")).await.unwrap();
+        assert_eq!(ready.status(), StatusCode::METHOD_NOT_ALLOWED);
         let peer =
             http_request::sync::MetadataPeer::<RuneModel>::new(&base, reqwest::Client::new());
         let error = anyhow::Error::new(peer.identity().await.unwrap_err());
-        assert!(metadata_unauthorized(&error));
+        assert!(metadata_unauthorized(&error), "{error:#}");
         assert!(!metadata_unauthorized(&anyhow::anyhow!("network failure")));
         server.abort();
     }
 
     #[test]
-    fn explicit_and_advertised_endpoint_hosts_preserve_ports() {
-        assert_eq!(
-            endpoint_host_port("127.0.0.1:4321"),
-            Some(("127.0.0.1".into(), Some(4321)))
-        );
-        assert_eq!(
-            endpoint_host_port("[::1]:5432"),
-            Some(("::1".into(), Some(5432)))
-        );
-        assert_eq!(endpoint_host_port("::1"), Some(("::1".into(), None)));
-        assert_eq!(
-            endpoint_host_port("peer.example:7654"),
-            Some(("peer.example".into(), Some(7654)))
-        );
-        assert_eq!(endpoint_host_port("peer.example:0"), None);
+    fn trusted_endpoint_addresses_resolve_hosts_and_ports() {
+        for (input, host, port) in [
+            ("127.0.0.1:4321", "127.0.0.1", 4321),
+            ("[::1]:5432", "::1", 5432),
+            ("::1", "::1", 7863),
+            ("peer.example:7654", "peer.example", 7654),
+            ("peer.example", "peer.example", 7863),
+        ] {
+            let address = input.parse::<DeviceAddress>().unwrap();
+            assert_eq!(address.host(), host);
+            assert_eq!(address.port(), port);
+        }
+        assert!("peer.example:0".parse::<DeviceAddress>().is_err());
     }
 
     #[tokio::test]
     async fn audio_range_requires_expected_status_and_content_range() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use axum::{
+            Router,
+            body::Body,
+            http::{
+                HeaderValue,
+                header::{CONTENT_LENGTH, CONTENT_RANGE},
+            },
+            response::Response,
+            routing::get,
+        };
+
+        fn response(status: StatusCode, content_range: Option<&'static str>) -> Response {
+            let mut response = Response::new(Body::from("data"));
+            *response.status_mut() = status;
+            response
+                .headers_mut()
+                .insert(CONTENT_LENGTH, HeaderValue::from_static("4"));
+            if let Some(content_range) = content_range {
+                response
+                    .headers_mut()
+                    .insert(CONTENT_RANGE, HeaderValue::from_static(content_range));
+            }
+            response
+        }
+
+        let app = Router::new()
+            .route(
+                "/wrong-status",
+                get(|| async { response(StatusCode::OK, None) }),
+            )
+            .route(
+                "/wrong-range",
+                get(|| async { response(StatusCode::PARTIAL_CONTENT, Some("bytes 0-3/8")) }),
+            )
+            .route(
+                "/valid-range",
+                get(|| async { response(StatusCode::PARTIAL_CONTENT, Some("bytes 4-7/8")) }),
+            );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            for response in [
-                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
-                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/8\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
-                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-7/8\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
-            ] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0; 1024];
-                let _ = socket.read(&mut request).await.unwrap();
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        for should_accept in [false, false, true] {
+        for (path, should_accept) in [
+            ("/wrong-status", false),
+            ("/wrong-range", false),
+            ("/valid-range", true),
+        ] {
             let response = client
-                .get(format!("http://{address}/audio"))
+                .get(format!("http://{address}{path}"))
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(
-                validate_audio_response(&response, 8, Some((4, Some(7)))).is_ok(),
-                should_accept
-            );
+            let accepted = validate_audio_response(&response, 8, Some((4, Some(7)))).is_ok();
+            let body = response.bytes().await.unwrap();
+            assert_eq!(body.as_ref(), b"data");
+            assert_eq!(accepted, should_accept);
         }
-        server.await.unwrap();
+        server.abort();
     }
 
     #[tokio::test]
     async fn blocked_audio_does_not_stop_independent_metadata_worker() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncReadExt;
         let audio_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let metadata_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let audio_addr = audio_listener.local_addr().unwrap();
-        let metadata_addr = metadata_listener.local_addr().unwrap();
         let cancel = CancellationToken::new();
         let audio_started = Arc::new(Notify::new());
         let audio_server = tokio::spawn({
@@ -1843,10 +2336,6 @@ mod tests {
                 let (_stream, _) = audio_listener.accept().await.unwrap();
                 cancel.cancelled().await;
             }
-        });
-        let metadata_server = tokio::spawn(async move {
-            let (mut stream, _) = metadata_listener.accept().await.unwrap();
-            stream.write_all(b"ok").await.unwrap();
         });
         let (done_tx, done_rx) = oneshot::channel();
         let audio = {
@@ -1863,10 +2352,7 @@ mod tests {
             let audio_started = audio_started.clone();
             async move {
                 audio_started.notified().await;
-                let mut stream = TcpStream::connect(metadata_addr).await.unwrap();
-                let mut bytes = [0; 2];
-                stream.read_exact(&mut bytes).await.unwrap();
-                done_tx.send(bytes).unwrap();
+                done_tx.send(*b"ok").unwrap();
             }
         };
         let workers = tokio::spawn(join_workers(metadata, audio));
@@ -1883,7 +2369,6 @@ mod tests {
             .unwrap()
             .unwrap();
         audio_server.await.unwrap();
-        metadata_server.await.unwrap();
     }
 
     #[test]
@@ -1970,6 +2455,30 @@ pub(crate) fn tls_config(
 /// Resolves an unmaterialized catalog track at playback time using paired peers.
 pub struct PairedAudioResolver(pub Weak<NodeContext>, pub String);
 impl PlaybackSourceResolver for PairedAudioResolver {
+    fn resolve_track(
+        &self,
+        library_id: String,
+        track: String,
+    ) -> BoxFuture<'static, Result<LibraryTrackKey>> {
+        let node = self.0.clone();
+        Box::pin(async move {
+            let owner = node.upgrade().context("Node stopped")?;
+            let library_id = library_id.parse()?;
+            let registry = LibraryRegistry::load(Path::new(&*owner.config_path))?;
+            let record = registry
+                .record(LibraryRecordId(library_id))
+                .or_else(|_| registry.catalog(library_id))
+                .map_err(|_| anyhow::Error::new(RemoteAudioError::LibraryUnavailable))?;
+            if matches!(&record.protocol, ProtocolAdapter::SubsonicTranslate { .. }) {
+                Ok(LibraryTrackKey::Subsonic(track))
+            } else {
+                Ok(LibraryTrackKey::Rune(
+                    Uuid::parse_str(&track).context("Invalid Rune library track UUID")?,
+                ))
+            }
+        })
+    }
+
     fn for_library(
         &self,
         library_id: String,
@@ -2032,6 +2541,18 @@ impl PlaybackSourceResolver for PairedAudioResolver {
                 .manager()?
                 .resolve_remote_audio(&library, owner.token.child_token(), id)
                 .await
+        })
+    }
+
+    fn resolve_subsonic(
+        &self,
+        item: SubsonicItem,
+    ) -> BoxFuture<'static, Result<RemoteAudioSource>> {
+        let node = self.0.clone();
+        Box::pin(async move {
+            let owner = node.upgrade().context("Node stopped")?;
+            let binding = subsonic_binding_for_playback(&owner, item.library_id).await?;
+            binding.playback_source(item).await
         })
     }
 }

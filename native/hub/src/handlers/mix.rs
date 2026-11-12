@@ -12,8 +12,7 @@ use ::database::actions::{
 
 use crate::library_pool::LibraryHandle;
 use crate::utils::{
-    GlobalParams, ParamsExtractor, RunningMode, parse_media_files, process_cover_art_map,
-    require_library,
+    GlobalParams, ParamsExtractor, parse_media_files, process_cover_art_map, require_library,
 };
 use crate::{Session, Signal, messages::*};
 
@@ -46,6 +45,7 @@ impl Signal for FetchAllMixesRequest {
             .with_context(|| "Failed to fetch all mixes")?;
 
         Ok(Some(FetchAllMixesResponse {
+            call_id: None,
             mixes: mixes
                 .into_iter()
                 .map(|mix| Mix {
@@ -100,6 +100,7 @@ impl Signal for CreateMixRequest {
         .with_context(|| "Failed to create mix")?;
 
         Ok(Some(CreateMixResponse {
+            call_id: None,
             mix: Mix {
                 id: mix.id,
                 name: mix.name,
@@ -154,6 +155,7 @@ impl Signal for UpdateMixRequest {
         .with_context(|| "Failed to update mix metadata")?;
 
         Ok(Some(UpdateMixResponse {
+            call_id: None,
             mix: Mix {
                 id: mix.id,
                 name: mix.name,
@@ -191,6 +193,7 @@ impl Signal for RemoveMixRequest {
             .with_context(|| format!("Failed to remove mix with id: {}", request.mix_id))?;
 
         Ok(Some(RemoveMixResponse {
+            call_id: None,
             mix_id: request.mix_id,
             success: true,
         }))
@@ -235,7 +238,10 @@ impl Signal for AddItemToMixRequest {
             )
         })?;
 
-        Ok(Some(AddItemToMixResponse { success: true }))
+        Ok(Some(AddItemToMixResponse {
+            call_id: None,
+            success: true,
+        }))
     }
 }
 
@@ -265,6 +271,7 @@ impl Signal for GetMixByIdRequest {
             .with_context(|| format!("Failed to get mix by id: {}", request.mix_id))?;
 
         Ok(Some(GetMixByIdResponse {
+            call_id: None,
             mix: Mix {
                 id: mix.id,
                 name: mix.name,
@@ -277,35 +284,24 @@ impl Signal for GetMixByIdRequest {
 }
 
 impl ParamsExtractor for MixQueryRequest {
-    type Params = (
-        Option<LibraryHandle>,
-        Arc<String>,
-        Arc<NodeContext>,
-        RunningMode,
-    );
+    type Params = (Option<LibraryHandle>, Arc<String>, Arc<NodeContext>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
         (
             all_params.library.clone(),
             Arc::clone(&all_params.node_id),
             all_params.node.clone(),
-            all_params.running_mode,
         )
     }
 }
 
 impl Signal for MixQueryRequest {
-    type Params = (
-        Option<LibraryHandle>,
-        Arc<String>,
-        Arc<NodeContext>,
-        RunningMode,
-    );
+    type Params = (Option<LibraryHandle>, Arc<String>, Arc<NodeContext>);
     type Response = MixQueryResponse;
 
     async fn handle(
         &self,
-        (library, node_id, node, running_mode): Self::Params,
+        (library, node_id, node): Self::Params,
         session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -320,9 +316,7 @@ impl Signal for MixQueryRequest {
             .map(|x| (x.operator, x.parameter))
             .collect();
 
-        let queue = node
-            .session_queue_for_library(library.descriptor.library_id)
-            .await?;
+        let queue = node.session_queue_for_library(library.library_id).await?;
         let media_entries = query_mix_media_files(
             &library.main_db,
             &library.recommend_db,
@@ -343,6 +337,7 @@ impl Signal for MixQueryRequest {
             &library.fsio,
             &library.main_db,
             &node_id,
+            &library.library_id.to_string(),
             media_summaries,
             lib_path,
         )
@@ -352,15 +347,11 @@ impl Signal for MixQueryRequest {
         } else {
             HashMap::new()
         };
-        let remote_host = session.map(|session| session.host);
-        let cover_art_map = process_cover_art_map(
-            cover_art_map,
-            library.descriptor.library_id,
-            &running_mode,
-            &remote_host,
-        );
+        let cover_art_map =
+            process_cover_art_map(cover_art_map, library.library_id, session.as_ref());
 
         Ok(Some(MixQueryResponse {
+            call_id: None,
             files,
             cover_art_map,
         }))
@@ -393,6 +384,7 @@ impl Signal for FetchMixQueriesRequest {
             .with_context(|| "Unable to get mix queries files")?;
 
         Ok(Some(FetchMixQueriesResponse {
+            call_id: None,
             result: queries
                 .into_iter()
                 .map(|x| crate::messages::StoredMixQuery {

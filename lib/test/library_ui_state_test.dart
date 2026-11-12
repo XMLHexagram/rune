@@ -74,8 +74,8 @@ void main() {
       (device) => 'From $device',
       s.readOnly,
     );
-    expect(row('/one', {'peer': 'Laptop'}).subtitle, 'From Laptop · Read only');
-    expect(row('/one').subtitle, 'From Music · Read only');
+    expect(row('/one', {'peer': 'Laptop'}).subtitle, 'From Laptop');
+    expect(row('/one').subtitle, 'From Music');
     expect(row('/one').library?.backgroundSync, true);
     expect(row('/two').subtitle, '/two');
     expect(row('/two').library?.backgroundSync, false);
@@ -131,31 +131,5 @@ void main() {
     expect(row('/two').subtitle, 'described /two');
     expect(row('/missing').subtitle, 'described /missing');
     expect(row('/one').subtitle, startsWith('From Music'));
-  });
-  test('only the current read replica is read only', () {
-    LocalLibrary library(String path, String? owner, DeviceSyncLevel? level) =>
-        LocalLibrary(
-          libraryId: path,
-          alias: path,
-          path: path,
-          ownerFingerprint: owner,
-          backgroundSync: true,
-          connectionAccess: level == DeviceSyncLevel.none
-              ? DeviceConnectionLevel.none
-              : DeviceConnectionLevel.view,
-          syncAccess: level,
-        );
-    final libraries = [
-      library('/owned', null, DeviceSyncLevel.pull),
-      library('/read', 'peer', DeviceSyncLevel.pull),
-      library('/write', 'peer', DeviceSyncLevel.pullPush),
-      library('/unknown', 'peer', null),
-    ];
-    expect(currentLibraryIsReadOnly('/owned', libraries), false);
-    expect(currentLibraryIsReadOnly('/read', libraries), true);
-    expect(currentLibraryIsReadOnly('/write', libraries), false);
-    expect(currentLibraryIsReadOnly('/unknown', libraries), false);
-    expect(currentLibraryIsReadOnly('/missing', libraries), false);
-    expect(currentLibraryIsReadOnly('@RR|/read', libraries), false);
   });
 }

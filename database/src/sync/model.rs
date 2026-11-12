@@ -5,7 +5,7 @@ use crate::entities::*;
 use migration::catalog_identity::{self, ParentKind};
 use sea_orm::{ColumnTrait, Condition, DbErr, Value, sea_query::Expr};
 use serde::{Deserialize, Serialize};
-use sync_orm::row_policy::{FieldCodec, RowView};
+use sync_orm::row_policy::{BinaryValue, FieldCodec, RowView};
 use uuid::Uuid;
 
 /// Maximum fingerprint size included in synchronization.
@@ -215,7 +215,7 @@ sync_orm::row_policies! {
     Collection,
     Payload {
         model: "rune.library",
-        schema: "1",
+        schema: "2",
         collections: {
             Albums => {
                 tag: "albums",
@@ -361,7 +361,7 @@ sync_orm::row_policies! {
                         media_files::Column::LocalAvailable => false,
                         media_files::Column::CoverArtCheckedAt => None::<String>,
                     },
-                    local_reads: [media_files::Column::LocalAvailable, media_files::Column::FileName],
+                    local_reads: [media_files::Column::LocalAvailable, media_files::Column::FileName, media_files::Column::ChangeToken],
                     lists: {
                         metadata: MetadataTag => {
                             entity: media_metadata::Entity,
@@ -637,7 +637,7 @@ sync_orm::row_policies! {
                     uuid: media_file_fingerprint::Column::HlcUuid,
                     fields: {
                         file_id: Uuid => media_file_fingerprint::Column::TrackUuid,
-                        bytes: Vec<u8> => media_file_fingerprint::Column::Fingerprint,
+                        bytes: BinaryValue => media_file_fingerprint::Column::Fingerprint,
                         is_duplicated: i32 => media_file_fingerprint::Column::IsDuplicated,
                         source_hash: Option<String> => media_file_fingerprint::Column::SourceHash,
                         source_size: Option<i64> => media_file_fingerprint::Column::SourceSize,

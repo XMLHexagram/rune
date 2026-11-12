@@ -1,5 +1,6 @@
 use crate::access_policy::Action;
 use discovery::access_policy::{AccessPolicy, PeerIdentity};
+use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
@@ -9,21 +10,71 @@ use axum::{
         ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
+    http::{HeaderMap, HeaderName, HeaderValue},
     response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
-use tokio::sync::{broadcast::Receiver, mpsc};
+use tokio::{
+    sync::{Mutex, broadcast::Receiver, broadcast::error::RecvError, mpsc},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     Session,
-    backends::remote::{decode_message_with_library_id, encode_message},
-    messages::RemoteRequestFailed,
+    backends::remote::{decode_message, decode_message_with_library_id, encode_message},
+    macros::capability_snapshot,
+    messages::{RemoteRequestFailed, RequestCapabilities, RequestCapability},
+    node::NodeContext,
     request_error::{FailedCall, classify, request_failure_cause},
     server::{ServerState, sync_auth::AuthenticatedFingerprint},
 };
+use discovery::endpoint::{DEFAULT_DEVICE_PORT, device_url};
+use discovery::protocol_version::{
+    Compatibility, DEVICE_ALIAS_HEADER, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, ProtocolVersion,
+    compatibility,
+};
 use discovery::server::{User, UserStatus};
+
+async fn capabilities_for_peer(
+    node: &NodeContext,
+    peer: &PeerIdentity,
+) -> Option<RequestCapabilities> {
+    let capabilities = capability_snapshot(node).ok()?;
+    let library_id = node
+        .current_ui()
+        .await
+        .ok()
+        .and_then(|params| params.library_id);
+    Some(node.capabilities_for_peer(capabilities, peer, library_id))
+}
+
+fn tailor_capability_message(
+    message: Vec<u8>,
+    capabilities: Option<&RequestCapabilities>,
+) -> Vec<u8> {
+    let Some(capabilities) = capabilities else {
+        return message;
+    };
+    let Some((name, _, request_id)) = decode_message(&message) else {
+        return message;
+    };
+    if name != "RequestCapabilities" {
+        return message;
+    }
+    match rinf::serialize(capabilities) {
+        Ok(payload) => encode_message(&name, &payload, Some(request_id)),
+        Err(error) => {
+            error!("Could not encode controller capabilities: {error}");
+            message
+        }
+    }
+}
+
+fn is_capability_message(message: &[u8]) -> bool {
+    decode_message(message).is_some_and(|(name, _, _)| name == "RequestCapabilities")
+}
 
 pub async fn websocket_handler(
     ws: WebSocketUpgrade,
@@ -31,7 +82,28 @@ pub async fn websocket_handler(
     Query(params): Query<HashMap<String, String>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
 ) -> Response {
+    let (local_version, local_alias) = {
+        let info = state.discovery_device_info.read().await;
+        (
+            info.protocol_version.unwrap_or(PROTOCOL_VERSION),
+            info.alias.clone(),
+        )
+    };
+    let version_header = HeaderName::from_static(PROTOCOL_VERSION_HEADER);
+    let mut response_headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&local_version.to_string()) {
+        response_headers.insert(version_header.clone(), value);
+    }
+    // The client names this device in its "needs update" message.
+    if let Ok(alias) = HeaderValue::from_str(&local_alias) {
+        response_headers.insert(HeaderName::from_static(DEVICE_ALIAS_HEADER), alias);
+    }
+    let peer_version = headers
+        .get(&version_header)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| ProtocolVersion::parse(value).ok());
     let host = params
         .get("host")
         .cloned()
@@ -45,10 +117,26 @@ pub async fn websocket_handler(
         .filter(|user| user.status == UserStatus::Approved);
     match user {
         Some(user) => {
+            let compatible = peer_version.is_some_and(|version| {
+                matches!(
+                    compatibility(local_version, version),
+                    Compatibility::Compatible { .. }
+                )
+            });
+            if !compatible {
+                return (StatusCode::UPGRADE_REQUIRED, response_headers).into_response();
+            }
             info!("Connection authorized for {} @ {}", user.alias, addr);
-            let host = format!("https://{host}:7863");
+            let Ok(host) = device_url(&host, DEFAULT_DEVICE_PORT, "https", "/") else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            let host = host.to_string();
             let broadcast_rx = state.websocket_service.broadcast_tx.subscribe();
-            ws.on_upgrade(move |socket| handle_socket(socket, state, user, host, broadcast_rx))
+            (
+                response_headers,
+                ws.on_upgrade(move |socket| handle_socket(socket, state, user, host, broadcast_rx)),
+            )
+                .into_response()
         }
         None => {
             warn!("Unauthorized connection attempt from {}", addr);
@@ -85,6 +173,7 @@ pub async fn handle_socket(
     let controller_cancel = controller_guard
         .as_ref()
         .map(|guard| guard.cancellation_token());
+    let is_controller = controller_cancel.is_some();
     drop(node);
     let peer = PeerIdentity {
         fingerprint: user.fingerprint.clone(),
@@ -115,7 +204,8 @@ pub async fn handle_socket(
             drop(guard);
         })
     };
-    let (mut sender, mut receiver) = socket.split();
+    let (mut sender, receiver) = socket.split();
+    let receiver = Arc::new(Mutex::new(receiver));
     let (tx, mut rx) = mpsc::channel(32);
 
     let alias = user.alias.clone();
@@ -138,62 +228,85 @@ pub async fn handle_socket(
     let incoming_tx = tx.clone();
     let incoming_alias = alias.clone();
     let incoming_public_key = peer.public_key.clone();
+    let incoming_receiver = receiver.clone();
+    let outgoing_node = state.node.clone();
+    enum IncomingEnd {
+        PeerClose(Option<CloseFrame>),
+        Ended,
+    }
     let incoming = async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            if let WsMessage::Binary(payload) = msg
-                && let Some((msg_type, msg_payload, uuid, library_id)) =
-                    decode_message_with_library_id(&payload)
-            {
-                debug!("[{incoming_alias}] Received: {msg_type}");
-
-                let Some(node) = state.node.upgrade() else {
+        loop {
+            let message = incoming_receiver.lock().await.next().await;
+            let msg = match message {
+                Some(Ok(msg)) => msg,
+                Some(Err(error)) => {
+                    warn!("[{incoming_alias}] WebSocket receive failed: {error}");
                     break;
-                };
-                let result = state
-                    .websocket_service
-                    .handle_addressed_message(
-                        &msg_type,
-                        msg_payload,
-                        Some(Session {
-                            fingerprint: fingerprint.to_owned(),
-                            public_key: incoming_public_key.clone(),
-                            host: host.to_owned(),
-                        }),
-                        library_id,
-                        &node,
-                    )
-                    .await;
-                if let Some((resp_type, response)) = result {
-                    let (response_type, response) = match response {
-                        Ok(response) => (resp_type, response),
-                        Err(e) => {
-                            error!("[{incoming_alias}] Failed to handle {msg_type}: {e:#}");
-                            let failure = remote_failure(msg_type, &e);
-                            match rinf::serialize(&failure) {
-                                Ok(payload) => ("RemoteRequestFailed".to_owned(), payload),
-                                Err(error) => {
-                                    error!(
-                                        "[{incoming_alias}] Failed to encode request failure: {error}"
-                                    );
-                                    continue;
+                }
+                None => break,
+            };
+            match msg {
+                WsMessage::Close(frame) => {
+                    return IncomingEnd::PeerClose(frame);
+                }
+                WsMessage::Binary(payload)
+                    if let Some((msg_type, msg_payload, uuid, library_id)) =
+                        decode_message_with_library_id(&payload) =>
+                {
+                    debug!("[{incoming_alias}] Received: {msg_type}");
+
+                    let Some(node) = state.node.upgrade() else {
+                        break;
+                    };
+                    let result = state
+                        .websocket_service
+                        .handle_addressed_message(
+                            &msg_type,
+                            msg_payload,
+                            Some(Session {
+                                fingerprint: fingerprint.to_owned(),
+                                public_key: incoming_public_key.clone(),
+                                host: host.to_owned(),
+                            }),
+                            library_id,
+                            &node,
+                        )
+                        .await;
+                    if let Some((resp_type, response)) = result {
+                        let (response_type, response) = match response {
+                            Ok(response) => (resp_type, response),
+                            Err(e) => {
+                                error!("[{incoming_alias}] Failed to handle {msg_type}: {e:#}");
+                                let failure = remote_failure(msg_type, &e);
+                                match rinf::serialize(&failure) {
+                                    Ok(payload) => ("RemoteRequestFailed".to_owned(), payload),
+                                    Err(error) => {
+                                        error!(
+                                            "[{incoming_alias}] Failed to encode request failure: {error}"
+                                        );
+                                        continue;
+                                    }
                                 }
                             }
-                        }
-                    };
+                        };
 
-                    let response_payload = encode_message(&response_type, &response, Some(uuid));
-                    if let Err(e) = incoming_tx
-                        .send(WsMessage::Binary(response_payload.into()))
-                        .await
-                    {
-                        error!("[{incoming_alias}] Failed to queue response: {e}");
-                        continue;
+                        let response_payload =
+                            encode_message(&response_type, &response, Some(uuid));
+                        if let Err(e) = incoming_tx
+                            .send(WsMessage::Binary(response_payload.into()))
+                            .await
+                        {
+                            error!("[{incoming_alias}] Failed to queue response: {e}");
+                            continue;
+                        }
                     }
                 }
+                _ => {}
             }
         }
 
         drop(incoming_tx);
+        IncomingEnd::Ended
     };
 
     // Clone alias for outgoing task
@@ -202,15 +315,68 @@ pub async fn handle_socket(
     let outgoing_policy = policy.clone();
     let outgoing_peer = peer.clone();
     let outgoing = async move {
-        while let Ok(msg) = broadcast_rx.recv().await {
+        let mut grant_changes = outgoing_policy.changes();
+        if is_controller
+            && let Some(node) = outgoing_node.upgrade()
+            && let Some(capabilities) = capabilities_for_peer(&node, &outgoing_peer).await
+            && capabilities.set_liked_request != RequestCapability::Available
+            && let Ok(payload) = rinf::serialize(&capabilities)
+        {
+            let message = encode_message("RequestCapabilities", &payload, None);
+            if broadcast_tx
+                .send(WsMessage::Binary(message.into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        loop {
+            let message = tokio::select! {
+                message = broadcast_rx.recv() => match message {
+                    Ok(message) => Some(message),
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                },
+                changed = grant_changes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let Some(node) = outgoing_node.upgrade() else {
+                        break;
+                    };
+                    if let Some(capabilities) = capabilities_for_peer(&node, &outgoing_peer).await
+                        && let Ok(payload) = rinf::serialize(&capabilities)
+                    {
+                        Some(encode_message("RequestCapabilities", &payload, None))
+                    } else {
+                        None
+                    }
+                }
+            };
+            let Some(message) = message else {
+                continue;
+            };
             if outgoing_policy
                 .check(&outgoing_peer, &Action::Control)
                 .is_err()
             {
                 continue;
             }
-            if let Err(e) = broadcast_tx.send(WsMessage::Binary(msg.into())).await {
-                error!("[{outgoing_alias}] Failed to queue broadcast: {e}");
+            let is_capability = is_capability_message(&message);
+            let Some(node) = outgoing_node.upgrade() else {
+                break;
+            };
+            let message = if is_capability {
+                let Some(capabilities) = capabilities_for_peer(&node, &outgoing_peer).await else {
+                    continue;
+                };
+                tailor_capability_message(message, Some(&capabilities))
+            } else {
+                message
+            };
+            if let Err(error) = broadcast_tx.send(WsMessage::Binary(message.into())).await {
+                error!("[{outgoing_alias}] Failed to queue broadcast: {error}");
                 break;
             }
         }
@@ -240,28 +406,67 @@ pub async fn handle_socket(
             None => std::future::pending().await,
         }
     };
-    let close = tokio::select! {
-        _ = incoming => None,
-        _ = outgoing => None,
-        _ = revoked => Some((4403, "revoked")),
-        _ = controller_cancelled => Some((4409, "detached")),
-        _ = session_cancel.cancelled() => Some((1001, "server stopping")),
+    let (close, drain_peer) = tokio::select! {
+        biased;
+        _ = session_cancel.cancelled() => (
+            Some(CloseFrame { code: 1001, reason: "server stopping".into() }),
+            true,
+        ),
+        end = incoming => match end {
+            IncomingEnd::PeerClose(frame) => (
+                Some(frame.unwrap_or(CloseFrame {
+                    code: 1000,
+                    reason: "".into(),
+                })),
+                false,
+            ),
+            IncomingEnd::Ended => (None, false),
+        },
+        _ = outgoing => (None, false),
+        _ = revoked => (
+            Some(CloseFrame { code: 4403, reason: "revoked".into() }),
+            true,
+        ),
+        _ = controller_cancelled => (
+            Some(CloseFrame { code: 4409, reason: "detached".into() }),
+            true,
+        ),
     };
-    if let Some((code, reason)) = close {
-        let _ = tx
-            .send(WsMessage::Close(Some(CloseFrame {
-                code,
-                reason: reason.into(),
-            })))
-            .await;
+    if let Some(frame) = close {
+        let _ = tx.send(WsMessage::Close(Some(frame))).await;
+        if drain_peer {
+            let drain = async {
+                let mut receiver = receiver.lock().await;
+                while let Some(message) = receiver.next().await {
+                    if matches!(message, Ok(WsMessage::Close(_)) | Err(_)) {
+                        break;
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(1), drain).await;
+        }
     }
     drop(tx);
     controller_watch_cancel.cancel();
     let _ = controller_watch.await;
 
-    // Wait for the send task to complete
-    let _ = send_task.await;
+    wait_for_send_task(send_task).await;
     info!("[{alias}] WebSocket connection closed");
+}
+
+async fn wait_for_send_task(mut send_task: JoinHandle<()>) {
+    match tokio::time::timeout(Duration::from_secs(1), &mut send_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if !error.is_cancelled() => {
+            warn!("WebSocket send task failed during shutdown: {error}");
+        }
+        Ok(Err(_)) => {}
+        Err(_) => {
+            send_task.abort();
+            let _ = send_task.await;
+            warn!("WebSocket send task did not stop within one second");
+        }
+    }
 }
 
 /// The failure frame for a request that failed on this node. It carries the
@@ -280,7 +485,9 @@ fn remote_failure(request: String, error: &anyhow::Error) -> RemoteRequestFailed
 
 #[cfg(test)]
 mod failure_tests {
-    use super::{FailedCall, remote_failure};
+    use super::{FailedCall, remote_failure, wait_for_send_task};
+    use std::time::Duration;
+    use tokio::time::timeout;
 
     #[test]
     fn failure_frame_names_the_failed_call() {
@@ -291,5 +498,13 @@ mod failure_tests {
         );
         let plain = anyhow::anyhow!("pause failed");
         assert_eq!(remote_failure("PauseRequest".into(), &plain).call_id, None);
+    }
+
+    #[tokio::test]
+    async fn stalled_send_task_is_cancelled_during_shutdown() {
+        let send_task = tokio::spawn(std::future::pending());
+        timeout(Duration::from_secs(3), wait_for_send_task(send_task))
+            .await
+            .expect("send task shutdown must be bounded");
     }
 }

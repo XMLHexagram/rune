@@ -148,6 +148,10 @@
   "@removeLibrary": {
     "description": "移除媒體庫的按鈕提示文字。按下此按鈕將從歷史記錄中刪除媒體庫條目。"
   },
+  "localFolder": "本機資料夾",
+  "localFolderSubtitle": "選擇此裝置上的資料夾。",
+  "runeDevice": "Rune 裝置",
+  "runeDeviceSubtitle": "連線到另一個 Rune 裝置。",
   "addLibrary": "添加媒體庫",
   "@addLibrary": {
     "description": "設置界面中創建新媒體庫的按鈕提示文字。按下此按鈕將引導用戶選擇一個目錄並創建媒體庫。"
@@ -985,11 +989,11 @@
   "@adaptiveSwitchingSubtitle": {
     "description": "播放設置頁面中條目的設置描述"
   },
-  "mixWithOthers": "與其他應用同時播放",
+  "mixWithOthers": "同時播放其他音訊",
   "@mixWithOthers": {
     "description": "播放設置頁面中條目的設置標題"
   },
-  "mixWithOthersSubtitle": "其他應用在 Rune 播放時繼續播放。開啟後，鎖屏、控制中心和耳機按鍵無法控制 Rune。",
+  "mixWithOthersSubtitle": "Rune 播放時，其他音訊仍會繼續播放。",
   "@mixWithOthersSubtitle": {
     "description": "播放設置頁面中條目的設置描述"
   },
@@ -1018,6 +1022,28 @@
   "loginFailedSubtitle": "嘗試登錄時出錯",
   "@loginFailedSubtitle": {
     "description": "登錄模態框中登入失敗按鈕的副標題。"
+  },
+  "scrobbleCredentialsRejected": "此服務拒絕了這些憑證。請檢查您的使用者名稱與密碼或權杖。",
+  "@scrobbleCredentialsRejected": {
+    "description": "Shown when a scrobbling service rejects the account credentials."
+  },
+  "scrobbleServiceUnreachable": "無法連接至此服務。請檢查網路連線後再試一次。",
+  "@scrobbleServiceUnreachable": {
+    "description": "Shown when a scrobbling service is unreachable or times out."
+  },
+  "scrobbleLastFmApiCredentialsMissing": "缺少 Last.fm 的{field}。",
+  "@scrobbleLastFmApiCredentialsMissing": {
+    "description": "Shown when the Last.fm API key or secret is missing.",
+    "placeholders": {
+      "field": {
+        "type": "String",
+        "example": "API Key"
+      }
+    }
+  },
+  "scrobbleLastFmApiCredentialsInvalid": "Last.fm 拒絕了 API 金鑰或密鑰。請檢查 API 憑證後再試一次。",
+  "@scrobbleLastFmApiCredentialsInvalid": {
+    "description": "Shown when Last.fm reports invalid API credentials."
   },
   "lastFmSubtitle": "使用此音樂跟蹤服務提供詳細的收聽見解。",
   "@lastFmSubtitle": {
@@ -1083,10 +1109,6 @@
   "@port": {
     "description": "URL 的埠部分。"
   },
-  "secured": "已加密",
-  "@secured": {
-    "description": "是否為加密連接。"
-  },
   "addConnection": "添加連接",
   "@addConnection": {
     "description": "對話框中的操作按鈕。"
@@ -1111,11 +1133,11 @@
   "@editDeviceInformationSubtitle": {
     "description": "強調更改將影響在他人掃描列表中的可見性。避免使用技術術語，突出“掃描”這一交互場景。"
   },
-  "enableBroadcast": "讓附近的裝置看見",
+  "enableBroadcast": "啟用廣播",
   "@enableBroadcast": {
     "description": "“廣播”意味著主動發送設備資訊。如目標語言中沒有直接對應詞彙，可優先使用“使可見”或“共享可用性”。"
   },
-  "enableBroadcastSubtitle": "讓附近的裝置找到此裝置。",
+  "enableBroadcastSubtitle": "展示您的設備資訊，供他人發現。",
   "@enableBroadcastSubtitle": {
     "description": "避免歧義：此處“公開”僅指對本地網路中的用戶，而非整個網路。"
   },
@@ -1187,15 +1209,15 @@
       }
     }
   },
-  "server": "分享",
+  "server": "伺服器",
   "@server": {
     "description": "用於控制媒體播放器共享行為的設置頁面標題，包括管理授權用戶和廣播設備狀態。"
   },
-  "serverControl": "允許其他裝置連線",
+  "serverControl": "伺服器控制",
   "@serverControl": {
     "description": "用於控制本地網路伺服器的部分標題。“伺服器”指的是用於設備發現的後台服務。"
   },
-  "serverControlSubtitle": "讓其他裝置連接此裝置。",
+  "serverControlSubtitle": "啟動伺服器以便其他設備在本地網路中發現此設備。",
   "@serverControlSubtitle": {
     "description": "明確伺服器僅在本地網路中運行。強調啟動伺服器會使設備對他人可見。"
   },
@@ -1219,7 +1241,7 @@
   "@unknownStatus": {
     "description": "作為用戶/用戶端狀態徽章顯示，表示狀態無法識別或未定義。建議使用“未識別”或“未定義”，保持中性語氣，不暗示錯誤。UI 中常配灰色。"
   },
-  "review": "處理請求",
+  "review": "審查",
   "@review": {
     "description": "用於審查待處理設備連接請求的按鈕。會彈出一個允許或阻止設備的對話框。"
   },
@@ -1227,13 +1249,9 @@
   "@reviewRequestTitle": {
     "description": "審查設備連接時對話框顯示的標題。保持簡潔，突出所需操作。"
   },
-  "blockDevice": "封鎖",
+  "blockDevice": "阻止設備",
   "@blockDevice": {
     "description": "永久拒絕訪問的操作。根據文化習慣也可用“封禁”，但避免負面情緒過重。"
-  },
-  "allowAccess": "我的裝置",
-  "@allowAccess": {
-    "description": "授權連接權限的操作。可根據習慣使用“批准”或“授權”。"
   },
   "connectionVerificationMessage": "若要允許設備 {alias}（{model}）連接，請分享以下通信金鑰指紋以驗證您的身份。",
   "@connectionVerificationMessage": {
@@ -1248,10 +1266,6 @@
         "description": "廠商定義的設備型號標識"
       }
     }
-  },
-  "allowAccessSubtitle": "此裝置可以瀏覽、播放及同步你的音樂庫。",
-  "@allowAccessSubtitle": {
-    "description": "說明允許訪問時會授予的權限。“獲取”指的是獲取媒體內容。"
   },
   "blockDeviceSubtitle": "阻止未來的連接。您可隨時取消對該設備的阻止。",
   "@blockDeviceSubtitle": {
@@ -1363,7 +1377,7 @@
   "@visualizerScenes": {
     "description": "列出視覺化場景、可勾選並排序的設置項標題。"
   },
-  "visualizerScenesSubtitle": "勾選封面牆右鍵選單裡可選的場景，拖動可排序。",
+  "visualizerScenesSubtitle": "查看封面牆選單提供的場景。拖曳以重新排序。",
   "@visualizerScenesSubtitle": {
     "description": "視覺化場景設置項的副標題。"
   },
@@ -1409,96 +1423,165 @@
   "@coverWallVisualizerSubtitle": {
     "description": "封面牆設為顯示視覺化時，播放控制列中開啟封面牆的項目的副標題。"
   },
-  "interfaceScale": "界面缩放",
-  "interfaceScaleSubtitle": "相对于系统缩放立即调整文字和应用内容。窗口大小和屏幕分辨率不会改变。100% 遵循系统缩放。",
-  "interfaceScaleSaveError": "无法保存界面缩放",
+  "interfaceScale": "介面縮放",
+  "interfaceScaleSubtitle": "調整 Rune 中文字與內容的大小。",
+  "interfaceScaleSaveError": "無法保存界面缩放",
   "interfaceScaleFollowTextSize": "跟隨文字大小",
   "linuxCustomWindowControls": "自定义窗口控件",
-  "@linuxCustomWindowControls": {"description": "Title for the Linux custom window controls setting option."},
-  "linuxCustomWindowControlsSubtitle": "启用自定义窗口控件，使用类似 Windows 模式的无边框窗口。",
-  "@linuxCustomWindowControlsSubtitle": {"description": "Subtitle explaining what the Linux custom window controls setting does."},
-  "offlineAvailability": "离线可用性",
-  "@offlineAvailability": {"description": "Context menu for the audio retained on this device."},
-  "keepAvailableOffline": "保持离线可用",
-  "@keepAvailableOffline": {"description": "Save a mix-query selection for background audio downloads."},
-  "stopKeepingOffline": "停止保持离线可用",
-  "@stopKeepingOffline": {"description": "Disable future downloads for this selection without deleting existing files."},
-  "offlineSelectionSaved": "已保存离线选择",
-  "@offlineSelectionSaved": {"description": "Acknowledges that a persistent download selection has been saved."},
-  "offlineSelectionRemoved": "已停止自动下载",
-  "@offlineSelectionRemoved": {"description": "Acknowledges disabling an offline selection."},
-  "offlineSelectionFailed": "无法保存离线选择",
-  "@offlineSelectionFailed": {"description": "Error title when saving a download selection fails."},
-  "offlineSelectionQueued": "配对设备可用时将下载匹配的曲目。设备在线时可在线播放。",
-  "@offlineSelectionQueued": {"description": "Explains the difference between a queued offline selection and online playback."},
-  "offlineSelectionRetained": "现有本地文件将予以保留。",
-  "@offlineSelectionRetained": {"description": "Explains that disabling downloads does not delete audio."},
-  "audioRemoteReference": "远程音频（连接状态未知）",
-  "audioUnavailable": "音频不可用",
-  "audioImportPending": "正在导入",
-  "allowPairedSync": "允许配对设备从此设备同步",
-  "@allowPairedSync": {"description": "Label for allowing incoming paired device sync"},
-  "allowPairedSyncDescription": "关闭后将停止监听和局域网广播。此设备仍可从其他设备同步。",
-  "@allowPairedSyncDescription": {"description": "Explanation of the incoming sync setting"},
-  "audioSyncedCopy": "已同步的副本",
-  "@audioSyncedCopy": {"description": "Label for audio downloaded from a paired device."},
-  "offlineCleanupDefault": "不再保持离线可用时删除下载的文件",
-  "@offlineCleanupDefault": {"description": "Default option to clean up unneeded offline downloads."},
-  "offlineCleanupDefaultDescription": "选择停止离线可用时删除不再需要的下载文件的默认行为。",
-  "@offlineCleanupDefaultDescription": {"description": "Explanation of the offline cleanup default."},
-  "offlineCleanupCheckbox": "同时删除不再需要的下载文件",
-  "@offlineCleanupCheckbox": {"description": "Option to delete downloads no enabled offline rule needs."},
-  "offlineSelectionCleaned": "离线选择已更新，并已尝试清理。",
-  "@offlineSelectionCleaned": {"description": "Confirmation after attempting to clean up offline downloads."},
-  "remoteOpenUntrusted": "此设备尚未信任该服务器，请先配对。",
-  "remoteOpenNotAuthorized": "另一台设备尚未允许此设备，或已将其阻止。",
-  "remoteOpenUnreachable": "无法连接设备，请检查设备是否已开启并连接到同一网络。",
-  "remoteOpenProtocol": "无法与设备通信，两台设备需要相同版本的 Rune。",
-  "remoteLossRevoked": "此设备的访问权限已被移除。",
-  "remoteLossDetached": "播放设备已断开此设备的遥控连接。",
+  "@linuxCustomWindowControls": {
+    "description": "Title for the Linux custom window controls setting option."
+  },
+  "linuxCustomWindowControlsSubtitle": "啟用自定义窗口控件，使用類似 Windows 模式的無边框窗口。",
+  "@linuxCustomWindowControlsSubtitle": {
+    "description": "Subtitle explaining what the Linux custom window controls setting does."
+  },
+  "offlineAvailability": "离線可用",
+  "@offlineAvailability": {
+    "description": "Context menu for the audio retained on this device."
+  },
+  "keepAvailableOffline": "保持离線可用",
+  "@keepAvailableOffline": {
+    "description": "Save a mix-query selection for background audio downloads."
+  },
+  "stopKeepingOffline": "停止保持离線可用",
+  "@stopKeepingOffline": {
+    "description": "Disable future downloads for this selection without deleting existing files."
+  },
+  "offlineSelectionSaved": "已保存離線選擇",
+  "@offlineSelectionSaved": {
+    "description": "Acknowledges that a persistent download selection has been saved."
+  },
+  "offlineSelectionRemoved": "已停止自動下載",
+  "@offlineSelectionRemoved": {
+    "description": "Acknowledges disabling an offline selection."
+  },
+  "offlineSelectionFailed": "無法保存離線選擇",
+  "@offlineSelectionFailed": {
+    "description": "Error title when saving a download selection fails."
+  },
+  "offlineSelectionQueued": "配對設備可用時將下載曲目。",
+  "@offlineSelectionQueued": {
+    "description": "Explains the difference between a queued offline selection and online playback."
+  },
+  "offlineSelectionRetained": "現有文件將會保留。",
+  "@offlineSelectionRetained": {
+    "description": "Explains that disabling downloads does not delete audio."
+  },
+  "audioUnavailable": "音訊無法使用",
+  "allowPairedSync": "允许同步",
+  "@allowPairedSync": {
+    "description": "Label for allowing incoming paired device sync"
+  },
+  "allowPairedSyncDescription": "關閉後，其他裝置將無法連線至此裝置。",
+  "@allowPairedSyncDescription": {
+    "description": "Explanation of the incoming sync setting"
+  },
+  "offlineCleanupDefault": "刪除不需要的下載",
+  "@offlineCleanupDefault": {
+    "description": "Default option to clean up unneeded offline downloads."
+  },
+  "offlineCleanupDefaultDescription": "選擇不再離線保存時是否刪除已下載的文件。",
+  "@offlineCleanupDefaultDescription": {
+    "description": "Explanation of the offline cleanup default."
+  },
+  "offlineCleanupCheckbox": "同時刪除不再需要的下載文件",
+  "@offlineCleanupCheckbox": {
+    "description": "Option to delete downloads no enabled offline rule needs."
+  },
+  "offlineSelectionCleaned": "離線選擇已更新。",
+  "@offlineSelectionCleaned": {
+    "description": "Confirmation after attempting to clean up offline downloads."
+  },
+  "remoteOpenUntrusted": "此設備尚未信任該伺服器，請先配對。",
+  "remoteOpenNotAuthorized": "另一台設備尚未允許此設備連接。",
+  "remoteOpenUnreachable": "無法連接設備，請檢查它的網絡連接。",
+  "remoteOpenProtocol": "無法與設備通信，两台設備需要相同版本的 Rune。",
+  "remoteLossRevoked": "此設備的訪問權限已被移除。",
+  "remoteLossDetached": "播放設備已斷開此設備的遙控連接。",
   "@remoteLossDetached": {
     "description": "Shown when the renderer owner detaches this controller."
   },
-  "remoteLossServerStopped": "另一台设备已停止共享。",
-  "remoteLossNetworkLost": "连接已断开。",
-  "deviceLibraries": "音乐库",
+  "remoteLossServerStopped": "另一台設備已停止共享。",
+  "remoteLossNetworkLost": "連接已斷開。",
+  "syncToThisDevice": "同步至此裝置",
+  "libraryNotShared": "未共享",
+  "controlPermissionRequired": "無法控制播放",
+  "deviceLibraries": "音樂庫",
   "addSharedLibrary": "添加",
   "sharedLibraryAdded": "已添加",
-  "openSharedLibrary": "打开",
-  "noSharedLibraries": "这台设备没有可共享的音乐库",
-  "libraryFromDevice": "来自 {device}",
-  "backgroundLibrarySync": "在后台保持同步",
-  "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
-  "requestItemMissing": "此项目已不存在",
-  "requestInvalid": "请求无效",
-  "requestCertificateMismatch": "此设备的证书不匹配",
-  "requestUnavailable": "目前无法使用",
-  "requestStorageBusy": "存储空间正忙，请重试。",
+  "openSharedLibrary": "打開",
+  "noSharedLibraries": "此裝置沒有共享音樂庫。",
+  "libraryFromDevice": "來自 {device}",
+  "backgroundLibrarySync": "後台同步",
+  "@libraryFromDevice": {
+    "placeholders": {
+      "device": {
+        "type": "String"
+      }
+    }
+  },
+  "requestItemMissing": "此項目已不存在",
+  "requestInvalid": "請求無效",
+  "requestCertificateMismatch": "此設備的證书不匹配",
+  "requestUnavailable": "目前無法使用",
+  "requestStorageBusy": "存儲空間正忙，請重試。",
   "mixNoLongerExists": "此混音已不存在",
   "devices": "裝置",
-  "playOn": "播放设备",
-  "playOnSubtitle": "选择音频播放的位置。",
-  "playOnFixedToRemote": "固定到此远程设备",
+  "playOn": "播放至",
+  "playOnSubtitle": "選擇音訊的播放位置。",
+  "playOnFixedToRemote": "固定到此遠程設備",
   "playOnPlayingOn": "正在 {alias} 上播放",
-  "@playOnPlayingOn": {"placeholders": {"alias": {"type": "String"}}},
-  "playOnOffline": "离线",
-  "playOnNotApproved": "此设备尚未批准你",
-  "playOnNoControl": "无法控制此设备",
-  "playOnCantPlay": "无法播放 {library}",
-  "@playOnCantPlay": {"placeholders": {"library": {"type": "String"}}},
-  "playOnRetry": "重试",
-  "castTrackMode": "投放曲目时",
-  "castTrackReplace": "替换队列并立即播放",
-  "castTrackPlayNext": "接下来播放",
-  "castControlRenderer": "投放后",
-  "castKeepControlling": "继续控制此设备",
-  "castControlCastDevice": "控制投放到的设备",
-  "castTrackModeSubtitle": "选择如何更改播放设备的队列。",
-  "castControlRendererSubtitle": "选择继续控制的设备。",
-  "castNotPossible": "{alias} 无法播放 {library}",
-  "@castNotPossible": {"placeholders": {"alias": {"type": "String"}, "library": {"type": "String"}}},
+  "@playOnPlayingOn": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
+  "playOnOffline": "离線",
+  "playOnNotApproved": "此設備尚未批准你",
+  "playOnNoControl": "無法控制此設備",
+  "playOnCantPlay": "無法播放 {library}",
+  "@playOnCantPlay": {
+    "placeholders": {
+      "library": {
+        "type": "String"
+      }
+    }
+  },
+  "playOnRetry": "重試",
+  "castTrackMode": "投放曲目時",
+  "castTrackReplace": "替換隊列",
+  "castTrackPlayNext": "接下來播放",
+  "castControlRenderer": "投放後",
+  "castKeepControlling": "繼續控制此設備",
+  "castControlCastDevice": "控制投放到的設備",
+  "castTrackModeSubtitle": "選擇投放曲目時如何變更佇列。",
+  "castControlRendererSubtitle": "選擇投放後要控制的裝置。",
+  "castNotPossible": "{alias} 無法播放 {library}",
+  "@castNotPossible": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      },
+      "library": {
+        "type": "String"
+      }
+    }
+  },
+  "castTracksLeftOut": "{count, plural, other{{alias}尚未保存的{count}首曲目未加入。}}",
+  "@castTracksLeftOut": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      },
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
   "thisDevice": "此裝置",
-  "devicesThatCanConnect": "可連接此裝置的裝置",
+  "devicesThatCanConnect": "可連接的設備",
   "otherDevices": "其他裝置",
   "myDevice": "我的裝置",
   "controllingNow": "正在控制此裝置",
@@ -1506,9 +1589,9 @@
   "guest": "訪客",
   "myDeviceAccessDescription": "可以播放、瀏覽和同步你的音樂庫",
   "guestAccessDescription": "可以控制播放並在控制時瀏覽",
-  "guestControlSummary": "訪客 · 可以控制播放",
   "customDeviceAccess": "自訂",
   "customizeDevice": "自訂",
+  "disconnect": "断开连接",
   "controlPlayback": "控制播放",
   "controlPlaybackDescription": "可以在此裝置上播放、暫停、加入佇列並投放",
   "deviceAccessLibraries": "音樂庫",
@@ -1520,17 +1603,128 @@
   "deviceSyncOff": "關閉",
   "deviceSyncPull": "拉取",
   "deviceSyncPullPush": "拉取與推送",
-  "requestConflict": "播放队列已变化，请重试",
+  "requestConflict": "播放隊列已變化，請重試。",
   "requestPermissionDenied": "此裝置不允許執行此操作",
   "readOnly": "唯讀",
   "queueUnavailableAccessRevoked": "存取權已撤銷",
   "queueUnavailableLibraryUnavailable": "資料庫無法使用",
   "queueUnavailableSourceUnreachable": "無法連線至來源",
   "queueUnavailableUnreadable": "無法讀取音訊",
-  "rendererLinkLost": "与 {alias} 的连接已断开",
-  "@rendererLinkLost": {"placeholders": {"alias": {"type": "String"}}},
-  "requestPublicKeyMismatch": "设备密钥与指纹不匹配",
-  "requestRegistrationConflict": "此指纹对应的设备已注册",
-  "remoteLibraryReconnecting": "正在重新连接到 {alias}…",
-  "@remoteLibraryReconnecting": {"placeholders": {"alias": {"type": "String"}}}
+  "rendererLinkLost": "與 {alias} 的連接已斷開。",
+  "@rendererLinkLost": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
+  "requestPublicKeyMismatch": "設備密鑰與指紋不匹配。",
+  "requestRegistrationConflict": "此指纹對應的設備已注册",
+  "remoteLibraryReconnecting": "正在重新連接到 {alias}…",
+  "@remoteLibraryReconnecting": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
+  "capabilityNotImplemented": "此設備不支持該操作",
+  "capabilityOwnerOnly": "只有拥有者設備才能执行此操作",
+  "requestOtherDeviceName": "另一台設備",
+  "requestPeerNeedsUpdatePeer": "{alias}需要更新 Rune 才能連接。",
+  "requestPeerNeedsUpdateThisDevice": "更新此設備上的 Rune 以連接到{alias}。",
+  "remoteLossProtocolIncompatible": "Rune 版本不再匹配。請在两台設備上更新 Rune 以重新連接。",
+  "capabilityPeerTooOld": "請在另一台設備上更新 Rune 以使用此功能。",
+  "requestPeerNeedsUpdateFallback": "請在两台設備上更新 Rune 以連接。",
+  "@requestPeerNeedsUpdatePeer": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
+  "@requestPeerNeedsUpdateThisDevice": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
+  "capabilityAccountRoleMissing": "您在此伺服器上的帳戶無權執行此操作。",
+  "@capabilityAccountRoleMissing": {
+    "description": "Shown when a Subsonic account lacks permission to use a control."
+  },
+  "invalidLibrarySettingsSubtitle": "無法讀取此媒體庫的設置。",
+  "@invalidLibrarySettingsSubtitle": {
+    "description": "Shown below a library record whose settings cannot be read."
+  },
+  "libraryRecordNotFound": "此媒體庫已不存在。",
+  "libraryRecordIsOpen": "請先關閉媒體庫，再將其移除。",
+  "libraryMediaFolderMissing": "找不到媒體庫資料夾。",
+  "libraryUntrusted": "此裝置未受信任。",
+  "libraryInvalidSource": "此資料夾無法用作媒體庫。",
+  "libraryStorageFailure": "無法儲存媒體庫。",
+  "libraryRemoteNotAuthorized": "裝置未授權此連線。",
+  "libraryRemoteUnreachable": "無法連線到裝置。",
+  "libraryRemoteProtocolFailure": "裝置傳回不相容的回應。",
+  "libraryProtocolIncompatible": "此裝置使用不相容的協定版本。",
+  "libraryNotSupportedYet": "目前尚不支援此媒體庫類型。",
+  "trayIconColorMode": "托盘图标颜色",
+  "@trayIconColorMode": {
+    "description": "A settings entry that allows users to control the color of the system tray icon, choosing between automatic, light, and dark modes."
+  },
+  "trayIconColorModeSubtitle": "控制托盤圖標如何適應系統主題。",
+  "@trayIconColorModeSubtitle": {},
+  "automaticTrayIconMode": "自動",
+  "@automaticTrayIconMode": {
+    "description": "An option for tray icon color mode that automatically switches between light and dark based on the system theme."
+  },
+  "visualizerLab": "視覺化實驗室",
+  "@visualizerLab": {
+    "description": "Name of the playback controller entry that turns the visualizer lab on the cover wall page on and off."
+  },
+  "visualizerLabSubtitle": "在可视化效果上顯示實驗室。",
+  "@visualizerLabSubtitle": {
+    "description": "Subtitle of the playback controller entry that turns the visualizer lab on and off."
+  },
+  "@interfaceScaleFollowTextSize": {
+    "description": "Option that sizes the interface to match the system text size."
+  },
+  "turnOnBackgroundSync": "開啟背景同步",
+  "turnOffBackgroundSync": "關閉背景同步",
+  "shareLibraryModeSubtitle": "Rune 會將您的媒體索引儲存在哪裡？",
+  "@shareLibraryModeSubtitle": {
+    "description": "Add-library guide text"
+  },
+  "keepIndexInShare": "共享文件夾",
+  "@keepIndexInShare": {
+    "description": "Add-library guide text"
+  },
+  "keepIndexInShareSubtitle": "我們會將您的媒體索引儲存在共享文件夾中，讓其他裝置可以同步。",
+  "@keepIndexInShareSubtitle": {
+    "description": "Add-library guide text"
+  },
+  "keepIndexOnThisDevice": "存放在此裝置",
+  "@keepIndexOnThisDevice": {
+    "description": "Add-library guide text"
+  },
+  "webDav": "WebDAV",
+  "webDavSubtitle": "連線至 WebDAV 伺服器上的資料夾。",
+  "s3": "S3",
+  "s3Subtitle": "連線至 S3 儲存桶中的資料夾。",
+  "folder": "資料夾",
+  "bucket": "儲存桶",
+  "region": "區域",
+  "accessKeyId": "存取金鑰 ID",
+  "secretAccessKey": "秘密存取金鑰",
+  "libraryOpenDalAuthenticationRejected": "請檢查使用者名稱和密碼。",
+  "libraryOpenDalUnreachable": "請檢查伺服器位址和網路連線。",
+  "libraryOpenDalNotFolder": "請確認所選資料夾存在且可供存取。",
+  "libraryOpenDalReadOnly": "請選擇可寫入的資料夾，才能將媒體索引儲存在共享資料夾中。",
+  "subsonic": "Subsonic",
+  "subsonicSubtitle": "连接到 Subsonic 音乐服务器。",
+  "playOnThisDevice": "在此设备播放",
+  "controlServerPlayer": "控制服务器播放器",
+  "howDoYouWantToUseIt": "您想如何使用？"
+
 }

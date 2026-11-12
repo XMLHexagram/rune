@@ -7,8 +7,11 @@ import '../../bindings/bindings.dart';
 import '../../l10n/app_localizations.dart';
 import '../../providers/playlist.dart';
 import '../../providers/renderer_attachment.dart';
-import '../../providers/library_path.dart';
+import '../../providers/request_capabilities.dart';
+import '../../providers/library_open_state.dart';
 import '../../providers/status.dart';
+import '../../providers/responsive_providers.dart';
+import '../../widgets/settings/settings_tile_title.dart';
 import '../../utils/api/request_failure.dart';
 import '../../utils/dialogs/play_on/play_on_dialog.dart';
 import '../../utils/dialogs/play_queue_dialog.dart';
@@ -16,7 +19,7 @@ import '../../utils/playing_item.dart';
 import '../../utils/execute_middle_click_action.dart';
 
 void main() {
-  testWidgets('unavailable reasons are dimmed and cannot be selected', (
+  testWidgets('unavailable reasons disable the selected row action', (
     tester,
   ) async {
     var attached = 0;
@@ -37,16 +40,17 @@ void main() {
     );
 
     expect(find.text('Offline'), findsOneWidget);
-    expect(find.text('This device has not approved you yet'), findsOneWidget);
-    expect(find.text("Can't control this device"), findsOneWidget);
-    expect(find.text("Can't play My Music"), findsOneWidget);
-    for (final alias in ['offline', 'unapproved', 'no-control', 'cant-play']) {
-      final row = tester.widget<ListTile>(
-        find.ancestor(of: find.text(alias), matching: find.byType(ListTile)),
-      );
-      expect(row.onPressed, isNull);
-      await tester.tap(find.text(alias));
-    }
+    expect(find.text('This device has not approved access.'), findsOneWidget);
+    expect(find.text("This device cannot be controlled."), findsOneWidget);
+    expect(find.text("Cannot play My Music."), findsOneWidget);
+    await tester.tap(find.text('offline'));
+    await tester.pumpAndSettle();
+    final playButton = tester.widget<Button>(
+      find
+          .ancestor(of: find.text('Play On'), matching: find.byType(Button))
+          .first,
+    );
+    expect(playButton.onPressed, isNull);
     expect(attached, 0);
   });
 
@@ -75,8 +79,10 @@ void main() {
       );
 
       expect(find.text('Bedroom'), findsOneWidget);
-      expect(find.byIcon(Symbols.check), findsOneWidget);
+      expect(find.byIcon(Symbols.play_arrow), findsOneWidget);
       await tester.tap(find.text('Kitchen'));
+      await tester.pumpAndSettle();
+      await _tapPlayAction(tester);
       await tester.pumpAndSettle();
       expect(handoffTarget, 'fp-k');
       expect(find.text('Kitchen'), findsNothing);
@@ -113,14 +119,16 @@ void main() {
       },
       handoff: (target) async => handedOffToThisDevice = target == null,
     );
-    expect(find.text("This isn't available right now"), findsOneWidget);
+    expect(find.text("This is not available right now."), findsOneWidget);
     await tester.tap(find.text('Retry'));
     await tester.pumpAndSettle();
     expect(loads, 2);
-    await tester.tap(find.text('This device'));
+    await tester.tap(find.text('This Device'));
+    await tester.pumpAndSettle();
+    await _tapPlayAction(tester);
     await tester.pumpAndSettle();
     expect(handedOffToThisDevice, isTrue);
-    expect(find.text('Play on'), findsNothing);
+    expect(find.text('Play On'), findsNothing);
   });
 
   test(
@@ -168,15 +176,39 @@ void main() {
       castLibraryIds: const ['library-h'],
       cast: (candidate) async {
         castTarget = castTargetFor(candidate.fingerprint, true);
+        return 0;
       },
     );
 
-    expect(find.text('This device'), findsNothing);
+    expect(find.text('This Device'), findsNothing);
     expect(requestedLibraries, ['library-h']);
     await tester.tap(find.text('Bedroom'));
     await tester.pumpAndSettle();
+    await _tapPlayAction(tester);
+    await tester.pumpAndSettle();
     expect(castTarget, const CastTarget(fingerprint: 'fp-b', attach: true));
-    expect(find.text('Play on'), findsNothing);
+    expect(find.text('Play On'), findsNothing);
+  });
+
+  testWidgets('partial cast shows the number of tracks left out', (
+    tester,
+  ) async {
+    await _open(
+      tester,
+      candidates: [_candidate('Bedroom', RendererAvailability.available)],
+      castLibraryIds: const ['blocked-library'],
+      cast: (_) async => 2,
+    );
+
+    await tester.tap(find.text('Bedroom'));
+    await tester.pumpAndSettle();
+    await _tapPlayAction(tester);
+    await tester.pumpAndSettle();
+    expect(
+      find.text('2 tracks are not on Bedroom yet and were not added.'),
+      findsOneWidget,
+    );
+    expect(find.text('Play On'), findsNWidgets(2));
   });
 
   testWidgets('typed cast failures name the renderer and blocked library', (
@@ -188,7 +220,7 @@ void main() {
       castLibraryIds: const ['blocked-library'],
       cast: (_) async {
         throw const RequestFailure(
-          'OperatePlaybackWithMixQueryRequest',
+          'LoadResolvedItemsRequest',
           RequestErrorKind.permissionDenied,
           'denied',
           RequestFailureCauseCastNotPossible(
@@ -201,8 +233,10 @@ void main() {
 
     await tester.tap(find.text('Bedroom'));
     await tester.pumpAndSettle();
-    expect(find.text("Bedroom can't play My Music"), findsOneWidget);
-    expect(find.text('Play on'), findsOneWidget);
+    await _tapPlayAction(tester);
+    await tester.pumpAndSettle();
+    expect(find.text("Bedroom cannot play My Music."), findsOneWidget);
+    expect(find.text('Play On'), findsNWidgets(2));
   });
 
   testWidgets('cast failures without a cause keep the generic message', (
@@ -214,7 +248,7 @@ void main() {
       castLibraryIds: const ['blocked-library'],
       cast: (_) async {
         throw const RequestFailure(
-          'OperatePlaybackWithMixQueryRequest',
+          'LoadResolvedItemsRequest',
           RequestErrorKind.permissionDenied,
           'denied',
         );
@@ -223,8 +257,39 @@ void main() {
 
     await tester.tap(find.text('Bedroom'));
     await tester.pumpAndSettle();
-    expect(find.text("This device isn't allowed to do that"), findsOneWidget);
+    await _tapPlayAction(tester);
+    await tester.pumpAndSettle();
+    expect(find.text("This device is not allowed to do that."), findsOneWidget);
   });
+
+  testWidgets(
+    'selected renderer actions and load errors stay in ContentDialog',
+    (tester) async {
+      await _open(
+        tester,
+        candidates: [_candidate('Bedroom', RendererAvailability.available)],
+      );
+      await tester.tap(find.text('Bedroom'));
+      await tester.pumpAndSettle();
+      expect(find.byType(SettingsTileTitle), findsNWidgets(2));
+      expect(find.text('Play On'), findsNWidgets(2));
+      expect(find.text('Close'), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _open(
+        tester,
+        loader: (_) async => throw const RequestFailure(
+          'ListRenderersRequest',
+          RequestErrorKind.unavailable,
+          'offline',
+        ),
+      );
+      expect(find.byType(ContentDialog), findsOneWidget);
+      expect(find.text('This is not available right now.'), findsOneWidget);
+      expect(find.text('Retry'), findsOneWidget);
+      expect(find.byType(InfoBar), findsNothing);
+    },
+  );
 
   testWidgets('handoff reports typed cast failures in the dialog', (
     tester,
@@ -247,19 +312,17 @@ void main() {
 
     await tester.tap(find.text('Bedroom'));
     await tester.pumpAndSettle();
-    expect(find.text("Bedroom can't play My Music"), findsOneWidget);
-    expect(find.text('Play on'), findsOneWidget);
+    await _tapPlayAction(tester);
+    await tester.pumpAndSettle();
+    expect(find.text("Bedroom cannot play My Music."), findsOneWidget);
+    expect(find.text('Play On'), findsNWidgets(2));
   });
 
   testWidgets('queue panel opens Play on and hides it for a remote library', (
     tester,
   ) async {
     var opened = 0;
-    await _openQueue(
-      tester,
-      libraryPath: '/music',
-      onPlayOn: (_) async => opened++,
-    );
+    await _openQueue(tester, remote: false, onPlayOn: (_) async => opened++);
     await tester.tap(find.byKey(const Key('queue-play-on')));
     await tester.pumpAndSettle();
     expect(opened, 1);
@@ -267,11 +330,7 @@ void main() {
     await tester.pumpAndSettle();
 
     await tester.pumpWidget(const SizedBox.shrink());
-    await _openQueue(
-      tester,
-      libraryPath: '@RR|ws://renderer',
-      onPlayOn: (_) async => opened++,
-    );
+    await _openQueue(tester, remote: true, onPlayOn: (_) async => opened++);
     expect(find.byKey(const Key('queue-play-on')), findsNothing);
   });
 }
@@ -307,6 +366,9 @@ Future<void> _open(
       providers: [
         ChangeNotifierProvider(create: (_) => PlaylistProvider()),
         ChangeNotifierProvider(
+          create: (_) => ScreenSizeProvider.withWriter(null, (_) async {}),
+        ),
+        ChangeNotifierProvider(
           create: (_) => RendererAttachmentProvider(initial: initial),
         ),
       ],
@@ -335,7 +397,7 @@ Future<void> _open(
 
 Future<void> _openQueue(
   WidgetTester tester, {
-  required String? libraryPath,
+  required bool remote,
   required PlayOnDialogOpener onPlayOn,
 }) async {
   await tester.pumpWidget(
@@ -343,8 +405,9 @@ Future<void> _openQueue(
       providers: [
         ChangeNotifierProvider(create: (_) => PlaylistProvider()),
         ChangeNotifierProvider(create: (_) => PlaybackStatusProvider()),
-        ChangeNotifierProvider<LibraryPathProvider>(
-          create: (_) => _TestLibraryPathProvider(libraryPath),
+        ChangeNotifierProvider(create: (_) => RequestCapabilitiesProvider()),
+        ChangeNotifierProvider<LibraryOpenStateProvider>(
+          create: (_) => _TestLibraryOpenStateProvider(remote: remote),
         ),
       ],
       child: FluentApp(
@@ -364,11 +427,39 @@ Future<void> _openQueue(
   await tester.pumpAndSettle();
 }
 
-class _TestLibraryPathProvider extends LibraryPathProvider {
-  _TestLibraryPathProvider(this.path) : super(null);
+Future<void> _tapPlayAction(WidgetTester tester) async {
+  await tester.tap(
+    find
+        .ancestor(of: find.text('Play On').last, matching: find.byType(Button))
+        .first,
+  );
+}
 
-  final String? path;
+class _TestLibraryOpenStateProvider extends ChangeNotifier
+    implements LibraryOpenStateProvider {
+  _TestLibraryOpenStateProvider({required this.remote});
+
+  final bool remote;
 
   @override
-  String? get currentPath => path;
+  bool get isRemoteControl => remote;
+
+  @override
+  LibraryRecordSummary? get openRecord => remote
+      ? const LibraryRecordSummary(
+          recordId: 'remote-record',
+          alias: 'Renderer',
+          kind: LibraryRecordKindSummaryRemoteControl(fingerprint: 'renderer'),
+        )
+      : const LibraryRecordSummary(
+          recordId: 'local-record',
+          alias: 'Music',
+          kind: LibraryRecordKindSummaryLocal(
+            libraryId: 'library-id',
+            path: '/music',
+          ),
+        );
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

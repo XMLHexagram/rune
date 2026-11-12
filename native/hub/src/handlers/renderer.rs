@@ -5,7 +5,8 @@ use anyhow::Result;
 use crate::{
     Session, Signal,
     messages::{
-        AttachRendererRequest, DetachRendererRequest, ListRenderersRequest, ListRenderersResponse,
+        AttachRendererRequest, AttachRendererResponse, DetachRendererRequest, ListRenderersRequest,
+        ListRenderersResponse,
     },
     node::NodeContext,
     server::libraries::{list_renderer_candidates, parse_library_ids},
@@ -22,7 +23,7 @@ impl ParamsExtractor for AttachRendererRequest {
 
 impl Signal for AttachRendererRequest {
     type Params = Arc<NodeContext>;
-    type Response = ();
+    type Response = AttachRendererResponse;
 
     async fn handle(
         &self,
@@ -31,7 +32,7 @@ impl Signal for AttachRendererRequest {
         request: &Self,
     ) -> Result<Option<Self::Response>> {
         node.attach_renderer(&request.fingerprint).await?;
-        Ok(None)
+        Ok(Some(AttachRendererResponse { call_id: None }))
     }
 }
 
@@ -78,6 +79,9 @@ impl Signal for ListRenderersRequest {
     ) -> Result<Option<Self::Response>> {
         let library_ids = parse_library_ids(&request.library_ids)?;
         let renderers = list_renderer_candidates(node, library_ids).await?;
-        Ok(Some(ListRenderersResponse { renderers }))
+        Ok(Some(ListRenderersResponse {
+            call_id: None,
+            renderers,
+        }))
     }
 }

@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     future::Future,
-    io::{BufReader, Error, ErrorKind},
+    io::{BufReader, Cursor, Error, ErrorKind},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -13,7 +13,7 @@ use std::{
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
-use fsio::{FileStream, FsIo};
+use fsio::{FileIoError, FileStream, FsIo};
 use log::{debug, error, info, warn};
 use rodio::{PlayError, Sink, Source, source::SeekError};
 use tokio::{
@@ -27,8 +27,10 @@ use crate::decoder::RuneDecoder;
 use crate::output_stream::{RuneOutputStream, RuneOutputStreamHandle};
 use crate::pcm_tap::PcmTap;
 use crate::player::{
-    PlaybackSource, PlaybackSourceResolver, PlayerStatus, PlayingItem, RemoteAudioError,
-    UnavailableReason,
+    AudioPlaybackNote, AudioSourceMode, ClearHandoffBlocksResult, HandoffBlockId,
+    HandoffLoadResult, InterruptedItem, LibraryTrackKey, PlaybackSource, PlaybackSourceResolver,
+    PlayerStatus, PlayingItem, PlaylistEdit, PlaylistPlacement, QueueEntry, RemoteAudioError,
+    SubsonicItem, TakeBackBlockResult, UnavailableReason,
 };
 use crate::realtime_fft::RealTimeFFT;
 use crate::shared_source::SharedSource;
@@ -36,6 +38,7 @@ use crate::strategies::{
     AddMode, PlaybackStrategy, RepeatAllStrategy, RepeatOneStrategy, SequentialStrategy,
     ShuffleStrategy, UpdateReason,
 };
+use crate::stream_utils::create_stream_with_authorizer;
 
 const SOURCE_START_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -67,11 +70,132 @@ where
     .context("decoder probe task failed")?
 }
 
+async fn open_local_source(fsio: Arc<FsIo>, path: PathBuf, remote: bool) -> Result<AnySource> {
+    let open_path = path.clone();
+    let stream = tokio::task::spawn_blocking(move || fsio.open(&open_path, "r"))
+        .await
+        .context("audio file open task failed")?
+        .map_err(|error| {
+            if remote {
+                return match error {
+                    FileIoError::PermissionDenied(_) => anyhow!(RemoteAudioError::AccessRevoked),
+                    error @ (FileIoError::Remote(_) | FileIoError::PathNotFound(_)) => {
+                        anyhow!(RemoteAudioError::unreachable(error))
+                    }
+                    other => anyhow::Error::new(other),
+                };
+            }
+            anyhow::Error::new(error)
+        })?;
+    let (stream, failure) = if remote {
+        let failure = Arc::new(Mutex::new(None));
+        (
+            Box::new(FailureTrackingFile {
+                inner: stream,
+                failure: failure.clone(),
+            }) as Box<dyn FileStream>,
+            Some(failure),
+        )
+    } else {
+        (stream, None)
+    };
+    let extension = path.extension().and_then(|value| value.to_str());
+    let decoder = match probe_decoder(BufReader::new(stream), extension.map(str::to_owned), None)
+        .await
+    {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            if let Some(reason) = failure
+                .as_ref()
+                .and_then(|failure| failure.lock().ok().and_then(|value| *value))
+            {
+                return Err(match reason {
+                    UnavailableReason::AccessRevoked => anyhow!(RemoteAudioError::AccessRevoked),
+                    UnavailableReason::SourceUnreachable => {
+                        anyhow!(RemoteAudioError::unreachable(error))
+                    }
+                    UnavailableReason::LibraryUnavailable => {
+                        anyhow!(RemoteAudioError::LibraryUnavailable)
+                    }
+                    UnavailableReason::Unreadable => error,
+                    UnavailableReason::CredentialsRejected => {
+                        anyhow!(RemoteAudioError::CredentialsRejected)
+                    }
+                    UnavailableReason::TrackGone => anyhow!(RemoteAudioError::TrackGone),
+                });
+            }
+            return Err(error);
+        }
+    };
+    Ok(AnySource::Local(rune_buffered(decoder), failure))
+}
+
+struct FailureTrackingFile {
+    inner: Box<dyn FileStream>,
+    failure: Arc<Mutex<Option<UnavailableReason>>>,
+}
+
+impl FailureTrackingFile {
+    fn record(&self, error: &std::io::Error) {
+        let reason = match error.kind() {
+            ErrorKind::PermissionDenied => UnavailableReason::AccessRevoked,
+            ErrorKind::NotFound => UnavailableReason::SourceUnreachable,
+            _ => UnavailableReason::SourceUnreachable,
+        };
+        if let Ok(mut failure) = self.failure.lock() {
+            *failure = Some(reason);
+        }
+    }
+}
+
+impl std::io::Read for FailureTrackingFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let result = self.inner.read(buf);
+        if let Err(error) = &result {
+            self.record(error);
+        }
+        result
+    }
+}
+
+impl std::io::Seek for FailureTrackingFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let result = self.inner.seek(pos);
+        if let Err(error) = &result {
+            self.record(error);
+        }
+        result
+    }
+}
+
+impl std::io::Write for FailureTrackingFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl FileStream for FailureTrackingFile {
+    fn sync_all(&mut self) -> Result<(), FileIoError> {
+        self.inner.sync_all()
+    }
+}
+
 pub enum AnySource {
-    Local(RuneBuffered<RuneDecoder<BufReader<Box<dyn FileStream>>>>),
+    Local(
+        RuneBuffered<RuneDecoder<BufReader<Box<dyn FileStream>>>>,
+        Option<Arc<Mutex<Option<UnavailableReason>>>>,
+    ),
     Online(
         RuneBuffered<RuneDecoder<ManagedStream>>,
         Arc<Mutex<Option<UnavailableReason>>>,
+    ),
+    Buffered(
+        RuneBuffered<RuneDecoder<Cursor<Vec<u8>>>>,
+        AudioPlaybackNote,
     ),
 }
 
@@ -98,11 +222,62 @@ async fn open_library_stream(
     ))
 }
 
+async fn open_subsonic_stream(
+    resolver: &Arc<dyn PlaybackSourceResolver>,
+    item: crate::player::SubsonicItem,
+) -> Result<(AnySource, PathBuf)> {
+    let remote = resolver.resolve_subsonic(item).await?;
+    let size = remote.size;
+    let guard = remote.cancellation.clone().drop_guard();
+    let failed = remote.failure_reason;
+    match remote.request.prepare().await? {
+        AudioSourceMode::Buffered { bytes, note } => {
+            let size = u64::try_from(bytes.len()).ok();
+            let decoder = probe_decoder(Cursor::new(bytes), Some(remote.extension), size).await?;
+            guard.disarm();
+            return Ok((
+                AnySource::Buffered(rune_buffered(decoder), note),
+                PathBuf::new(),
+            ));
+        }
+        AudioSourceMode::Ranged => {}
+    }
+    let reader = match create_stream_with_authorizer(remote.request, &remote.url).await {
+        Ok(reader) => reader,
+        Err(error) => {
+            let reason = failed.lock().ok().and_then(|reason| *reason);
+            return Err(match reason {
+                Some(UnavailableReason::AccessRevoked) => {
+                    anyhow!(RemoteAudioError::AccessRevoked)
+                }
+                Some(UnavailableReason::CredentialsRejected) => {
+                    anyhow!(RemoteAudioError::CredentialsRejected)
+                }
+                Some(UnavailableReason::Unreadable | UnavailableReason::TrackGone) => {
+                    anyhow!(RemoteAudioError::TrackGone)
+                }
+                _ => error,
+            });
+        }
+    };
+    let reader = ManagedStream::new_with_failure(reader, remote.cancellation, failed.clone());
+    let decoder =
+        probe_decoder(reader, Some(remote.extension), (size != 0).then_some(size)).await?;
+    guard.disarm();
+    Ok((
+        AnySource::Online(rune_buffered(decoder), failed),
+        PathBuf::new(),
+    ))
+}
+
 impl Debug for AnySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AnySource::Local(_) => f.debug_struct("AnySource::Local").finish(),
+            AnySource::Local(_, _) => f.debug_struct("AnySource::Local").finish(),
             AnySource::Online(_, _) => f.debug_struct("AnySource::Online").finish(),
+            AnySource::Buffered(_, note) => {
+                f.debug_tuple("AnySource::Buffered").field(note).finish()
+            }
         }
     }
 }
@@ -110,8 +285,9 @@ impl Debug for AnySource {
 impl AnySource {
     fn current_samples(&self) -> Option<Vec<i16>> {
         match self {
-            AnySource::Local(s) => s.current_samples(),
+            AnySource::Local(s, _) => s.current_samples(),
             AnySource::Online(s, _) => s.current_samples(),
+            AnySource::Buffered(s, _) => s.current_samples(),
         }
     }
 }
@@ -121,8 +297,9 @@ impl Iterator for AnySource {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            AnySource::Local(s) => s.next(),
+            AnySource::Local(s, _) => s.next(),
             AnySource::Online(s, _) => s.next(),
+            AnySource::Buffered(s, _) => s.next(),
         }
     }
 }
@@ -130,36 +307,41 @@ impl Iterator for AnySource {
 impl Source for AnySource {
     fn current_frame_len(&self) -> Option<usize> {
         match self {
-            AnySource::Local(s) => s.current_frame_len(),
+            AnySource::Local(s, _) => s.current_frame_len(),
             AnySource::Online(s, _) => s.current_frame_len(),
+            AnySource::Buffered(s, _) => s.current_frame_len(),
         }
     }
 
     fn channels(&self) -> u16 {
         match self {
-            AnySource::Local(s) => s.channels(),
+            AnySource::Local(s, _) => s.channels(),
             AnySource::Online(s, _) => s.channels(),
+            AnySource::Buffered(s, _) => s.channels(),
         }
     }
 
     fn sample_rate(&self) -> u32 {
         match self {
-            AnySource::Local(s) => s.sample_rate(),
+            AnySource::Local(s, _) => s.sample_rate(),
             AnySource::Online(s, _) => s.sample_rate(),
+            AnySource::Buffered(s, _) => s.sample_rate(),
         }
     }
 
     fn total_duration(&self) -> Option<Duration> {
         match self {
-            AnySource::Local(s) => s.total_duration(),
+            AnySource::Local(s, _) => s.total_duration(),
             AnySource::Online(s, _) => s.total_duration(),
+            AnySource::Buffered(s, _) => s.total_duration(),
         }
     }
 
     fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
         match self {
-            AnySource::Local(s) => s.try_seek(pos),
+            AnySource::Local(s, _) => s.try_seek(pos),
             AnySource::Online(s, _) => s.try_seek(pos),
+            AnySource::Buffered(s, _) => s.try_seek(pos),
         }
     }
 }
@@ -167,8 +349,9 @@ impl Source for AnySource {
 impl AnySource {
     fn stream_failure(&self) -> Option<Arc<Mutex<Option<UnavailableReason>>>> {
         match self {
-            AnySource::Local(_) => None,
+            AnySource::Local(_, failed) => failed.clone(),
             AnySource::Online(_, failed) => Some(failed.clone()),
+            AnySource::Buffered(_, _) => None,
         }
     }
 }
@@ -206,8 +389,18 @@ impl From<PlaybackMode> for u32 {
 
 #[derive(Debug)]
 pub enum PlayerCommand {
+    WithCompletion {
+        command: Box<PlayerCommand>,
+        response: oneshot::Sender<PlayerStatus>,
+    },
     Restore {
         tracks: Vec<(PlayingItem, PlaybackSource)>,
+        index: Option<usize>,
+        position: Duration,
+        mode: PlaybackMode,
+    },
+    RestoreTagged {
+        entries: Vec<QueueEntry>,
         index: Option<usize>,
         position: Duration,
         mode: PlaybackMode,
@@ -240,6 +433,24 @@ pub enum PlayerCommand {
     AddToPlaylist {
         tracks: Vec<(PlayingItem, PlaybackSource)>,
         mode: AddMode,
+    },
+    EditPlaylist(PlaylistEdit),
+    HandoffLoad {
+        tracks: Vec<(PlayingItem, PlaybackSource)>,
+        block: HandoffBlockId,
+        start_index: Option<usize>,
+        position: Duration,
+        play: bool,
+        playback_mode: Option<PlaybackMode>,
+        response: oneshot::Sender<HandoffLoadResult>,
+    },
+    TakeBackBlock {
+        block: HandoffBlockId,
+        interrupted: InterruptedItem,
+        response: oneshot::Sender<Option<TakeBackBlockResult>>,
+    },
+    ClearHandoffBlocks {
+        response: oneshot::Sender<ClearHandoffBlocksResult>,
     },
     RemoveFromPlaylist {
         index: usize,
@@ -325,7 +536,7 @@ pub enum PlayerEvent {
         ready: bool,
     },
     VolumeUpdate(f32),
-    PlaylistUpdated(Vec<PlayingItem>),
+    PlaylistUpdated(Vec<PlaylistItem>),
     RealtimeFFT(Vec<f32>),
     Log(InternalLog),
 }
@@ -334,6 +545,14 @@ pub enum PlayerEvent {
 pub struct PlaylistItem {
     pub item: PlayingItem,
     pub source: PlaybackSource,
+    pub block: Option<HandoffBlockId>,
+}
+
+fn queue_entry(item: &PlaylistItem) -> QueueEntry {
+    QueueEntry {
+        item: item.item.clone(),
+        block: item.block,
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -563,10 +782,35 @@ impl PlayerInternal {
 
                     debug!("Received command: {cmd:?}");
                     match cmd {
+                        PlayerCommand::WithCompletion { command, response } => {
+                            self.commands_sender
+                                .send(*command)
+                                .context("Failed to queue completed player command")?;
+                            self.commands_sender
+                                .send(PlayerCommand::StatusAfterPending(response))
+                                .context("Failed to queue player completion")?;
+                        },
                         PlayerCommand::Restore { tracks, index, position, mode } => {
                             self.clear_unavailable(None)?;
                             self.add_to_playlist(tracks, AddMode::AppendToEnd);
                             self.debounce_timer = None;
+                            self.send_playlist_updated()?;
+                            self.set_playback_mode(mode)?;
+                            self.load_at(index, false, false, Some(position))?;
+                        },
+                        PlayerCommand::RestoreTagged { entries, index, position, mode } => {
+                            self.clear_unavailable(None)?;
+                            self.playlist = entries
+                                .into_iter()
+                                .map(|entry| PlaylistItem {
+                                    source: PlaybackSource::from(&entry.item),
+                                    item: entry.item,
+                                    block: entry.block,
+                                })
+                                .collect();
+                            self.debounce_timer = None;
+                            self.playback_strategy.on_playlist_updated(self.playlist.len(), UpdateReason::ClearPlaylist);
+                            self.playback_strategy.on_playlist_updated(self.playlist.len(), UpdateReason::AddToPlaylist { mode: AddMode::AppendToEnd, index: None, count: self.playlist.len() });
                             self.send_playlist_updated()?;
                             self.set_playback_mode(mode)?;
                             self.load_at(index, false, false, Some(position))?;
@@ -580,10 +824,9 @@ impl PlayerInternal {
                         },
                         PlayerCommand::LoadAtPosition { index, position, play } => {
                             if index < self.playlist.len() {
-                                let mapped = self.get_mapped_track_index(index);
-                                self.clear_unavailable(Some(self.playlist[mapped].item.clone()))?;
+                                self.clear_unavailable(Some(self.playlist[index].item.clone()))?;
                             }
-                            self.load_at(Some(index), play, true, Some(position))?;
+                            self.load_at(Some(index), play, false, Some(position))?;
                         },
                         PlayerCommand::LoadComplete { generation, result, item, original_item, index, mapped, playlist_index, path } => {
                             if generation != self.load_generation {
@@ -644,6 +887,135 @@ impl PlayerInternal {
                         PlayerCommand::Seek(position) => self.seek(position)?,
                         PlayerCommand::AddToPlaylist { tracks, mode } => {
                             self.add_to_playlist(tracks, mode);
+                        },
+                        PlayerCommand::EditPlaylist(edit) => {
+                            let add_mode = match edit.placement {
+                                PlaylistPlacement::Replace | PlaylistPlacement::AppendToEnd => {
+                                    AddMode::AppendToEnd
+                                }
+                                PlaylistPlacement::PlayNext => AddMode::PlayNext,
+                            };
+                            let insertion = match edit.placement {
+                                PlaylistPlacement::Replace => {
+                                    self.clear_playlist()?;
+                                    0
+                                }
+                                PlaylistPlacement::AppendToEnd => self.playlist.len(),
+                                PlaylistPlacement::PlayNext => self.current_queue_edit_index()
+                                    .map_or(self.playlist.len(), |index| index + 1),
+                            };
+                            let added = !edit.tracks.is_empty();
+                            if added {
+                                self.add_to_playlist_tagged(edit.tracks, add_mode, edit.block);
+                            }
+                            if let Some(mode) = edit.playback_mode {
+                                self.set_playback_mode(mode)?;
+                            }
+                            if let Some(load) = edit.load {
+                                self.load_at(
+                                    Some(insertion + load.start_index),
+                                    load.play,
+                                    false,
+                                    Some(load.position),
+                                )?;
+                            } else if added
+                                && edit.placement == PlaylistPlacement::PlayNext
+                                && self.current_queue_edit_index().is_none()
+                            {
+                                self.load_at(Some(insertion), true, false, Some(Duration::ZERO))?;
+                            }
+                        },
+                        PlayerCommand::HandoffLoad { tracks, block, start_index, position, play, playback_mode, response } => {
+                            let interrupted = self.interrupted_item();
+                            let current_index = self.current_queue_edit_index()
+                                .and_then(|_| self.current_playlist_index());
+                            let insertion = current_index.map_or(self.playlist.len(), |index| index + 1);
+                            if let Some(index) = current_index {
+                                self.current_track_index = Some(index);
+                                self.current_track_mapped = false;
+                            }
+                            self.add_to_playlist_tagged(tracks, AddMode::PlayNext, Some(block));
+                            if let Some(mode) = playback_mode {
+                                self.set_playback_mode(mode)?;
+                            }
+                            if let Some(start_index) = start_index {
+                                self.load_at(Some(insertion + start_index), play, false, Some(position))?;
+                            }
+                            let _ = response.send(HandoffLoadResult {
+                                interrupted,
+                                items: self.playlist.iter().map(queue_entry).collect(),
+                            });
+                        },
+                        PlayerCommand::TakeBackBlock { block, interrupted, response } => {
+                            if !self.playlist.iter().any(|item| item.block == Some(block)) {
+                                let _ = response.send(None);
+                                continue;
+                            }
+                            let current_index = self.current_playlist_index();
+                            let current_item = self.current_item.clone();
+                            let was_playing = self.state == InternalPlaybackState::Playing
+                                || (self.state == InternalPlaybackState::Loading && self.play_when_loaded);
+                            let was_inside = self.state != InternalPlaybackState::Stopped
+                                && current_item.is_some()
+                                && current_index
+                                .and_then(|index| self.playlist.get(index))
+                                .is_some_and(|item| item.block == Some(block));
+                            let block_items = self.playlist.iter()
+                                .filter(|item| item.block == Some(block))
+                                .map(queue_entry)
+                                .collect::<Vec<_>>();
+                            let block_index = if was_inside {
+                                current_index.map(|index| self.playlist[..index]
+                                    .iter().filter(|item| item.block == Some(block)).count())
+                            } else {
+                                None
+                            };
+                            let position = if was_inside { self.current_position().unwrap_or_default() } else { Duration::ZERO };
+                            let indices = self.playlist.iter().enumerate()
+                                .filter_map(|(index, item)| (item.block == Some(block)).then_some(index))
+                                .collect::<Vec<_>>();
+                            for index in indices.into_iter().rev() {
+                                self.remove_from_playlist(index)?;
+                            }
+                            if was_inside {
+                                match interrupted {
+                                    InterruptedItem::Nothing => self.stop()?,
+                                    InterruptedItem::Item { index_hint, item, position } => {
+                                        let index = self.playlist.iter().position(|entry| entry.item == item)
+                                            .unwrap_or_else(|| index_hint.min(self.playlist.len().saturating_sub(1)));
+                                        if self.playlist.is_empty() {
+                                            self.stop()?;
+                                        } else {
+                                            self.load_at(Some(index), false, false, Some(position))?;
+                                        }
+                                    }
+                                }
+                            } else if let Some(item) = current_item {
+                                self.current_track_index = self.playlist.iter()
+                                    .position(|entry| entry.item == item);
+                                self.current_track_mapped = false;
+                            }
+                            let _ = response.send(Some(TakeBackBlockResult {
+                                items: block_items,
+                                remaining: self.playlist.iter().map(queue_entry).collect(),
+                                index: block_index,
+                                position,
+                                playback_mode: self.playback_mode,
+                                playing: was_playing,
+                            }));
+                        },
+                        PlayerCommand::ClearHandoffBlocks { response } => {
+                            let mut changed = false;
+                            for item in &mut self.playlist {
+                                changed |= item.block.take().is_some();
+                            }
+                            if changed {
+                                self.schedule_playlist_update();
+                            }
+                            let _ = response.send(ClearHandoffBlocksResult {
+                                changed,
+                                items: self.playlist.iter().map(queue_entry).collect(),
+                            });
                         },
                         PlayerCommand::RemoveFromPlaylist { index } => self.remove_from_playlist(index)?,
                         PlayerCommand::ClearPlaylist => self.clear_playlist()?,
@@ -763,30 +1135,59 @@ impl PlayerInternal {
                 let source_future = async {
                     let mut fsio = fsio;
                     let mut resolver = resolver;
-                    if let (PlayingItem::InLibrary(identity), Some(root)) =
-                        (&item.item, resolver.as_ref())
-                        && let Some(library) =
-                            root.for_library(identity.library_id.to_string()).await?
+                    let mut remote_storage = false;
+                    let library_track_key =
+                        if let (PlayingItem::LibraryTrack { library_id, track }, Some(resolver)) =
+                            (&item.item, resolver.as_ref())
+                        {
+                            Some(
+                                resolver
+                                    .resolve_track(library_id.to_string(), track.clone())
+                                    .await?,
+                            )
+                        } else {
+                            None
+                        };
+                    if matches!(library_track_key, Some(LibraryTrackKey::Rune(_)))
+                        && let (PlayingItem::LibraryTrack { library_id, .. }, Some(root)) =
+                            (&item.item, resolver.as_ref())
+                        && let Some(library) = root.for_library(library_id.to_string()).await?
                     {
+                        remote_storage = library.fsio.name() == "OpenDAL";
                         fsio = library.fsio;
                         resolver = Some(library.resolver);
                     }
-                    let local_file_id = if let (PlayingItem::InLibrary(identity), Some(resolver)) =
-                        (&item.item, resolver.as_ref())
-                    {
-                        debug!("Resolving source identity for track load {index}");
-                        Some(
-                            resolver
-                                .resolve_id(identity.file_uuid)
-                                .await?
-                                .context("library track no longer exists")?,
-                        )
-                    } else {
-                        None
-                    };
+                    let local_file_id =
+                        if let (Some(LibraryTrackKey::Rune(file_uuid)), Some(resolver)) =
+                            (&library_track_key, resolver.as_ref())
+                        {
+                            debug!("Resolving source identity for track load {index}");
+                            Some(
+                                resolver
+                                    .resolve_id(*file_uuid)
+                                    .await?
+                                    .context("library track no longer exists")?,
+                            )
+                        } else {
+                            None
+                        };
                     let resolved_item = item.item.clone();
                     match &resolved_item {
-                        PlayingItem::IndependentFile(_) | PlayingItem::InLibrary(_) => {
+                        PlayingItem::IndependentFile(_) => {
+                            let path = match &item.source {
+                                PlaybackSource::Local(path) => path.clone(),
+                                PlaybackSource::LibraryStream => {
+                                    bail!("library stream resolver unavailable")
+                                }
+                            };
+                            let source = open_local_source(fsio, path.clone(), remote_storage)
+                                .await
+                                .with_context(|| format!("Failed to open file: {path:?}"))?;
+                            Ok((source, path, resolved_item.clone()))
+                        }
+                        PlayingItem::LibraryTrack { .. }
+                            if matches!(library_track_key, Some(LibraryTrackKey::Rune(_))) =>
+                        {
                             let path = if let (Some(id), Some(resolver)) =
                                 (local_file_id, resolver.as_ref())
                             {
@@ -813,18 +1214,29 @@ impl PlayerInternal {
                                     }
                                 }
                             };
-                            let stream = fsio
-                                .open(&path, "r")
+                            let source = open_local_source(fsio, path.clone(), remote_storage)
+                                .await
                                 .with_context(|| format!("Failed to open file: {path:?}"))?;
-                            let ext = path.extension().and_then(|e| e.to_str());
-                            let decoder =
-                                probe_decoder(BufReader::new(stream), ext.map(str::to_owned), None)
-                                    .await?;
-                            Ok((
-                                AnySource::Local(rune_buffered(decoder)),
-                                path,
-                                resolved_item.clone(),
-                            ))
+                            Ok((source, path, resolved_item.clone()))
+                        }
+                        PlayingItem::LibraryTrack { library_id, .. }
+                            if matches!(library_track_key, Some(LibraryTrackKey::Subsonic(_))) =>
+                        {
+                            let resolver = resolver
+                                .as_ref()
+                                .context("Subsonic playback resolver unavailable")?;
+                            let item = SubsonicItem {
+                                library_id: *library_id,
+                                track_id: match library_track_key.as_ref() {
+                                    Some(LibraryTrackKey::Subsonic(track)) => track.clone(),
+                                    _ => bail!("Subsonic track key unavailable"),
+                                },
+                            };
+                            let (source, path) = open_subsonic_stream(resolver, item).await?;
+                            Ok((source, path, resolved_item.clone()))
+                        }
+                        PlayingItem::LibraryTrack { .. } => {
+                            bail!("library track resolver unavailable")
                         }
                         PlayingItem::Online(url, _) => {
                             info!("Downloading from url: {url}");
@@ -891,7 +1303,7 @@ impl PlayerInternal {
             self.output_opens.fetch_add(1, Ordering::SeqCst);
             if self
                 .failing_opens
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 bail!("the test output refused to open");
@@ -1300,7 +1712,7 @@ impl PlayerInternal {
             self.output_resumes.fetch_add(1, Ordering::SeqCst);
             if self
                 .failing_resumes
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 bail!("the test output refused to start again");
@@ -1572,10 +1984,20 @@ impl PlayerInternal {
     }
 
     fn add_to_playlist(&mut self, tracks: Vec<(PlayingItem, PlaybackSource)>, mode: AddMode) {
+        self.add_to_playlist_tagged(tracks, mode, None);
+    }
+
+    fn add_to_playlist_tagged(
+        &mut self,
+        tracks: Vec<(PlayingItem, PlaybackSource)>,
+        mode: AddMode,
+        requested_block: Option<HandoffBlockId>,
+    ) {
         debug!("Adding tracks to playlist with mode: {:?}", { mode });
+        let count = tracks.len();
         let insert_index = match mode {
             AddMode::PlayNext => {
-                if let Some(current_index) = self.current_track_index {
+                if let Some(current_index) = self.current_queue_edit_index() {
                     Some(current_index + 1)
                 } else {
                     Some(self.playlist.len())
@@ -1584,6 +2006,14 @@ impl PlayerInternal {
             AddMode::AppendToEnd => None,
         };
 
+        let inherited_index = insert_index.unwrap_or(self.playlist.len());
+        let current_item = (self.state != InternalPlaybackState::Stopped)
+            .then_some(self.current_item.as_ref())
+            .flatten();
+        let inherited_block =
+            inherited_block_for_insert(&self.playlist, inherited_index, current_item);
+        let block = requested_block.or(inherited_block);
+
         if let Some(index) = insert_index {
             for (i, track) in tracks.into_iter().enumerate() {
                 self.playlist.insert(
@@ -1591,6 +2021,7 @@ impl PlayerInternal {
                     PlaylistItem {
                         item: track.0,
                         source: track.1,
+                        block,
                     },
                 );
             }
@@ -1599,6 +2030,7 @@ impl PlayerInternal {
                 .extend(tracks.into_iter().map(|track| PlaylistItem {
                     item: track.0,
                     source: track.1,
+                    block,
                 }));
         }
 
@@ -1607,9 +2039,29 @@ impl PlayerInternal {
             UpdateReason::AddToPlaylist {
                 mode,
                 index: insert_index,
+                count,
             },
         );
         self.schedule_playlist_update();
+    }
+
+    fn interrupted_item(&self) -> InterruptedItem {
+        match (self.current_track_index, self.current_item.as_ref()) {
+            (Some(index_hint), Some(item)) if self.state != InternalPlaybackState::Stopped => {
+                InterruptedItem::Item {
+                    index_hint: self.current_playlist_index().unwrap_or(index_hint),
+                    item: item.clone(),
+                    position: self.current_position().unwrap_or_default(),
+                }
+            }
+            _ => InterruptedItem::Nothing,
+        }
+    }
+
+    fn current_queue_edit_index(&self) -> Option<usize> {
+        (self.state != InternalPlaybackState::Stopped)
+            .then(|| self.current_playlist_index())
+            .flatten()
     }
 
     fn remove_from_playlist(&mut self, index: usize) -> Result<()> {
@@ -1842,8 +2294,7 @@ impl PlayerInternal {
     }
 
     fn send_playlist_updated(&self) -> Result<()> {
-        let playlist_items: Vec<PlayingItem> =
-            self.playlist.iter().map(|item| item.item.clone()).collect();
+        let playlist_items: Vec<PlaylistItem> = self.playlist.clone();
         self.event_sender
             .send(PlayerEvent::PlaylistUpdated(playlist_items))
             .with_context(|| "Failed to send PlaylistUpdated event")?;
@@ -1919,15 +2370,143 @@ impl PlayerInternal {
     }
 }
 
+fn inherited_block_for_insert(
+    playlist: &[PlaylistItem],
+    index: usize,
+    current_item: Option<&PlayingItem>,
+) -> Option<HandoffBlockId> {
+    let left = index.checked_sub(1).and_then(|left| playlist.get(left));
+    let right = playlist.get(index);
+    let between_same_block = left
+        .and_then(|item| item.block)
+        .filter(|block| right.is_some_and(|item| item.block == Some(*block)));
+    between_same_block.or_else(|| {
+        left.and_then(|item| item.block).filter(|block| {
+            !playlist[index..]
+                .iter()
+                .any(|item| item.block == Some(*block))
+                && current_item.is_some_and(|current| {
+                    playlist
+                        .iter()
+                        .any(|entry| entry.block == Some(*block) && &entry.item == current)
+                })
+        })
+    })
+}
+
 #[cfg(test)]
 mod stream_open_tests {
     use super::*;
-    use crate::player::{AudioRequest, LibraryItem, LibraryPlaybackSource, RemoteAudioSource};
+    use crate::player::{AudioRequest, LibraryPlaybackSource, RemoteAudioSource};
     use futures::future::BoxFuture;
     use std::collections::{HashMap, HashSet};
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{Receiver, channel};
+    use tokio::runtime::Handle;
+
+    fn opendal_fsio(config: fsio::OpenDalConfig) -> Result<Arc<FsIo>> {
+        Ok(Arc::new(FsIo::new_opendal(config, Handle::current())?))
+    }
+
+    async fn decode_opendal_asset(fsio: Arc<FsIo>) -> Result<()> {
+        let source = open_local_source(fsio, PathBuf::from("startup_0.ogg"), true).await?;
+        let duration = source
+            .total_duration()
+            .context("decoded duration missing")?;
+        anyhow::ensure!(duration > Duration::from_secs(1));
+        let samples = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut source = source;
+            source
+                .try_seek(duration.saturating_sub(Duration::from_millis(500)))
+                .map_err(|error| anyhow!("seek failed: {error}"))?;
+            let mut samples = 0usize;
+            while source.next().is_some() {
+                samples += 1;
+            }
+            Ok(samples)
+        })
+        .await??;
+        anyhow::ensure!(samples > 0, "seek near the end produced no samples");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn opendal_track_decodes_seeks_and_finishes_on_current_thread() -> Result<()> {
+        use fsio::{OpenDalConfig, test_fixtures::WebDavFixture};
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let asset = include_bytes!("../../assets/startup_0.ogg").to_vec();
+            let fixture = WebDavFixture::start(vec![("startup_0.ogg".into(), asset)]).await?;
+            let fsio = opendal_fsio(OpenDalConfig::WebDav {
+                endpoint: fixture.endpoint.clone(),
+                root: "/dav/library/".into(),
+                username: "user".into(),
+                password: "pass".into(),
+            })?;
+            decode_opendal_asset(fsio).await?;
+            anyhow::ensure!(fixture.write_requests().is_empty());
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("current-thread OpenDAL decode timed out")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn opendal_s3_track_decodes_seeks_and_finishes_on_current_thread() -> Result<()> {
+        use fsio::{OpenDalConfig, test_fixtures::S3Fixture};
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let fixture = S3Fixture::start(vec![(
+                "startup_0.ogg".into(),
+                include_bytes!("../../assets/startup_0.ogg").to_vec(),
+            )])
+            .await?;
+            let fsio = opendal_fsio(OpenDalConfig::S3 {
+                endpoint: fixture.endpoint.clone(),
+                bucket: "bucket".into(),
+                region: "us-east-1".into(),
+                root: "/library/".into(),
+                access_key_id: "access".into(),
+                secret_access_key: "secret".into(),
+            })?;
+            decode_opendal_asset(fsio).await
+        })
+        .await
+        .context("current-thread OpenDAL S3 decode timed out")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_opendal_credentials_are_a_typed_source_failure() -> Result<()> {
+        use fsio::{OpenDalConfig, test_fixtures::WebDavFixture};
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let fixture = WebDavFixture::start(vec![(
+                "startup_0.ogg".into(),
+                include_bytes!("../../assets/startup_0.ogg").to_vec(),
+            )])
+            .await?;
+            let fsio = opendal_fsio(OpenDalConfig::WebDav {
+                endpoint: fixture.endpoint.clone(),
+                root: "/dav/library/".into(),
+                username: "user".into(),
+                password: "wrong".into(),
+            })?;
+            let error = open_local_source(fsio, PathBuf::from("startup_0.ogg"), true)
+                .await
+                .expect_err("rejected credentials must fail the source");
+            anyhow::ensure!(
+                UnavailableReason::classify(&error) == UnavailableReason::AccessRevoked,
+                "OpenDAL error was not classified as a typed access failure: {error:#}"
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("current-thread credential failure timed out")??;
+        Ok(())
+    }
     use tokio::sync::Notify;
     use tokio::task::LocalSet;
     use uuid::Uuid;
@@ -2204,10 +2783,10 @@ mod stream_open_tests {
                             .iter()
                             .map(|file_uuid| {
                                 (
-                                    PlayingItem::InLibrary(LibraryItem {
+                                    PlayingItem::LibraryTrack {
                                         library_id,
-                                        file_uuid: *file_uuid,
-                                    }),
+                                        track: file_uuid.to_string(),
+                                    },
                                     PlaybackSource::LibraryStream,
                                 )
                             })
@@ -2270,12 +2849,12 @@ mod stream_open_tests {
                 let runner = tokio::task::spawn_local(async move { internal.run().await });
                 async {
                     let library_id = Uuid::new_v4();
-                    let track = |file_uuid| {
+                    let track = |file_uuid: Uuid| {
                         (
-                            PlayingItem::InLibrary(LibraryItem {
+                            PlayingItem::LibraryTrack {
                                 library_id,
-                                file_uuid,
-                            }),
+                                track: file_uuid.to_string(),
+                            },
                             PlaybackSource::LibraryStream,
                         )
                     };
@@ -2308,10 +2887,10 @@ mod stream_open_tests {
                     assert_eq!(&*ids.lock().unwrap(), &[1, 2]);
                     release.notify_one();
 
-                    let expected = PlayingItem::InLibrary(LibraryItem {
+                    let expected = PlayingItem::LibraryTrack {
                         library_id,
-                        file_uuid: file_uuids[1],
-                    });
+                        track: file_uuids[1].to_string(),
+                    };
                     tokio::time::timeout(Duration::from_secs(3), async {
                         loop {
                             if let Some(PlayerEvent::Playing { item, .. }) = events.recv().await
@@ -2359,10 +2938,10 @@ mod stream_open_tests {
                 let runner = tokio::task::spawn_local(async move { internal.run().await });
                 async {
                     let library_id = Uuid::new_v4();
-                    let expected = PlayingItem::InLibrary(LibraryItem {
+                    let expected = PlayingItem::LibraryTrack {
                         library_id,
-                        file_uuid: file_uuids[0],
-                    });
+                        track: file_uuids[0].to_string(),
+                    };
                     commands_sender.send(PlayerCommand::AddToPlaylist {
                         tracks: vec![(expected.clone(), PlaybackSource::LibraryStream)],
                         mode: AddMode::AppendToEnd,
@@ -2398,7 +2977,7 @@ mod playback_state_tests {
         DelayedResolver, delayed_resolver_fixture, delayed_resolver_fixture_with_samples,
     };
     use super::*;
-    use crate::player::LibraryItem;
+    use crate::player::PlaylistLoad;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc::channel;
     use tokio::runtime::Builder;
@@ -2428,10 +3007,10 @@ mod playback_state_tests {
     }
 
     fn library_item(library_id: Uuid, file_uuid: Uuid) -> PlayingItem {
-        PlayingItem::InLibrary(LibraryItem {
+        PlayingItem::LibraryTrack {
             library_id,
-            file_uuid,
-        })
+            track: file_uuid.to_string(),
+        }
     }
 
     fn library_tracks(library_id: Uuid, file_uuids: &[Uuid]) -> Vec<(PlayingItem, PlaybackSource)> {
@@ -2451,6 +3030,72 @@ mod playback_state_tests {
             tracks: library_tracks(library_id, file_uuids),
             mode: AddMode::AppendToEnd,
         }
+    }
+
+    #[test]
+    fn handoff_tags_propagate_only_inside_the_block_and_follow_queue_edits() -> Result<()> {
+        let (commands_sender, commands) = mpsc::unbounded_channel();
+        let (event_sender, _events) = mpsc::unbounded_channel();
+        let mut internal = PlayerInternal::new(
+            commands,
+            event_sender,
+            CancellationToken::new(),
+            commands_sender,
+            Arc::new(FsIo::new_noop()),
+            PcmTap::new(),
+            Arc::new(RwLock::new(None)),
+        );
+        let library_id = Uuid::new_v4();
+        let block = HandoffBlockId(Uuid::new_v4());
+        let ids = (0..6).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        internal.playlist = ids[..4]
+            .iter()
+            .enumerate()
+            .map(|(index, id)| PlaylistItem {
+                item: library_item(library_id, *id),
+                source: PlaybackSource::LibraryStream,
+                block: (index < 3).then_some(block),
+            })
+            .collect();
+        internal.current_item = Some(library_item(library_id, ids[1]));
+        internal.current_track_index = Some(1);
+        internal.state = InternalPlaybackState::Paused;
+
+        internal.add_to_playlist_tagged(
+            library_tracks(library_id, &[ids[4]]),
+            AddMode::PlayNext,
+            None,
+        );
+        assert_eq!(internal.playlist[2].block, Some(block));
+        assert_eq!(internal.playlist[4].block, None);
+
+        internal.current_item = Some(library_item(library_id, ids[2]));
+        internal.current_track_index = Some(3);
+        internal.add_to_playlist_tagged(
+            library_tracks(library_id, &[ids[5]]),
+            AddMode::PlayNext,
+            None,
+        );
+        assert_eq!(internal.playlist[4].block, Some(block));
+        assert_eq!(
+            inherited_block_for_insert(&internal.playlist[..5], 5, internal.current_item.as_ref(),),
+            Some(block)
+        );
+
+        let moved = internal.playlist[0].clone();
+        internal.move_playlist_item(0, 5);
+        assert_eq!(internal.playlist[5].item, moved.item);
+        assert_eq!(internal.playlist[5].block, moved.block);
+        internal.remove_from_playlist(5)?;
+
+        internal.clear_playlist()?;
+        internal.add_to_playlist_tagged(
+            library_tracks(library_id, &[ids[0], ids[1]]),
+            AddMode::AppendToEnd,
+            None,
+        );
+        assert!(internal.playlist.iter().all(|item| item.block.is_none()));
+        Ok(())
     }
 
     // Waits for the next event that brings a track up, plays it or pauses it.
@@ -2571,6 +3216,104 @@ mod playback_state_tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         while events.try_recv().is_ok() {}
         Ok(track)
+    }
+
+    #[tokio::test]
+    async fn playlist_edit_uses_current_index_when_the_command_runs() -> Result<()> {
+        let file_uuids = (0..8).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&file_uuids);
+        let local = LocalSet::new();
+        local
+            .run_until(async move {
+                let runner = tokio::task::spawn_local(async move { internal.run().await });
+                async {
+                    let library_id = Uuid::new_v4();
+                    let original = library_tracks(library_id, &file_uuids[..5]);
+                    commands_sender.send(PlayerCommand::AddToPlaylist {
+                        tracks: original,
+                        mode: AddMode::AppendToEnd,
+                    })?;
+                    commands_sender.send(PlayerCommand::Switch(2))?;
+                    let target_c = library_item(library_id, file_uuids[2]);
+                    expect_playing(&mut events, &target_c).await?;
+                    let snapshot_index = 2;
+
+                    commands_sender.send(PlayerCommand::Switch(3))?;
+                    let target_d = library_item(library_id, file_uuids[3]);
+                    expect_playing(&mut events, &target_d).await?;
+                    assert_ne!(snapshot_index, 3);
+
+                    commands_sender.send(PlayerCommand::EditPlaylist(PlaylistEdit {
+                        tracks: library_tracks(library_id, &file_uuids[5..8]),
+                        placement: PlaylistPlacement::PlayNext,
+                        playback_mode: None,
+                        block: None,
+                        load: Some(PlaylistLoad {
+                            start_index: 1,
+                            position: Duration::from_secs(1),
+                            play: false,
+                        }),
+                    }))?;
+                    let loaded = next_track_state(&mut events).await?;
+                    assert!(
+                        matches!(
+                            loaded,
+                        PlayerEvent::Loaded { ref item, index: 5, .. }
+                            if *item == library_item(library_id, file_uuids[6])
+                        ),
+                        "{loaded:?}"
+                    );
+
+                    runner.abort();
+                    let _ = std::fs::remove_file(wav_path);
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+            })
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn play_next_edit_appends_and_starts_when_stopped_with_a_stale_index() -> Result<()> {
+        let file_uuids = (0..4).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&file_uuids);
+        let local = LocalSet::new();
+        local
+            .run_until(async move {
+                let runner = tokio::task::spawn_local(async move { internal.run().await });
+                async {
+                    let library_id = Uuid::new_v4();
+                    commands_sender.send(PlayerCommand::AddToPlaylist {
+                        tracks: library_tracks(library_id, &file_uuids[..3]),
+                        mode: AddMode::AppendToEnd,
+                    })?;
+                    commands_sender.send(PlayerCommand::Switch(1))?;
+                    expect_playing(&mut events, &library_item(library_id, file_uuids[1])).await?;
+                    commands_sender.send(PlayerCommand::Stop)?;
+
+                    commands_sender.send(PlayerCommand::EditPlaylist(PlaylistEdit {
+                        tracks: library_tracks(library_id, &file_uuids[3..]),
+                        placement: PlaylistPlacement::PlayNext,
+                        playback_mode: None,
+                        block: None,
+                        load: None,
+                    }))?;
+                    let started = next_track_state(&mut events).await?;
+                    assert!(
+                        matches!(started, PlayerEvent::Playing { ref item, index: 3, .. }
+                            if *item == library_item(library_id, file_uuids[3])),
+                        "{started:?}"
+                    );
+
+                    runner.abort();
+                    let _ = std::fs::remove_file(wav_path);
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+            })
+            .await?;
+        Ok(())
     }
 
     async fn assert_nothing_plays(events: &mut mpsc::UnboundedReceiver<PlayerEvent>) {
@@ -4301,6 +5044,43 @@ mod playback_state_tests {
         );
         assert_about(position_of(&event), Duration::from_secs(1));
         let _ = std::fs::remove_file(wav_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_at_position_uses_the_playlist_index_in_shuffle_mode() -> Result<()> {
+        let file_uuids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&file_uuids);
+        let library_id = Uuid::new_v4();
+        let expected = library_item(library_id, file_uuids[2]);
+        internal.playback_mode = PlaybackMode::Shuffle;
+        internal.playback_strategy = Box::new(ShiftedOrder);
+        let local = LocalSet::new();
+        local
+            .run_until(async move {
+                let runner = tokio::task::spawn_local(async move { internal.run().await });
+                commands_sender.send(add_library_tracks(library_id, &file_uuids))?;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !matches!(events.recv().await, Some(PlayerEvent::PlaylistUpdated(_))) {}
+                })
+                .await?;
+
+                commands_sender.send(PlayerCommand::LoadAtPosition {
+                    index: 2,
+                    position: Duration::from_secs(1),
+                    play: false,
+                })?;
+                let event = next_track_state(&mut events).await?;
+                assert!(
+                    matches!(&event, PlayerEvent::Loaded { item, index: 2, .. } if *item == expected),
+                    "{event:?}"
+                );
+
+                runner.abort();
+                let _ = std::fs::remove_file(wav_path);
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
         Ok(())
     }
 

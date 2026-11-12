@@ -1,7 +1,6 @@
 mod source;
 
 use crate::actions::file::hash_file;
-use crate::actions::metadata::is_fatal_scan_error;
 use crate::sync::model::{BlobRef, MAX_PORTABLE_FINGERPRINT_BYTES};
 pub use source::{
     ComputedFingerprint, ComputedSimilarity, SourceStatus, assign_computed_fingerprint,
@@ -116,7 +115,10 @@ pub fn bytes_to_u32s(bytes: Vec<u8>) -> Result<Vec<u32>> {
     Ok(u32s)
 }
 
-fn group_similar_files(similarities: &[media_file_similarity::Model]) -> Vec<Vec<String>> {
+fn group_similar_files(
+    similarities: &[media_file_similarity::Model],
+    zero_score_files: &[String],
+) -> Vec<Vec<String>> {
     let mut adjacency_list: HashMap<String, Vec<String>> = HashMap::new();
 
     // Build an adjacency list for our similarity graph
@@ -129,6 +131,16 @@ fn group_similar_files(similarities: &[media_file_similarity::Model]) -> Vec<Vec
             .entry(similarity.second_track_uuid.clone())
             .or_default()
             .push(similarity.first_track_uuid.clone());
+    }
+    for pair in zero_score_files.windows(2) {
+        adjacency_list
+            .entry(pair[0].clone())
+            .or_default()
+            .push(pair[1].clone());
+        adjacency_list
+            .entry(pair[1].clone())
+            .or_default()
+            .push(pair[0].clone());
     }
 
     // Use a set to track visited nodes during our search
@@ -300,13 +312,8 @@ where
                     )
                     .await
                     {
-                        if is_fatal_scan_error(&error) {
-                            return Err(error);
-                        }
-                        log::warn!(
-                            "Fingerprint assignment failed for {}: {error:#}",
-                            file.file_name
-                        );
+                        return Err(error)
+                            .with_context(|| format!("assign fingerprint for {}", file.file_name));
                     }
                 }
                 Err(error) => {
@@ -444,7 +451,22 @@ where
         }
         verified.push(row);
     }
-    let groups = group_similar_files(&verified);
+    let mut zero_score_files = Vec::new();
+    if threshold <= 0.0 {
+        let files = MediaFiles::find()
+            .filter(media_files::Column::LocalAvailable.eq(true))
+            .all(db)
+            .await?;
+        for file in files {
+            let Some(fingerprint) = current_fingerprint(db, &file).await? else {
+                continue;
+            };
+            if fingerprint_status(&fingerprint, &file) == SourceStatus::Verified {
+                zero_score_files.push(file.hlc_uuid);
+            }
+        }
+    }
+    let groups = group_similar_files(&verified, &zero_score_files);
     let total = groups.len();
     let mut marked = 0;
     for (index, group) in groups.into_iter().enumerate() {

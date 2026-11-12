@@ -1,18 +1,172 @@
 //! Transaction-bound causal authoring, reception, and accepted-state queries.
 use crate::causal_candidates::CandidateRow;
-use crate::causal_leases::lock_on;
+use crate::causal_leases::{begin_write, lock_on};
+use crate::causal_schema::{ensure_export_cursors_on, ensure_journal_origin_on};
 use crate::causal_writer::WriterIncarnation;
 use anyhow::{Result, ensure};
 use sea_orm::sea_query::Order;
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseTransaction, ExprTrait, FromQueryResult,
-    TransactionTrait,
+    ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, ExprTrait,
+    FromQueryResult, Statement, TransactionTrait,
     sea_query::{Alias, Expr, Query},
 };
-use std::{marker::PhantomData, sync::Arc};
+use std::{cmp::max, marker::PhantomData, sync::Arc};
 use sync::causal::{self, Context};
 use sync::protocol::{self, ModelId, StoreIdentity, SyncModel};
 use uuid::Uuid;
+
+const WRITER_RESERVATION_SIZE: i64 = 1_000_000_000;
+
+async fn ensure_writer_columns_on<C: ConnectionTrait>(db: &C) -> Result<()> {
+    let statement = Statement::from_string(DbBackend::Sqlite, "PRAGMA table_info(sync_meta)");
+    let columns = db
+        .query_all_raw(statement)
+        .await?
+        .into_iter()
+        .map(|row| row.try_get_by_index::<String>(1))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (name, sql_type) in [
+        ("writer_incarnation", "BLOB"),
+        ("writer_author", "BLOB"),
+        ("writer_reserved_counter", "BIGINT"),
+        ("writer_file_token", "BLOB"),
+        ("writer_clean_counter", "BIGINT"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            db.execute_unprepared(&format!(
+                "ALTER TABLE sync_meta ADD COLUMN {name} {sql_type}"
+            ))
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn reserve_writer_on<C: ConnectionTrait>(
+    db: &C,
+    namespace: Uuid,
+    author: Uuid,
+    expected_file_token: Option<Uuid>,
+) -> Result<WriterIncarnation> {
+    ensure_writer_columns_on(db).await?;
+    let query = Query::select()
+        .columns(
+            [
+                "writer_incarnation",
+                "writer_author",
+                "writer_reserved_counter",
+                "writer_file_token",
+                "writer_clean_counter",
+            ]
+            .map(Alias::new),
+        )
+        .from(Alias::new("sync_meta"))
+        .and_where(Expr::col(Alias::new("namespace")).eq(namespace.as_bytes().to_vec()))
+        .to_owned();
+    let row = db
+        .query_one(&query)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing causal namespace"))?;
+    let stored_id = row.try_get_by_index::<Option<Vec<u8>>>(0)?;
+    let stored_author = row.try_get_by_index::<Option<Vec<u8>>>(1)?;
+    let stored_end = row.try_get_by_index::<Option<i64>>(2)?;
+    let stored_file_token = row.try_get_by_index::<Option<Vec<u8>>>(3)?;
+    let clean_counter = row.try_get_by_index::<Option<i64>>(4)?;
+    let parsed_id = stored_id
+        .as_deref()
+        .and_then(|bytes| Uuid::from_slice(bytes).ok())
+        .filter(|id| !id.is_nil());
+    let parsed_author = stored_author
+        .as_deref()
+        .and_then(|bytes| Uuid::from_slice(bytes).ok())
+        .filter(|id| !id.is_nil());
+    let mut incarnation = parsed_id.unwrap_or_else(Uuid::new_v4);
+    let mut start = stored_end.filter(|end| *end >= 0).unwrap_or(0);
+    let mismatched_owner = parsed_author.is_some_and(|owner| owner != author);
+    let invalid_metadata = parsed_id.is_none() || parsed_author.is_none() || stored_end.is_none();
+    let maximum_candidate_dot = match db
+        .query_one(
+            &Query::select()
+                .expr(Expr::col(Alias::new("counter")).max())
+                .from(Alias::new("sync_candidates"))
+                .and_where(Expr::col(Alias::new("namespace")).eq(namespace.as_bytes().to_vec()))
+                .and_where(Expr::col(Alias::new("writer")).eq(incarnation.as_bytes().to_vec()))
+                .to_owned(),
+        )
+        .await?
+    {
+        Some(row) => row.try_get_by_index::<Option<i64>>(0)?.unwrap_or(0),
+        None => 0,
+    };
+    let maximum_observed_dot = match db
+        .query_one(
+            &Query::select()
+                .expr(Expr::col(Alias::new("last")).max())
+                .from(Alias::new("sync_observed"))
+                .and_where(Expr::col(Alias::new("namespace")).eq(namespace.as_bytes().to_vec()))
+                .and_where(Expr::col(Alias::new("writer")).eq(incarnation.as_bytes().to_vec()))
+                .to_owned(),
+        )
+        .await?
+    {
+        Some(row) => row.try_get_by_index::<Option<i64>>(0)?.unwrap_or(0),
+        None => 0,
+    };
+    let maximum_dot = max(maximum_candidate_dot, maximum_observed_dot);
+    let inconsistent_reservation = stored_end.is_some_and(|end| end < maximum_dot);
+    let valid_clean_counter = clean_counter.filter(|counter| {
+        *counter >= maximum_dot && *counter >= 0 && stored_end.is_some_and(|end| *counter <= end)
+    });
+    let mismatched_file = expected_file_token.is_some_and(|token| {
+        stored_file_token
+            .as_deref()
+            .and_then(|bytes| Uuid::from_slice(bytes).ok())
+            != Some(token)
+    });
+    if mismatched_owner || invalid_metadata || inconsistent_reservation || mismatched_file {
+        incarnation = Uuid::new_v4();
+        start = 0;
+    } else if let Some(counter) = valid_clean_counter {
+        start = counter;
+    }
+    let end = start
+        .checked_add(WRITER_RESERVATION_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("writer counter exhausted"))?;
+    let update = Query::update()
+        .table(Alias::new("sync_meta"))
+        .values([
+            (
+                Alias::new("writer_incarnation"),
+                incarnation.as_bytes().to_vec().into(),
+            ),
+            (
+                Alias::new("writer_author"),
+                author.as_bytes().to_vec().into(),
+            ),
+            (Alias::new("writer_reserved_counter"), end.into()),
+            (Alias::new("writer_clean_counter"), Expr::val(None::<i64>)),
+            (
+                Alias::new("writer_file_token"),
+                Expr::val(
+                    expected_file_token
+                        .or_else(|| {
+                            stored_file_token
+                                .as_deref()
+                                .and_then(|bytes| Uuid::from_slice(bytes).ok())
+                        })
+                        .map(|token| token.as_bytes().to_vec()),
+                ),
+            ),
+        ])
+        .and_where(Expr::col(Alias::new("namespace")).eq(namespace.as_bytes().to_vec()))
+        .to_owned();
+    ensure!(
+        db.execute(&update).await?.rows_affected() == 1,
+        "missing causal namespace"
+    );
+    WriterIncarnation::with_reservation(author, incarnation, start as u64, end as u64)
+        .map_err(anyhow::Error::msg)
+}
 
 #[derive(Clone, Debug)]
 pub struct ProjectedPage<M: SyncModel> {
@@ -45,12 +199,61 @@ pub async fn list_namespace_ids_on<C: ConnectionTrait>(db: &C, limit: u64) -> Re
     }
     Ok(namespaces)
 }
+
+/// Read the model identity for one stored namespace without opening it as a model.
+pub async fn namespace_model_on<C: ConnectionTrait>(
+    db: &C,
+    namespace: Uuid,
+) -> Result<Option<ModelId>> {
+    let query = Query::select()
+        .columns(["model", "schema"].map(Alias::new))
+        .from(Alias::new("sync_meta"))
+        .and_where(Expr::col(Alias::new("namespace")).eq(namespace.as_bytes().to_vec()))
+        .to_owned();
+    let statement = db.get_database_backend().build(&query);
+    let Some(row) = db.query_one_raw(statement).await? else {
+        return Ok(None);
+    };
+    Ok(Some(ModelId {
+        model: row.try_get_by_index(0)?,
+        schema: row.try_get_by_index(1)?,
+    }))
+}
 #[derive(Clone)]
 pub struct CausalReplica<M: SyncModel> {
     db: DatabaseConnection,
     namespace: Uuid,
     writer: Arc<WriterIncarnation>,
     model: PhantomData<M>,
+}
+
+/// The store that supplied a relayed journal event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalOrigin {
+    pub replica: Uuid,
+    pub generation: Uuid,
+}
+
+/// Local read metadata keyed by sequence, kept outside the peer wire format.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalOriginEntry {
+    pub sequence: u64,
+    pub origin: Option<JournalOrigin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalPageRead<M: SyncModel> {
+    pub read: protocol::PageRead<M>,
+    pub origins: Vec<JournalOriginEntry>,
+}
+
+struct DeltaApply<'a, M: SyncModel> {
+    delta: &'a protocol::MergeDelta<M>,
+    event: &'a protocol::Event<M>,
+    revision: u64,
+    origin: &'a protocol::StoreIdentity,
+    limits: protocol::ApplyLimits,
+    budget: &'a mut u64,
 }
 pub(crate) fn winner<M: SyncModel>(
     values: &[protocol::Candidate<M>],
@@ -88,12 +291,21 @@ impl<M: SyncModel> CausalReplica<M> {
         namespace: Uuid,
         author: Uuid,
     ) -> Result<Self> {
+        Self::create_empty_with_file_token(db, namespace, author, None).await
+    }
+    pub async fn create_empty_with_file_token(
+        db: DatabaseConnection,
+        namespace: Uuid,
+        author: Uuid,
+        file_token: Option<Uuid>,
+    ) -> Result<Self> {
         ensure!(
             !namespace.is_nil() && !author.is_nil(),
             "nil namespace or author"
         );
         protocol::validate_model::<M>()?;
-        let writer = Arc::new(WriterIncarnation::new(author).map_err(anyhow::Error::msg)?);
+        let writer_id = Uuid::new_v4();
+        let reserved_end = WRITER_RESERVATION_SIZE;
         let identity = StoreIdentity {
             namespace,
             model: ModelId {
@@ -104,7 +316,10 @@ impl<M: SyncModel> CausalReplica<M> {
             generation: Uuid::new_v4(),
         };
         let anchor = protocol::initial_anchor(&identity)?;
-        let tx = crate::causal_leases::begin_write(&db).await?;
+        let tx = begin_write(&db).await?;
+        ensure_journal_origin_on(&tx).await?;
+        ensure_export_cursors_on(&tx).await?;
+        ensure_writer_columns_on(&tx).await?;
         let q = Query::insert()
             .into_table(Alias::new("sync_meta"))
             .columns(
@@ -123,6 +338,11 @@ impl<M: SyncModel> CausalReplica<M> {
                     "floor_anchor",
                     "floor_state_seq",
                     "retained_bytes",
+                    "writer_incarnation",
+                    "writer_author",
+                    "writer_reserved_counter",
+                    "writer_file_token",
+                    "writer_clean_counter",
                 ]
                 .map(Alias::new),
             )
@@ -141,10 +361,19 @@ impl<M: SyncModel> CausalReplica<M> {
                 anchor.to_vec().into(),
                 0_i64.into(),
                 0_i64.into(),
+                writer_id.as_bytes().to_vec().into(),
+                author.as_bytes().to_vec().into(),
+                reserved_end.into(),
+                file_token.map(|token| token.as_bytes().to_vec()).into(),
+                Option::<i64>::None.into(),
             ])
             .to_owned();
         tx.execute(&q).await?;
         tx.commit().await?;
+        let writer = Arc::new(
+            WriterIncarnation::with_reservation(author, writer_id, 0, reserved_end as u64)
+                .map_err(anyhow::Error::msg)?,
+        );
         Ok(Self {
             db,
             namespace,
@@ -152,21 +381,32 @@ impl<M: SyncModel> CausalReplica<M> {
             model: PhantomData,
         })
     }
-    /// Reopening retains replica/history and creates a distinct writer incarnation.
+    /// Reopening retains replica/history and reserves a disjoint block for its writer.
     pub async fn open(db: DatabaseConnection, namespace: Uuid, author: Uuid) -> Result<Self> {
+        Self::open_with_file_token(db, namespace, author, None).await
+    }
+    pub async fn open_with_file_token(
+        db: DatabaseConnection,
+        namespace: Uuid,
+        author: Uuid,
+        file_token: Option<Uuid>,
+    ) -> Result<Self> {
         ensure!(
             !namespace.is_nil() && !author.is_nil(),
             "nil namespace or author"
         );
         protocol::validate_model::<M>()?;
-        let writer = Arc::new(WriterIncarnation::new(author).map_err(anyhow::Error::msg)?);
+        let tx = begin_write(&db).await?;
+        ensure_journal_origin_on(&tx).await?;
+        ensure_export_cursors_on(&tx).await?;
+        ensure_writer_columns_on(&tx).await?;
+        let writer = Arc::new(reserve_writer_on(&tx, namespace, author, file_token).await?);
         let replica = Self {
             db,
             namespace,
             writer,
             model: PhantomData,
         };
-        let tx = replica.db.begin().await?;
         replica.meta_on(&tx).await?;
         tx.commit().await?;
         Ok(replica)
@@ -191,6 +431,30 @@ impl<M: SyncModel> CausalReplica<M> {
     }
     pub fn writer_incarnation(&self) -> Uuid {
         self.writer.id()
+    }
+    /// Record the last consumed counter before the owner closes this database.
+    pub async fn clean_close(&self) -> Result<()> {
+        let counter = i64::try_from(self.writer.last_allocated_counter())
+            .map_err(|_| anyhow::anyhow!("writer counter exceeds database range"))?;
+        let tx = begin_write(&self.db).await?;
+        let update = Query::update()
+            .table(Alias::new("sync_meta"))
+            .value(Alias::new("writer_clean_counter"), counter)
+            .and_where(Expr::col(Alias::new("namespace")).eq(self.namespace.as_bytes().to_vec()))
+            .and_where(
+                Expr::col(Alias::new("writer_incarnation")).eq(self
+                    .writer
+                    .id()
+                    .as_bytes()
+                    .to_vec()),
+            )
+            .to_owned();
+        ensure!(
+            tx.execute(&update).await?.rows_affected() == 1,
+            "writer incarnation changed before clean close"
+        );
+        tx.commit().await?;
+        Ok(())
     }
     async fn meta_on<C: ConnectionTrait>(&self, tx: &C) -> Result<(StoreIdentity, MetaRow)> {
         let q = Query::select()
@@ -532,6 +796,8 @@ impl<M: SyncModel> CausalReplica<M> {
                     "event_digest",
                     "event_manifest",
                     "anchor_after",
+                    "origin_replica",
+                    "origin_generation",
                 ]
                 .map(Alias::new),
             )
@@ -544,6 +810,8 @@ impl<M: SyncModel> CausalReplica<M> {
                 digest.to_vec().into(),
                 manifest.manifest_digest.to_vec().into(),
                 new_anchor.to_vec().into(),
+                Option::<Vec<u8>>::None.into(),
+                Option::<Vec<u8>>::None.into(),
             ])
             .to_owned();
         tx.execute(&q).await?;
@@ -592,22 +860,25 @@ impl<M: SyncModel> CausalReplica<M> {
     ) -> Result<protocol::Record<M>> {
         self.author_on(tx, key, value).await
     }
-    /// Apply one already-received keyed event inside the caller transaction.
+    /// Apply one already-received keyed event inside the caller transaction,
+    /// recording the immediate source store as its relay origin.
     /// The caller must combine projection and any receive checkpoint with this
     /// operation and roll back the entire transaction on failure.
     pub async fn apply_key_on(
         &self,
         tx: &DatabaseTransaction,
         delta: &protocol::KeyDelta<M>,
+        origin: &protocol::StoreIdentity,
     ) -> Result<protocol::ProjectionChange<M>> {
         lock_on(tx, self.namespace).await?;
-        self.apply_key_locked_on(tx, delta).await
+        self.apply_key_locked_on(tx, delta, origin).await
     }
 
     async fn apply_key_locked_on(
         &self,
         tx: &DatabaseTransaction,
         delta: &protocol::KeyDelta<M>,
+        origin: &protocol::StoreIdentity,
     ) -> Result<protocol::ProjectionChange<M>> {
         let event = protocol::Event::Key(delta.clone());
         protocol::canonical_event(&event)?;
@@ -661,11 +932,14 @@ impl<M: SyncModel> CausalReplica<M> {
         let mut budget = u64::MAX;
         self.apply_delta_on(
             tx,
-            &merge,
-            &event,
-            delta.author.counter,
-            limits,
-            &mut budget,
+            DeltaApply {
+                delta: &merge,
+                event: &event,
+                revision: delta.author.counter,
+                origin,
+                limits,
+                budget: &mut budget,
+            },
         )
         .await?;
         let after = winner(&self.key_candidates_on(tx, &delta.key).await?)?;
@@ -871,7 +1145,9 @@ impl<M: SyncModel> CausalReplica<M> {
         for link in &page.links {
             if let Some(EventRef::Inline(Event::Key(delta))) = &link.event {
                 let before_head = self.meta_on(tx).await?.1.head;
-                let change = self.apply_key_locked_on(tx, delta).await?;
+                let change = self
+                    .apply_key_locked_on(tx, delta, &page.request.source)
+                    .await?;
                 let after_head = self.meta_on(tx).await?.1.head;
                 if after_head > before_head {
                     causal_changes += 1;
@@ -896,7 +1172,13 @@ impl<M: SyncModel> CausalReplica<M> {
             if let Some(EventRef::Inline(Event::Merge(range))) = &link.event {
                 ensure!(range_budget > 0, protocol::SyncError::WorkLimit);
                 let (_, batch) = self
-                    .apply_merge_locked_on(tx, range, limits, &mut range_budget)
+                    .apply_merge_locked_on(
+                        tx,
+                        range,
+                        &page.request.source,
+                        limits,
+                        &mut range_budget,
+                    )
                     .await?;
                 causal_changes = causal_changes
                     .checked_add(batch.causal_changes)
@@ -1164,6 +1446,24 @@ impl<M: SyncModel> CausalReplica<M> {
         &self,
         request: protocol::PageRequest<M>,
     ) -> Result<protocol::PageRead<M>> {
+        Ok(self.read_page_with_origins(request).await?.read)
+    }
+
+    /// Return the journal checkpoint at a retained sequence for export readers.
+    pub async fn progress_at(&self, sequence: u64) -> Result<protocol::ReceiveProgress> {
+        let tx = self.db.begin().await?;
+        let (_, meta) = self.meta_on(&tx).await?;
+        let anchor = self.anchor_at_on(&tx, &meta, sequence).await?;
+        tx.commit().await?;
+        Ok(protocol::ReceiveProgress { sequence, anchor })
+    }
+
+    /// Read a peer page with local-only journal origin metadata. Origins are
+    /// keyed by sequence and are never serialized into `ChangePage`.
+    pub async fn read_page_with_origins(
+        &self,
+        request: protocol::PageRequest<M>,
+    ) -> Result<LocalPageRead<M>> {
         use protocol::{ChangePage, EventRef, PageRead, ReceiveProgress, ScanLink};
         ensure!(
             request.limits.max_scanned > 0
@@ -1215,6 +1515,8 @@ impl<M: SyncModel> CausalReplica<M> {
                     "event_digest",
                     "event_manifest",
                     "anchor_after",
+                    "origin_replica",
+                    "origin_generation",
                 ]
                 .map(Alias::new),
             )
@@ -1244,6 +1546,7 @@ impl<M: SyncModel> CausalReplica<M> {
         );
         let mut link_bytes = 0_usize;
         let mut previous = request.after.anchor;
+        let mut origins = Vec::new();
         for row in rows {
             let sequence = u64::try_from(row.try_get_by_index::<i64>(0)?)?;
             ensure!(sequence == page.next.sequence + 1, "journal gap");
@@ -1267,6 +1570,20 @@ impl<M: SyncModel> CausalReplica<M> {
             let anchor: [u8; 32] = stored_anchor
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("invalid journal anchor"))?;
+            let origin_replica: Option<Vec<u8>> = row.try_get_by_index(5)?;
+            let origin_generation: Option<Vec<u8>> = row.try_get_by_index(6)?;
+            ensure!(
+                origin_replica.is_some() == origin_generation.is_some(),
+                "partial journal origin"
+            );
+            let origin = match (origin_replica, origin_generation) {
+                (Some(replica), Some(generation)) => Some(JournalOrigin {
+                    replica: Uuid::from_slice(&replica)?,
+                    generation: Uuid::from_slice(&generation)?,
+                }),
+                (None, None) => None,
+                _ => anyhow::bail!("partial journal origin"),
+            };
             ensure!(
                 protocol::next_anchor::<M>(previous, sequence, &collection, digest)? == anchor,
                 "journal continuity mismatch"
@@ -1335,18 +1652,22 @@ impl<M: SyncModel> CausalReplica<M> {
                     };
                     ensure!(scoped, protocol::SyncError::WorkLimit);
                     tx.commit().await?;
-                    return Ok(PageRead::FragmentNeeded {
-                        request,
-                        sequence,
-                        collection,
-                        event_digest: digest,
-                        manifest,
+                    return Ok(LocalPageRead {
+                        read: PageRead::FragmentNeeded {
+                            request,
+                            sequence,
+                            collection,
+                            event_digest: digest,
+                            manifest,
+                        },
+                        origins: vec![JournalOriginEntry { sequence, origin }],
                     });
                 }
                 break;
             }
             link_bytes += new_link_size;
             page.links.push(link);
+            origins.push(JournalOriginEntry { sequence, origin });
             page.next = ReceiveProgress { sequence, anchor };
             page.done = done;
             previous = anchor;
@@ -1361,7 +1682,10 @@ impl<M: SyncModel> CausalReplica<M> {
             "page exceeds limit"
         );
         tx.commit().await?;
-        Ok(PageRead::Page(page))
+        Ok(LocalPageRead {
+            read: PageRead::Page(page),
+            origins,
+        })
     }
     pub async fn identity_on<C: ConnectionTrait>(&self, tx: &C) -> Result<StoreIdentity> {
         Ok(self.meta_on(tx).await?.0)
@@ -1417,23 +1741,27 @@ impl<M: SyncModel> CausalReplica<M> {
             .collect()
     }
 
-    /// Apply a complete collection-wide delta and relay its original event.
+    /// Apply a complete collection-wide delta and relay its original event,
+    /// recording the immediate source store as its relay origin.
     /// The caller owns projection, commit, and rollback on any failure.
     pub async fn apply_merge_on(
         &self,
         tx: &DatabaseTransaction,
         delta: &protocol::MergeDelta<M>,
+        origin: &protocol::StoreIdentity,
         limits: protocol::ApplyLimits,
         budget: &mut u64,
     ) -> Result<(bool, protocol::ProjectionBatch<M>)> {
         lock_on(tx, self.namespace).await?;
-        self.apply_merge_locked_on(tx, delta, limits, budget).await
+        self.apply_merge_locked_on(tx, delta, origin, limits, budget)
+            .await
     }
 
     pub(crate) async fn apply_merge_locked_on(
         &self,
         tx: &DatabaseTransaction,
         delta: &protocol::MergeDelta<M>,
+        origin: &protocol::StoreIdentity,
         limits: protocol::ApplyLimits,
         budget: &mut u64,
     ) -> Result<(bool, protocol::ProjectionBatch<M>)> {
@@ -1457,19 +1785,33 @@ impl<M: SyncModel> CausalReplica<M> {
             .map(|c| c.revision.counter)
             .max()
             .unwrap_or(0);
-        self.apply_delta_on(tx, delta, &event, revision, limits, budget)
-            .await
+        self.apply_delta_on(
+            tx,
+            DeltaApply {
+                delta,
+                event: &event,
+                revision,
+                origin,
+                limits,
+                budget,
+            },
+        )
+        .await
     }
 
     async fn apply_delta_on(
         &self,
         tx: &DatabaseTransaction,
-        delta: &protocol::MergeDelta<M>,
-        event: &protocol::Event<M>,
-        revision: u64,
-        limits: protocol::ApplyLimits,
-        budget: &mut u64,
+        apply: DeltaApply<'_, M>,
     ) -> Result<(bool, protocol::ProjectionBatch<M>)> {
+        let DeltaApply {
+            delta,
+            event,
+            revision,
+            origin,
+            limits,
+            budget,
+        } = apply;
         use std::collections::{BTreeMap, BTreeSet};
         let (identity, meta) = self.meta_on(tx).await?;
         let tag = M::collection_tag(&delta.collection).as_bytes();
@@ -1692,6 +2034,8 @@ impl<M: SyncModel> CausalReplica<M> {
                             "event_digest",
                             "event_manifest",
                             "anchor_after",
+                            "origin_replica",
+                            "origin_generation",
                         ]
                         .map(Alias::new),
                     )
@@ -1704,6 +2048,8 @@ impl<M: SyncModel> CausalReplica<M> {
                         digest.to_vec().into(),
                         manifest.manifest_digest.to_vec().into(),
                         anchor.to_vec().into(),
+                        origin.replica.as_bytes().to_vec().into(),
+                        origin.generation.as_bytes().to_vec().into(),
                     ])
                     .to_owned(),
             )

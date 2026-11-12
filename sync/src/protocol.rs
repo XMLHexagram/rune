@@ -19,11 +19,15 @@ pub use receiver::{
     MAX_RECEIVER_METADATA_ITEMS, MAX_RECEIVER_RETRY_RECEIPTS, PreparedEvent, PreparedLeaf,
     PromotionAdmission, PromotionStep, RangeAdmission, ReceiverLedger,
 };
-use std::{collections::BTreeSet, fmt::Debug, future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::BTreeSet, fmt::Debug, future::Future, pin::Pin, result::Result as StdResult,
+    sync::Arc,
+};
 pub use uuid::Uuid;
 pub type Digest = [u8; 32];
 pub type Result<T> = std::result::Result<T, SyncError>;
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+pub type BoxFuture<'a, T, E = SyncError> =
+    Pin<Box<dyn Future<Output = StdResult<T, E>> + Send + 'a>>;
 pub const MAX_NUMBER: u64 = i64::MAX as u64;
 pub const MAX_CANDIDATE_BYTES: u64 = 64 * 1024;
 pub const MAX_TAG_BYTES: usize = 128;
@@ -68,11 +72,14 @@ pub enum SyncError {
     Invalid(String),
     IncompatibleModel,
     ClockExhausted,
-    LimitTooSmall { required: u64 },
+    LimitTooSmall {
+        required: u64,
+    },
     LogicalLimit,
     StageQuota,
     WorkLimit,
     RetryAt(ReceiveProgress),
+    CheckpointAnchorMismatch(ReceiveProgress),
     NeedsReconciliation(HistoryStatus),
     SnapshotExpired,
     ConflictingDot,
@@ -85,6 +92,8 @@ pub enum SyncError {
     Forbidden,
     NamespaceNotServed,
     StorageBusy,
+    /// A referenced immutable share base object is missing or fails its digest check.
+    SnapshotSourceUnavailable,
     Storage(String),
     Transport(String),
 }

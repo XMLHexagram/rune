@@ -1,17 +1,20 @@
 #[path = "support/fixtures.rs"]
 mod fixtures;
 
-use anyhow::Result;
+use anyhow::{Context as AnyhowContext, Result};
 use sea_orm::{
-    ConnectionTrait, Database, TransactionTrait,
-    sea_query::{Alias, ColumnDef, Expr, Query, Table},
+    ConnectionTrait, Database, DbBackend, ExprTrait, Statement, TransactionTrait,
+    sea_query::{Alias, ColumnDef, Expr, Order, Query, Table},
 };
 use serde::{Deserialize, Serialize};
 use sync::causal::Context;
 use sync::causal::Dot;
 use sync::protocol::{self, ObjectKey, Observed, SyncModel};
 use sync_orm::causal_compaction::FloorStep;
-use sync_orm::{causal_schema, causal_store::CausalReplica};
+use sync_orm::{
+    causal_progress, causal_schema,
+    causal_store::{CausalReplica, JournalOrigin},
+};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,7 +67,13 @@ async fn author_and_projection_rollback_and_reveal_lower_survivor() -> Result<()
     let actor = Uuid::new_v4();
     let replica = CausalReplica::<Notes>::create_empty(db.clone(), namespace, actor).await?;
     let reopened = CausalReplica::<Notes>::open(db.clone(), namespace, actor).await?;
-    assert_ne!(replica.writer_incarnation(), reopened.writer_incarnation());
+    assert_eq!(replica.writer_incarnation(), reopened.writer_incarnation());
+    let mut incarnation = reopened.writer_incarnation();
+    for _ in 0..9 {
+        let reopened = CausalReplica::<Notes>::open(db.clone(), namespace, actor).await?;
+        assert_eq!(incarnation, reopened.writer_incarnation());
+        incarnation = reopened.writer_incarnation();
+    }
     let key = ObjectKey {
         collection: Collection::Notes,
         id: Uuid::new_v4(),
@@ -186,6 +195,611 @@ async fn author_and_projection_rollback_and_reveal_lower_survivor() -> Result<()
 }
 
 #[tokio::test]
+async fn journal_local_author_has_null_origin() -> Result<()> {
+    let db = fixtures::fresh_database().await?;
+    let namespace = Uuid::new_v4();
+    let replica =
+        CausalReplica::<Notes>::create_empty(db.clone(), namespace, Uuid::new_v4()).await?;
+    let tx = db.begin().await?;
+    replica
+        .write_local_projected_on(
+            &tx,
+            ObjectKey {
+                collection: Collection::Notes,
+                id: Uuid::new_v4(),
+            },
+            Some(Note {
+                text: "local".into(),
+            }),
+        )
+        .await?;
+    tx.commit().await?;
+    let row = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT origin_replica, origin_generation FROM sync_journal",
+        ))
+        .await?
+        .context("missing journal event")?;
+    assert_eq!(row.try_get_by_index::<Option<Vec<u8>>>(0)?, None);
+    assert_eq!(row.try_get_by_index::<Option<Vec<u8>>>(1)?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn opening_an_old_journal_adds_null_origins_without_changing_history() -> Result<()> {
+    let db = fixtures::fresh_database().await?;
+    let namespace = Uuid::new_v4();
+    let replica =
+        CausalReplica::<Notes>::create_empty(db.clone(), namespace, Uuid::new_v4()).await?;
+    let tx = db.begin().await?;
+    replica
+        .write_local_projected_on(
+            &tx,
+            ObjectKey {
+                collection: Collection::Notes,
+                id: Uuid::new_v4(),
+            },
+            Some(Note {
+                text: "before upgrade".into(),
+            }),
+        )
+        .await?;
+    tx.commit().await?;
+    db.execute_unprepared("ALTER TABLE sync_journal DROP COLUMN origin_replica")
+        .await?;
+    db.execute_unprepared("ALTER TABLE sync_journal DROP COLUMN origin_generation")
+        .await?;
+
+    let _reopened = CausalReplica::<Notes>::open(db.clone(), namespace, Uuid::new_v4()).await?;
+    let row = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT origin_replica, origin_generation FROM sync_journal",
+        ))
+        .await?
+        .context("missing journal event")?;
+    assert_eq!(row.try_get_by_index::<Option<Vec<u8>>>(0)?, None);
+    assert_eq!(row.try_get_by_index::<Option<Vec<u8>>>(1)?, None);
+    let head = db
+        .query_one(
+            &Query::select()
+                .column(Alias::new("head"))
+                .from(Alias::new("sync_meta"))
+                .to_owned(),
+        )
+        .await?
+        .context("missing replica metadata")?
+        .try_get_by_index::<i64>(0)?;
+    assert_eq!(head, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn peer_merge_page_is_journaled_with_its_store_identity() -> Result<()> {
+    use sync::protocol::{
+        ApplyLimits, ChangePage, Event, EventRef, MergeDelta, PageLimits, PageRequest,
+        ReceiveProgress, ScanLink, Scope, WriterContext,
+    };
+
+    let source_db = fixtures::fresh_database().await?;
+    let target_db = fixtures::fresh_database().await?;
+    let namespace = Uuid::new_v4();
+    let source =
+        CausalReplica::<Notes>::create_empty(source_db.clone(), namespace, Uuid::new_v4()).await?;
+    let target =
+        CausalReplica::<Notes>::create_empty(target_db.clone(), namespace, Uuid::new_v4()).await?;
+    let source_identity = source.identity_on(&source_db).await?;
+    let scope = Scope {
+        collections: [Collection::Notes].into_iter().collect(),
+    };
+    let genesis = protocol::initial_anchor(&source_identity)?;
+    let delta = MergeDelta {
+        collection: Collection::Notes,
+        added: vec![],
+        observed: protocol::ExactContext {
+            writers: vec![WriterContext {
+                writer_incarnation: Uuid::new_v4(),
+                prefix: 1,
+                exceptions: vec![],
+            }],
+        },
+    };
+    let event = Event::Merge(Box::new(delta));
+    let digest = protocol::event_digest(&event)?;
+    let next_anchor = protocol::next_anchor::<Notes>(genesis, 1, &Collection::Notes, digest)?;
+    let start = ReceiveProgress {
+        sequence: 0,
+        anchor: genesis,
+    };
+    let end = ReceiveProgress {
+        sequence: 1,
+        anchor: next_anchor,
+    };
+    let page = ChangePage {
+        request: PageRequest {
+            source: source_identity.clone(),
+            scope,
+            after: start,
+            through: end.clone(),
+            limits: PageLimits {
+                max_scanned: 8,
+                max_bytes: 65536,
+            },
+        },
+        next: end,
+        done: true,
+        links: vec![ScanLink {
+            sequence: 1,
+            collection: Collection::Notes,
+            event_digest: digest,
+            event: Some(EventRef::Inline(event)),
+        }],
+    };
+    let scope_id = protocol::scope_id(&page.request.scope)?;
+    target_db
+        .execute(
+            &Query::insert()
+                .into_table(Alias::new("sync_checkpoints"))
+                .columns(
+                    [
+                        "namespace",
+                        "source_replica",
+                        "source_generation",
+                        "scope_digest",
+                        "normalized_scope",
+                        "sequence",
+                        "anchor",
+                    ]
+                    .map(Alias::new),
+                )
+                .values_panic([
+                    namespace.as_bytes().to_vec().into(),
+                    source_identity.replica.as_bytes().to_vec().into(),
+                    source_identity.generation.as_bytes().to_vec().into(),
+                    scope_id.to_vec().into(),
+                    b"notes".to_vec().into(),
+                    0_i64.into(),
+                    genesis.to_vec().into(),
+                ])
+                .to_owned(),
+        )
+        .await?;
+    let tx = target_db.begin().await?;
+    target
+        .apply_page_on(
+            &tx,
+            &page,
+            ApplyLimits {
+                max_projection_items: 8,
+                max_projection_bytes: 65536,
+                max_mutations: 128,
+            },
+        )
+        .await?;
+    tx.commit().await?;
+    let identity = target.identity_on(&target_db).await?;
+    let target_genesis = protocol::initial_anchor(&identity)?;
+    let local = target
+        .read_page_with_origins(PageRequest {
+            source: identity,
+            scope: page.request.scope,
+            after: ReceiveProgress {
+                sequence: 0,
+                anchor: target_genesis,
+            },
+            through: causal_progress::head_on(&target_db, namespace).await?,
+            limits: PageLimits {
+                max_scanned: 8,
+                max_bytes: 65536,
+            },
+        })
+        .await?;
+    assert_eq!(local.origins.len(), 1);
+    assert_eq!(
+        local.origins[0].origin,
+        Some(JournalOrigin {
+            replica: source_identity.replica,
+            generation: source_identity.generation,
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ten_reopens_author_with_one_writer_context() -> Result<()> {
+    let db = fixtures::fresh_database().await?;
+    let namespace = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let mut replica = CausalReplica::<Notes>::create_empty(db.clone(), namespace, actor).await?;
+    for index in 0..10 {
+        if index != 0 {
+            replica = CausalReplica::<Notes>::open(db.clone(), namespace, actor).await?;
+        }
+        let tx = db.begin().await?;
+        replica
+            .write_observed_on(
+                &tx,
+                ObjectKey {
+                    collection: Collection::Notes,
+                    id: Uuid::new_v4(),
+                },
+                Some(Note {
+                    text: format!("note {index}"),
+                }),
+                Observed::AllCurrent,
+            )
+            .await?;
+        tx.commit().await?;
+    }
+    let rows = db
+        .query_all(
+            &Query::select()
+                .column(Alias::new("writer"))
+                .from(Alias::new("sync_candidates"))
+                .to_owned(),
+        )
+        .await?;
+    let writers = rows
+        .into_iter()
+        .map(|row| row.try_get_by_index::<Vec<u8>>(0))
+        .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()?;
+    assert_eq!(writers.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn abandoned_reservation_is_skipped_after_reopen() -> Result<()> {
+    let db = fixtures::fresh_database().await?;
+    let namespace = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let initial = CausalReplica::<Notes>::create_empty(db.clone(), namespace, actor).await?;
+    let incarnation = initial.writer_incarnation();
+    drop(initial);
+    let crashed = CausalReplica::<Notes>::open(db.clone(), namespace, actor).await?;
+    assert_eq!(crashed.writer_incarnation(), incarnation);
+    drop(crashed);
+    let recovered = CausalReplica::<Notes>::open(db.clone(), namespace, actor).await?;
+    let tx = db.begin().await?;
+    recovered
+        .write_observed_on(
+            &tx,
+            ObjectKey {
+                collection: Collection::Notes,
+                id: Uuid::new_v4(),
+            },
+            Some(Note {
+                text: "after crash".into(),
+            }),
+            Observed::AllCurrent,
+        )
+        .await?;
+    tx.commit().await?;
+    let row = db
+        .query_one(
+            &Query::select()
+                .columns(["writer", "counter"].map(Alias::new))
+                .from(Alias::new("sync_candidates"))
+                .to_owned(),
+        )
+        .await?
+        .expect("authored candidate exists");
+    assert_eq!(
+        Uuid::from_slice(&row.try_get_by_index::<Vec<u8>>(0)?)?,
+        incarnation
+    );
+    assert!(row.try_get_by_index::<i64>(1)? > 1_000_000_000);
+    Ok(())
+}
+
+#[tokio::test]
+async fn clean_close_reopen_continues_writer_prefix() -> Result<()> {
+    let db = fixtures::fresh_database().await?;
+    let namespace = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let mut counters = Vec::new();
+    for index in 0..3 {
+        let store = if index == 0 {
+            CausalReplica::<Notes>::create_empty(db.clone(), namespace, actor).await?
+        } else {
+            CausalReplica::<Notes>::open(db.clone(), namespace, actor).await?
+        };
+        let tx = db.begin().await?;
+        store
+            .write_observed_on(
+                &tx,
+                ObjectKey {
+                    collection: Collection::Notes,
+                    id: Uuid::new_v4(),
+                },
+                Some(Note {
+                    text: format!("clean {index}"),
+                }),
+                Observed::AllCurrent,
+            )
+            .await?;
+        tx.commit().await?;
+        store.clean_close().await?;
+        drop(store);
+        let row = db
+            .query_one(
+                &Query::select()
+                    .column(Alias::new("counter"))
+                    .from(Alias::new("sync_candidates"))
+                    .order_by(Alias::new("counter"), Order::Asc)
+                    .limit(1)
+                    .offset(index)
+                    .to_owned(),
+            )
+            .await?
+            .context("authored dot exists")?;
+        counters.push(row.try_get_by_index::<i64>(0)?);
+    }
+    assert_eq!(counters, vec![1, 2, 3]);
+    let mut context = Context::default();
+    let incarnation = CausalReplica::<Notes>::open(db.clone(), namespace, actor)
+        .await?
+        .writer_incarnation();
+    for counter in counters {
+        context.insert(Dot::new(incarnation, counter as u64)?)?;
+    }
+    let exact = protocol::exact_context(&context);
+    assert_eq!(exact.writers.len(), 1);
+    assert_eq!(exact.writers[0].prefix, 3);
+    assert!(exact.writers[0].exceptions.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn clean_counter_below_stored_dot_is_ignored() -> Result<()> {
+    let db = fixtures::fresh_database().await?;
+    let namespace = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let store = CausalReplica::<Notes>::create_empty(db.clone(), namespace, actor).await?;
+    let incarnation = store.writer_incarnation();
+    let tx = db.begin().await?;
+    store
+        .write_observed_on(
+            &tx,
+            ObjectKey {
+                collection: Collection::Notes,
+                id: Uuid::new_v4(),
+            },
+            Some(Note {
+                text: "stored".into(),
+            }),
+            Observed::AllCurrent,
+        )
+        .await?;
+    tx.commit().await?;
+    store.clean_close().await?;
+    db.execute(
+        &Query::update()
+            .table(Alias::new("sync_meta"))
+            .value(Alias::new("writer_clean_counter"), 0_i64)
+            .and_where(Expr::col(Alias::new("namespace")).eq(namespace.as_bytes().to_vec()))
+            .to_owned(),
+    )
+    .await?;
+    let reopened = CausalReplica::<Notes>::open(db.clone(), namespace, actor).await?;
+    assert_eq!(reopened.writer_incarnation(), incarnation);
+    let tx = db.begin().await?;
+    reopened
+        .write_observed_on(
+            &tx,
+            ObjectKey {
+                collection: Collection::Notes,
+                id: Uuid::new_v4(),
+            },
+            Some(Note {
+                text: "after tamper".into(),
+            }),
+            Observed::AllCurrent,
+        )
+        .await?;
+    tx.commit().await?;
+    let row = db
+        .query_one(
+            &Query::select()
+                .expr(Expr::col(Alias::new("counter")).max())
+                .from(Alias::new("sync_candidates"))
+                .and_where(Expr::col(Alias::new("namespace")).eq(namespace.as_bytes().to_vec()))
+                .to_owned(),
+        )
+        .await?
+        .context("authored counters exist")?;
+    assert!(row.try_get_by_index::<Option<i64>>(0)?.unwrap_or(0) > 1_000_000_000);
+    Ok(())
+}
+
+#[tokio::test]
+async fn copied_database_rotates_on_file_token_change_and_both_continue() -> Result<()> {
+    let original_path =
+        std::env::temp_dir().join(format!("sync-writer-original-{}.sqlite", Uuid::new_v4()));
+    let copy_path =
+        std::env::temp_dir().join(format!("sync-writer-copy-{}.sqlite", Uuid::new_v4()));
+    let original_url = format!("sqlite://{}?mode=rwc", original_path.display());
+    let copy_url = format!("sqlite://{}?mode=rwc", copy_path.display());
+    let original_db = Database::connect(&original_url).await?;
+    causal_schema::install_fresh(&original_db).await?;
+    let namespace = Uuid::new_v4();
+    let author_a = Uuid::new_v4();
+    let file_token_a = Uuid::new_v4();
+    let file_token_b = Uuid::new_v4();
+    let created = CausalReplica::<Notes>::create_empty_with_file_token(
+        original_db.clone(),
+        namespace,
+        author_a,
+        Some(file_token_a),
+    )
+    .await?;
+    let original_incarnation = created.writer_incarnation();
+    drop(created);
+    original_db.close().await?;
+    std::fs::copy(&original_path, &copy_path)?;
+    let original_db = Database::connect(&original_url).await?;
+    let copy_db = Database::connect(&copy_url).await?;
+    let original = CausalReplica::<Notes>::open_with_file_token(
+        original_db.clone(),
+        namespace,
+        author_a,
+        Some(file_token_a),
+    )
+    .await?;
+    let copied = CausalReplica::<Notes>::open_with_file_token(
+        copy_db.clone(),
+        namespace,
+        author_a,
+        Some(file_token_b),
+    )
+    .await?;
+    assert_eq!(original.writer_incarnation(), original_incarnation);
+    assert_ne!(copied.writer_incarnation(), original.writer_incarnation());
+    for (replica, db, note) in [
+        (&original, &original_db, "original"),
+        (&copied, &copy_db, "copy"),
+    ] {
+        let tx = db.begin().await?;
+        replica
+            .write_observed_on(
+                &tx,
+                ObjectKey {
+                    collection: Collection::Notes,
+                    id: Uuid::new_v4(),
+                },
+                Some(Note { text: note.into() }),
+                Observed::AllCurrent,
+            )
+            .await?;
+        tx.commit().await?;
+    }
+    original_db.close().await?;
+    copy_db.close().await?;
+    let _ = std::fs::remove_file(original_path);
+    let _ = std::fs::remove_file(copy_path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_store_adopts_and_retains_writer_incarnation() -> Result<()> {
+    let db = fixtures::fresh_database().await?;
+    let namespace = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    CausalReplica::<Notes>::create_empty(db.clone(), namespace, actor).await?;
+    db.execute_unprepared("ALTER TABLE sync_meta DROP COLUMN writer_incarnation")
+        .await?;
+    db.execute_unprepared("ALTER TABLE sync_meta DROP COLUMN writer_author")
+        .await?;
+    db.execute_unprepared("ALTER TABLE sync_meta DROP COLUMN writer_reserved_counter")
+        .await?;
+    let first = CausalReplica::<Notes>::open(db.clone(), namespace, actor).await?;
+    let adopted = first.writer_incarnation();
+    drop(first);
+    let second = CausalReplica::<Notes>::open(db.clone(), namespace, actor).await?;
+    assert_eq!(second.writer_incarnation(), adopted);
+    Ok(())
+}
+
+#[tokio::test]
+async fn restored_store_rotates_when_config_sidecar_token_changes() -> Result<()> {
+    let db = fixtures::fresh_database().await?;
+    let namespace = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let file_token = Uuid::new_v4();
+    let original = CausalReplica::<Notes>::create_empty_with_file_token(
+        db.clone(),
+        namespace,
+        actor,
+        Some(file_token),
+    )
+    .await?;
+    let original_incarnation = original.writer_incarnation();
+    let tx = db.begin().await?;
+    original
+        .write_observed_on(
+            &tx,
+            ObjectKey {
+                collection: Collection::Notes,
+                id: Uuid::new_v4(),
+            },
+            Some(Note {
+                text: "before restore".into(),
+            }),
+            Observed::AllCurrent,
+        )
+        .await?;
+    tx.commit().await?;
+    let restored = CausalReplica::<Notes>::open_with_file_token(
+        db.clone(),
+        namespace,
+        actor,
+        Some(Uuid::new_v4()),
+    )
+    .await?;
+    assert_ne!(restored.writer_incarnation(), original_incarnation);
+    let old_dot = db
+        .query_one(
+            &Query::select()
+                .column(Alias::new("writer"))
+                .from(Alias::new("sync_candidates"))
+                .to_owned(),
+        )
+        .await?
+        .expect("pre-restore causal dot remains stored")
+        .try_get_by_index::<Vec<u8>>(0)?;
+    assert_eq!(Uuid::from_slice(&old_dot)?, original_incarnation);
+    Ok(())
+}
+
+#[tokio::test]
+async fn inconsistent_counter_reservation_rotates_even_after_candidate_reclamation() -> Result<()> {
+    let db = fixtures::fresh_database().await?;
+    let namespace = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let replica = CausalReplica::<Notes>::create_empty(db.clone(), namespace, actor).await?;
+    let incarnation = replica.writer_incarnation();
+    let key = ObjectKey {
+        collection: Collection::Notes,
+        id: Uuid::new_v4(),
+    };
+    let tx = db.begin().await?;
+    replica
+        .write_observed_on(
+            &tx,
+            key.clone(),
+            Some(Note {
+                text: "value".into(),
+            }),
+            Observed::AllCurrent,
+        )
+        .await?;
+    tx.commit().await?;
+    let tx = db.begin().await?;
+    replica
+        .write_observed_on(&tx, key, None, Observed::AllCurrent)
+        .await?;
+    tx.commit().await?;
+    db.execute(
+        &Query::delete()
+            .from_table(Alias::new("sync_candidates"))
+            .and_where(Expr::col(Alias::new("namespace")).eq(namespace.as_bytes().to_vec()))
+            .to_owned(),
+    )
+    .await?;
+    db.execute(
+        &Query::update()
+            .table(Alias::new("sync_meta"))
+            .value(Alias::new("writer_reserved_counter"), 0_i64)
+            .and_where(Expr::col(Alias::new("namespace")).eq(namespace.as_bytes().to_vec()))
+            .to_owned(),
+    )
+    .await?;
+    let reopened = CausalReplica::<Notes>::open(db, namespace, actor).await?;
+    assert_ne!(reopened.writer_incarnation(), incarnation);
+    Ok(())
+}
+
+#[tokio::test]
 async fn keyed_receive_retains_original_author_and_never_resurrects_observed_dot() -> Result<()> {
     use sync::protocol::{Candidate, Dot, KeyDelta, ModelId, Revision};
     let db = fixtures::fresh_database().await?;
@@ -225,7 +839,9 @@ async fn keyed_receive_retains_original_author_and_never_resurrects_observed_dot
         added: vec![],
     };
     let tx = db.begin().await?;
-    let change = replica.apply_key_on(&tx, &remove).await?;
+    let change = replica
+        .apply_key_on(&tx, &remove, &replica.identity_on(&tx).await?)
+        .await?;
     assert!(change.after.is_none());
     tx.commit().await?;
     let late = KeyDelta {
@@ -235,7 +851,9 @@ async fn keyed_receive_retains_original_author_and_never_resurrects_observed_dot
         added: vec![candidate.clone()],
     };
     let tx = db.begin().await?;
-    let change = replica.apply_key_on(&tx, &late).await?;
+    let change = replica
+        .apply_key_on(&tx, &late, &replica.identity_on(&tx).await?)
+        .await?;
     assert!(change.after.is_none());
     tx.commit().await?;
     let other_dot = Dot {
@@ -260,7 +878,9 @@ async fn keyed_receive_retains_original_author_and_never_resurrects_observed_dot
         added: vec![current],
     };
     let tx = db.begin().await?;
-    let change = replica.apply_key_on(&tx, &add).await?;
+    let change = replica
+        .apply_key_on(&tx, &add, &replica.identity_on(&tx).await?)
+        .await?;
     assert_eq!(change.after.unwrap().revision.actor, original);
     tx.commit().await?;
     Ok(())
@@ -368,7 +988,12 @@ async fn suppressed_late_protected_candidate_cannot_create_empty_state() -> Resu
         added: vec![candidate],
     };
     let tx = db.begin().await?;
-    assert!(store.apply_key_on(&tx, &delta).await.is_err());
+    assert!(
+        store
+            .apply_key_on(&tx, &delta, &store.identity_on(&tx).await?)
+            .await
+            .is_err()
+    );
     tx.rollback().await?;
     assert!(
         db.query_one(
@@ -674,7 +1299,9 @@ async fn equal_revision_winner_uses_digest_before_dot() -> Result<()> {
         removed: vec![],
         added: vec![low_dot.clone()],
     };
-    store.apply_key_on(&tx, &first).await?;
+    store
+        .apply_key_on(&tx, &first, &store.identity_on(&tx).await?)
+        .await?;
     tx.commit().await?;
     let tx = db.begin().await?;
     let second = KeyDelta {
@@ -683,7 +1310,9 @@ async fn equal_revision_winner_uses_digest_before_dot() -> Result<()> {
         removed: vec![],
         added: vec![high_dot],
     };
-    let change = store.apply_key_on(&tx, &second).await?;
+    let change = store
+        .apply_key_on(&tx, &second, &store.identity_on(&tx).await?)
+        .await?;
     assert_eq!(change.after.unwrap(), low_dot);
     tx.commit().await?;
     Ok(())
@@ -767,7 +1396,12 @@ async fn structural_protection_rejects_removal_even_with_a_survivor() -> Result<
         added: vec![],
     };
     let tx = db.begin().await?;
-    assert!(store.apply_key_on(&tx, &removal).await.is_err());
+    assert!(
+        store
+            .apply_key_on(&tx, &removal, &store.identity_on(&tx).await?)
+            .await
+            .is_err()
+    );
     tx.rollback().await?;
     assert_eq!(db.query_all(&journal).await?.len(), 2);
     assert_eq!(db.query_all(&candidates).await?.len(), 2);
@@ -808,14 +1442,28 @@ async fn observed_context_is_collection_wide_and_suppresses_late_candidates() ->
         max_mutations: 1024,
     };
     let tx = db.begin().await?;
-    let (changed, projection) = store.apply_merge_on(&tx, &delta, limits, &mut 1024).await?;
+    let (changed, projection) = store
+        .apply_merge_on(
+            &tx,
+            &delta,
+            &store.identity_on(&tx).await?,
+            limits,
+            &mut 1024,
+        )
+        .await?;
     assert!(changed);
     assert!(projection.changes[0].after.is_none());
     tx.commit().await?;
     let tx = db.begin().await?;
     assert!(
         !store
-            .apply_merge_on(&tx, &delta, limits, &mut 1024)
+            .apply_merge_on(
+                &tx,
+                &delta,
+                &store.identity_on(&tx).await?,
+                limits,
+                &mut 1024
+            )
             .await?
             .0
     );
@@ -834,7 +1482,13 @@ async fn observed_context_is_collection_wide_and_suppresses_late_candidates() ->
         removed: vec![],
         added: vec![initial.clone()],
     };
-    assert!(store.apply_key_on(&tx, &stale).await?.after.is_none());
+    assert!(
+        store
+            .apply_key_on(&tx, &stale, &store.identity_on(&tx).await?)
+            .await?
+            .after
+            .is_none()
+    );
     let mut bad = initial;
     bad.payload.text = "conflicting".into();
     assert!(matches!(
@@ -846,6 +1500,7 @@ async fn observed_context_is_collection_wide_and_suppresses_late_candidates() ->
                     added: vec![bad],
                     observed: protocol::ExactContext { writers: vec![] }
                 },
+                &store.identity_on(&tx).await?,
                 limits,
                 &mut 1024
             )
@@ -958,7 +1613,9 @@ async fn bounded_floor_compaction_preserves_context_and_respects_a_pin() -> Resu
         added: vec![initial],
     };
     let tx = db.begin().await?;
-    let projection = store.apply_key_on(&tx, &stale).await?;
+    let projection = store
+        .apply_key_on(&tx, &stale, &store.identity_on(&tx).await?)
+        .await?;
     assert!(projection.after.is_none());
     tx.commit().await?;
     Ok(())

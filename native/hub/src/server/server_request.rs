@@ -6,10 +6,10 @@ use uuid::Uuid;
 
 use crate::macros::RequestScope;
 use crate::node::NodeContext;
-use crate::request_error::FailedCall;
+use crate::request_error::{ExpectedRequestError, FailedCall};
 use crate::rpc::TargetRequest;
 use crate::utils::ParamsExtractor;
-use crate::{CallIdentified, Session, Signal, TypedRequest};
+use crate::{RequestCallId, ResponseCallId, Session, Signal, TypedRequest};
 
 /// Serve one catalogue request, deferring decoding until after authorization.
 pub(crate) async fn serve_remote<R>(
@@ -22,9 +22,13 @@ where
     R: TargetRequest
         + Signal<Response = <R as TypedRequest>::Response, Params = <R as ParamsExtractor>::Params>
         + ParamsExtractor
-        + CallIdentified,
+        + RequestCallId,
     <R as TypedRequest>::Response: Serialize,
+    <R as TypedRequest>::Response: ResponseCallId,
 {
+    if R::SCOPE == RequestScope::Library && library_id.is_none() {
+        return Err(ExpectedRequestError::Unavailable { what: "library id" }.into());
+    }
     let addressed_library = library_id.filter(|_| R::SCOPE == RequestScope::Library);
     let params = if let Some(library_id) = addressed_library {
         if let Some(session) = &session {
@@ -40,7 +44,7 @@ where
         // Unaddressed library requests need the UI library; session-only requests do not.
         let ui_params = match node.current_ui().await {
             Ok(params) => params,
-            Err(_) if R::SCOPE == RequestScope::Session && !R::USES_CONTROLLER_LIBRARY => {
+            Err(_) if matches!(R::SCOPE, RequestScope::Session | RequestScope::Node) => {
                 Arc::new(node.params_for_ui()?)
             }
             Err(error) => return Err(error),
@@ -60,7 +64,8 @@ where
             None => error,
         })?;
     match response {
-        Some(response) if !R::response_name().is_empty() => {
+        Some(mut response) if !R::response_name().is_empty() => {
+            response.set_call_id(request.call_id());
             Ok((R::response_name().to_owned(), rinf::serialize(&response)?))
         }
         _ => Ok((String::new(), Vec::new())),

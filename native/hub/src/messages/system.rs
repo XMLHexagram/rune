@@ -1,11 +1,13 @@
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
 
-use super::CastLibraryState;
-use crate::CallIdentified;
+use super::{CastLibraryState, LibraryTaskKind};
 
 #[derive(Serialize, Deserialize, DartSignal)]
-pub struct SystemInfoRequest {}
+pub struct SystemInfoRequest {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
 
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct SystemInfoResponse {
@@ -18,6 +20,8 @@ pub struct SystemInfoResponse {
     pub system_os_version: String,
     pub system_host_name: String,
     pub users: Vec<String>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, RustSignal)]
@@ -34,6 +38,7 @@ pub enum RequestErrorKind {
     Internal,
     PermissionDenied,
     Conflict,
+    PeerNeedsUpdate,
 }
 
 #[derive(Deserialize, Serialize, SignalPiece, Clone, Debug, PartialEq, Eq)]
@@ -49,6 +54,22 @@ pub enum RequestFailureCause {
     Reconnecting {
         alias: String,
     },
+    PeerNeedsUpdate {
+        update_side: ProtocolUpdateSide,
+        peer_alias: Option<String>,
+        local_version: String,
+        peer_version: Option<String>,
+    },
+    SubsonicNotAuthorized,
+    LibraryTaskAlreadyRunning {
+        task: LibraryTaskKind,
+    },
+}
+
+#[derive(Deserialize, Serialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtocolUpdateSide {
+    ThisDevice,
+    Peer,
 }
 
 #[derive(Deserialize, Serialize, RustSignal)]
@@ -63,7 +84,7 @@ pub struct RequestFailedResponse {
 }
 
 impl RequestFailedResponse {
-    pub fn for_request<T: crate::CallIdentified>(
+    pub fn for_request<T: crate::RequestCallId>(
         request: &T,
         request_name: &str,
         kind: RequestErrorKind,
@@ -72,7 +93,7 @@ impl RequestFailedResponse {
     ) -> Self {
         Self {
             request: request_name.to_owned(),
-            call_id: CallIdentified::call_id(request),
+            call_id: request.call_id(),
             kind,
             detail,
             cause,
@@ -82,22 +103,23 @@ impl RequestFailedResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::{CallIdentified, messages::*};
+    use crate::RequestCallId;
+    use crate::messages::*;
 
     #[test]
     fn search_request_uses_its_declared_call_id() {
         let request = SearchForRequest {
-            call_id: 42,
+            call_id: Some(42),
             query_str: "search".to_owned(),
             fields: Vec::new(),
             n: 10,
         };
-        assert_eq!(CallIdentified::call_id(&request), Some(42));
+        assert_eq!(request.call_id(), Some(42));
     }
 
     #[test]
     fn requests_without_call_ids_use_the_default() {
-        let request = SystemInfoRequest {};
-        assert_eq!(CallIdentified::call_id(&request), None);
+        let request = SystemInfoRequest { call_id: None };
+        assert_eq!(request.call_id(), None);
     }
 }

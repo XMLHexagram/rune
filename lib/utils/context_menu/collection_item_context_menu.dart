@@ -16,7 +16,7 @@ import '../../utils/dialogs/playlist/create_edit_playlist.dart';
 import '../../utils/dialogs/playlist/remove_playlist_dialog.dart';
 import '../../bindings/bindings.dart';
 import '../../providers/responsive_providers.dart';
-import '../../providers/library_path.dart';
+import '../../providers/library_open_state.dart';
 import '../../utils/l10n.dart';
 
 import '../build_query.dart';
@@ -198,7 +198,8 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
   final operator = typeToOperator[type];
   final edit = typeToEdit[type];
   final remove = typeToRemove[type];
-  final libraryPath = context.read<LibraryPathProvider>().currentPath;
+  final libraryState = context.read<LibraryOpenStateProvider>();
+  final castLibraryId = libraryState.catalogLibraryId ?? libraryState.openRecord?.recordId;
 
   final List<MenuFlyoutItem> mixItems = mixes.where((x) => !x.locked).map((
     mix,
@@ -218,8 +219,6 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
   }).toList();
 
   List<MenuFlyoutItemBase> items = [
-    if (supportsOfflineSelection(context))
-      offlineSelectionMenu(context, type, id),
     MenuFlyoutItem(
       leading: const Icon(Symbols.play_circle),
       text: Text(S.of(context).startPlaying),
@@ -230,7 +229,7 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
         );
       },
     ),
-    if (libraryPath != null && !libraryPath.startsWith('@RR|'))
+    if (libraryState.openRecord != null && !libraryState.isRemoteControl)
       MenuFlyoutItem(
         leading: const Icon(Symbols.cast),
         text: Text(S.of(context).playOn),
@@ -240,7 +239,7 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
           await _handleCollectionRequest(host, () async {
             await showCastOnDialog(
               host,
-              libraryPath: libraryPath,
+              libraryId: castLibraryId!,
               cast: (candidate) => castCollectionWithSettings(
                 type,
                 id,
@@ -273,7 +272,7 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
     ),
   ];
 
-  if (edit != null && !context.read<LibraryPathProvider>().isReadOnlyReplica) {
+  if (edit != null && !context.read<LibraryOpenStateProvider>().isReadOnlyReplica) {
     items.add(const MenuFlyoutSeparator());
     items.add(
       MenuFlyoutItem(
@@ -289,7 +288,7 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
   }
 
   if (remove != null &&
-      !context.read<LibraryPathProvider>().isReadOnlyReplica) {
+      !context.read<LibraryOpenStateProvider>().isReadOnlyReplica) {
     items.add(
       MenuFlyoutItem(
         leading: const Icon(Symbols.delete),
@@ -304,7 +303,7 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
   }
 
   if (operator != null &&
-      !context.read<LibraryPathProvider>().isReadOnlyReplica) {
+      !context.read<LibraryOpenStateProvider>().isReadOnlyReplica) {
     items.add(const MenuFlyoutSeparator());
     items.add(
       MenuFlyoutSubItem(
@@ -385,6 +384,11 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
     );
   }
 
+  if (supportsOfflineSelection(context)) {
+    items.add(const MenuFlyoutSeparator());
+    items.add(offlineSelectionMenu(context, type, id));
+  }
+
   return MenuFlyout(items: items);
 }
 
@@ -395,7 +399,8 @@ FlyoutContent buildBandScreenCollectionItemContextMenu(
   bool isBand, [
   List<int> fallbackFileIds = const [],
 ]) {
-  final libraryPath = context.read<LibraryPathProvider>().currentPath;
+  final libraryState = context.read<LibraryOpenStateProvider>();
+  final castLibraryId = libraryState.catalogLibraryId ?? libraryState.openRecord?.recordId;
   List<CommandBarButton> items = [
     CommandBarButton(
       icon: Tooltip(
@@ -409,7 +414,7 @@ FlyoutContent buildBandScreenCollectionItemContextMenu(
         );
       },
     ),
-    if (libraryPath != null && !libraryPath.startsWith('@RR|'))
+    if (libraryState.openRecord != null && !libraryState.isRemoteControl)
       CommandBarButton(
         icon: Tooltip(
           message: S.of(context).playOn,
@@ -420,7 +425,7 @@ FlyoutContent buildBandScreenCollectionItemContextMenu(
           await _handleCollectionRequest(host, () async {
             await showCastOnDialog(
               host,
-              libraryPath: libraryPath,
+              libraryId: castLibraryId!,
               cast: (candidate) => castCollectionWithSettings(
                 type,
                 id,

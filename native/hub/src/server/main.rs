@@ -3,7 +3,7 @@ mod cli;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use log::info;
 use rustls::crypto::ring::default_provider;
@@ -17,11 +17,12 @@ use cli::{
 use hub::{
     node::initialize_node,
     server::WebSocketService,
-    utils::{GlobalParams, RunningMode, TaskTokens},
+    utils::{GlobalParams, TaskTokens},
 };
 
 use ::database::connection::check_storage_mode;
 use ::database::library_registry::{LibraryRegistry, resolve_library};
+use ::discovery::endpoint::DEFAULT_DEVICE_PORT;
 use ::fsio::FsIo;
 use ::playback::sfx_player::SfxPlayer;
 
@@ -36,7 +37,7 @@ struct Cli {
 enum Commands {
     /// Start the server
     Server {
-        #[arg(short, long, default_value = "127.0.0.1:7863")]
+        #[arg(short, long, default_value_t = default_server_addr())]
         addr: String,
         #[arg(required = true, index = 1)]
         lib_path: String,
@@ -50,6 +51,10 @@ enum Commands {
         #[command(subcommand)]
         action: PermissionAction,
     },
+}
+
+fn default_server_addr() -> String {
+    format!("127.0.0.1:{DEFAULT_DEVICE_PORT}")
 }
 
 #[derive(Subcommand)]
@@ -113,18 +118,20 @@ async fn initialize_global_params(lib_path: &str, config_path: &str) -> Result<A
     let mode = check_storage_mode(&fsio, lib_path)?;
     let mut registry = LibraryRegistry::load(Path::new(config_path))?;
     let descriptor = resolve_library(&fsio, &mut registry, lib_path, "", mode).await?;
-    info!("Resolved library id: {}", descriptor.library_id);
+    let library_id = descriptor
+        .catalog_library_id()
+        .context("Resolved endpoint has no catalog")?;
+    info!("Resolved library id: {}", library_id);
 
     let pool = node.library_pool.clone();
-    let library = pool.acquire_ui(descriptor.library_id).await?;
+    let library = pool.acquire_ui(library_id).await?;
     let config_path = node.config_path.clone();
 
     let main_cancel_token = node.token.child_token();
-    let task_tokens: Arc<Mutex<TaskTokens>> = Arc::new(Mutex::new(TaskTokens::default()));
+    let task_tokens: Arc<Mutex<TaskTokens>> = node.task_tokens.clone();
 
     info!("Initializing player");
     let session = node.session()?;
-    session.migrate_legacy(&library).await?;
     let player = session.player.clone();
     let scrobbler = session.scrobbler.clone();
 
@@ -140,7 +147,7 @@ async fn initialize_global_params(lib_path: &str, config_path: &str) -> Result<A
 
     let global_params = Arc::new(GlobalParams {
         node: node.clone(),
-        library_id: Some(descriptor.library_id),
+        library_id: Some(library_id),
         library_pool: pool,
         library: Some(library.clone()),
         ui_library: Arc::new(Mutex::new(Some(library))),
@@ -149,6 +156,7 @@ async fn initialize_global_params(lib_path: &str, config_path: &str) -> Result<A
         node_id,
         main_token: main_cancel_token,
         task_tokens,
+        library_tasks: node.library_tasks.clone(),
         player,
         sfx_player,
         scrobbler,
@@ -157,7 +165,6 @@ async fn initialize_global_params(lib_path: &str, config_path: &str) -> Result<A
         cert_validator,
         permission_manager,
         server_manager: OnceLock::new(),
-        running_mode: RunningMode::Server,
     });
 
     let server_manager = node.manager()?;

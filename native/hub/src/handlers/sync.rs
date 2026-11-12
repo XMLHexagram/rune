@@ -15,6 +15,7 @@ use crate::{
 use database::actions::downloads::{
     cleanup_unselected_downloads, remove_download_rule, set_download_rule,
 };
+use discovery::endpoint::DEFAULT_DEVICE_PORT;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -37,7 +38,7 @@ impl DownloadParams {
     async fn cleanup(&self, library: &LibraryHandle) -> Result<()> {
         let queue = self
             .node
-            .session_queue_for_library(library.descriptor.library_id)
+            .session_queue_for_library(library.library_id)
             .await?;
         let result = cleanup_unselected_downloads(
             &library.main_db,
@@ -49,7 +50,7 @@ impl DownloadParams {
         )
         .await;
         self.broadcaster.broadcast(&LibraryContentChanged {
-            path: library.descriptor.app_name(),
+            path: library.display_name.clone(),
         });
         result.map(|_| ())
     }
@@ -93,6 +94,7 @@ impl Signal for SetDownloadRuleRequest {
             Err(error) => (String::new(), Some(format!("{error:#}"))),
         };
         Ok(Some(Self::Response {
+            call_id: None,
             request_id: request.request_id.clone(),
             rule_id,
             error,
@@ -124,6 +126,7 @@ impl Signal for RemoveDownloadRuleRequest {
         }
         .await;
         Ok(Some(Self::Response {
+            call_id: None,
             request_id: request.request_id.clone(),
             error: result.err().map(|e| format!("{e:#}")),
         }))
@@ -147,6 +150,7 @@ impl Signal for crate::messages::GetSyncSettingsRequest {
     ) -> Result<Option<Self::Response>> {
         let settings = settings.read().await;
         Ok(Some(Self::Response {
+            call_id: None,
             request_id: request.request_id.clone(),
             listen: settings.listen,
             missing_host_file: settings.missing_host_file.into(),
@@ -200,7 +204,7 @@ impl Signal for crate::messages::SetSyncSettingsRequest {
                         let info = load_device_info(Path::new(&**config)).await?;
                         manager
                             .start_sync(
-                                ([0, 0, 0, 0], 7863).into(),
+                                ([0, 0, 0, 0], DEFAULT_DEVICE_PORT).into(),
                                 discovery::DiscoveryParams { device_info: info },
                             )
                             .await?;
@@ -213,6 +217,7 @@ impl Signal for crate::messages::SetSyncSettingsRequest {
         }
         .await;
         Ok(Some(Self::Response {
+            call_id: None,
             request_id: request.request_id.clone(),
             error: result.err().map(|error| format!("{error:#}")),
         }))

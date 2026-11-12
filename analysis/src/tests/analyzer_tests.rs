@@ -3,6 +3,7 @@ mod tests {
     use fsio::FsIo;
     use log::info;
     use std::path::Path;
+    use wgpu::{Instance, RequestAdapterOptions};
 
     use crate::{
         analyzer::core_analyzer::Analyzer, measure_time, utils::computing_device::ComputingDevice,
@@ -15,6 +16,7 @@ mod tests {
         let run = || {
             Analyzer::new(ComputingDevice::Cpu, 1024, 512, None, None)
                 .process(&fsio, path)
+                .unwrap()
                 .unwrap()
         };
         let a = run();
@@ -30,6 +32,18 @@ mod tests {
     #[tokio::test]
     async fn test_fft_cpu_vs_gpu() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let adapter = Instance::default()
+            .request_adapter(&RequestAdapterOptions::default())
+            .await;
+        let Some(adapter) = adapter else {
+            println!("Skipping test_fft_cpu_vs_gpu: no WGPU adapter is available");
+            return;
+        };
+        info!(
+            "WGPU adapter used by GPU analyzer: {:?}",
+            adapter.get_info()
+        );
+
         let file_path = "../assets/startup_0.ogg";
         let fsio = FsIo::new();
         let window_size = 1024;
@@ -38,12 +52,16 @@ mod tests {
         let mut analyzer =
             Analyzer::new(ComputingDevice::Cpu, window_size, overlap_size, None, None);
 
-        let cpu_result = measure_time!("CPU FFT", analyzer.process(&fsio, file_path)).unwrap();
+        let cpu_result = measure_time!("CPU FFT", analyzer.process(&fsio, file_path))
+            .unwrap()
+            .unwrap();
 
         let mut analyzer =
             Analyzer::new(ComputingDevice::Gpu, window_size, overlap_size, None, None);
 
-        let gpu_result = measure_time!("GPU FFT", analyzer.process(&fsio, file_path)).unwrap();
+        let gpu_result = measure_time!("GPU FFT", analyzer.process(&fsio, file_path))
+            .unwrap()
+            .unwrap();
 
         info!("CPU result: {cpu_result:?}");
         info!("GPU result: {gpu_result:?}");
@@ -68,11 +86,13 @@ mod tests {
             gpu_result.zcr
         );
 
-        // Compare spectrum values
+        // The real CPU FFT stores only the unique positive-frequency bins. The GPU FFT
+        // computes the full spectrum, including the mirrored negative frequencies.
         for (i, (cpu_value, gpu_value)) in cpu_result
             .spectrum
             .iter()
             .zip(gpu_result.spectrum.iter())
+            .take(window_size / 2 + 1)
             .enumerate()
         {
             assert!(
@@ -94,7 +114,7 @@ mod tests {
         }
         let fsio = FsIo::new();
         let mut analyzer = Analyzer::new(ComputingDevice::Cpu, 1024, 512, None, None);
-        let result = analyzer.process(&fsio, file_path);
+        let result = analyzer.process(&fsio, file_path).unwrap();
         assert!(result.is_some(), "Opus analysis should succeed");
         let desc = result.unwrap();
         assert!(desc.total_samples > 0);
@@ -114,7 +134,7 @@ mod tests {
         }
         let fsio = FsIo::new();
         let mut analyzer = Analyzer::new(ComputingDevice::Cpu, 1024, 512, None, None);
-        let result = analyzer.process(&fsio, file_path);
+        let result = analyzer.process(&fsio, file_path).unwrap();
         assert!(result.is_some(), "AAC analysis should succeed");
         let desc = result.unwrap();
         assert!(desc.total_samples > 0);

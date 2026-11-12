@@ -13,7 +13,10 @@ pub async fn fetch_mix_queries_by_mix_id(
     mix_id: i32,
     connection: &WSConnection,
 ) -> Result<Vec<MixQuery>> {
-    let request = FetchMixQueriesRequest { mix_id };
+    let request = FetchMixQueriesRequest {
+        call_id: None,
+        mix_id,
+    };
     let response: FetchMixQueriesResponse = connection.request(&request).await?;
     anyhow::ensure!(
         response.result.iter().all(|query| query.available),
@@ -89,7 +92,10 @@ pub async fn fetch_collection_group_summary(
     collection_type: CollectionType,
     connection: &WSConnection,
 ) -> Result<CollectionGroupSummaryResponse> {
-    let request = FetchCollectionGroupSummaryRequest { collection_type };
+    let request = FetchCollectionGroupSummaryRequest {
+        call_id: None,
+        collection_type,
+    };
 
     connection.request(&request).await
 }
@@ -100,6 +106,7 @@ pub async fn fetch_collection_groups(
     connection: &WSConnection,
 ) -> Result<FetchCollectionGroupsResponse> {
     let request = FetchCollectionGroupsRequest {
+        call_id: None,
         collection_type,
         bake_cover_arts: false,
         group_titles,
@@ -123,26 +130,39 @@ pub async fn operate_playback_with_mix_query_request(
     instant_play: bool,
     operate_mode: OperateMode,
     connection: &WSConnection,
-) -> Result<OperatePlaybackWithMixQueryResponse> {
-    let request = OperatePlaybackWithMixQueryRequest {
-        queries: queries
-            .into_iter()
-            .map(|(operator, parameter)| MixQuery {
-                operator,
-                parameter,
-            })
-            .collect(),
-        playback_mode: playback_mode.into(),
-        hint_position: -1,
-        initial_playback_item: Default::default(),
-        instantly_play: instant_play,
-        operate_mode: operate_mode.into(),
-        fallback_playing_items: vec![],
-        expected_revision: None,
-        cast_to: None,
-    };
+) -> Result<ResolveMixQueryResponse> {
+    let queries = queries
+        .into_iter()
+        .map(|(operator, parameter)| MixQuery {
+            operator,
+            parameter,
+        })
+        .collect();
+    let resolved: ResolveMixQueryResponse = connection
+        .request(&ResolveMixQueryRequest {
+            call_id: None,
+            queries,
+            hint_position: -1,
+            initial_playback_item: None,
+            instantly_play: instant_play,
+            fallback_playing_items: vec![],
+            exclude_current_queue: true,
+        })
+        .await?;
+    let _: LoadResolvedItemsResponse = connection
+        .request(&LoadResolvedItemsRequest {
+            position_seconds: None,
+            play: None,
 
-    connection.request(&request).await
+            call_id: None,
+            items: resolved.playing_items.clone(),
+            start_index: resolved.start_index,
+            mode: operate_mode.into(),
+            expected_revision: None,
+            playback_mode: instant_play.then(|| playback_mode.into()),
+        })
+        .await?;
+    Ok(resolved)
 }
 
 pub async fn send_mix_query_request(
@@ -150,6 +170,7 @@ pub async fn send_mix_query_request(
     connection: &WSConnection,
 ) -> Result<MixQueryResponse> {
     let request = MixQueryRequest {
+        call_id: None,
         queries: queries
             .into_iter()
             .map(|(operator, parameter)| MixQuery {
@@ -166,25 +187,25 @@ pub async fn send_mix_query_request(
 }
 
 pub async fn send_play_request(connection: &WSConnection) -> Result<()> {
-    let request = PlayRequest {};
+    let request = PlayRequest { call_id: None };
 
     connection.request_simple(&request).await
 }
 
 pub async fn send_pause_request(connection: &WSConnection) -> Result<()> {
-    let request = PauseRequest {};
+    let request = PauseRequest { call_id: None };
 
     connection.request_simple(&request).await
 }
 
 pub async fn send_next_request(connection: &WSConnection) -> Result<()> {
-    let request = NextRequest {};
+    let request = NextRequest { call_id: None };
 
     connection.request_simple(&request).await
 }
 
 pub async fn send_previous_request(connection: &WSConnection) -> Result<()> {
-    let request = PreviousRequest {};
+    let request = PreviousRequest { call_id: None };
 
     connection.request_simple(&request).await
 }
@@ -194,6 +215,7 @@ pub async fn send_set_playback_mode_request(
     connection: &WSConnection,
 ) -> Result<()> {
     let request = SetPlaybackModeRequest {
+        call_id: None,
         mode: playback_mode.into(),
     };
 

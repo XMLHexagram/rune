@@ -3,8 +3,11 @@ use database::error::ExpectedError;
 use thiserror::Error as ThisError;
 
 use crate::access_policy::Denial;
-use crate::messages::{CastLibraryState, RequestErrorKind, RequestFailureCause};
+use crate::messages::{
+    CastLibraryState, LibraryTaskKind, ProtocolUpdateSide, RequestErrorKind, RequestFailureCause,
+};
 use crate::rpc::UnsupportedReason;
+use discovery::protocol_version::ProtocolVersion;
 
 /// Expected failures at the request boundary.
 #[derive(Debug, ThisError)]
@@ -15,6 +18,8 @@ pub enum ExpectedRequestError {
     Reconnecting { alias: String },
     #[error("{what} unavailable")]
     Unavailable { what: &'static str },
+    #[error("Subsonic account is not authorized for this request")]
+    SubsonicNotAuthorized,
     #[error("{request} is unsupported by this target: {reason}")]
     Unsupported {
         request: &'static str,
@@ -26,6 +31,15 @@ pub enum ExpectedRequestError {
     PublicKeyMismatch,
     #[error("A device with this fingerprint is already registered")]
     RegistrationConflict,
+    #[error(
+        "protocol versions are incompatible: this device {local_version}, peer {peer_version:?}"
+    )]
+    PeerNeedsUpdate {
+        update_side: ProtocolUpdateSide,
+        peer_alias: Option<String>,
+        local_version: ProtocolVersion,
+        peer_version: Option<ProtocolVersion>,
+    },
     #[error("Renderer request failed: {detail}")]
     Remote {
         kind: RequestErrorKind,
@@ -36,6 +50,10 @@ pub enum ExpectedRequestError {
     UnexpectedResponse { expected: String, actual: String },
     #[error("Queue changed: expected revision {expected}, current revision {current}")]
     StaleQueueRevision { expected: u64, current: u64 },
+    #[error("Cannot start a library task while {task} is running")]
+    LibraryTaskAlreadyRunning { task: LibraryTaskKind },
+    #[error("Handoff was superseded by a newer request")]
+    HandoffSuperseded,
     #[error("Cast is not possible for library {library_id}: {state:?}")]
     CastNotPossible {
         library_id: String,
@@ -86,12 +104,18 @@ pub fn classify(error: &Error) -> RequestErrorKind {
                 ExpectedRequestError::Unavailable { .. }
                 | ExpectedRequestError::Reconnecting { .. }
                 | ExpectedRequestError::Unsupported { .. } => RequestErrorKind::Unavailable,
+                ExpectedRequestError::SubsonicNotAuthorized => RequestErrorKind::PermissionDenied,
                 ExpectedRequestError::CertificateMismatch => RequestErrorKind::InvalidInput,
                 ExpectedRequestError::PublicKeyMismatch => RequestErrorKind::InvalidInput,
                 ExpectedRequestError::RegistrationConflict => RequestErrorKind::Conflict,
+                ExpectedRequestError::PeerNeedsUpdate { .. } => RequestErrorKind::PeerNeedsUpdate,
                 ExpectedRequestError::Remote { kind, .. } => *kind,
                 ExpectedRequestError::UnexpectedResponse { .. } => RequestErrorKind::Internal,
                 ExpectedRequestError::StaleQueueRevision { .. } => RequestErrorKind::Conflict,
+                ExpectedRequestError::LibraryTaskAlreadyRunning { .. } => {
+                    RequestErrorKind::Conflict
+                }
+                ExpectedRequestError::HandoffSuperseded => RequestErrorKind::Conflict,
                 ExpectedRequestError::CastNotPossible { state, .. } => match state {
                     CastLibraryState::NotHeld | CastLibraryState::AccessRevoked => {
                         RequestErrorKind::PermissionDenied
@@ -119,6 +143,9 @@ pub fn request_failure_cause(error: &Error) -> Option<RequestFailureCause> {
                         state: *state,
                     });
                 }
+                ExpectedRequestError::LibraryTaskAlreadyRunning { task } => {
+                    return Some(RequestFailureCause::LibraryTaskAlreadyRunning { task: *task });
+                }
                 ExpectedRequestError::Reconnecting { alias } => {
                     return Some(RequestFailureCause::Reconnecting {
                         alias: alias.clone(),
@@ -134,6 +161,22 @@ pub fn request_failure_cause(error: &Error) -> Option<RequestFailureCause> {
                 ExpectedRequestError::RegistrationConflict => {
                     return Some(RequestFailureCause::RegistrationConflict);
                 }
+                ExpectedRequestError::PeerNeedsUpdate {
+                    update_side,
+                    peer_alias,
+                    local_version,
+                    peer_version,
+                } => {
+                    return Some(RequestFailureCause::PeerNeedsUpdate {
+                        update_side: *update_side,
+                        peer_alias: peer_alias.clone(),
+                        local_version: local_version.to_string(),
+                        peer_version: peer_version.map(|version| version.to_string()),
+                    });
+                }
+                ExpectedRequestError::SubsonicNotAuthorized => {
+                    return Some(RequestFailureCause::SubsonicNotAuthorized);
+                }
                 _ => {}
             }
         }
@@ -147,7 +190,9 @@ mod tests {
     use database::error::ExpectedError;
 
     use super::{ExpectedRequestError, classify, request_failure_cause};
-    use crate::messages::{CastLibraryState, RequestErrorKind, RequestFailureCause};
+    use crate::messages::{
+        CastLibraryState, LibraryTaskKind, RequestErrorKind, RequestFailureCause,
+    };
     use sea_orm::{
         ConnectionTrait, SqlxSqliteConnector,
         sqlx::{SqlitePool, sqlite::SqliteConnectOptions},
@@ -204,13 +249,35 @@ mod tests {
     }
 
     #[test]
+    fn superseded_handoff_is_a_conflict_after_context() {
+        let error = Error::new(ExpectedRequestError::HandoffSuperseded).context("handoff");
+        assert_eq!(classify(&error), RequestErrorKind::Conflict);
+    }
+
+    #[test]
+    fn running_library_task_is_a_typed_conflict_after_context() {
+        let error = Error::new(ExpectedRequestError::LibraryTaskAlreadyRunning {
+            task: LibraryTaskKind::Scan,
+        })
+        .context("AnalyzeAudioLibraryRequest");
+        assert_eq!(classify(&error), RequestErrorKind::Conflict);
+        assert_eq!(
+            request_failure_cause(&error),
+            Some(RequestFailureCause::LibraryTaskAlreadyRunning {
+                task: LibraryTaskKind::Scan,
+            })
+        );
+        assert!(format!("{error:#}").contains("scan is running"));
+    }
+
+    #[test]
     fn remote_request_error_preserves_renderer_kind() {
         let error = Error::new(ExpectedRequestError::Remote {
             kind: RequestErrorKind::InvalidInput,
             detail: "invalid cast item".into(),
             cause: None,
         })
-        .context("CastLoadRequest");
+        .context("LoadResolvedItemsRequest");
         assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
     }
 

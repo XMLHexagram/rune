@@ -17,9 +17,7 @@ use ::database::{
 use ::fsio::FsIo;
 use uuid::Uuid;
 
-use crate::utils::{
-    GlobalParams, ParamsExtractor, RunningMode, inject_cover_art_map, require_library,
-};
+use crate::utils::{GlobalParams, ParamsExtractor, inject_cover_art_map, require_library};
 use crate::{Session, Signal, messages::*};
 
 impl From<CollectionQueryType> for CollectionType {
@@ -46,8 +44,7 @@ pub struct CollectionActionParams {
 
 struct CollectionCoverContext<'a> {
     library_id: Uuid,
-    running_mode: &'a RunningMode,
-    remote_host: &'a Option<String>,
+    session: Option<&'a Session>,
     playback_queue: Vec<i32>,
 }
 
@@ -73,6 +70,7 @@ async fn handle_fetch_group_summary<T: CollectionQuery>(
     collection_groups = special;
 
     Ok(Some(CollectionGroupSummaryResponse {
+        call_id: None,
         collection_type: T::collection_type().into(),
         groups: collection_groups,
     }))
@@ -107,8 +105,7 @@ async fn handle_fetch_groups<T: CollectionQuery + std::clone::Clone>(
                     CollectionCoverOptions {
                         bake: params.bake_cover_arts,
                         library_id: cover_context.library_id,
-                        running_mode: cover_context.running_mode,
-                        remote_host: cover_context.remote_host,
+                        session: cover_context.session,
                         playback_queue: &playback_queue,
                     },
                 )
@@ -129,6 +126,7 @@ async fn handle_fetch_groups<T: CollectionQuery + std::clone::Clone>(
     .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Some(FetchCollectionGroupsResponse {
+        call_id: None,
         groups: collection_groups,
     }))
 }
@@ -158,8 +156,7 @@ async fn handle_fetch_by_id<T: CollectionQuery + std::clone::Clone>(
                 CollectionCoverOptions {
                     bake: params.bake_cover_arts,
                     library_id: cover_context.library_id,
-                    running_mode: cover_context.running_mode,
-                    remote_host: cover_context.remote_host,
+                    session: cover_context.session,
                     playback_queue: &playback_queue,
                 },
             )
@@ -173,6 +170,7 @@ async fn handle_fetch_by_id<T: CollectionQuery + std::clone::Clone>(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Some(FetchCollectionByIdsResponse {
+        call_id: None,
         collection_type: T::collection_type().into(),
         result: collections,
     }))
@@ -199,6 +197,7 @@ async fn handle_search<T: CollectionQuery>(
     let results = results?;
 
     Ok(Some(SearchCollectionSummaryResponse {
+        call_id: None,
         collection_type: T::collection_type().into(),
         result: results,
     }))
@@ -333,24 +332,20 @@ impl Signal for FetchCollectionGroupSummaryRequest {
 }
 
 impl ParamsExtractor for FetchCollectionGroupsRequest {
-    type Params = (Option<LibraryHandle>, RunningMode, Arc<NodeContext>);
+    type Params = (Option<LibraryHandle>, Arc<NodeContext>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            all_params.library.clone(),
-            all_params.running_mode,
-            all_params.node.clone(),
-        )
+        (all_params.library.clone(), all_params.node.clone())
     }
 }
 
 impl Signal for FetchCollectionGroupsRequest {
-    type Params = (Option<LibraryHandle>, RunningMode, Arc<NodeContext>);
+    type Params = (Option<LibraryHandle>, Arc<NodeContext>);
     type Response = FetchCollectionGroupsResponse;
 
     async fn handle(
         &self,
-        (library, running_mode, node): Self::Params,
+        (library, node): Self::Params,
         session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -358,19 +353,14 @@ impl Signal for FetchCollectionGroupsRequest {
         let fsio = &library.fsio;
         let main_db = &library.main_db;
         let recommend_db = &library.recommend_db;
-        let queue = node
-            .session_queue_for_library(library.descriptor.library_id)
-            .await?;
+        let queue = node.session_queue_for_library(library.library_id).await?;
         let params = CollectionActionParams {
             group_titles: Some(dart_signal.group_titles.clone()),
             bake_cover_arts: dart_signal.bake_cover_arts,
             ..Default::default()
         };
 
-        let remote_host = match session {
-            Some(x) => Some(x.host),
-            None => None,
-        };
+        let session = session.as_ref();
 
         match dart_signal.collection_type {
             CollectionType::Album => {
@@ -380,9 +370,8 @@ impl Signal for FetchCollectionGroupsRequest {
                     recommend_db,
                     params,
                     CollectionCoverContext {
-                        library_id: library.descriptor.library_id,
-                        running_mode: &running_mode,
-                        remote_host: &remote_host,
+                        library_id: library.library_id,
+                        session,
                         playback_queue: queue.clone(),
                     },
                 )
@@ -395,9 +384,8 @@ impl Signal for FetchCollectionGroupsRequest {
                     recommend_db,
                     params,
                     CollectionCoverContext {
-                        library_id: library.descriptor.library_id,
-                        running_mode: &running_mode,
-                        remote_host: &remote_host,
+                        library_id: library.library_id,
+                        session,
                         playback_queue: queue.clone(),
                     },
                 )
@@ -410,9 +398,8 @@ impl Signal for FetchCollectionGroupsRequest {
                     recommend_db,
                     params,
                     CollectionCoverContext {
-                        library_id: library.descriptor.library_id,
-                        running_mode: &running_mode,
-                        remote_host: &remote_host,
+                        library_id: library.library_id,
+                        session,
                         playback_queue: queue.clone(),
                     },
                 )
@@ -425,9 +412,8 @@ impl Signal for FetchCollectionGroupsRequest {
                     recommend_db,
                     params,
                     CollectionCoverContext {
-                        library_id: library.descriptor.library_id,
-                        running_mode: &running_mode,
-                        remote_host: &remote_host,
+                        library_id: library.library_id,
+                        session,
                         playback_queue: queue.clone(),
                     },
                 )
@@ -440,9 +426,8 @@ impl Signal for FetchCollectionGroupsRequest {
                     recommend_db,
                     params,
                     CollectionCoverContext {
-                        library_id: library.descriptor.library_id,
-                        running_mode: &running_mode,
-                        remote_host: &remote_host,
+                        library_id: library.library_id,
+                        session,
                         playback_queue: queue.clone(),
                     },
                 )
@@ -454,24 +439,20 @@ impl Signal for FetchCollectionGroupsRequest {
 }
 
 impl ParamsExtractor for FetchCollectionByIdsRequest {
-    type Params = (Option<LibraryHandle>, RunningMode, Arc<NodeContext>);
+    type Params = (Option<LibraryHandle>, Arc<NodeContext>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            all_params.library.clone(),
-            all_params.running_mode,
-            all_params.node.clone(),
-        )
+        (all_params.library.clone(), all_params.node.clone())
     }
 }
 
 impl Signal for FetchCollectionByIdsRequest {
-    type Params = (Option<LibraryHandle>, RunningMode, Arc<NodeContext>);
+    type Params = (Option<LibraryHandle>, Arc<NodeContext>);
     type Response = FetchCollectionByIdsResponse;
 
     async fn handle(
         &self,
-        (library, running_mode, node): Self::Params,
+        (library, node): Self::Params,
         session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -479,18 +460,13 @@ impl Signal for FetchCollectionByIdsRequest {
         let fsio = &library.fsio;
         let main_db = &library.main_db;
         let recommend_db = &library.recommend_db;
-        let queue = node
-            .session_queue_for_library(library.descriptor.library_id)
-            .await?;
+        let queue = node.session_queue_for_library(library.library_id).await?;
         let params = CollectionActionParams {
             ids: Some(dart_signal.ids.clone()),
             ..Default::default()
         };
 
-        let remote_host = match session {
-            Some(x) => Some(x.host),
-            None => None,
-        };
+        let session = session.as_ref();
 
         match dart_signal.collection_type {
             CollectionType::Album => {
@@ -500,9 +476,8 @@ impl Signal for FetchCollectionByIdsRequest {
                     recommend_db,
                     params,
                     CollectionCoverContext {
-                        library_id: library.descriptor.library_id,
-                        running_mode: &running_mode,
-                        remote_host: &remote_host,
+                        library_id: library.library_id,
+                        session,
                         playback_queue: queue.clone(),
                     },
                 )
@@ -515,9 +490,8 @@ impl Signal for FetchCollectionByIdsRequest {
                     recommend_db,
                     params,
                     CollectionCoverContext {
-                        library_id: library.descriptor.library_id,
-                        running_mode: &running_mode,
-                        remote_host: &remote_host,
+                        library_id: library.library_id,
+                        session,
                         playback_queue: queue.clone(),
                     },
                 )
@@ -530,9 +504,8 @@ impl Signal for FetchCollectionByIdsRequest {
                     recommend_db,
                     params,
                     CollectionCoverContext {
-                        library_id: library.descriptor.library_id,
-                        running_mode: &running_mode,
-                        remote_host: &remote_host,
+                        library_id: library.library_id,
+                        session,
                         playback_queue: queue.clone(),
                     },
                 )
@@ -545,9 +518,8 @@ impl Signal for FetchCollectionByIdsRequest {
                     recommend_db,
                     params,
                     CollectionCoverContext {
-                        library_id: library.descriptor.library_id,
-                        running_mode: &running_mode,
-                        remote_host: &remote_host,
+                        library_id: library.library_id,
+                        session,
                         playback_queue: queue.clone(),
                     },
                 )
@@ -560,9 +532,8 @@ impl Signal for FetchCollectionByIdsRequest {
                     recommend_db,
                     params,
                     CollectionCoverContext {
-                        library_id: library.descriptor.library_id,
-                        running_mode: &running_mode,
-                        remote_host: &remote_host,
+                        library_id: library.library_id,
+                        session,
                         playback_queue: queue.clone(),
                     },
                 )

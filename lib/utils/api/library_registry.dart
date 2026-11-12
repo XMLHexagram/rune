@@ -3,6 +3,24 @@ import '../../bindings/bindings.dart';
 
 const _timeout = Duration(seconds: 30);
 
+Future<ReplaceSubsonicCredentialResponse> replaceSubsonicCredential(
+  String recordId,
+  String username,
+  String password,
+) async {
+  final response = await awaitResponse(
+    'ReplaceSubsonicCredentialRequest',
+    ReplaceSubsonicCredentialResponse.rustSignalStream,
+    timeout: _timeout,
+    send: () => ReplaceSubsonicCredentialRequest(
+      recordId: recordId,
+      username: username,
+      password: password,
+    ).sendSignalToRust(),
+  );
+  return response.message;
+}
+
 Future<ListPeerLibrariesResponse> listPeerLibraries(String fingerprint) async {
   final response = awaitResponse(
     'ListPeerLibrariesRequest',
@@ -10,6 +28,59 @@ Future<ListPeerLibrariesResponse> listPeerLibraries(String fingerprint) async {
     timeout: _timeout,
     send: () =>
         ListPeerLibrariesRequest(fingerprint: fingerprint).sendSignalToRust(),
+  );
+  return (await response).message;
+}
+
+Future<RegisterLibraryResponse> registerOpenDalLibrary(
+  OpenDalLibraryService service,
+  String alias,
+  ShareDataChoice shareDataChoice,
+) async {
+  final response = awaitResponse(
+    'RegisterOpenDalLibraryRequest',
+    RegisterLibraryResponse.rustSignalStream,
+    timeout: _timeout,
+    send: () => RegisterOpenDalLibraryRequest(
+      service: service,
+      alias: alias,
+      shareDataChoice: shareDataChoice,
+    ).sendSignalToRust(),
+  );
+  return (await response).message;
+}
+
+Future<DetectOpenDalShareDataResponse> detectOpenDalShareData(
+  OpenDalLibraryService service,
+) async {
+  final response = await awaitResponse(
+    'DetectOpenDalShareDataRequest',
+    DetectOpenDalShareDataResponse.rustSignalStream,
+    timeout: _timeout,
+    send: () =>
+        DetectOpenDalShareDataRequest(service: service).sendSignalToRust(),
+  );
+  return response.message;
+}
+
+Future<RegisterLibraryResponse> registerSubsonicLibrary(
+  String endpoint,
+  String username,
+  String password,
+  String alias,
+  SubsonicOpenModeMessage? mode,
+) async {
+  final response = awaitResponse(
+    'RegisterSubsonicLibraryRequest',
+    RegisterLibraryResponse.rustSignalStream,
+    timeout: _timeout,
+    send: () => RegisterSubsonicLibraryRequest(
+      endpoint: endpoint,
+      username: username,
+      password: password,
+      alias: alias,
+      mode: mode,
+    ).sendSignalToRust(),
   );
   return (await response).message;
 }

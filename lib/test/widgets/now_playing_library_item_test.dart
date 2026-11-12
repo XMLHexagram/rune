@@ -3,8 +3,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:material_symbols_icons/symbols.dart';
 
+import '../../bindings/bindings.dart';
 import '../../providers/playback_controller.dart';
-import '../../providers/library_path.dart';
+import '../../providers/library_open_state.dart';
 import '../../providers/responsive_providers.dart';
 import '../../providers/status.dart';
 import '../../utils/playing_item.dart';
@@ -45,25 +46,38 @@ void main() {
     expect(find.text('Other Library Artist'), findsOneWidget);
   });
 
-  testWidgets('the now-playing like action is hidden without a local id', (
+  testWidgets('the now-playing like action shows without a local id', (
     tester,
   ) async {
     await tester.pumpWidget(
-      ChangeNotifierProvider<LibraryPathProvider>(
-        create: (_) => LibraryPathProvider(null),
+      ChangeNotifierProvider<LibraryOpenStateProvider>(
+        create: (_) => _LibraryOpenStateProvider(),
         child: FluentApp(
           home: LikeButton(
             item: PlayingItem.libraryItem(
               libraryId: 'library-uuid',
               fileUuid: 'file-uuid',
             ),
+            fetchLikedStatus: (_) async => false,
           ),
         ),
       ),
     );
 
-    expect(find.byIcon(Symbols.favorite), findsNothing);
+    expect(find.byIcon(Symbols.favorite), findsOneWidget);
   });
+}
+
+class _LibraryOpenStateProvider extends ChangeNotifier
+    implements LibraryOpenStateProvider {
+  @override
+  bool get isReadOnlyReplica => false;
+
+  @override
+  LibraryRecordSummary? get openRecord => null;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 class _StatusProvider extends ChangeNotifier implements PlaybackStatusProvider {

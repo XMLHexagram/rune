@@ -22,17 +22,20 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use log::info;
 use reqwest::redirect::Policy;
-use tokio::sync::RwLock;
+use rustls::pki_types::CertificateDer;
+use tokio::{sync::RwLock, time::timeout};
 use url::Url;
 use uuid::Uuid;
 
 use ::database::actions::cover_art::COVER_TEMP_DIR;
 use ::discovery::{
     DiscoveryParams,
-    client::{CertValidator, fetch_server_certificate, select_best_host, try_connect},
+    client::{
+        CertValidator, CertValidatorError, fetch_server_certificate, select_best_host, try_connect,
+    },
+    endpoint::{DEFAULT_DEVICE_PORT, DeviceAddress},
     protocol::DiscoveryService,
     server::{PermissionManager, UserStatus},
-    url::decode_rnsrv_url,
     utils::{DeviceInfo, DeviceType},
 };
 
@@ -44,17 +47,35 @@ pub(crate) async fn select_pinned_pair_host(
     validator: &CertValidator,
     fingerprint: &str,
 ) -> Result<String> {
+    let addresses = hosts
+        .iter()
+        .map(|host| {
+            host.parse::<DeviceAddress>()
+                .map_err(|_| ExpectedRequestError::invalid_input("Device address is malformed"))
+                .map_err(anyhow::Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let urls = addresses
+        .iter()
+        .map(|address| address.url("https", "/").map(|url| url.to_string()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     match select_best_host(
-        hosts.clone(),
+        urls.clone(),
         Arc::new(tls_config(validator.clone(), fingerprint)),
     )
     .await
     {
-        Ok(host) => Ok(host),
+        Ok(url) => {
+            let parsed = Url::parse(&url).context("Invalid selected device URL")?;
+            let host = parsed
+                .host_str()
+                .context("Selected device URL has no host")?;
+            let port = parsed.port().unwrap_or(DEFAULT_DEVICE_PORT);
+            Ok(DeviceAddress::new(host, port)?.to_string())
+        }
         Err(_) => {
-            for host in &hosts {
-                if let Ok(certificate) =
-                    fetch_server_certificate(&certificate_fetch_url(host)).await
+            for url in &urls {
+                if let Ok(certificate) = fetch_server_certificate(url).await
                     && certificate.fingerprint != fingerprint
                 {
                     return Err(ExpectedRequestError::CertificateMismatch.into());
@@ -65,14 +86,6 @@ pub(crate) async fn select_pinned_pair_host(
             }
             .into())
         }
-    }
-}
-
-fn certificate_fetch_url(host: &str) -> String {
-    if matches!(host.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
-        format!("https://[{host}]/ping")
-    } else {
-        format!("https://{host}/ping")
     }
 }
 
@@ -114,8 +127,9 @@ impl Signal for StartBroadcastRequest {
                     version: "Technical Preview".to_owned(),
                     device_type: Some(DeviceType::Desktop),
                     fingerprint: fingerprint.clone(),
-                    api_port: 7863,
+                    api_port: DEFAULT_DEVICE_PORT,
                     protocol: "http".to_owned(),
+                    protocol_version: Some(discovery::protocol_version::PROTOCOL_VERSION),
                     capabilities: None,
                 },
                 Duration::from_secs(request.duration_seconds.into()),
@@ -226,20 +240,31 @@ impl Signal for GetDiscoveredDeviceRequest {
 
         let devices_message = devices
             .into_iter()
-            .map(|x| DiscoveredDeviceMessage {
-                alias: x.alias,
-                fingerprint: x.fingerprint,
-                device_model: x.device_model,
-                device_type: x.device_type.to_string(),
-                last_seen_unix_epoch: x.last_seen.timestamp(),
-                ips: x.ips.into_iter().map(|ip| ip.to_string()).collect(),
+            .map(|x| {
+                let addresses = announced_device_addresses(&x.ips, x.api_port)?;
+                Ok(DiscoveredDeviceMessage {
+                    alias: x.alias,
+                    fingerprint: x.fingerprint,
+                    device_model: x.device_model,
+                    device_type: x.device_type.to_string(),
+                    last_seen_unix_epoch: x.last_seen.timestamp(),
+                    addresses,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Some(GetDiscoveredDeviceResponse {
+            call_id: None,
             devices: devices_message,
         }))
     }
+}
+
+fn announced_device_addresses(ips: &[IpAddr], api_port: Option<u16>) -> Result<Vec<String>> {
+    let port = api_port.unwrap_or(DEFAULT_DEVICE_PORT);
+    ips.iter()
+        .map(|ip| Ok(DeviceAddress::new(ip.to_string(), port)?.to_string()))
+        .collect()
 }
 
 impl ParamsExtractor for StartServerRequest {
@@ -277,7 +302,7 @@ impl Signal for StartServerRequest {
                     request.interface, e
                 ))
             })?;
-            let addr = SocketAddr::new(ip, 7863);
+            let addr = SocketAddr::new(ip, DEFAULT_DEVICE_PORT);
 
             let device_info = DeviceInfo {
                 alias: request.alias.clone(),
@@ -290,8 +315,9 @@ impl Signal for StartServerRequest {
                 )
                 .await?
                 .0,
-                api_port: 7863,
+                api_port: DEFAULT_DEVICE_PORT,
                 protocol: "http".to_owned(),
+                protocol_version: Some(discovery::protocol_version::PROTOCOL_VERSION),
                 capabilities: None,
             };
 
@@ -299,10 +325,12 @@ impl Signal for StartServerRequest {
 
             match server_manager.start(addr, discovery_params).await {
                 Ok(_) => Ok(Some(StartServerResponse {
+                    call_id: None,
                     success: true,
                     error: String::new(),
                 })),
                 Err(e) => Ok(Some(StartServerResponse {
+                    call_id: None,
                     success: false,
                     error: format!("{e:#?}"),
                 })),
@@ -353,10 +381,12 @@ impl Signal for StopServerRequest {
         .await;
         match result {
             Ok(_) => Ok(Some(StopServerResponse {
+                call_id: None,
                 success: true,
                 error: "".into(),
             })),
             Err(e) => Ok(Some(StopServerResponse {
+                call_id: None,
                 success: false,
                 error: format!("{e:#?}"),
             })),
@@ -399,6 +429,7 @@ impl Signal for ListClientsRequest {
             .collect();
 
         Ok(Some(ListClientsResponse {
+            call_id: None,
             success: true,
             users: converted_users,
             error: String::new(),
@@ -432,7 +463,10 @@ impl Signal for GetSslCertificateFingerprintRequest {
                 .await
                 .context("Failed to initialize certificates")?;
 
-        Ok(Some(GetSslCertificateFingerprintResponse { fingerprint }))
+        Ok(Some(GetSslCertificateFingerprintResponse {
+            call_id: None,
+            fingerprint,
+        }))
     }
 }
 
@@ -465,10 +499,12 @@ impl Signal for RemoveTrustedClientRequest {
         }
         match result {
             Ok(_) => Ok(Some(RemoveTrustedClientResponse {
+                call_id: None,
                 success: true,
                 error: String::new(),
             })),
             Err(e) => Ok(Some(RemoveTrustedClientResponse {
+                call_id: None,
                 success: false,
                 error: format!("{e:#?}"),
             })),
@@ -496,30 +532,102 @@ impl Signal for ServerAvailabilityTestRequest {
     ) -> Result<Option<Self::Response>> {
         let validator = Arc::new(validator.read().await.clone());
 
-        let hosts = match decode_rnsrv_url(&req.url) {
-            Ok(x) => x,
-            Err(e) => {
+        let hosts = &req.hosts;
+        if hosts.is_empty()
+            || hosts
+                .iter()
+                .any(|host| host.parse::<DeviceAddress>().is_err())
+        {
+            return Ok(Some(ServerAvailabilityTestResponse {
+                call_id: None,
+                outcome: ServerAvailabilityTestOutcome::Failed(
+                    ServerAvailabilityTestFailure::AddressMalformed,
+                ),
+            }));
+        }
+
+        let client_config = Arc::new(validator.clone().into_client_config());
+        let device_urls = match hosts
+            .iter()
+            .map(|host| {
+                host.parse::<DeviceAddress>()
+                    .and_then(|address| address.url("https", "/"))
+                    .map(|url| url.to_string())
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(urls) => urls,
+            Err(_) => {
                 return Ok(Some(ServerAvailabilityTestResponse {
-                    success: false,
-                    error: format!("{e:#?}"),
+                    call_id: None,
+                    outcome: ServerAvailabilityTestOutcome::Failed(
+                        ServerAvailabilityTestFailure::AddressMalformed,
+                    ),
                 }));
             }
         };
+        let outcome = match timeout(
+            Duration::from_secs(5),
+            select_best_host(device_urls, client_config),
+        )
+        .await
+        {
+            Err(_) => availability_outcome(Err(ServerAvailabilityTestFailure::TimedOut)),
+            Ok(Ok(_)) => availability_outcome(Ok(())),
+            Ok(Err(_)) => {
+                let failure = if has_fingerprint_mismatch(hosts, &validator).await {
+                    ServerAvailabilityTestFailure::TlsFingerprintMismatch
+                } else {
+                    ServerAvailabilityTestFailure::NoHostReachable
+                };
+                availability_outcome(Err(failure))
+            }
+        };
 
-        let client_config = Arc::new(validator.clone().into_client_config());
-        let host = select_best_host(hosts, client_config).await;
-
-        Ok(Some(match host {
-            Ok(_) => ServerAvailabilityTestResponse {
-                success: true,
-                error: String::new(),
-            },
-            Err(e) => ServerAvailabilityTestResponse {
-                success: false,
-                error: format!("{e:#?}"),
-            },
+        Ok(Some(ServerAvailabilityTestResponse {
+            call_id: None,
+            outcome,
         }))
     }
+}
+
+fn availability_outcome(
+    result: Result<(), ServerAvailabilityTestFailure>,
+) -> ServerAvailabilityTestOutcome {
+    match result {
+        Ok(()) => ServerAvailabilityTestOutcome::Success,
+        Err(failure) => ServerAvailabilityTestOutcome::Failed(failure),
+    }
+}
+
+async fn has_fingerprint_mismatch(hosts: &[String], validator: &CertValidator) -> bool {
+    for host in hosts {
+        let Ok(address) = host.parse::<DeviceAddress>() else {
+            continue;
+        };
+        let Ok(url) = address.url("https", "/ping") else {
+            continue;
+        };
+        let Ok(Ok(server_certificate)) = timeout(
+            Duration::from_secs(5),
+            fetch_server_certificate(url.as_str()),
+        )
+        .await
+        else {
+            continue;
+        };
+        let Ok(certificate_pem) = pem::parse(server_certificate.cert) else {
+            continue;
+        };
+        let certificate = CertificateDer::from(certificate_pem.into_contents());
+        if matches!(
+            validator.verify_certificate(&certificate, host).await,
+            Err(CertValidatorError::FingerprintMismatch)
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 impl ParamsExtractor for UpdateClientStatusRequest {
@@ -569,10 +677,12 @@ impl Signal for UpdateClientStatusRequest {
         .await;
         match result {
             Ok(_) => Ok(Some(UpdateClientStatusResponse {
+                call_id: None,
                 success: true,
                 error: String::new(),
             })),
             Err(e) => Ok(Some(UpdateClientStatusResponse {
+                call_id: None,
                 success: false,
                 error: format!("{e:#?}"),
             })),
@@ -605,6 +715,7 @@ impl Signal for EditHostsRequest {
         )
         .await?;
         Ok(Some(EditHostsResponse {
+            call_id: None,
             success: true,
             error: String::new(),
         }))
@@ -639,6 +750,7 @@ impl Signal for AddTrustedServerRequest {
         }
 
         Ok(Some(AddTrustedServerResponse {
+            call_id: None,
             success: true,
             error: String::new(),
         }))
@@ -674,10 +786,12 @@ impl Signal for RemoveTrustedServerRequest {
         }
         match result {
             Ok(_) => Ok(Some(RemoveTrustedServerResponse {
+                call_id: None,
                 success: true,
                 error: String::new(),
             })),
             Err(e) => Ok(Some(RemoveTrustedServerResponse {
+                call_id: None,
                 success: false,
                 error: format!("{e:#?}"),
             })),
@@ -728,6 +842,7 @@ impl Signal for RegisterDeviceOnServerRequest {
         )
         .await?;
         Ok(Some(RegisterDeviceOnServerResponse {
+            call_id: None,
             success: true,
             error: String::new(),
         }))
@@ -773,6 +888,7 @@ impl Signal for CheckDeviceOnServerRequest {
                 };
 
                 Ok(Some(CheckDeviceOnServerResponse {
+                    call_id: None,
                     success: true,
                     error: String::new(),
                     status: Some(status),
@@ -818,6 +934,7 @@ impl Signal for ConnectRequest {
             match task.await {
                 Ok(Ok(host)) => {
                     return Ok(Some(ConnectResponse {
+                        call_id: None,
                         success: true,
                         connected_host: host,
                         error: String::new(),
@@ -829,6 +946,7 @@ impl Signal for ConnectRequest {
         }
 
         Ok(Some(ConnectResponse {
+            call_id: None,
             success: false,
             connected_host: String::new(),
             error: last_err.map(|e| e.to_string()).unwrap_or_default(),
@@ -854,11 +972,13 @@ impl Signal for FetchServerCertificateRequest {
     ) -> Result<Option<Self::Response>> {
         match fetch_server_certificate(&req.url).await {
             Ok(cert) => Ok(Some(FetchServerCertificateResponse {
+                call_id: None,
                 success: true,
                 fingerprint: cert.fingerprint,
                 error: String::new(),
             })),
             Err(e) => Ok(Some(FetchServerCertificateResponse {
+                call_id: None,
                 success: false,
                 fingerprint: String::new(),
                 error: format!("{e:#?}"),
@@ -902,7 +1022,7 @@ pub(crate) async fn authorized_get(
         .use_preconfigured_tls(tls_config(validator, &server_fingerprint))
         .redirect(Policy::none())
         .build()?;
-    let base = peer_base(host, port);
+    let base = peer_base(host, port)?;
     let token = obtain_or_reuse_token(
         sync_tokens,
         &client,
@@ -973,10 +1093,11 @@ impl Signal for FetchRemoteFileRequest {
         let validator = params.validator.read().await.clone();
 
         // Parse the URL to extract host, port, and path
-        let mut url = match Url::parse(&req.url) {
+        let url = match Url::parse(&req.url) {
             Ok(url) => url,
             Err(e) => {
                 return Ok(Some(FetchRemoteFileResponse {
+                    call_id: None,
                     success: false,
                     local_path: String::new(),
                     error: format!("Invalid URL: {e}"),
@@ -989,6 +1110,7 @@ impl Signal for FetchRemoteFileRequest {
             Some(host) => host.to_string(),
             None => {
                 return Ok(Some(FetchRemoteFileResponse {
+                    call_id: None,
                     success: false,
                     local_path: String::new(),
                     error: "Missing host in URL".to_string(),
@@ -996,14 +1118,22 @@ impl Signal for FetchRemoteFileRequest {
             }
         };
 
-        let port = url.port().unwrap_or(7863);
-        if url.scheme() != "https" || url.set_port(Some(port)).is_err() {
+        let address = (url.scheme() == "https")
+            .then(|| {
+                url.host_str().and_then(|host| {
+                    DeviceAddress::new(host, url.port().unwrap_or(DEFAULT_DEVICE_PORT)).ok()
+                })
+            })
+            .flatten();
+        let Some(address) = address else {
             return Ok(Some(FetchRemoteFileResponse {
+                call_id: None,
                 success: false,
                 local_path: String::new(),
                 error: "Remote file URL must be an HTTPS URL with a valid port".to_string(),
             }));
-        }
+        };
+        let port = address.port();
 
         let library_id = url
             .query_pairs()
@@ -1011,6 +1141,7 @@ impl Signal for FetchRemoteFileRequest {
             .and_then(|(_, value)| Uuid::parse_str(&value).ok());
         let Some(library_id) = library_id else {
             return Ok(Some(FetchRemoteFileResponse {
+                call_id: None,
                 success: false,
                 local_path: String::new(),
                 error: "Remote file URL must include a valid library_id".to_string(),
@@ -1027,6 +1158,7 @@ impl Signal for FetchRemoteFileRequest {
 
         if file_name.is_empty() {
             return Ok(Some(FetchRemoteFileResponse {
+                call_id: None,
                 success: false,
                 local_path: String::new(),
                 error: "Invalid file path in URL".to_string(),
@@ -1035,6 +1167,7 @@ impl Signal for FetchRemoteFileRequest {
 
         if file_name.len() != 64 || !file_name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Ok(Some(FetchRemoteFileResponse {
+                call_id: None,
                 success: false,
                 local_path: String::new(),
                 error: "Remote cover file name must be a BLAKE3 digest".to_string(),
@@ -1046,6 +1179,7 @@ impl Signal for FetchRemoteFileRequest {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 return Ok(Some(FetchRemoteFileResponse {
+                    call_id: None,
                     success: false,
                     local_path: String::new(),
                     error: format!("Failed to authorize remote host: {error:#}"),
@@ -1060,6 +1194,7 @@ impl Signal for FetchRemoteFileRequest {
             .context("remote file cache path has no parent")?;
         if let Err(e) = fs::create_dir_all(cache_dir) {
             return Ok(Some(FetchRemoteFileResponse {
+                call_id: None,
                 success: false,
                 local_path: String::new(),
                 error: format!("Failed to create temp directory: {e}"),
@@ -1070,6 +1205,7 @@ impl Signal for FetchRemoteFileRequest {
         // within that peer and library, so a cached copy needs no new download.
         if local_path.exists() {
             return Ok(Some(FetchRemoteFileResponse {
+                call_id: None,
                 success: true,
                 local_path: local_path.to_string_lossy().into_owned(),
                 error: String::new(),
@@ -1089,6 +1225,7 @@ impl Signal for FetchRemoteFileRequest {
             Ok(res) => res,
             Err(e) => {
                 return Ok(Some(FetchRemoteFileResponse {
+                    call_id: None,
                     success: false,
                     local_path: String::new(),
                     error: format!("Failed to fetch remote file: {e:#}"),
@@ -1098,6 +1235,7 @@ impl Signal for FetchRemoteFileRequest {
 
         if !res.status().is_success() {
             return Ok(Some(FetchRemoteFileResponse {
+                call_id: None,
                 success: false,
                 local_path: String::new(),
                 error: format!("HTTP request failed with status: {}", res.status()),
@@ -1109,6 +1247,7 @@ impl Signal for FetchRemoteFileRequest {
             Ok(body) => body,
             Err(e) => {
                 return Ok(Some(FetchRemoteFileResponse {
+                    call_id: None,
                     success: false,
                     local_path: String::new(),
                     error: format!("Failed to read response body: {e}"),
@@ -1120,6 +1259,7 @@ impl Signal for FetchRemoteFileRequest {
             Ok(path) => path,
             Err(error) => {
                 return Ok(Some(FetchRemoteFileResponse {
+                    call_id: None,
                     success: false,
                     local_path: String::new(),
                     error: format!("Failed to verify or publish remote file: {error:#}"),
@@ -1129,10 +1269,26 @@ impl Signal for FetchRemoteFileRequest {
 
         // Return the successful response with the local file path
         Ok(Some(FetchRemoteFileResponse {
+            call_id: None,
             success: true,
             local_path: published_path.to_string_lossy().into_owned(),
             error: String::new(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod discovered_device_address_tests {
+    use super::announced_device_addresses;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn announced_api_port_is_kept_in_discovered_addresses() {
+        let ips = [IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))];
+        assert_eq!(
+            announced_device_addresses(&ips, Some(9999)).unwrap(),
+            ["192.0.2.1:9999"],
+        );
     }
 }
 
@@ -1171,5 +1327,97 @@ mod remote_file_cache_tests {
         assert!(result.is_err());
         assert!(!temp.path().join(file_name).exists());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod server_availability_test_tests {
+    use super::{Signal, availability_outcome};
+    use crate::{
+        Session,
+        messages::{
+            ServerAvailabilityTestFailure, ServerAvailabilityTestOutcome,
+            ServerAvailabilityTestRequest,
+        },
+    };
+    use discovery::client::CertValidator;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    async fn request_outcome(hosts: Vec<String>) -> ServerAvailabilityTestOutcome {
+        let directory = tempfile::tempdir().expect("temporary certificate directory");
+        let validator = Arc::new(RwLock::new(
+            CertValidator::new(directory.path())
+                .await
+                .expect("certificate validator"),
+        ));
+        let request = ServerAvailabilityTestRequest {
+            hosts,
+            call_id: None,
+        };
+        request
+            .handle(validator, None::<Session>, &request)
+            .await
+            .expect("availability request")
+            .expect("availability response")
+            .outcome
+    }
+
+    #[tokio::test]
+    async fn empty_host_list_is_typed_malformed_address() {
+        assert_eq!(
+            request_outcome(Vec::new()).await,
+            ServerAvailabilityTestOutcome::Failed(ServerAvailabilityTestFailure::AddressMalformed),
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_host_is_typed_malformed_address() {
+        assert_eq!(
+            request_outcome(vec!["bad host:7863".to_owned()]).await,
+            ServerAvailabilityTestOutcome::Failed(ServerAvailabilityTestFailure::AddressMalformed),
+        );
+    }
+
+    #[test]
+    fn malformed_address_is_reported_as_typed_failure() {
+        assert_eq!(
+            availability_outcome(Err(ServerAvailabilityTestFailure::AddressMalformed)),
+            ServerAvailabilityTestOutcome::Failed(ServerAvailabilityTestFailure::AddressMalformed,),
+        );
+    }
+
+    #[test]
+    fn unreachable_hosts_are_reported_as_typed_failure() {
+        assert_eq!(
+            availability_outcome(Err(ServerAvailabilityTestFailure::NoHostReachable)),
+            ServerAvailabilityTestOutcome::Failed(ServerAvailabilityTestFailure::NoHostReachable,),
+        );
+    }
+
+    #[test]
+    fn tls_fingerprint_mismatch_is_reported_as_typed_failure() {
+        assert_eq!(
+            availability_outcome(Err(ServerAvailabilityTestFailure::TlsFingerprintMismatch,)),
+            ServerAvailabilityTestOutcome::Failed(
+                ServerAvailabilityTestFailure::TlsFingerprintMismatch,
+            ),
+        );
+    }
+
+    #[test]
+    fn timed_out_probe_is_reported_as_typed_failure() {
+        assert_eq!(
+            availability_outcome(Err(ServerAvailabilityTestFailure::TimedOut)),
+            ServerAvailabilityTestOutcome::Failed(ServerAvailabilityTestFailure::TimedOut),
+        );
+    }
+
+    #[test]
+    fn successful_probe_has_success_outcome() {
+        assert_eq!(
+            availability_outcome(Ok(())),
+            ServerAvailabilityTestOutcome::Success,
+        );
     }
 }

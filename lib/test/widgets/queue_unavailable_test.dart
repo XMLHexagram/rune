@@ -1,16 +1,18 @@
 import 'package:fluent_ui/fluent_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:provider/provider.dart';
 
 import '../../bindings/bindings.dart';
 import '../../l10n/app_localizations.dart';
 import '../../providers/playlist.dart';
+import '../../providers/request_capabilities.dart';
 import '../../widgets/playback_controller/queue.dart';
 
 PlaylistEntry queueEntry(PlaylistUnavailableReason? reason) => PlaylistEntry(
   0,
   PlaylistItem(
     unavailable: reason,
-    item: const PlayingItemRequest(),
+    item: const PlayingItemRefIndependentFile(path: ''),
     artist: 'Artist',
     album: 'Album',
     title: 'Track',
@@ -20,10 +22,10 @@ PlaylistEntry queueEntry(PlaylistUnavailableReason? reason) => PlaylistEntry(
 
 void main() {
   const reasons = {
-    PlaylistUnavailableReason.accessRevoked: 'Access was revoked',
-    PlaylistUnavailableReason.libraryUnavailable: 'Library is unavailable',
-    PlaylistUnavailableReason.sourceUnreachable: 'Source is unreachable',
-    PlaylistUnavailableReason.unreadable: 'Audio cannot be read',
+    PlaylistUnavailableReason.accessRevoked: 'Access was revoked.',
+    PlaylistUnavailableReason.libraryUnavailable: 'Library is unavailable.',
+    PlaylistUnavailableReason.sourceUnreachable: 'Source is unreachable.',
+    PlaylistUnavailableReason.unreadable: 'Audio cannot be read.',
   };
 
   Future<void> pumpItem(
@@ -32,15 +34,18 @@ void main() {
     VoidCallback onPlay = _noop,
   }) async {
     await tester.pumpWidget(
-      FluentApp(
-        locale: const Locale('en'),
-        localizationsDelegates: AppLocalizations.localizationsDelegates,
-        supportedLocales: AppLocalizations.supportedLocales,
-        home: ScaffoldPage(
-          content: PlaylistQueueItem(
-            entry: queueEntry(reason),
-            isCurrent: false,
-            onPlay: onPlay,
+      ChangeNotifierProvider(
+        create: (_) => RequestCapabilitiesProvider(),
+        child: FluentApp(
+          locale: const Locale('en'),
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: ScaffoldPage(
+            content: PlaylistQueueItem(
+              entry: queueEntry(reason),
+              isCurrent: false,
+              onPlay: onPlay,
+            ),
           ),
         ),
       ),
@@ -70,11 +75,9 @@ void main() {
     final entry = PlaylistEntry(
       0,
       PlaylistItem(
-        item: const PlayingItemRequest(
-          libraryItem: LibraryItemRequest(
-            libraryId: 'library-uuid',
-            fileUuid: 'file-uuid',
-          ),
+        item: const PlayingItemRefLibraryTrack(
+          libraryId: 'library-uuid',
+          track: 'file-uuid',
         ),
         artist: 'Other Artist',
         album: 'Other Album',
@@ -83,15 +86,18 @@ void main() {
       ),
     );
     await tester.pumpWidget(
-      FluentApp(
-        locale: const Locale('en'),
-        localizationsDelegates: AppLocalizations.localizationsDelegates,
-        supportedLocales: AppLocalizations.supportedLocales,
-        home: ScaffoldPage(
-          content: PlaylistQueueItem(
-            entry: entry,
-            isCurrent: false,
-            onPlay: _noop,
+      ChangeNotifierProvider(
+        create: (_) => RequestCapabilitiesProvider(),
+        child: FluentApp(
+          locale: const Locale('en'),
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: ScaffoldPage(
+            content: PlaylistQueueItem(
+              entry: entry,
+              isCurrent: false,
+              onPlay: _noop,
+            ),
           ),
         ),
       ),
@@ -118,7 +124,7 @@ void main() {
     expect(
       find.descendant(
         of: find.byType(ContentDialog),
-        matching: find.text('Access was revoked'),
+        matching: find.text('Access was revoked.'),
       ),
       findsOneWidget,
     );

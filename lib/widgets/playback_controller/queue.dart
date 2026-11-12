@@ -10,8 +10,11 @@ import '../../utils/playing_item.dart';
 import '../../bindings/bindings.dart';
 import '../../providers/playlist.dart';
 import '../../providers/status.dart';
+import '../../providers/request_capabilities.dart';
 import '../../utils/dialogs/information/error.dart';
 import '../../utils/api/request_failure.dart';
+import '../../utils/router/router_aware_flyout_controller.dart';
+import '../context_menu_wrapper.dart';
 
 String? _unavailableReason(
   BuildContext context,
@@ -29,7 +32,7 @@ String? _unavailableReason(
   };
 }
 
-class PlaylistQueueItem extends StatelessWidget {
+class PlaylistQueueItem extends StatefulWidget {
   const PlaylistQueueItem({
     super.key,
     required this.entry,
@@ -42,66 +45,128 @@ class PlaylistQueueItem extends StatelessWidget {
   final VoidCallback onPlay;
 
   @override
+  State<PlaylistQueueItem> createState() => _PlaylistQueueItemState();
+}
+
+class _PlaylistQueueItemState extends State<PlaylistQueueItem> {
+  final _contextController = RouterAwareFlyoutController();
+  final _contextAttachKey = GlobalKey();
+
+  @override
+  void dispose() {
+    _contextController.dispose();
+    super.dispose();
+  }
+
+  void _showContextMenu(Offset localPosition) {
+    final targetContext = _contextAttachKey.currentContext;
+    if (targetContext == null) return;
+
+    final box = targetContext.findRenderObject() as RenderBox;
+    final position = box.localToGlobal(
+      localPosition,
+      ancestor: Navigator.of(context).context.findRenderObject(),
+    );
+    final removeCapability = capabilityForRequest(
+      context,
+      (capabilities) => capabilities.removeRequest,
+      listen: false,
+    );
+    if (removeCapability is! RequestCapabilityAvailable) return;
+
+    _contextController.showFlyout(
+      position: position,
+      builder: (context) => MenuFlyout(
+        items: [
+          MenuFlyoutItem(
+            leading: const Icon(Symbols.delete),
+            text: Text(S.of(context).removeFromPlaylist),
+            onPressed: () {
+              Navigator.pop(context);
+              this.context.read<PlaylistProvider>().removeItem(
+                widget.entry.index,
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
     final typography = FluentTheme.of(context).typography;
     final accentColor = Color.alphaBlend(
       FluentTheme.of(context).inactiveColor.withAlpha(100),
       FluentTheme.of(context).accentColor,
     );
-    final reason = _unavailableReason(context, entry.entry.unavailable);
-    final color = isCurrent ? accentColor : null;
+    final reason = _unavailableReason(context, widget.entry.entry.unavailable);
+    final color = widget.isCurrent ? accentColor : null;
 
-    return ListTile.selectable(
+    // The queue stays visible on any target; only switching to an item is gated.
+    final canSwitch =
+        capabilityForRequest(
+              context,
+              (capabilities) => capabilities.switchRequest,
+            )
+            is RequestCapabilityAvailable;
+
+    final tile = ListTile.selectable(
       title: Transform.translate(
         offset: const Offset(-8, 0),
         child: Row(
           children: [
-            isCurrent
+            widget.isCurrent
                 ? Icon(Symbols.play_arrow, color: color, size: 24)
                 : const SizedBox(width: 24),
             const SizedBox(width: 4),
             SizedBox(
               width: 320,
-              child: Opacity(
-                opacity: reason == null ? 1 : 0.5,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      entry.entry.title,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    widget.entry.entry.title,
+                    overflow: TextOverflow.ellipsis,
+                    style: typography.body?.apply(color: color),
+                  ),
+                  Opacity(
+                    opacity: widget.isCurrent ? 0.8 : 0.46,
+                    child: Text(
+                      widget.entry.entry.artist,
                       overflow: TextOverflow.ellipsis,
-                      style: typography.body?.apply(color: color),
+                      style: typography.caption?.apply(color: color),
                     ),
-                    Opacity(
-                      opacity: isCurrent ? 0.8 : 0.46,
-                      child: Text(
-                        entry.entry.artist,
-                        overflow: TextOverflow.ellipsis,
-                        style: typography.caption?.apply(color: color),
-                      ),
+                  ),
+                  if (reason != null)
+                    Text(
+                      reason,
+                      key: const Key('queue-unavailable-reason'),
+                      overflow: TextOverflow.ellipsis,
+                      style: typography.caption?.apply(color: color),
                     ),
-                    if (reason != null)
-                      Text(
-                        reason,
-                        key: const Key('queue-unavailable-reason'),
-                        overflow: TextOverflow.ellipsis,
-                        style: typography.caption?.apply(color: color),
-                      ),
-                  ],
-                ),
+                ],
               ),
             ),
           ],
         ),
       ),
       onPressed: reason == null
-          ? onPlay
+          ? (canSwitch ? widget.onPlay : null)
           : () => showErrorDialog(
               context: context,
               title: S.of(context).unavailable,
-              subtitle: entry.entry.title,
+              subtitle: widget.entry.entry.title,
               errorMessage: reason,
             ),
+    );
+
+    return ContextMenuWrapper(
+      contextAttachKey: _contextAttachKey,
+      contextController: _contextController,
+      onContextMenu: _showContextMenu,
+      onMiddleClick: (_) {},
+      child: tile,
     );
   }
 }
@@ -125,13 +190,10 @@ class _QueueState extends State<Queue> {
         .failureFeedback
         .listen((failure) {
           if (!mounted) return;
-          displayInfoBar(
-            context,
-            builder: (_, close) => InfoBar(
-              title: Text(requestFailureMessage(S.of(context), failure)),
-              severity: InfoBarSeverity.error,
-              onClose: close,
-            ),
+          showErrorDialog(
+            context: context,
+            title: S.of(context).unavailable,
+            errorMessage: requestFailureMessage(S.of(context), failure),
           );
         });
   }
@@ -158,6 +220,12 @@ class _QueueState extends State<Queue> {
               playlistProvider.reorderItems(oldIndex, newIndex);
             }
 
+            final moveCapability = capabilityForRequest(
+              context,
+              (capabilities) => capabilities.movePlaylistItemRequest,
+            );
+            final canMove = moveCapability is RequestCapabilityAvailable;
+
             return playlistProvider.items.isEmpty
                 ? ListTile.selectable(
                     key: const Key("disabled"),
@@ -168,24 +236,41 @@ class _QueueState extends State<Queue> {
                 : CustomScrollView(
                     controller: _scrollController,
                     slivers: [
-                      ReorderableSliverList(
-                        onReorder: onReorder,
-                        delegate: ReorderableSliverChildBuilderDelegate((
-                          BuildContext context,
-                          int index,
-                        ) {
-                          final x = playlistProvider.items[index];
-                          final isCurrent =
-                              playbackStatusProvider.$1 == x.index &&
-                              playbackStatusProvider.$2 == x.item;
-                          return PlaylistQueueItem(
-                            key: ValueKey(x.entry.item),
-                            entry: x,
-                            isCurrent: isCurrent,
-                            onPlay: () => playlistProvider.playItem(x.index),
-                          );
-                        }, childCount: playlistProvider.items.length),
-                      ),
+                      if (canMove)
+                        ReorderableSliverList(
+                          onReorder: onReorder,
+                          delegate: ReorderableSliverChildBuilderDelegate((
+                            BuildContext context,
+                            int index,
+                          ) {
+                            final x = playlistProvider.items[index];
+                            final isCurrent =
+                                playbackStatusProvider.$1 == x.index &&
+                                playbackStatusProvider.$2 == x.item;
+                            return PlaylistQueueItem(
+                              key: ValueKey(x.entry.item),
+                              entry: x,
+                              isCurrent: isCurrent,
+                              onPlay: () => playlistProvider.playItem(x.index),
+                            );
+                          }, childCount: playlistProvider.items.length),
+                        )
+                      else
+                        SliverList.builder(
+                          itemCount: playlistProvider.items.length,
+                          itemBuilder: (context, index) {
+                            final x = playlistProvider.items[index];
+                            final isCurrent =
+                                playbackStatusProvider.$1 == x.index &&
+                                playbackStatusProvider.$2 == x.item;
+                            return PlaylistQueueItem(
+                              key: ValueKey(x.entry.item),
+                              entry: x,
+                              isCurrent: isCurrent,
+                              onPlay: () => playlistProvider.playItem(x.index),
+                            );
+                          },
+                        ),
                     ],
                   );
           },

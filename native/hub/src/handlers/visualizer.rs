@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use ::playback::player::Playable;
 use ::visualizer::{
     Inspect, LabCommand, LabEvent, LabEventKind, LabTransition, Level, Location, PcmInput,
-    Transport,
+    SceneInputs, Transport, VisualizerInputs as EngineInputs,
 };
 
 use crate::{
@@ -19,6 +19,14 @@ use crate::{
     utils::{GlobalParams, ParamsExtractor, require_library},
     visualizer::{VISUALIZER, provide_covers},
 };
+
+fn message_inputs(inputs: EngineInputs) -> VisualizerInputs {
+    match inputs {
+        EngineInputs::None => VisualizerInputs::None,
+        EngineInputs::SpectrumOnly => VisualizerInputs::SpectrumOnly,
+        EngineInputs::Full => VisualizerInputs::Full,
+    }
+}
 
 /// Errors of the visualizer controls go to the status (`last_error`) and the Log page, under
 /// `operation`, instead of crashing the request loop, since a missing scene or GPU is an ordinary
@@ -74,7 +82,8 @@ impl Signal for StartVisualizerRequest {
             Arc::clone(&library.main_db),
             Arc::clone(&library.recommend_db),
             node,
-            library.descriptor.library_id,
+            library.library_id,
+            player.lock().await.get_status().item,
         );
         let tap = player.lock().await.pcm_tap();
         // A restart: take the audio back from the running visualizer first.
@@ -322,6 +331,7 @@ impl Signal for VisualizerStatusRequest {
     ) -> Result<Option<Self::Response>> {
         let status = VISUALIZER.status();
         Ok(Some(VisualizerStatusResponse {
+            call_id: None,
             running: status.running,
             width: status.width,
             height: status.height,
@@ -330,6 +340,7 @@ impl Signal for VisualizerStatusRequest {
             preset_name: status.preset_name,
             preset_path: status.preset_path,
             preset_count: u32::try_from(status.preset_count).unwrap_or(u32::MAX),
+            inputs: message_inputs(status.inputs),
             adapter: status.adapter,
             transport: match status.transport {
                 Some(Transport::IoSurface) => "iosurface",
@@ -389,7 +400,10 @@ impl Signal for ListVisualizerCreditsRequest {
                 assets: credit.assets,
             })
             .collect();
-        Ok(Some(ListVisualizerCreditsResponse { credits }))
+        Ok(Some(ListVisualizerCreditsResponse {
+            call_id: None,
+            credits,
+        }))
     }
 }
 
@@ -458,6 +472,7 @@ impl Signal for ImportVisualizerSceneRequest {
             }
         };
         Ok(Some(ImportVisualizerSceneResponse {
+            call_id: None,
             file: dart_signal.file.clone(),
             path,
             error,
@@ -503,6 +518,7 @@ impl Signal for RemoveVisualizerSceneRequest {
             }
         };
         Ok(Some(RemoveVisualizerSceneResponse {
+            call_id: None,
             path: dart_signal.path.clone(),
             error,
         }))
@@ -586,14 +602,18 @@ impl Signal for VisualizerSupportRequest {
             .await;
         Ok(Some(match gpu {
             Ok(adapter) => VisualizerSupportResponse {
+                call_id: None,
                 supported: true,
                 adapter: adapter.clone(),
                 problem: None,
+                inputs: message_inputs(VISUALIZER.status().inputs),
             },
             Err(problem) => VisualizerSupportResponse {
+                call_id: None,
                 supported: false,
                 adapter: String::new(),
                 problem: Some(problem.clone()),
+                inputs: message_inputs(VISUALIZER.status().inputs),
             },
         }))
     }
@@ -623,9 +643,16 @@ impl Signal for ListVisualizerPresetsRequest {
                 path: info.location.to_string(),
                 group: info.group,
                 builtin: matches!(info.location, Location::Builtin(_)),
+                inputs: match info.inputs {
+                    SceneInputs::Spectrum => VisualizerSceneInputs::Spectrum,
+                    SceneInputs::SpectrumAndChart => VisualizerSceneInputs::SpectrumAndChart,
+                },
             })
             .collect();
-        Ok(Some(ListVisualizerPresetsResponse { presets }))
+        Ok(Some(ListVisualizerPresetsResponse {
+            call_id: None,
+            presets,
+        }))
     }
 }
 
@@ -828,6 +855,7 @@ impl Signal for VisualizerLabRequest {
                     .collect(),
             });
         Ok(Some(VisualizerLabResponse {
+            call_id: None,
             inspecting: VISUALIZER.is_inspecting(),
             song_time: inspect
                 .as_ref()
@@ -919,6 +947,10 @@ impl Signal for VisualizerPlanRequest {
                 values: series.values.clone(),
             }),
         });
-        Ok(Some(VisualizerPlanResponse { version, plan }))
+        Ok(Some(VisualizerPlanResponse {
+            call_id: None,
+            version,
+            plan,
+        }))
     }
 }

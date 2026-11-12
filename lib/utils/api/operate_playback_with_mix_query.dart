@@ -18,26 +18,129 @@ Future<List<PlayingItem>> operatePlaybackWithMixQuery({
   required PlaylistOperateMode operateMode,
   required List<PlayingItem> fallbackPlayingItems,
   CastTarget? castTo,
+  void Function(ResolvedItemsLoadResult result)? onCastResult,
 }) async {
-  final rustSignal = await awaitResponse(
-    'OperatePlaybackWithMixQueryRequest',
-    OperatePlaybackWithMixQueryResponse.rustSignalStream,
-    send: () => OperatePlaybackWithMixQueryRequest(
+  final requestItems = await playingItemRefs([
+    PlayingItem.inLibrary(initialPlaybackId),
+    ...fallbackPlayingItems,
+  ]);
+  final resolvedSignal = await awaitResponse(
+    'ResolveMixQueryRequest',
+    ResolveMixQueryResponse.rustSignalStream,
+    send: () => ResolveMixQueryRequest(
       queries: queries.toQueryList(),
-      playbackMode: playbackMode,
       hintPosition: hintPosition,
-      initialPlaybackItem: PlayingItem.inLibrary(initialPlaybackId).toRequest(),
+      initialPlaybackItem: requestItems.first,
       instantlyPlay: instantlyPlay,
-      operateMode: operateMode,
-      fallbackPlayingItems: fallbackPlayingItems
-          .map((x) => x.toRequest())
-          .toList(),
-      castTo: castTo,
+      fallbackPlayingItems: requestItems.skip(1).toList(),
+      excludeCurrentQueue: castTo == null,
     ).sendSignalToRust(),
   );
-  final response = rustSignal.message;
+  final resolved = resolvedSignal.message;
+  final items = resolved.playingItems;
+  final startIndex = resolved.startIndex;
 
-  return response.playingItems.map(PlayingItem.fromRequest).toList();
+  final previousRenderer =
+      RendererAttachmentChanged.latestRustSignal?.message.renderer?.fingerprint;
+  final localWasPlaying =
+      PlaybackStatus.latestRustSignal?.message.state == 'Playing';
+  var attachedForLoad = false;
+  if (castTo != null && castTo.attach) {
+    await awaitResponse(
+      'AttachRendererRequest',
+      AttachRendererResponse.rustSignalStream,
+      send: () => AttachRendererRequest(
+        fingerprint: castTo.fingerprint,
+      ).sendSignalToRust(),
+    );
+    attachedForLoad = true;
+  }
+
+  try {
+    final expectedRevision = castTo != null && !castTo.attach
+        ? (await awaitResponse(
+            'RemotePlaylistRevisionRequest',
+            RemotePlaylistRevisionResponse.rustSignalStream,
+            send: () => RemotePlaylistRevisionRequest(
+              fingerprint: castTo.fingerprint,
+            ).sendSignalToRust(),
+          )).message.revision
+        : (await awaitResponse(
+            'PlaylistRevisionRequest',
+            PlaylistRevisionResponse.rustSignalStream,
+            send: () => PlaylistRevisionRequest().sendSignalToRust(),
+          )).message.revision;
+    final load = LoadResolvedItemsRequest(
+      items: items,
+      startIndex: startIndex,
+      mode: operateMode,
+      expectedRevision: expectedRevision,
+      playbackMode: instantlyPlay ? playbackMode : null,
+      positionSeconds: null,
+      play: null,
+    );
+    if (castTo != null && !castTo.attach) {
+      final response = await awaitResponse(
+        'CastResolvedItemsRequest',
+        CastResolvedItemsResponse.rustSignalStream,
+        send: () => CastResolvedItemsRequest(
+          fingerprint: castTo.fingerprint,
+          load: load,
+        ).sendSignalToRust(),
+      );
+      onCastResult?.call(response.message.result);
+    } else {
+      final response = await awaitResponse(
+        'LoadResolvedItemsRequest',
+        LoadResolvedItemsResponse.rustSignalStream,
+        send: () => load.sendSignalToRust(),
+      );
+      onCastResult?.call(response.message.result);
+    }
+  } catch (_) {
+    if (attachedForLoad) {
+      await restoreCastAttachmentAfterLoadFailure(
+        previousRenderer: previousRenderer,
+        wasPlaying: localWasPlaying,
+        attach: (fingerprint) async {
+          await awaitResponse(
+            'AttachRendererRequest',
+            AttachRendererResponse.rustSignalStream,
+            send: () => AttachRendererRequest(
+              fingerprint: fingerprint,
+            ).sendSignalToRust(),
+          );
+        },
+        detach: () async {
+          DetachRendererRequest().sendSignalToRust();
+          await Future<void>.delayed(Duration.zero);
+        },
+        resume: () => PlayRequest().sendSignalToRust(),
+      );
+    }
+    rethrow;
+  }
+
+  return items.map(PlayingItem.fromRequest).toList();
+}
+
+Future<void> restoreCastAttachmentAfterLoadFailure({
+  required String? previousRenderer,
+  required bool wasPlaying,
+  required Future<void> Function(String fingerprint) attach,
+  required Future<void> Function() detach,
+  required void Function() resume,
+}) async {
+  try {
+    if (previousRenderer case final fingerprint?) {
+      await attach(fingerprint);
+    } else {
+      await detach();
+    }
+    if (wasPlaying) resume();
+  } catch (_) {
+    // Keep the original load failure as the user's error.
+  }
 }
 
 Future<List<PlayingItem>> safeOperatePlaybackWithMixQuery({

@@ -136,6 +136,10 @@
   "@removeLibrary": {
     "description": "Button prompt text for removing a media library. Pressing this button will delete the library entry from the history."
   },
+  "localFolder": "Loka Dosierujo",
+  "localFolderSubtitle": "Elektu dosierujon en ĉi tiu aparato.",
+  "runeDevice": "Rune-Aparato",
+  "runeDeviceSubtitle": "Konektiĝu al alia Rune-aparato.",
   "addLibrary": "Aldoni Bibliotekon",
   "@addLibrary": {
     "description": "Button prompt text in the settings interface for creating a new media library. Pressing this button guides the user to select a directory and create a library."
@@ -1001,6 +1005,28 @@
   "@loginFailedSubtitle": {
     "description": "The subtitle of the login failed button of the login modal."
   },
+  "scrobbleCredentialsRejected": "La servo rifuzis tiujn akreditaĵojn. Kontrolu vian uzantnomon kaj pasvorton aŭ ĵetonon.",
+  "@scrobbleCredentialsRejected": {
+    "description": "Shown when a scrobbling service rejects the account credentials."
+  },
+  "scrobbleServiceUnreachable": "La servo ne atingeblis. Kontrolu vian konekton kaj reprovu.",
+  "@scrobbleServiceUnreachable": {
+    "description": "Shown when a scrobbling service is unreachable or times out."
+  },
+  "scrobbleLastFmApiCredentialsMissing": "Via Last.fm {field} mankas.",
+  "@scrobbleLastFmApiCredentialsMissing": {
+    "description": "Shown when the Last.fm API key or secret is missing.",
+    "placeholders": {
+      "field": {
+        "type": "String",
+        "example": "API-Ŝlosilo"
+      }
+    }
+  },
+  "scrobbleLastFmApiCredentialsInvalid": "Last.fm rifuzis la API-ŝlosilon aŭ sekreton. Kontrolu viajn API-akreditaĵojn kaj reprovu.",
+  "@scrobbleLastFmApiCredentialsInvalid": {
+    "description": "Shown when Last.fm reports invalid API credentials."
+  },
   "lastFmSubtitle": "Provizu detalajn aŭskultajn statistikojn per ĉi tiu muzikspura servo.",
   "@lastFmSubtitle": {
     "description": "The service description of the scrobble service."
@@ -1065,10 +1091,6 @@
   "@port": {
     "description": "La porda parto de URL."
   },
-  "secured": "Sekurigita",
-  "@secured": {
-    "description": "Ĉu la konekto estas sekurigita."
-  },
   "addConnection": "Aldoni Konekton",
   "@addConnection": {
     "description": "La ago-butono de la dialogo."
@@ -1093,11 +1115,11 @@
   "@editDeviceInformationSubtitle": {
     "description": "Emfazas ke ŝanĝoj influas videblecon en skan-listoj de aliaj. Evitas teknikajn terminojn. Fokusas je 'skanoj' kiel interaga kunteksto."
   },
-  "enableBroadcast": "Videbla por proksimaj aparatoj",
+  "enableBroadcast": "Ebligi Dissendo",
   "@enableBroadcast": {
     "description": "'Dissendo' implicas aktive sendado de aparat-informoj. Se cela lingvo mankas rektan ekvivalenton, prioritatu 'videbliigi' aŭ 'kunhavigi disponeblon'."
   },
-  "enableBroadcastSubtitle": "Lasu proksimajn aparatojn trovi ĉi tiun aparaton.",
+  "enableBroadcastSubtitle": "Kunhavigi viajn aparat-informojn publike por ke aliaj malkovru.",
   "@enableBroadcastSubtitle": {
     "description": "Evitas duecocon: 'publike' = al uzantoj en la loka reto, ne la tuta interreto."
   },
@@ -1169,15 +1191,15 @@
       }
     }
   },
-  "server": "Kundivido",
+  "server": "Servilo",
   "@server": {
     "description": "La titolo de la agorda paĝo por regi amaskomunikilaj ludilo-kunhavigaj kondutoj. Inkluzivas administri rajtitajn uzantojn kaj dissendi aparatan ĉeeston."
   },
-  "serverControl": "Permesi konektojn de aliaj aparatoj",
+  "serverControl": "Servilo-regado",
   "@serverControl": {
     "description": "Sekcia titolo por regi la lokan retan servilon. 'Servilo' ĉi tie rilatas al la fona servo kiu administras aparat-malkovron."
   },
-  "serverControlSubtitle": "Lasu aliajn aparatojn konektiĝi al ĉi tiu aparato.",
+  "serverControlSubtitle": "Startigi la servilon por permesi aliajn aparatojn malkovri ĉi tiun aparaton en la loka reto.",
   "@serverControlSubtitle": {
     "description": "Klarigas ke la servilo nur funkcias en la loka reto. Emfazas ke startigo ebligas videblecon al aliaj."
   },
@@ -1201,7 +1223,7 @@
   "@unknownStatus": {
     "description": "Montrita kiel uzanto/kliento-stata insigno. Indikas ke la stato estas nerekonita aŭ nedifinita. Sugesti terminojn kiel 'Nerekonita' aŭ 'Nedifinita' sed manteni neŭtralan tonon sen implici erarojn. Asociita kun neŭtralaj koloroj kiel grizo en la UI."
   },
-  "review": "Respondi",
+  "review": "Kontroli",
   "@review": {
     "description": "Butono por kontroli atendantajn aparat-konektajn petojn. Malfermas modalon por aprobi aŭ bloki la aparaton."
   },
@@ -1209,13 +1231,9 @@
   "@reviewRequestTitle": {
     "description": "Titolo montrita en la modalo dum kontrolado de aparat-konekto. Manteni konciza, fokusi je bezonata ago."
   },
-  "blockDevice": "Bloki",
+  "blockDevice": "Bloki Aparaton",
   "@blockDevice": {
     "description": "Ago por daŭre rifuzi aliron. Uzu fortajn verbojn kiel 'Malpermesi' se kulture pli taŭgaj, sed evitu negativajn konotaciojn."
-  },
-  "allowAccess": "Mia aparato",
-  "@allowAccess": {
-    "description": "Ago por doni konektan permeson. Harmoniu kun terminoj kiel 'Aprobi' aŭ 'Rajtigi' se pli taŭgaj por cela lingvo."
   },
   "connectionVerificationMessage": "Por permesi al la aparato {alias} ({model}) konektiĝi, kunhavigu la komunikadan ŝlosilo-fingropremon sube por helpi kontroli vian identecon.",
   "@connectionVerificationMessage": {
@@ -1230,10 +1248,6 @@
         "description": "Fabrikant-aparata modelo-identigilo"
       }
     }
-  },
-  "allowAccessSubtitle": "Ĉi tiu aparato povas foliumi, ludi kaj sinkronigi viajn bibliotekojn.",
-  "@allowAccessSubtitle": {
-    "description": "Klarigas permesojn donitajn dum permesi aliron. Uzu 'Rajtigi' aŭ 'Doni permesojn' kiel alternativojn. Klarigu ke 'elŝuti' rilatas al amaskomuna enhavo-akiro."
   },
   "blockDeviceSubtitle": "Malhelpi estontan konekton. Vi povas malbloki ĉi tiun aparaton iam ajn.",
   "@blockDeviceSubtitle": {
@@ -1341,9 +1355,9 @@
   "@deduplicating": {
     "description": "Etikedo indikanta ke la maldubliga proceso estas nuntempe aktiva. Montrita al uzantoj dum duobligitaj kantoj estas forigataj el ilia muzikbiblioteko aŭ ludlisto. Alternativaj frazigoj povus inkluzivi 'Forigi duoblaĵojn progresanta' aŭ 'Maldubligado progresanta' depende de tio kio estas plej natura en la cela lingvo."
   },
-  "interfaceScale": "Interface scale",
-  "interfaceScaleSubtitle": "Changes text and app content immediately relative to the system scale. Window size and display resolution do not change. 100% follows the system scale.",
-  "interfaceScaleSaveError": "Could not save interface scale",
+  "interfaceScale": "Interfaca skalo",
+  "interfaceScaleSubtitle": "Agordi la grandecon de teksto kaj enhavo en Rune.",
+  "interfaceScaleSaveError": "Ne eblis konservi la interfacan skalon.",
   "remoteOpenUntrusted": "Ĉi tiu aparato ankoraŭ ne fidas tiun servilon. Unue parigu ilin.",
   "remoteOpenNotAuthorized": "La alia aparato ne permesis ĉi tiun aparaton aŭ blokis ĝin.",
   "remoteOpenUnreachable": "La aparato ne estas atingebla. Kontrolu, ke ĝi estas ŝaltita kaj en la sama reto.",
@@ -1355,6 +1369,9 @@
   },
   "remoteLossServerStopped": "La alia aparato ĉesis kundividi.",
   "remoteLossNetworkLost": "La konekto perdiĝis.",
+  "syncToThisDevice": "Sinkronigi al Ĉi Tiu Aparato",
+  "libraryNotShared": "Ne kunhavigita",
+  "controlPermissionRequired": "Neniu ludregado",
   "deviceLibraries": "Bibliotekoj",
   "addSharedLibrary": "Aldoni",
   "sharedLibraryAdded": "Aldonita",
@@ -1362,10 +1379,16 @@
   "noSharedLibraries": "Ĉi tiu aparato ne havas bibliotekojn por dividi",
   "libraryFromDevice": "De {device}",
   "backgroundLibrarySync": "Sinkronigi en la fono",
-  "@libraryFromDevice": {"placeholders": {"device": {"type": "String"}}},
+  "@libraryFromDevice": {
+    "placeholders": {
+      "device": {
+        "type": "String"
+      }
+    }
+  },
   "requestItemMissing": "Ĉi tiu ero ne plu ekzistas",
   "requestInvalid": "La peto ne estis valida",
-  "requestCertificateMismatch": "This device's certificate does not match",
+  "requestCertificateMismatch": "La atestilo de ĉi tiu aparato ne kongruas.",
   "requestUnavailable": "Ĉi tio nun ne disponeblas",
   "requestStorageBusy": "La memoro estas okupita. Bonvolu reprovi.",
   "mixNoLongerExists": "Ĉi tiu miksaĵo ne plu ekzistas",
@@ -1374,12 +1397,24 @@
   "playOnSubtitle": "Elektu kie aŭdio ludos.",
   "playOnFixedToRemote": "Fiksita al ĉi tiu fora aparato",
   "playOnPlayingOn": "Ludante ĉe {alias}",
-  "@playOnPlayingOn": {"placeholders": {"alias": {"type": "String"}}},
+  "@playOnPlayingOn": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
   "playOnOffline": "Senrete",
   "playOnNotApproved": "Ĉi tiu aparato ankoraŭ ne aprobis vin",
   "playOnNoControl": "Ne eblas regi ĉi tiun aparaton",
   "playOnCantPlay": "Ne eblas ludi {library}",
-  "@playOnCantPlay": {"placeholders": {"library": {"type": "String"}}},
+  "@playOnCantPlay": {
+    "placeholders": {
+      "library": {
+        "type": "String"
+      }
+    }
+  },
   "playOnRetry": "Reprovi",
   "castTrackMode": "Kiam oni ĵetas trakon",
   "castTrackReplace": "Anstataŭigi la atendovicon kaj ludi nun",
@@ -1390,7 +1425,27 @@
   "castTrackModeSubtitle": "Elektu kiel ŝanĝiĝas la atendovico de la ludilo.",
   "castControlRendererSubtitle": "Elektu kiun aparaton vi plu regas.",
   "castNotPossible": "{alias} ne povas ludi {library}",
-  "@castNotPossible": {"placeholders": {"alias": {"type": "String"}, "library": {"type": "String"}}},
+  "@castNotPossible": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      },
+      "library": {
+        "type": "String"
+      }
+    }
+  },
+  "castTracksLeftOut": "{count, plural, one{{count} trako ankoraŭ ne estas ĉe {alias} kaj ne estis aldonita.} other{{count} trakoj ankoraŭ ne estas ĉe {alias} kaj ne estis aldonitaj.}}",
+  "@castTracksLeftOut": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      },
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
   "thisDevice": "Ĉi tiu aparato",
   "devicesThatCanConnect": "Aparatoj kiuj povas konektiĝi al ĉi tiu",
   "otherDevices": "Aliaj aparatoj",
@@ -1400,20 +1455,20 @@
   "guest": "Gasto",
   "myDeviceAccessDescription": "Povas ludi, foliumi kaj sinkronigi viajn bibliotekojn",
   "guestAccessDescription": "Povas regi la ludadon kaj foliumi dum tio",
-  "guestControlSummary": "Gasto · Povas regi la ludadon",
   "customDeviceAccess": "Propra",
   "customizeDevice": "Agordi",
+  "disconnect": "Malkonekti",
   "controlPlayback": "Regi la ludadon",
-  "controlPlaybackDescription": "Can play, pause, queue, and cast to this device",
+  "controlPlaybackDescription": "Povas ludi, paŭzi, vicigi kaj ĵeti al ĉi tiu aparato.",
   "deviceAccessLibraries": "Bibliotekoj",
-  "deviceConnection": "Connection",
-  "deviceSync": "Sync",
-  "deviceConnectionOff": "Off",
-  "deviceConnectionView": "View",
-  "deviceConnectionViewEdit": "View & edit",
-  "deviceSyncOff": "Off",
-  "deviceSyncPull": "Pull",
-  "deviceSyncPullPush": "Pull & push",
+  "deviceConnection": "Konekto",
+  "deviceSync": "Sinkronigo",
+  "deviceConnectionOff": "Malŝaltita",
+  "deviceConnectionView": "Vidi",
+  "deviceConnectionViewEdit": "Vidi kaj redakti",
+  "deviceSyncOff": "Malŝaltita",
+  "deviceSyncPull": "Ricevi",
+  "deviceSyncPullPush": "Ricevi kaj sendi",
   "requestConflict": "La vico ŝanĝiĝis; reprovu",
   "requestPermissionDenied": "Ĉi tiu aparato ne rajtas fari tion",
   "readOnly": "Nurlegebla",
@@ -1422,9 +1477,256 @@
   "queueUnavailableSourceUnreachable": "La fonto ne atingeblas",
   "queueUnavailableUnreadable": "La aŭdaĵo ne legeblas",
   "rendererLinkLost": "Konekto al {alias} perdiĝis",
-  "@rendererLinkLost": {"placeholders": {"alias": {"type": "String"}}},
+  "@rendererLinkLost": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
   "requestPublicKeyMismatch": "La aparatŝlosilo ne kongruas kun la fingrospuro",
   "requestRegistrationConflict": "Aparato kun ĉi tiu fingrospuro jam estas registrita",
   "remoteLibraryReconnecting": "Rekonektante al {alias}…",
-  "@remoteLibraryReconnecting": {"placeholders": {"alias": {"type": "String"}}}
+  "@remoteLibraryReconnecting": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
+  "capabilityNotImplemented": "Ĉi tiu aparato ne subtenas ĉi tiun regilon",
+  "capabilityOwnerOnly": "Nur la posedanta aparato povas fari tion",
+  "requestOtherDeviceName": "la alia aparato",
+  "requestPeerNeedsUpdatePeer": "{alias} bezonas ĝisdatigon de Rune por konektiĝi.",
+  "requestPeerNeedsUpdateThisDevice": "{alias} uzas pli novan version de Rune. Ĝisdatigu Rune ĉe ĉi tiu aparato por konektiĝi.",
+  "remoteLossProtocolIncompatible": "La versioj de Rune ne plu kongruas. Ĝisdatigu Rune ĉe ambaŭ aparatoj por rekonektiĝi.",
+  "capabilityPeerTooOld": "Ĝisdatigu Rune ĉe la alia aparato por uzi ĉi tion.",
+  "requestPeerNeedsUpdateFallback": "Ĝisdatigu Rune ĉe ambaŭ aparatoj por konektiĝi.",
+  "@requestPeerNeedsUpdatePeer": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
+  "@requestPeerNeedsUpdateThisDevice": {
+    "placeholders": {
+      "alias": {
+        "type": "String"
+      }
+    }
+  },
+  "capabilityAccountRoleMissing": "Via konto en ĉi tiu servilo ne rajtas fari tion.",
+  "@capabilityAccountRoleMissing": {
+    "description": "Shown when a Subsonic account lacks permission to use a control."
+  },
+  "invalidLibrarySettingsSubtitle": "La agordoj de ĉi tiu biblioteko ne legeblas.",
+  "@invalidLibrarySettingsSubtitle": {
+    "description": "Shown below a library record whose settings cannot be read."
+  },
+  "libraryRecordNotFound": "Tiu biblioteka registro ne plu ekzistas.",
+  "libraryRecordIsOpen": "Fermu la bibliotekon antaŭ ol forigi ĝian registron.",
+  "libraryMediaFolderMissing": "La biblioteka dosierujo mankas.",
+  "libraryUntrusted": "Ĉi tiu aparato ne estas fidata.",
+  "libraryInvalidSource": "Ĉi tiu dosierujo ne povas esti biblioteko.",
+  "libraryStorageFailure": "La biblioteko ne povis esti konservita.",
+  "libraryRemoteNotAuthorized": "La aparato ne rajtigis ĉi tiun konekton.",
+  "libraryRemoteUnreachable": "La aparato ne atingeblas.",
+  "libraryRemoteProtocolFailure": "La aparato sendis nekongruan respondon.",
+  "libraryProtocolIncompatible": "Ĉi tiu aparato uzas nekongruan protokolversion.",
+  "libraryNotSupportedYet": "Ĉi tiu biblioteka tipo ankoraŭ ne estas subtenata.",
+  "onMyIPhone": "Sur mia iPhone",
+  "@onMyIPhone": {
+    "description": "The Files app location for folders on an iPhone, shown as the start of a library's location."
+  },
+  "onMyIPad": "Sur mia iPad",
+  "@onMyIPad": {
+    "description": "The Files app location for folders on an iPad, shown as the start of a library's location."
+  },
+  "iCloudDrive": "iCloud Drive",
+  "@iCloudDrive": {
+    "description": "The Files app location for folders in iCloud Drive, shown as the start of a library's location."
+  },
+  "trayIconColorMode": "Koloro de pleta piktogramo",
+  "@trayIconColorMode": {
+    "description": "A settings entry that allows users to control the color of the system tray icon, choosing between automatic, light, and dark modes."
+  },
+  "trayIconColorModeSubtitle": "Elektu la piktograman koloron.",
+  "@trayIconColorModeSubtitle": {},
+  "automaticTrayIconMode": "Aŭtomata",
+  "@automaticTrayIconMode": {
+    "description": "An option for tray icon color mode that automatically switches between light and dark based on the system theme."
+  },
+  "mixWithOthers": "Ludi kune kun alia aŭdio",
+  "@mixWithOthers": {
+    "description": "Settings title of an entry in the playback settings page"
+  },
+  "mixWithOthersSubtitle": "Alia aŭdio plu ludas dum Rune ludas.",
+  "@mixWithOthersSubtitle": {
+    "description": "Settings description of an entry in the playback settings page"
+  },
+  "visualizerScenes": "Scenoj",
+  "@visualizerScenes": {
+    "description": "Title of the setting that lists the visualizer scenes to check, uncheck and reorder."
+  },
+  "visualizerScenesSubtitle": "Elektu scenojn por la kovromuro. Trenu por ordigi.",
+  "@visualizerScenesSubtitle": {
+    "description": "Subtitle of the visualizer scenes setting."
+  },
+  "visualizerSceneImported": "Importis {name}",
+  "@visualizerSceneImported": {
+    "description": "Notification after a visualizer scene file was imported.",
+    "placeholders": {
+      "name": {
+        "type": "String",
+        "example": "Night Drive"
+      }
+    }
+  },
+  "visualizerSceneImportFailed": "Ne eblis importi {name}",
+  "@visualizerSceneImportFailed": {
+    "description": "Notification when a file is not a visualizer scene; the reason, in English, follows below it.",
+    "placeholders": {
+      "name": {
+        "type": "String",
+        "example": "Night Drive"
+      }
+    }
+  },
+  "visualizerDeleteScene": "Forigi scenon",
+  "@visualizerDeleteScene": {
+    "description": "Button and dialog title that delete an imported visualizer scene."
+  },
+  "visualizerDeleteSceneConfirm": "Forigi {name}? Importu ĝin denove por restarigi.",
+  "@visualizerDeleteSceneConfirm": {
+    "description": "Text of the dialog that confirms deleting an imported visualizer scene.",
+    "placeholders": {
+      "name": {
+        "type": "String",
+        "example": "Night Drive"
+      }
+    }
+  },
+  "visualizer": "Vidigilo",
+  "@visualizer": {
+    "description": "Title of the visualizer settings page and the navigation entries that open it, also the name of the cover wall button while the visualizer is available."
+  },
+  "coverWallVisualizerSubtitle": "Vidaĵoj laŭ la muziko",
+  "@coverWallVisualizerSubtitle": {
+    "description": "Subtitle of the playback controller entry that opens the cover wall while it is set to show the visualizer."
+  },
+  "visualizerLab": "Vidigila laboratorio",
+  "@visualizerLab": {
+    "description": "Name of the playback controller entry that turns the visualizer lab on the cover wall page on and off."
+  },
+  "visualizerLabSubtitle": "Montri la laboratorion super la vidigilo.",
+  "@visualizerLabSubtitle": {
+    "description": "Subtitle of the playback controller entry that turns the visualizer lab on and off."
+  },
+  "interfaceScaleFollowTextSize": "Sekvi tekstgrandecon",
+  "@interfaceScaleFollowTextSize": {
+    "description": "Option that sizes the interface to match the system text size."
+  },
+  "linuxCustomWindowControls": "Custom Window Controls",
+  "@linuxCustomWindowControls": {
+    "description": "Title for the Linux custom window controls setting option."
+  },
+  "linuxCustomWindowControlsSubtitle": "Ebligi proprajn fenestrajn regilojn por senkadra fenestro simila al la Vindoza reĝimo.",
+  "@linuxCustomWindowControlsSubtitle": {
+    "description": "Subtitle explaining what the Linux custom window controls setting does."
+  },
+  "offlineAvailability": "Senreta havebleco",
+  "@offlineAvailability": {
+    "description": "Context menu for the audio retained on this device."
+  },
+  "keepAvailableOffline": "Konservi senrete",
+  "@keepAvailableOffline": {
+    "description": "Save a mix-query selection for background audio downloads."
+  },
+  "stopKeepingOffline": "Ĉesi konservi senrete",
+  "@stopKeepingOffline": {
+    "description": "Disable future downloads for this selection without deleting existing files."
+  },
+  "offlineSelectionSaved": "Senreta elekto konservita",
+  "@offlineSelectionSaved": {
+    "description": "Acknowledges that a persistent download selection has been saved."
+  },
+  "offlineSelectionRemoved": "Aŭtomataj elŝutoj ĉesigitaj",
+  "@offlineSelectionRemoved": {
+    "description": "Acknowledges disabling an offline selection."
+  },
+  "offlineSelectionFailed": "Ne eblis konservi la senretan elekton.",
+  "@offlineSelectionFailed": {
+    "description": "Error title when saving a download selection fails."
+  },
+  "offlineSelectionQueued": "Trakoj elŝutiĝos kiam parigita aparato disponeblos.",
+  "@offlineSelectionQueued": {
+    "description": "Explains the difference between a queued offline selection and online playback."
+  },
+  "offlineSelectionRetained": "Ekzistantaj dosieroj estas konservataj.",
+  "@offlineSelectionRetained": {
+    "description": "Explains that disabling downloads does not delete audio."
+  },
+  "audioUnavailable": "Aŭdio ne disponeblas",
+  "allowPairedSync": "Permesi sinkronigon kun parigitaj aparatoj",
+  "@allowPairedSync": {
+    "description": "Label for allowing incoming paired device sync"
+  },
+  "allowPairedSyncDescription": "Malŝaltu por malhelpi aliajn aparatojn konektiĝi al ĉi tiu aparato.",
+  "@allowPairedSyncDescription": {
+    "description": "Explanation of the incoming sync setting"
+  },
+  "offlineCleanupDefault": "Forigi nebezonatajn elŝutojn",
+  "@offlineCleanupDefault": {
+    "description": "Default option to clean up unneeded offline downloads."
+  },
+  "offlineCleanupDefaultDescription": "Elektu ĉu forigi elŝutojn kiam ili ne plu estas konservataj senrete.",
+  "@offlineCleanupDefaultDescription": {
+    "description": "Explanation of the offline cleanup default."
+  },
+  "offlineCleanupCheckbox": "Forigi nebezonatajn elŝutojn",
+  "@offlineCleanupCheckbox": {
+    "description": "Option to delete downloads no enabled offline rule needs."
+  },
+  "offlineSelectionCleaned": "Senreta elekto ĝisdatigita.",
+  "@offlineSelectionCleaned": {
+    "description": "Confirmation after attempting to clean up offline downloads."
+  },
+  "turnOnBackgroundSync": "Ŝalti Sinkronigon en la Fono",
+  "turnOffBackgroundSync": "Malŝalti Sinkronigon en la Fono",
+  "shareLibraryModeSubtitle": "Kie Rune konservu vian mediindekson?",
+  "@shareLibraryModeSubtitle": {
+    "description": "Add-library guide text"
+  },
+  "keepIndexInShare": "En la komuna dosierujo",
+  "@keepIndexInShare": {
+    "description": "Add-library guide text"
+  },
+  "keepIndexInShareSubtitle": "Ni konservos vian mediindekson en la komuna dosierujo, por ke viaj aliaj aparatoj povu sinkronigi ĝin.",
+  "@keepIndexInShareSubtitle": {
+    "description": "Add-library guide text"
+  },
+  "keepIndexOnThisDevice": "En ĉi tiu aparato",
+  "@keepIndexOnThisDevice": {
+    "description": "Add-library guide text"
+  },
+  "webDav": "WebDAV",
+  "webDavSubtitle": "Konektu al dosierujo ĉe WebDAV-servilo.",
+  "s3": "S3",
+  "s3Subtitle": "Konektu al dosierujo en S3-bukedo.",
+  "folder": "Dosierujo",
+  "bucket": "Bukedo",
+  "region": "Regiono",
+  "accessKeyId": "Identigilo de alirŝlosilo",
+  "secretAccessKey": "Sekreta alirŝlosilo",
+  "libraryOpenDalAuthenticationRejected": "Kontrolu la uzantnomon kaj pasvorton.",
+  "libraryOpenDalUnreachable": "Kontrolu la servilan adreson kaj retkonekton.",
+  "libraryOpenDalNotFolder": "Kontrolu, ĉu la elektita dosierujo ekzistas kaj estas atingebla.",
+  "libraryOpenDalReadOnly": "Elektu skribeblan dosierujon por konservi la mediindekson en la komuna dosierujo.",
+  "subsonic": "Subsonic",
+  "subsonicSubtitle": "Konektu al Subsona muzikservilo.",
+  "playOnThisDevice": "Ludi en Ĉi tiu Aparato",
+  "controlServerPlayer": "Regi la Servilan Ludilon",
+  "howDoYouWantToUseIt": "Kiel vi volas uzi ĝin?"
+
 }

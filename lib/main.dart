@@ -75,13 +75,17 @@ import 'providers/scrobble.dart';
 import 'providers/broadcast.dart';
 import 'providers/full_screen.dart';
 import 'providers/router_path.dart';
-import 'providers/library_path.dart';
+import 'providers/library_open_state.dart';
+import 'providers/library_registry.dart';
+import 'utils/dialogs/subsonic/subsonic_relogin_dialog.dart';
 import 'providers/library_home.dart';
 import 'providers/library_manager.dart';
+import 'providers/local_folder_picker.dart';
 import 'providers/linux_custom_window_controls.dart';
 import 'providers/playback_controller.dart';
 import 'providers/controllers.dart';
 import 'providers/renderer_attachment.dart';
+import 'providers/request_capabilities.dart';
 import 'providers/renderer_link_loss.dart';
 import 'providers/remote_library_reconnect.dart';
 import 'providers/responsive_providers.dart';
@@ -90,6 +94,9 @@ import 'theme.dart';
 
 late bool disableBrandingAnimation;
 late String? initialPath;
+late final LibraryRegistryProvider libraryRegistry;
+// Whether startup opens a library: the development LIBRARY_PATH or the record open last.
+late bool hasStartupLibrary;
 bool isWindows11 = false;
 late bool cafeMode;
 
@@ -97,6 +104,7 @@ void main(List<String> arguments) async {
   WidgetsFlutterBinding.ensureInitialized();
   PlatformDispatcher.instance.onError = (error, stack) {
     if (error is! RequestFailure) return false;
+    if (error.cause is RequestFailureCauseSubsonicNotAuthorized) return true;
     if (error.kind != RequestErrorKind.internal) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         final context = rootNavigatorKey.currentState?.overlay?.context;
@@ -256,6 +264,13 @@ void main(List<String> arguments) async {
   };
 
   initialPath = await getInitialPath();
+  libraryRegistry = LibraryRegistryProvider();
+  try {
+    await libraryRegistry.ready;
+  } on Object catch (error) {
+    error$('Could not list the libraries: $error');
+  }
+  hasStartupLibrary = shouldOpenLibraryAtStartup(initialPath, libraryRegistry);
   await findSystemLocale();
 
   $closeManager;
@@ -366,6 +381,10 @@ void mainLoop(
         ),
         ChangeNotifierProvider(
           lazy: false,
+          create: (_) => RequestCapabilitiesProvider(),
+        ),
+        ChangeNotifierProvider(
+          lazy: false,
           create: (_) => ControllersProvider(),
         ),
         ChangeNotifierProvider(
@@ -377,9 +396,14 @@ void mainLoop(
           lazy: false,
           create: (_) => PlaybackStatusProvider(),
         ),
+        ChangeNotifierProvider.value(value: libraryRegistry),
+        Provider(create: (_) => LocalFolderPickerProvider()),
         ChangeNotifierProvider(
           lazy: false,
-          create: (_) => LibraryPathProvider(initialPath),
+          create: (context) => LibraryOpenStateProvider(
+            initialPath,
+            context.read<LibraryRegistryProvider>(),
+          ),
         ),
         ChangeNotifierProxyProvider<ScreenSizeProvider, ResponsiveProvider>(
           create: (context) =>
@@ -392,8 +416,11 @@ void mainLoop(
         ChangeNotifierProvider(create: (_) => BroadcastProvider()),
         ChangeNotifierProvider(create: (_) => FullScreenProvider()),
         ChangeNotifierProvider(create: (_) => VisualizerScenesProvider()),
-        ChangeNotifierProxyProvider2<PlaybackStatusProvider,
-            VisualizerScenesProvider, VisualizerLabProvider>(
+        ChangeNotifierProxyProvider2<
+          PlaybackStatusProvider,
+          VisualizerScenesProvider,
+          VisualizerLabProvider
+        >(
           lazy: false,
           create: (_) => VisualizerLabProvider(),
           update: (_, status, scenes, previous) => previous!
@@ -468,7 +495,7 @@ class _RuneState extends State<Rune> {
 
         return FluentApp(
           title: appTitle,
-          initialRoute: initialPath == null
+          initialRoute: !hasStartupLibrary
               ? "/"
               : cafeMode
               ? '/cover_wall'
@@ -559,12 +586,38 @@ class RuneLifecycleState extends State<RuneLifecycle> {
   late final RemoteConnectionLossHandler _remoteLoss;
   late final RendererLinkLossHandler _rendererLinkLoss;
   late final RemoteLibraryReconnectNotice _remoteReconnect;
-  LibraryPathProvider? _libraryPath;
-  String? _noticeLibraryPath;
+  LibraryOpenStateProvider? _libraryState;
+  String? _noticeOpenRecordId;
+  StreamSubscription<RustSignalPack<RequestFailedResponse>>?
+  _requestFailureSubscription;
+  bool _subsonicReloginOpen = false;
+  bool _startupReloginChecked = false;
 
   @override
   void initState() {
     super.initState();
+
+    final registry = context.read<LibraryRegistryProvider>();
+    _requestFailureSubscription = RequestFailedResponse.rustSignalStream.listen(
+      (signal) {
+        if (signal.message.cause
+                is! RequestFailureCauseSubsonicNotAuthorized ||
+            _subsonicReloginOpen) {
+          return;
+        }
+        final recordId = registry.openRecordId;
+        final dialogContext = rootNavigatorKey.currentState?.overlay?.context;
+        if (recordId == null ||
+            dialogContext == null ||
+            !mounted ||
+            !dialogContext.mounted) {
+          return;
+        }
+        _subsonicReloginOpen = true;
+        showSubsonicReloginDialog(dialogContext, registry, recordId)
+            .whenComplete(() => _subsonicReloginOpen = false);
+      },
+    );
 
     _remoteReconnect = RemoteLibraryReconnectNotice(
       reconnecting: RemoteLibraryReconnecting.rustSignalStream.map(
@@ -610,10 +663,10 @@ class RuneLifecycleState extends State<RuneLifecycle> {
       },
     );
 
-    if (cafeMode && initialPath != null) {
+    if (cafeMode && hasStartupLibrary) {
       unawaited(
         startCafePlaybackAfterOpen(
-          libraryOpened: context.read<LibraryPathProvider>().initialOpen,
+          libraryOpened: context.read<LibraryOpenStateProvider>().initialOpen,
           play: () => operatePlaybackWithMixQuery(
             queries: const QueryList([
               ("lib::random", "1"),
@@ -636,11 +689,35 @@ class RuneLifecycleState extends State<RuneLifecycle> {
   void didChangeDependencies() {
     super.didChangeDependencies();
 
-    final libraryPath = context.read<LibraryPathProvider>();
-    if (_libraryPath != libraryPath) {
-      _libraryPath?.removeListener(_libraryChanged);
-      _libraryPath = libraryPath;
-      _noticeLibraryPath = libraryPath.currentPath;
+    final libraryPath = context.read<LibraryOpenStateProvider>();
+    if (!_startupReloginChecked) {
+      _startupReloginChecked = true;
+      libraryPath.initialOpen.then((_) {
+        final failure = libraryPath.initialOpenFailure;
+        if (!mounted ||
+            failure?.kind != OpenLibraryFailureKind.remoteNotAuthorized) {
+          return;
+        }
+        final recordId = libraryPath.registry.lastOpenRecordId;
+        if (recordId == null) return;
+        WidgetsBinding.instance.addPostFrameCallback((_) async {
+          final dialogContext = rootNavigatorKey.currentState?.overlay?.context;
+          if (!mounted || dialogContext == null) return;
+          final updated = await showSubsonicReloginDialog(
+            dialogContext,
+            libraryPath.registry,
+            recordId,
+          );
+          if (updated && mounted) {
+            await libraryPath.registry.open(recordId);
+          }
+        });
+      });
+    }
+    if (_libraryState != libraryPath) {
+      _libraryState?.removeListener(_libraryChanged);
+      _libraryState = libraryPath;
+      _noticeOpenRecordId = libraryPath.registry.openRecordId;
       libraryPath.addListener(_libraryChanged);
     }
 
@@ -662,7 +739,8 @@ class RuneLifecycleState extends State<RuneLifecycle> {
 
     _remoteLoss.dispose();
     _rendererLinkLoss.dispose();
-    _libraryPath?.removeListener(_libraryChanged);
+    _requestFailureSubscription?.cancel();
+    _libraryState?.removeListener(_libraryChanged);
     _remoteReconnect.dispose();
     license.removeListener(_updateLicense);
     status.removeListener(_throttleUpdateTray);
@@ -672,9 +750,9 @@ class RuneLifecycleState extends State<RuneLifecycle> {
   }
 
   void _libraryChanged() {
-    final path = _libraryPath?.currentPath;
-    if (path != _noticeLibraryPath) {
-      _noticeLibraryPath = path;
+    final recordId = _libraryState?.registry.openRecordId;
+    if (recordId != _noticeOpenRecordId) {
+      _noticeOpenRecordId = recordId;
       _remoteReconnect.clear();
     }
   }

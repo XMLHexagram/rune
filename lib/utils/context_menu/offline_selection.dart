@@ -6,14 +6,16 @@ import '../../bindings/bindings.dart';
 import '../../constants/configurations.dart';
 import '../../constants/settings_manager.dart';
 import '../router/navigation.dart';
-import '../../providers/library_path.dart';
+import '../../providers/library_open_state.dart';
 import '../api/set_download_rule.dart';
 import '../api/request_failure.dart';
 import '../l10n.dart';
+import '../dialogs/information/error.dart';
 
 bool supportsOfflineSelection(BuildContext context) {
-  final path = context.read<LibraryPathProvider>().currentPath;
-  return path != null && !path.startsWith('@RR|') && !path.startsWith('@LR|');
+  final record = context.read<LibraryOpenStateProvider>().openRecord;
+  return record != null &&
+      record.kind is! LibraryRecordKindSummaryRemoteControl;
 }
 
 MenuFlyoutSubItem offlineSelectionMenu(
@@ -62,7 +64,6 @@ Future<void> _saveSelection(
     deleteFiles = result ?? false;
     if (confirmed != true || !host.mounted) return;
   }
-  String? failure;
   try {
     await setDownloadRule(
       type,
@@ -71,35 +72,20 @@ Future<void> _saveSelection(
       deleteUnselectedFiles: deleteFiles,
     );
   } on RequestFailure catch (error) {
-    failure = requestFailureMessage(s, error);
+    if (!host.mounted) return;
+    await showErrorDialog(
+      context: host,
+      title: s.offlineSelectionFailed,
+      errorMessage: requestFailureMessage(s, error),
+    );
   } catch (error) {
-    failure = error.toString();
+    if (!host.mounted) return;
+    await showErrorDialog(
+      context: host,
+      title: s.offlineSelectionFailed,
+      errorMessage: requestErrorText(s, error),
+    );
   }
-  if (!host.mounted) return;
-  displayInfoBar(
-    host,
-    builder: (_, close) => InfoBar(
-      title: Text(
-        failure != null
-            ? s.offlineSelectionFailed
-            : enabled
-            ? s.offlineSelectionSaved
-            : s.offlineSelectionRemoved,
-      ),
-      content: Text(
-        failure ??
-            (enabled
-                ? s.offlineSelectionQueued
-                : deleteFiles
-                ? s.offlineSelectionCleaned
-                : s.offlineSelectionRetained),
-      ),
-      severity: failure == null
-          ? InfoBarSeverity.success
-          : InfoBarSeverity.error,
-      onClose: close,
-    ),
-  );
 }
 
 class OfflineCleanupDialog extends StatefulWidget {

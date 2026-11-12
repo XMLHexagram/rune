@@ -73,18 +73,36 @@ Future<T> awaitResponse<T>(
 
 String requestFailureMessage(AppLocalizations s, RequestFailure failure) =>
     switch (failure.cause) {
+      RequestFailureCauseLibraryTaskAlreadyRunning(:final task) =>
+        '${switch (task) {
+          LibraryTaskKind.scan => s.scanning,
+          LibraryTaskKind.analyze => s.analyzing,
+          LibraryTaskKind.deduplicate => s.deduplicating,
+        }}: ${s.requestUnavailable}',
       RequestFailureCauseReconnecting(:final alias) =>
         s.remoteLibraryReconnecting(alias),
       RequestFailureCauseStorageBusy() => s.requestStorageBusy,
       RequestFailureCauseCertificateMismatch() => s.requestCertificateMismatch,
       RequestFailureCausePublicKeyMismatch() => s.requestPublicKeyMismatch,
       RequestFailureCauseRegistrationConflict() => s.requestRegistrationConflict,
+      RequestFailureCausePeerNeedsUpdate(
+        :final updateSide,
+        :final peerAlias,
+      ) => switch (updateSide) {
+        ProtocolUpdateSide.peer => s.requestPeerNeedsUpdatePeer(
+          peerAlias ?? s.requestOtherDeviceName,
+        ),
+        ProtocolUpdateSide.thisDevice => s.requestPeerNeedsUpdateThisDevice(
+          peerAlias ?? s.requestOtherDeviceName,
+        ),
+      },
       _ => switch (failure.kind) {
       RequestErrorKind.notFound => s.requestItemMissing,
       RequestErrorKind.invalidInput => s.requestInvalid,
       RequestErrorKind.unavailable => s.requestUnavailable,
       RequestErrorKind.permissionDenied => s.requestPermissionDenied,
       RequestErrorKind.conflict => s.requestConflict,
+      RequestErrorKind.peerNeedsUpdate => s.requestPeerNeedsUpdateFallback,
       RequestErrorKind.internal => s.unknownError,
       },
     };

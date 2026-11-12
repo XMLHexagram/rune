@@ -57,6 +57,7 @@ impl Signal for GetLyricByTrackIdRequest {
         };
 
         Ok(Some(GetLyricByTrackIdResponse {
+            call_id: None,
             item: item.clone(),
             lines,
         }))
@@ -67,7 +68,7 @@ async fn load_lyric_lines(
     fsio: &FsIo,
     media_root: &String,
     main_db: &MainDbConnection,
-    item: &PlayingItemRequest,
+    item: &PlayingItemRef,
     library: &LibraryHandle,
 ) -> Result<Vec<LyricContentLine>> {
     let parsed_item = playing_item_from_request(item.clone(), Some(library)).await?;
