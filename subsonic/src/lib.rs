@@ -8,8 +8,13 @@ use thiserror::Error;
 use url::Url;
 
 pub mod api;
+mod rune;
 
 pub use api::{ApiFuture, StreamBody, SubsonicApi};
+pub use rune::{
+    RuneAttribution, RuneEdit, RuneLoginCompletion, RuneLoginMethod, RuneLoginMethods,
+    RuneLoginStart, RuneReason, RuneServiceDescriptor, RuneUnsupported,
+};
 
 const CLIENT_VERSION: &str = "1.16.1";
 
@@ -58,6 +63,8 @@ pub enum SubsonicError {
     Server {
         kind: SubsonicServerError,
         message: String,
+        /// Set by `runeService` servers that say why they refused.
+        rune_reason: Option<RuneReason>,
     },
     #[error("malformed Subsonic response: {0}")]
     Malformed(String),
@@ -72,6 +79,19 @@ pub enum SubsonicError {
     /// The server implementation does not provide this endpoint.
     #[error("Subsonic endpoint {endpoint} is not supported")]
     Unsupported { endpoint: &'static str },
+}
+
+impl SubsonicError {
+    /// Whether a `runeService` server says the stored sign-in expired.
+    pub fn is_rune_credentials_expired(&self) -> bool {
+        matches!(
+            self,
+            Self::Server {
+                rune_reason: Some(RuneReason::CredentialsExpired),
+                ..
+            }
+        )
+    }
 }
 
 /// Safe classifications for stream failures; these values never contain a URL or credentials.
@@ -193,16 +213,7 @@ impl SubsonicClient {
     /// authenticated account lookup (tokenInfo followed by getUser for API keys).
     pub async fn probe(&self) -> Result<SubsonicProbe, SubsonicError> {
         let ping: PingResponse = self.call("ping", &[]).await?;
-        let mut extensions = Vec::new();
-        if ping.open_subsonic {
-            let response: ExtensionsResponse = self.call("getOpenSubsonicExtensions", &[]).await?;
-            extensions = response
-                .extensions
-                .unwrap_or_default()
-                .into_iter()
-                .map(|extension| (extension.name, extension.versions.unwrap_or_default()))
-                .collect();
-        }
+        let extensions = self.read_extensions(&ping).await?;
         let username = match &self.credentials {
             SubsonicCredentials::Password { user, .. } => user.clone(),
             SubsonicCredentials::ApiKey { .. } => {
@@ -233,6 +244,74 @@ impl SubsonicClient {
             roles,
             roles_known: true,
         })
+    }
+
+    /// Read the descriptor of the service behind a `runeService` server.
+    pub async fn rune_service(&self) -> Result<RuneServiceDescriptor, SubsonicError> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "runeService")]
+            descriptor: Option<RuneServiceDescriptor>,
+        }
+        let response: Response = self.call("getRuneService", &[]).await?;
+        response
+            .descriptor
+            .ok_or_else(|| SubsonicError::Malformed("getRuneService omitted runeService".into()))
+    }
+
+    /// Begin a sign-in with `method`.
+    pub async fn start_rune_login(
+        &self,
+        method: RuneLoginMethod,
+    ) -> Result<RuneLoginStart, SubsonicError> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "runeLogin")]
+            login: Option<RuneLoginStart>,
+        }
+        let method = method.as_str().ok_or(SubsonicError::Unsupported {
+            endpoint: "startRuneLogin",
+        })?;
+        let response: Response = self.call("startRuneLogin", &[("method", method)]).await?;
+        response
+            .login
+            .ok_or_else(|| SubsonicError::Malformed("startRuneLogin omitted runeLogin".into()))
+    }
+
+    /// Finish a sign-in. Posted as a form, because the fields carry secrets.
+    pub async fn complete_rune_login(
+        &self,
+        completion: &RuneLoginCompletion,
+    ) -> Result<(), SubsonicError> {
+        let form = completion.form().ok_or(SubsonicError::Unsupported {
+            endpoint: "completeRuneLogin",
+        })?;
+        let _: EmptyResponse = self
+            .call_with_form("completeRuneLogin", &[], Some(&form))
+            .await?;
+        Ok(())
+    }
+
+    /// The OpenSubsonic extensions the server declares, read through the public endpoints only.
+    pub async fn extensions(&self) -> Result<Vec<(String, Vec<u32>)>, SubsonicError> {
+        let ping: PingResponse = self.call("ping", &[]).await?;
+        self.read_extensions(&ping).await
+    }
+
+    async fn read_extensions(
+        &self,
+        ping: &PingResponse,
+    ) -> Result<Vec<(String, Vec<u32>)>, SubsonicError> {
+        if !ping.open_subsonic {
+            return Ok(Vec::new());
+        }
+        let response: ExtensionsResponse = self.call("getOpenSubsonicExtensions", &[]).await?;
+        Ok(response
+            .extensions
+            .unwrap_or_default()
+            .into_iter()
+            .map(|extension| (extension.name, extension.versions.unwrap_or_default()))
+            .collect())
     }
 
     /// Resolve the declared Rune visualizer feed endpoint and attach this account's credentials.
@@ -793,6 +872,16 @@ impl SubsonicClient {
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> Result<T, SubsonicError> {
+        self.call_with_form(endpoint, params, None).await
+    }
+
+    /// Like `call`, sending `form` as a POST body so secrets never sit in a URL.
+    async fn call_with_form<T: for<'de> Deserialize<'de>>(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+        form: Option<&[(&str, &str)]>,
+    ) -> Result<T, SubsonicError> {
         let url = self.endpoint_url(endpoint);
         let mut query = self.auth_query();
         query.extend(
@@ -800,10 +889,11 @@ impl SubsonicClient {
                 .iter()
                 .map(|(key, value)| (*key, (*value).to_owned())),
         );
-        let response = self
-            .http
-            .get(url)
-            .query(&query)
+        let request = match form {
+            Some(form) => self.http.post(url).query(&query).form(form),
+            None => self.http.get(url).query(&query),
+        };
+        let response = request
             .send()
             .await
             .map_err(|error| SubsonicError::Transport(error.without_url().to_string()))?;
@@ -836,6 +926,13 @@ impl SubsonicClient {
                     message = message.replace(secret, "[REDACTED]");
                 }
             }
+            for (key, secret) in form.unwrap_or_default() {
+                if matches!(*key, "state" | "code" | "token" | "developerToken")
+                    && !secret.is_empty()
+                {
+                    message = message.replace(secret, "[REDACTED]");
+                }
+            }
             if endpoint == "jukeboxControl"
                 && matches!(error.code, 0 | 70)
                 && message.to_ascii_lowercase().contains("jukebox")
@@ -845,6 +942,7 @@ impl SubsonicClient {
             return Err(SubsonicError::Server {
                 kind: error.code.into(),
                 message,
+                rune_reason: error.rune_reason,
             });
         }
         if envelope.response.status != "ok" {
@@ -1049,6 +1147,8 @@ pub struct SubsonicPlaylist {
     pub owner: Option<String>,
     pub public: Option<bool>,
     pub cover_art: Option<String>,
+    /// Rune's `runeService` extension. Servers without it never send it.
+    pub rune_edit: Option<RuneEdit>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1060,6 +1160,7 @@ pub struct SubsonicPlaylistDetail {
     pub owner: Option<String>,
     pub public: Option<bool>,
     pub cover_art: Option<String>,
+    pub rune_edit: Option<RuneEdit>,
     pub songs: Vec<SubsonicSong>,
 }
 
@@ -1336,6 +1437,7 @@ impl<'de> Deserialize<'de> for SubsonicPlaylistDetail {
             owner: Option<String>,
             public: Option<bool>,
             cover_art: Option<String>,
+            rune_edit: Option<RuneEdit>,
             entry: Option<OneOrMany<SubsonicSong>>,
         }
         let raw = RawPlaylist::deserialize(deserializer)?;
@@ -1347,6 +1449,7 @@ impl<'de> Deserialize<'de> for SubsonicPlaylistDetail {
             owner: raw.owner,
             public: raw.public,
             cover_art: raw.cover_art,
+            rune_edit: raw.rune_edit,
             songs: raw.entry.map(OneOrMany::into_vec).unwrap_or_default(),
         })
     }
@@ -1392,6 +1495,8 @@ struct RawResponse {
 struct RawError {
     code: i64,
     message: String,
+    #[serde(default, rename = "runeReason")]
+    rune_reason: Option<RuneReason>,
 }
 #[derive(Deserialize)]
 struct PingResponse {

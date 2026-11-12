@@ -9,9 +9,10 @@ use reqwest::header::HeaderMap;
 use url::Url;
 
 use crate::{
-    SearchLimits, StreamError, SubsonicAlbum, SubsonicAlbumDetail, SubsonicArtist,
-    SubsonicArtistDetail, SubsonicClient, SubsonicError, SubsonicJukebox, SubsonicJukeboxStatus,
-    SubsonicLyrics, SubsonicPlaylist, SubsonicPlaylistDetail, SubsonicProbe, SubsonicScanStatus,
+    RuneLoginCompletion, RuneLoginMethod, RuneLoginStart, RuneServiceDescriptor, SearchLimits,
+    StreamError, SubsonicAlbum, SubsonicAlbumDetail, SubsonicArtist, SubsonicArtistDetail,
+    SubsonicClient, SubsonicError, SubsonicJukebox, SubsonicJukeboxStatus, SubsonicLyrics,
+    SubsonicPlaylist, SubsonicPlaylistDetail, SubsonicProbe, SubsonicScanStatus,
     SubsonicSearchResult, SubsonicSong,
 };
 
@@ -97,6 +98,11 @@ impl StreamBody {
 pub trait System: Send + Sync {
     fn probe<'a>(&'a self) -> ApiFuture<'a, SubsonicProbe> {
         unsupported("ping")
+    }
+
+    /// The declared OpenSubsonic extensions, without authenticating.
+    fn extensions<'a>(&'a self) -> ApiFuture<'a, Vec<(String, Vec<u32>)>> {
+        unsupported("getOpenSubsonicExtensions")
     }
 }
 
@@ -300,6 +306,22 @@ pub trait RuneVisualizerFeed: Send + Sync {
     }
 }
 
+/// Rune service extension: the service descriptor and generic sign-in.
+#[allow(unused_variables)]
+pub trait RuneService: Send + Sync {
+    fn rune_service<'a>(&'a self) -> ApiFuture<'a, RuneServiceDescriptor> {
+        unsupported("getRuneService")
+    }
+
+    fn start_rune_login<'a>(&'a self, method: RuneLoginMethod) -> ApiFuture<'a, RuneLoginStart> {
+        unsupported("startRuneLogin")
+    }
+
+    fn complete_rune_login<'a>(&'a self, completion: &'a RuneLoginCompletion) -> ApiFuture<'a, ()> {
+        unsupported("completeRuneLogin")
+    }
+}
+
 /// Everything the hub needs from a Subsonic-shaped server.
 pub trait SubsonicApi:
     System
@@ -312,6 +334,7 @@ pub trait SubsonicApi:
     + Jukebox
     + Scanning
     + RuneVisualizerFeed
+    + RuneService
     + Send
     + Sync
 {
@@ -328,6 +351,7 @@ impl<T> SubsonicApi for T where
         + Jukebox
         + Scanning
         + RuneVisualizerFeed
+        + RuneService
         + Send
         + Sync
 {
@@ -335,14 +359,18 @@ impl<T> SubsonicApi for T where
 
 pub mod prelude {
     pub use super::{
-        Annotation, Browsing, Jukebox, Lists, MediaRetrieval, Playlists, RuneVisualizerFeed,
-        Scanning, Searching, System,
+        Annotation, Browsing, Jukebox, Lists, MediaRetrieval, Playlists, RuneService,
+        RuneVisualizerFeed, Scanning, Searching, System,
     };
 }
 
 impl System for SubsonicClient {
     fn probe<'a>(&'a self) -> ApiFuture<'a, SubsonicProbe> {
         Box::pin(SubsonicClient::probe(self))
+    }
+
+    fn extensions<'a>(&'a self) -> ApiFuture<'a, Vec<(String, Vec<u32>)>> {
+        Box::pin(SubsonicClient::extensions(self))
     }
 }
 
@@ -544,5 +572,19 @@ impl Scanning for SubsonicClient {
 impl RuneVisualizerFeed for SubsonicClient {
     fn rune_visualizer_feed_url<'a>(&'a self, probe: &'a SubsonicProbe) -> ApiFuture<'a, Url> {
         Box::pin(SubsonicClient::rune_visualizer_feed_url(self, probe))
+    }
+}
+
+impl RuneService for SubsonicClient {
+    fn rune_service<'a>(&'a self) -> ApiFuture<'a, RuneServiceDescriptor> {
+        Box::pin(SubsonicClient::rune_service(self))
+    }
+
+    fn start_rune_login<'a>(&'a self, method: RuneLoginMethod) -> ApiFuture<'a, RuneLoginStart> {
+        Box::pin(SubsonicClient::start_rune_login(self, method))
+    }
+
+    fn complete_rune_login<'a>(&'a self, completion: &'a RuneLoginCompletion) -> ApiFuture<'a, ()> {
+        Box::pin(SubsonicClient::complete_rune_login(self, completion))
     }
 }

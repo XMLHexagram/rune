@@ -324,7 +324,8 @@ async fn missing_optional_fields_are_none_and_error_secrets_are_redacted() {
         error,
         SubsonicError::Server {
             kind: SubsonicServerError::NotFound,
-            message: "not found [REDACTED]".into()
+            message: "not found [REDACTED]".into(),
+            rune_reason: None,
         }
     );
     assert!(!format!("{error:?} {error}").contains("secret-password"));

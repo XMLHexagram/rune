@@ -249,6 +249,7 @@ async fn missing_jukebox_role_is_not_authorized() {
         SubsonicError::Server {
             kind: SubsonicServerError::NotAuthorized,
             message: "jukebox role not granted".into(),
+            rune_reason: None,
         }
     );
     assert_authenticated_action(&server, "start");

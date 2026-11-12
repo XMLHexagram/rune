@@ -301,7 +301,8 @@ async fn every_subsonic_error_code_is_typed_and_malformed_is_reported() {
             error,
             SubsonicError::Server {
                 kind: expected,
-                message: "server says no".into()
+                message: "server says no".into(),
+                rune_reason: None,
             }
         );
     }
