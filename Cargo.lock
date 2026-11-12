@@ -7957,6 +7957,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "subsonic-server"
+version = "0.1.0"
+dependencies = [
+ "apple-music",
+ "axum",
+ "bytes",
+ "reqwest 0.12.18",
+ "serde_json",
+ "subsonic",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
