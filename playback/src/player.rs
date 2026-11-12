@@ -16,6 +16,7 @@ use simple_channel::{SimpleChannel, SimpleReceiver, SimpleSender};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::hosted::{HostBridge, HostEvent, HostedTrack};
 use crate::internal::{InternalLog, PlaybackMode, PlayerCommand, PlayerEvent, PlayerInternal};
 use crate::pcm_tap::PcmTap;
 use crate::strategies::AddMode;
@@ -96,6 +97,8 @@ pub struct PlayerStatus {
     pub playback_mode: PlaybackMode,
     pub ready: bool,
     pub volume: f32,
+    /// The platform host that plays the current track, when this player does not play it itself.
+    pub hosted_by: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -321,6 +324,13 @@ pub struct LibraryPlaybackSource {
     pub resolver: Arc<dyn PlaybackSourceResolver>,
 }
 
+/// How a track of a Subsonic-protocol library plays: from audio this player decodes, or by a
+/// platform host that never hands over the audio.
+pub enum SubsonicTarget {
+    Stream(RemoteAudioSource),
+    Hosted(HostedTrack),
+}
+
 pub trait PlaybackSourceResolver: Send + Sync {
     fn resolve_track(
         &self,
@@ -359,6 +369,16 @@ pub trait PlaybackSourceResolver: Send + Sync {
         _item: SubsonicItem,
     ) -> BoxFuture<'static, Result<RemoteAudioSource>> {
         Box::pin(async { anyhow::bail!("Subsonic playback resolver unavailable") })
+    }
+
+    /// Says how a Subsonic track plays. A library that only streams leaves it to
+    /// [`Self::resolve_subsonic`].
+    fn resolve_subsonic_target(
+        &self,
+        item: SubsonicItem,
+    ) -> BoxFuture<'static, Result<SubsonicTarget>> {
+        let stream = self.resolve_subsonic(item);
+        Box::pin(async move { stream.await.map(SubsonicTarget::Stream) })
     }
 }
 
@@ -698,6 +718,10 @@ pub trait Playable: Send {
         mode: PlaybackMode,
     );
     fn set_source_resolver(&self, _resolver: Arc<dyn PlaybackSourceResolver>) {}
+    /// Where commands for hosted tracks go. Without one, hosted tracks cannot play.
+    fn set_host_bridge(&self, _bridge: Arc<dyn HostBridge>) {}
+    /// Passes on what a platform host reports about the hosted track it plays.
+    fn deliver_host_event(&self, _event: HostEvent) {}
     fn remove_from_playlist(&self, index: usize);
     fn clear_playlist(&self);
     fn move_playlist_item(&self, old_index: usize, new_index: usize);
@@ -749,6 +773,7 @@ pub struct PlaylistLoad {
 pub struct Player {
     commands: Arc<Mutex<mpsc::UnboundedSender<PlayerCommand>>>,
     source_resolver: Arc<RwLock<Option<Arc<dyn PlaybackSourceResolver>>>>,
+    host_bridge: Arc<RwLock<Option<Arc<dyn HostBridge>>>>,
     pub current_status: Arc<Mutex<PlayerStatus>>,
     status_sender: SimpleSender<PlayerStatus>,
     playlist_sender: SimpleSender<PlaylistStatus>,
@@ -804,6 +829,7 @@ impl Player {
             unavailable_reasons: HashMap::new(),
             ready: false,
             volume: 1.0,
+            hosted_by: None,
         }));
 
         let pcm_tap = PcmTap::new();
@@ -815,8 +841,10 @@ impl Player {
         crate::ios_session::configure(false);
         // Create the Player instance and wrap the command sender in Arc<Mutex>
         let source_resolver = Arc::new(RwLock::new(None));
+        let host_bridge = Arc::new(RwLock::new(None));
         let player = Player {
             source_resolver: source_resolver.clone(),
+            host_bridge: host_bridge.clone(),
             commands: commands.clone(),
             current_status: current_status.clone(),
             status_sender: status_sender.clone(),
@@ -843,7 +871,8 @@ impl Player {
                 fsio,
                 pcm_tap,
                 source_resolver,
-            );
+            )
+            .with_host_bridge(host_bridge);
             // Create a new Tokio runtime for asynchronous tasks
             let runtime = Runtime::new().expect("Failed to create Tokio runtime");
             // Run the main loop of PlayerInternal within the Tokio runtime
@@ -1005,6 +1034,9 @@ impl Player {
                     }
                     PlayerEvent::VolumeUpdate(value) => {
                         status.volume = value;
+                    }
+                    PlayerEvent::HostedChanged(host) => {
+                        status.hosted_by = host;
                     }
                     PlayerEvent::StatusAfterPending(response) => {
                         let _ = response.send(status.clone());
@@ -1217,6 +1249,18 @@ impl Playable for Player {
         *slot = Some(resolver);
     }
 
+    fn set_host_bridge(&self, bridge: Arc<dyn HostBridge>) {
+        let mut slot = self
+            .host_bridge
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(bridge);
+    }
+
+    fn deliver_host_event(&self, event: HostEvent) {
+        self.command(PlayerCommand::Hosted(event));
+    }
+
     fn remove_from_playlist(&self, index: usize) {
         self.command(PlayerCommand::RemoveFromPlaylist { index });
     }
@@ -1423,6 +1467,7 @@ impl Playable for MockPlayer {
             playback_mode: PlaybackMode::Sequential,
             ready: false,
             volume: 1.0,
+            hosted_by: None,
         }
     }
     fn status_after_pending(&self) -> BoxFuture<'static, PlayerStatus> {
@@ -1471,5 +1516,58 @@ mod unavailable_reason_tests {
             UnavailableReason::classify(&error),
             UnavailableReason::AccessRevoked
         );
+    }
+}
+
+#[cfg(test)]
+mod subsonic_target_tests {
+    use super::*;
+
+    struct NoRequest;
+
+    impl AudioRequest for NoRequest {
+        fn get(
+            &self,
+            _: Option<(u64, Option<u64>)>,
+        ) -> BoxFuture<'static, Result<reqwest::Response>> {
+            Box::pin(async { anyhow::bail!("no request in this test") })
+        }
+    }
+
+    // A resolver from before hosted tracks: it only knows how to stream.
+    struct StreamOnly;
+
+    impl PlaybackSourceResolver for StreamOnly {
+        fn resolve(&self, _: i32) -> BoxFuture<'static, Result<RemoteAudioSource>> {
+            Box::pin(async { anyhow::bail!("no library tracks in this test") })
+        }
+
+        fn resolve_subsonic(
+            &self,
+            item: SubsonicItem,
+        ) -> BoxFuture<'static, Result<RemoteAudioSource>> {
+            Box::pin(async move {
+                Ok(RemoteAudioSource {
+                    request: Arc::new(NoRequest),
+                    url: item.track_id,
+                    extension: "mp3".to_owned(),
+                    size: 0,
+                    cancellation: CancellationToken::new(),
+                    failure_reason: Arc::new(Mutex::new(None)),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resolver_that_only_streams_streams_subsonic_tracks() {
+        let target = StreamOnly
+            .resolve_subsonic_target(SubsonicItem {
+                library_id: Uuid::new_v4(),
+                track_id: "t1".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(target, SubsonicTarget::Stream(source) if source.url == "t1"));
     }
 }

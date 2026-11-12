@@ -24,13 +24,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffered::{RuneBuffered, rune_buffered};
 use crate::decoder::RuneDecoder;
+use crate::hosted::{HostAction, HostBridge, HostCommand, HostEvent, HostedTrack};
 use crate::output_stream::{RuneOutputStream, RuneOutputStreamHandle};
 use crate::pcm_tap::PcmTap;
 use crate::player::{
     AudioPlaybackNote, AudioSourceMode, ClearHandoffBlocksResult, HandoffBlockId,
     HandoffLoadResult, InterruptedItem, LibraryTrackKey, PlaybackSource, PlaybackSourceResolver,
     PlayerStatus, PlayingItem, PlaylistEdit, PlaylistPlacement, QueueEntry, RemoteAudioError,
-    SubsonicItem, TakeBackBlockResult, UnavailableReason,
+    RemoteAudioSource, SubsonicItem, SubsonicTarget, TakeBackBlockResult, UnavailableReason,
 };
 use crate::realtime_fft::RealTimeFFT;
 use crate::shared_source::SharedSource;
@@ -41,6 +42,10 @@ use crate::strategies::{
 use crate::stream_utils::create_stream_with_authorizer;
 
 const SOURCE_START_TIMEOUT: Duration = Duration::from_secs(30);
+// How long a host that is to play a track may take to report on it once it was given the track,
+// and how long it may then go without reporting, before the track counts as unreachable.
+const HOST_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+const HOST_SILENCE_TIMEOUT: Duration = Duration::from_secs(15);
 
 async fn bound_source_start<T>(
     limit: Duration,
@@ -222,11 +227,7 @@ async fn open_library_stream(
     ))
 }
 
-async fn open_subsonic_stream(
-    resolver: &Arc<dyn PlaybackSourceResolver>,
-    item: crate::player::SubsonicItem,
-) -> Result<(AnySource, PathBuf)> {
-    let remote = resolver.resolve_subsonic(item).await?;
+async fn open_subsonic_stream(remote: RemoteAudioSource) -> Result<(AnySource, PathBuf)> {
     let size = remote.size;
     let guard = remote.cancellation.clone().drop_guard();
     let failed = remote.failure_reason;
@@ -268,6 +269,19 @@ async fn open_subsonic_stream(
         AnySource::Online(rune_buffered(decoder), failed),
         PathBuf::new(),
     ))
+}
+
+/// What a load brings: audio this player decodes, or a track that a platform host plays.
+#[derive(Debug)]
+pub enum LoadedSource {
+    Audio(AnySource),
+    Hosted(HostedTrack),
+}
+
+impl From<AnySource> for LoadedSource {
+    fn from(source: AnySource) -> Self {
+        Self::Audio(source)
+    }
 }
 
 impl Debug for AnySource {
@@ -415,7 +429,7 @@ pub enum PlayerCommand {
     },
     LoadComplete {
         generation: u64,
-        result: Box<Result<AnySource>>,
+        result: Box<Result<LoadedSource>>,
         item: PlayingItem,
         original_item: PlayingItem,
         index: usize,
@@ -467,6 +481,7 @@ pub enum PlayerCommand {
     SetMixWithOthers(bool),
     StatusAfterPending(oneshot::Sender<PlayerStatus>),
     Output(OutputEvent),
+    Hosted(HostEvent),
 }
 
 /// What happened to this device's audio output. The player decides from its own state whether to
@@ -536,6 +551,9 @@ pub enum PlayerEvent {
         ready: bool,
     },
     VolumeUpdate(f32),
+    // The host that plays the current track, from when a hosted track becomes current until it
+    // stops being current.
+    HostedChanged(Option<String>),
     PlaylistUpdated(Vec<PlaylistItem>),
     RealtimeFFT(Vec<f32>),
     Log(InternalLog),
@@ -581,6 +599,48 @@ struct LoadedTrack {
     // Where the track stands in the playlist, which the events report.
     playlist_index: usize,
     path: PathBuf,
+}
+
+/// The current track once it was handed to a platform host, which plays it.
+struct HostedPlayback {
+    track: HostedTrack,
+    // The batch that handed the track over, and the latest batch sent about it. An end or a
+    // failure counts from the first on, and a status only for the second.
+    handed_revision: u64,
+    latest_revision: u64,
+    playing: bool,
+    // Where the track stood when the host last reported, or when it was last told to move, and
+    // when that was.
+    position: Duration,
+    reported_at: Instant,
+    // When the host was last told to play the track, and when it last reported on it since it
+    // was handed over.
+    started_at: Instant,
+    heard_at: Option<Instant>,
+    // The host lost the track once and was given it again.
+    recovered: bool,
+    ended: bool,
+}
+
+impl HostedPlayback {
+    // Where the track stands now: it moves on from the last report while it plays.
+    fn position(&self) -> Duration {
+        if self.playing {
+            self.position + self.reported_at.elapsed()
+        } else {
+            self.position
+        }
+    }
+
+    fn report(&mut self, position: Duration, playing: bool) {
+        self.position = position;
+        self.playing = playing;
+        self.reported_at = Instant::now();
+    }
+}
+
+fn offset_ms(position: Duration) -> u64 {
+    u64::try_from(position.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The place a seek asks for, in seconds. A place before the start is the start, and a value
@@ -685,6 +745,14 @@ pub(crate) struct PlayerInternal {
     // or a track that starts playing, settles it first.
     resume_after_interruption: bool,
     unavailable: HashMap<PlayingItem, UnavailableReason>,
+    host_bridge: Arc<RwLock<Option<Arc<dyn HostBridge>>>>,
+    hosted: Option<HostedPlayback>,
+    // The revision of the last batch sent to a host.
+    host_revision: u64,
+    // Hosts that said they cannot play, and why, until they say they can.
+    hosts_unable: HashMap<String, UnavailableReason>,
+    host_status_timeout: Duration,
+    host_silence_timeout: Duration,
     // How many of the next attempts to open an output fail.
     #[cfg(test)]
     failing_opens: Arc<AtomicUsize>,
@@ -748,6 +816,12 @@ impl PlayerInternal {
             output_stale: false,
             resume_after_interruption: false,
             unavailable: HashMap::new(),
+            host_bridge: Arc::new(RwLock::new(None)),
+            hosted: None,
+            host_revision: 0,
+            hosts_unable: HashMap::new(),
+            host_status_timeout: HOST_STATUS_TIMEOUT,
+            host_silence_timeout: HOST_SILENCE_TIMEOUT,
             #[cfg(test)]
             failing_opens: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -759,6 +833,14 @@ impl PlayerInternal {
             #[cfg(test)]
             failing_resumes: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn with_host_bridge(
+        mut self,
+        host_bridge: Arc<RwLock<Option<Arc<dyn HostBridge>>>>,
+    ) -> Self {
+        self.host_bridge = host_bridge;
+        self
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -840,7 +922,11 @@ impl PlayerInternal {
                                 self.load_at(Some(pending.index), pending.play, pending.mapped, pending.restore_position)?;
                                 continue;
                             }
-                            match *result {
+                            let result = match *result {
+                                Ok(LoadedSource::Hosted(track)) => self.check_host(&track).map(|()| LoadedSource::Hosted(track)),
+                                result => result,
+                            };
+                            match result {
                                 Ok(source) => {
                                     if let Some(entry) = self.playlist.get_mut(playlist_index)
                                         && entry.item == original_item && entry.item != item
@@ -850,10 +936,19 @@ impl PlayerInternal {
                                     }
                                     let start = self.restore_position.take();
                                     let track = LoadedTrack { item, index, mapped, playlist_index, path };
-                                    if play {
-                                        self.setup_sink(source, track, start)?;
-                                    } else {
-                                        self.loaded_paused(track, start.unwrap_or_default())?;
+                                    match source {
+                                        LoadedSource::Hosted(hosted) if play => {
+                                            self.start_hosted(hosted, track, start.unwrap_or_default())?;
+                                        }
+                                        // A hosted track that comes up paused waits as a local one
+                                        // does, and the first play loads it again for its host.
+                                        source => {
+                                            self.release_host()?;
+                                            match source {
+                                                LoadedSource::Audio(source) if play => self.setup_sink(source, track, start)?,
+                                                _ => self.loaded_paused(track, start.unwrap_or_default())?,
+                                            }
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -1036,6 +1131,7 @@ impl PlayerInternal {
                                 .context("Failed to send player status barrier")?;
                         },
                         PlayerCommand::Output(event) => self.output_event(event)?,
+                        PlayerCommand::Hosted(event) => self.host_event(event)?,
                     };
                 },
                 Ok(fft_data) = fft_receiver.recv() => {
@@ -1183,7 +1279,7 @@ impl PlayerInternal {
                             let source = open_local_source(fsio, path.clone(), remote_storage)
                                 .await
                                 .with_context(|| format!("Failed to open file: {path:?}"))?;
-                            Ok((source, path, resolved_item.clone()))
+                            Ok((source.into(), path, resolved_item.clone()))
                         }
                         PlayingItem::LibraryTrack { .. }
                             if matches!(library_track_key, Some(LibraryTrackKey::Rune(_))) =>
@@ -1200,7 +1296,7 @@ impl PlayerInternal {
                                 );
                                 if requires_stream {
                                     let (source, path) = open_library_stream(resolver, id).await?;
-                                    return Ok((source, path, resolved_item.clone()));
+                                    return Ok((source.into(), path, resolved_item.clone()));
                                 }
                                 resolver
                                     .local_path(id)
@@ -1217,7 +1313,7 @@ impl PlayerInternal {
                             let source = open_local_source(fsio, path.clone(), remote_storage)
                                 .await
                                 .with_context(|| format!("Failed to open file: {path:?}"))?;
-                            Ok((source, path, resolved_item.clone()))
+                            Ok((source.into(), path, resolved_item.clone()))
                         }
                         PlayingItem::LibraryTrack { library_id, .. }
                             if matches!(library_track_key, Some(LibraryTrackKey::Subsonic(_))) =>
@@ -1232,8 +1328,16 @@ impl PlayerInternal {
                                     _ => bail!("Subsonic track key unavailable"),
                                 },
                             };
-                            let (source, path) = open_subsonic_stream(resolver, item).await?;
-                            Ok((source, path, resolved_item.clone()))
+                            match resolver.resolve_subsonic_target(item).await? {
+                                SubsonicTarget::Stream(remote) => {
+                                    let (source, path) = open_subsonic_stream(remote).await?;
+                                    Ok((source.into(), path, resolved_item.clone()))
+                                }
+                                SubsonicTarget::Hosted(track) => {
+                                    let path = track.path();
+                                    Ok((LoadedSource::Hosted(track), path, resolved_item.clone()))
+                                }
+                            }
                         }
                         PlayingItem::LibraryTrack { .. } => {
                             bail!("library track resolver unavailable")
@@ -1251,7 +1355,7 @@ impl PlayerInternal {
                             let decoder =
                                 probe_decoder(reader, ext.map(str::to_owned), None).await?;
                             Ok((
-                                AnySource::Online(rune_buffered(decoder), failed),
+                                AnySource::Online(rune_buffered(decoder), failed).into(),
                                 PathBuf::new(),
                                 resolved_item.clone(),
                             ))
@@ -1478,6 +1582,9 @@ impl PlayerInternal {
         if loading {
             self.set_play_when_loaded(true);
         }
+        if self.hosted.is_some() {
+            return self.set_hosted_playing(true, loading);
+        }
 
         if !loading && self.output_stale && self.current_track_index.is_some() {
             return self.reopen_output();
@@ -1531,6 +1638,9 @@ impl PlayerInternal {
         let loading = self.state == InternalPlaybackState::Loading;
         if loading {
             self.set_play_when_loaded(false);
+        }
+        if self.hosted.is_some() {
+            return self.set_hosted_playing(false, loading);
         }
 
         if let Some(sink) = &self.sink {
@@ -1595,6 +1705,10 @@ impl PlayerInternal {
 
     fn output_event(&mut self, event: OutputEvent) -> Result<()> {
         info!("Audio output event: {event:?}");
+        // The host of a hosted track owns its audio session, unless a track that loads takes over.
+        if self.hosted.is_some() && self.state != InternalPlaybackState::Loading {
+            return Ok(());
+        }
         match event {
             OutputEvent::Interrupted => {
                 // The system stopped the output, and pausing stops it on this side too. The same
@@ -1810,6 +1924,7 @@ impl PlayerInternal {
         self.state = InternalPlaybackState::Stopped;
         // The output plays nothing more: the next track opens one of its own.
         self.suspend_output();
+        let hosted = self.release_host()?;
         if let Some(sink) = self.sink.take() {
             sink.stop();
             info!("Playback stopped");
@@ -1817,8 +1932,9 @@ impl PlayerInternal {
                 .send(PlayerEvent::Stopped)
                 .with_context(|| "Failed to send Stopped event")?;
             self.state = InternalPlaybackState::Stopped;
-        } else if self.output_stale {
-            // A track whose output failed to open still shows as paused.
+        } else if self.output_stale || hosted {
+            // A track whose output failed to open still shows as paused, and a hosted track has
+            // no sink.
             self.event_sender
                 .send(PlayerEvent::Stopped)
                 .with_context(|| "Failed to send Stopped event")?;
@@ -1834,9 +1950,14 @@ impl PlayerInternal {
     }
 
     fn next(&mut self) -> Result<()> {
+        self.next_with(true)
+    }
+
+    // Loads the next track, playing or paused.
+    fn next_with(&mut self, play: bool) -> Result<()> {
         if let Some(index) = self.current_track_index {
             if let Some(next_index) = self.playback_strategy.next(index, self.playlist.len()) {
-                self.load(Some(next_index), true, true)?;
+                self.load(Some(next_index), play, true)?;
             } else {
                 info!("End of playlist reached");
                 self.event_sender
@@ -1889,6 +2010,9 @@ impl PlayerInternal {
     // Where the current track stands: where a seek put it while its output was stopped, where it
     // starts once an output opens while it has none that plays, or else where its sink is.
     fn current_position(&self) -> Option<Duration> {
+        if let Some(hosted) = &self.hosted {
+            return Some(hosted.position());
+        }
         if let Some(position) = self.pending_seek {
             return Some(position);
         }
@@ -1921,6 +2045,9 @@ impl PlayerInternal {
             warn!("Seek to {seconds} s ignored: it is no place in a track");
             return Ok(());
         };
+        if self.hosted.is_some() {
+            return self.seek_hosted(position);
+        }
 
         if self.output_stale {
             // A stale stream never takes the seek, and waiting for it would stall the player.
@@ -2099,6 +2226,7 @@ impl PlayerInternal {
         self.resume_after_interruption = false;
         self.sink = None;
         self._stream = None;
+        self.release_host()?;
         info!("Playlist cleared");
         self.event_sender
             .send(PlayerEvent::Stopped)
@@ -2177,6 +2305,28 @@ impl PlayerInternal {
         // A track reports where a seek put it even while its output does not run, so the
         // reports do not take the slider back.
         let position = self.current_position().unwrap_or_default();
+
+        if let Some(hosted) = &self.hosted {
+            if self.host_overdue(hosted) {
+                warn!(
+                    "Host {} did not report on its track in time",
+                    hosted.track.host
+                );
+                return self.hosted_failed(UnavailableReason::SourceUnreachable);
+            }
+            // The host reports the end of the track, so its position stands for the sink's.
+            self.event_sender
+                .send(PlayerEvent::Progress {
+                    item: id,
+                    index,
+                    path,
+                    playback_mode,
+                    position,
+                    ready: true,
+                })
+                .with_context(|| "Failed to send Progress event")?;
+            return Ok(());
+        }
 
         if let Some(sink) = &self.sink {
             // While a track loads, the previous one keeps the sink and may still run out. Its end
@@ -2307,6 +2457,7 @@ impl PlayerInternal {
         if let Some(sink) = &self.sink {
             sink.set_volume(volume);
         }
+        self.command_host(vec![HostAction::SetGain { gain: volume }]);
         self.event_sender
             .send(PlayerEvent::VolumeUpdate(volume))
             .with_context(|| "Failed to send VolumeUpdate event")?;
@@ -2366,6 +2517,432 @@ impl PlayerInternal {
 
         info!("Adaptive switching status changed: {:#?}", { x });
 
+        Ok(())
+    }
+
+    fn host_bridge(&self) -> Option<Arc<dyn HostBridge>> {
+        match self.host_bridge.read() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    // Sends a batch to a host under a new revision, and returns that revision.
+    fn send_to_host(&mut self, host: &str, actions: Vec<HostAction>) -> u64 {
+        self.host_revision = self.host_revision.wrapping_add(1);
+        let revision = self.host_revision;
+        match self.host_bridge() {
+            Some(bridge) => bridge.send(HostCommand {
+                host: host.to_owned(),
+                revision,
+                actions,
+            }),
+            None => warn!("No host bridge, so {actions:?} for host {host} is dropped"),
+        }
+        revision
+    }
+
+    // Sends a batch about the current track, if a host plays it.
+    fn command_host(&mut self, actions: Vec<HostAction>) {
+        let Some(host) = self.hosted.as_ref().map(|hosted| hosted.track.host.clone()) else {
+            return;
+        };
+        let revision = self.send_to_host(&host, actions);
+        if let Some(hosted) = &mut self.hosted {
+            hosted.latest_revision = revision;
+        }
+    }
+
+    fn hand_over_actions(
+        &self,
+        track: &HostedTrack,
+        position: Duration,
+        play: bool,
+    ) -> Vec<HostAction> {
+        vec![
+            HostAction::Set {
+                ids: vec![track.key.clone()],
+            },
+            HostAction::Skip {
+                index: 0,
+                offset_ms: offset_ms(position),
+            },
+            HostAction::SetGain { gain: self.volume },
+            if play {
+                HostAction::Start
+            } else {
+                HostAction::Stop
+            },
+        ]
+    }
+
+    // Whether a hosted track can be handed to its host. Without a bridge, or with a host that
+    // said it cannot play, it fails as a load does.
+    fn check_host(&self, track: &HostedTrack) -> Result<()> {
+        let (error, problem) = if self.host_bridge().is_none() {
+            (
+                RemoteAudioError::LibraryUnavailable,
+                "no host bridge is set",
+            )
+        } else {
+            match self.hosts_unable.get(&track.host) {
+                None => return Ok(()),
+                Some(UnavailableReason::AccessRevoked) => (
+                    RemoteAudioError::AccessRevoked,
+                    "the host is not authorized",
+                ),
+                Some(_) => (RemoteAudioError::LibraryUnavailable, "the host cannot play"),
+            }
+        };
+        Err(anyhow::Error::new(error).context(format!(
+            "Hosted track {} of {}: {problem}",
+            track.key, track.host
+        )))
+    }
+
+    // Hands a hosted track to its host, which plays it from `position` in place of any output
+    // here. The host only ever holds the current track, and the new Set replaces what it held.
+    fn start_hosted(
+        &mut self,
+        track: HostedTrack,
+        loaded: LoadedTrack,
+        position: Duration,
+    ) -> Result<()> {
+        self.suspend_output();
+        if let Some(sink) = self.sink.take() {
+            sink.stop();
+        }
+        self._stream = None;
+        self.active_stream_failure = None;
+        self.output_stale = false;
+        self.restore_position = None;
+        self.pending_seek = None;
+        self.resume_after_interruption = false;
+        let previous_host = match self.hosted.take() {
+            // Another host takes over, so the one that played stops and forgets its track.
+            Some(previous) if previous.track.host != track.host => {
+                self.send_to_host(
+                    &previous.track.host,
+                    vec![HostAction::Stop, HostAction::Clear],
+                );
+                Some(previous.track.host)
+            }
+            previous => previous.map(|previous| previous.track.host),
+        };
+
+        let host = track.host.clone();
+        let actions = self.hand_over_actions(&track, position, true);
+        let revision = self.send_to_host(&host, actions);
+        info!("Track handed to host {host}: {}", track.key);
+        let now = Instant::now();
+        self.hosted = Some(HostedPlayback {
+            track,
+            handed_revision: revision,
+            latest_revision: revision,
+            playing: true,
+            position,
+            reported_at: now,
+            started_at: now,
+            heard_at: None,
+            recovered: false,
+            ended: false,
+        });
+        if previous_host.as_ref() != Some(&host) {
+            self.event_sender
+                .send(PlayerEvent::HostedChanged(Some(host)))
+                .context("Failed to send HostedChanged event")?;
+        }
+
+        let LoadedTrack {
+            item,
+            index,
+            mapped,
+            playlist_index,
+            path,
+        } = loaded;
+        self.current_track_index = Some(index);
+        self.current_track_mapped = mapped;
+        self.current_item = Some(item.clone());
+        self.current_track_path = Some(path.clone());
+        self.state = InternalPlaybackState::Playing;
+        self.event_sender
+            .send(PlayerEvent::Playing {
+                item,
+                index: playlist_index,
+                path,
+                playback_mode: self.playback_mode,
+                position,
+            })
+            .context("Failed to send the state of the hosted track")?;
+        Ok(())
+    }
+
+    // Hands the current track to its host again where it stands, playing or paused as it was,
+    // after the host lost it. Not once the track ended or while another track loads.
+    fn hand_over_again(&mut self) {
+        if self.state == InternalPlaybackState::Loading {
+            return;
+        }
+        let Some(hosted) = &self.hosted else {
+            return;
+        };
+        if hosted.ended {
+            return;
+        }
+        let (track, position, playing) = (hosted.track.clone(), hosted.position(), hosted.playing);
+        info!(
+            "Handing the track to host {} again at {position:?}",
+            track.host
+        );
+        let actions = self.hand_over_actions(&track, position, playing);
+        let revision = self.send_to_host(&track.host, actions);
+        if let Some(hosted) = &mut self.hosted {
+            hosted.handed_revision = revision;
+            hosted.latest_revision = revision;
+            hosted.report(position, playing);
+            hosted.started_at = Instant::now();
+            hosted.heard_at = None;
+        }
+    }
+
+    // The current track stops being hosted, so its host stops and forgets it. Returns whether a
+    // hosted track was current.
+    fn release_host(&mut self) -> Result<bool> {
+        let Some(hosted) = self.hosted.take() else {
+            return Ok(false);
+        };
+        self.send_to_host(
+            &hosted.track.host,
+            vec![HostAction::Stop, HostAction::Clear],
+        );
+        self.event_sender
+            .send(PlayerEvent::HostedChanged(None))
+            .context("Failed to send HostedChanged event")?;
+        Ok(true)
+    }
+
+    // Whether the host of a track that is to play went quiet for too long: it did not report in
+    // time after it was told to play, or it stopped reporting. A track that loads takes over
+    // anyway.
+    fn host_overdue(&self, hosted: &HostedPlayback) -> bool {
+        if !hosted.playing || hosted.ended || self.state == InternalPlaybackState::Loading {
+            return false;
+        }
+        let (since, limit) = match hosted.heard_at {
+            None => (hosted.started_at, self.host_status_timeout),
+            Some(heard) => (heard.max(hosted.started_at), self.host_silence_timeout),
+        };
+        since.elapsed() >= limit
+    }
+
+    // Play and Pause of a hosted track go to its host. While another track loads, the hosted one
+    // follows them as an older track's sink does.
+    fn set_hosted_playing(&mut self, playing: bool, loading: bool) -> Result<()> {
+        let Some(hosted) = &mut self.hosted else {
+            return Ok(());
+        };
+        let position = hosted.position();
+        hosted.report(position, playing);
+        if playing {
+            hosted.started_at = Instant::now();
+        }
+        self.command_host(vec![if playing {
+            HostAction::Start
+        } else {
+            HostAction::Stop
+        }]);
+        self.send_track_state(playing, position)?;
+        if !loading {
+            self.state = if playing {
+                InternalPlaybackState::Playing
+            } else {
+                InternalPlaybackState::Paused
+            };
+        }
+        Ok(())
+    }
+
+    fn seek_hosted(&mut self, position: Duration) -> Result<()> {
+        let Some(hosted) = &mut self.hosted else {
+            return Ok(());
+        };
+        let playing = hosted.playing;
+        hosted.report(position, playing);
+        self.command_host(vec![HostAction::Skip {
+            index: 0,
+            offset_ms: offset_ms(position),
+        }]);
+        info!("Seeking the hosted track to {position:?}");
+        self.send_track_state(playing, position)
+    }
+
+    // The current hosted track, if an end or a failure that `host` reported in `revision` is
+    // about it: one from before the track was handed over is about an older one.
+    fn hosted_since_handed(&mut self, host: &str, revision: u64) -> Option<&mut HostedPlayback> {
+        self.hosted.as_mut().filter(|hosted| {
+            hosted.track.host == host
+                && (hosted.handed_revision..=hosted.latest_revision).contains(&revision)
+        })
+    }
+
+    fn host_event(&mut self, event: HostEvent) -> Result<()> {
+        let loading = self.state == InternalPlaybackState::Loading;
+        match event {
+            HostEvent::HostReady {
+                host,
+                authorized,
+                can_play,
+            } => {
+                let current = self
+                    .hosted
+                    .as_ref()
+                    .is_some_and(|hosted| hosted.track.host == host);
+                let refusal = if !authorized {
+                    Some(UnavailableReason::AccessRevoked)
+                } else if !can_play {
+                    Some(UnavailableReason::LibraryUnavailable)
+                } else {
+                    None
+                };
+                match refusal {
+                    Some(reason) => {
+                        warn!("Host {host} cannot play: {reason:?}");
+                        self.hosts_unable.insert(host, reason);
+                        if current {
+                            return self.hosted_failed(reason);
+                        }
+                    }
+                    None => {
+                        self.hosts_unable.remove(&host);
+                        // A host that comes up again lost what it held.
+                        if current {
+                            self.hand_over_again();
+                        }
+                    }
+                }
+            }
+            HostEvent::JukeboxStatus {
+                host,
+                revision,
+                current_index,
+                playing,
+                position_ms,
+            } => {
+                // A status from before the latest batch may undo what that batch did.
+                let Some(hosted) = self.hosted.as_mut().filter(|hosted| {
+                    hosted.track.host == host && hosted.latest_revision == revision
+                }) else {
+                    return Ok(());
+                };
+                if current_index.is_none() {
+                    // The host lost the track, as after a restart. It gets it again once.
+                    if hosted.ended || loading {
+                        return Ok(());
+                    }
+                    if hosted.recovered {
+                        warn!("Host {host} lost its track again");
+                        return self.hosted_failed(UnavailableReason::SourceUnreachable);
+                    }
+                    hosted.recovered = true;
+                    self.hand_over_again();
+                    return Ok(());
+                }
+                let changed = hosted.playing != playing;
+                let position = Duration::from_millis(position_ms);
+                hosted.report(position, playing);
+                hosted.heard_at = Some(Instant::now());
+                if changed {
+                    self.send_track_state(playing, position)?;
+                    if !loading {
+                        self.state = if playing {
+                            InternalPlaybackState::Playing
+                        } else {
+                            InternalPlaybackState::Paused
+                        };
+                    }
+                }
+            }
+            HostEvent::JukeboxItemFailed {
+                host,
+                revision,
+                reason,
+                ..
+            } => {
+                if self.hosted_since_handed(&host, revision).is_some() {
+                    warn!("Host {host} failed to play its track: {reason:?}");
+                    return self.hosted_failed(reason.into());
+                }
+            }
+            HostEvent::JukeboxEnded { host, revision } => {
+                let Some(hosted) = self
+                    .hosted_since_handed(&host, revision)
+                    .filter(|hosted| !hosted.ended)
+                else {
+                    return Ok(());
+                };
+                // A track the user paused just as it ended leaves the next one paused.
+                let play = hosted.playing;
+                let position = hosted.position();
+                hosted.report(position, false);
+                hosted.ended = true;
+                // As with an older track's sink that runs out while a track loads, the end
+                // either started this load or was skipped by the listener.
+                if loading {
+                    return Ok(());
+                }
+                let (Some(item), Some(index), Some(path)) = (
+                    self.current_item.clone(),
+                    self.current_playlist_index(),
+                    self.current_track_path.clone(),
+                ) else {
+                    return Ok(());
+                };
+                self.event_sender
+                    .send(PlayerEvent::EndOfTrack {
+                        item,
+                        index,
+                        path,
+                        playback_mode: self.playback_mode,
+                    })
+                    .with_context(|| "Failed to send EndOfTrack event")?;
+                if self.state != InternalPlaybackState::Stopped {
+                    self.next_with(play)?;
+                }
+            }
+            HostEvent::Unknown => {}
+        }
+        Ok(())
+    }
+
+    // The host cannot play the current track. It is marked unavailable and playback moves on, as
+    // after a stream that fails. While another track loads, that track takes over instead.
+    fn hosted_failed(&mut self, reason: UnavailableReason) -> Result<()> {
+        let (Some(item), Some(failed_index)) =
+            (self.current_item.clone(), self.current_playlist_index())
+        else {
+            return Ok(());
+        };
+        let Some(hosted) = &mut self.hosted else {
+            return Ok(());
+        };
+        let play = hosted.playing;
+        let loading = self.state == InternalPlaybackState::Loading;
+        if loading {
+            hosted.report(hosted.position(), false);
+        } else {
+            self.stop()?;
+        }
+        self.unavailable.insert(item.clone(), reason);
+        self.event_sender
+            .send(PlayerEvent::Unavailable(item, reason))?;
+        if loading {
+            return Ok(());
+        }
+        if let Some(next) = self.find_available_after(failed_index) {
+            self.load(Some(next), play, true)?;
+        } else {
+            self.event_sender.send(PlayerEvent::EndOfPlaylist)?;
+        }
         Ok(())
     }
 }
@@ -5469,5 +6046,1131 @@ mod playback_state_tests {
     #[tokio::test]
     async fn load_at_a_position_during_a_load_comes_up_paused_there() -> Result<()> {
         check_load_at_position_during_a_load(false).await
+    }
+
+    // Hosted tracks, which a platform host plays: a fake one that records what it is told, while
+    // the tests report its events.
+    mod hosted {
+        use super::*;
+        use crate::hosted::HostFailure;
+        use crate::player::{
+            LibraryPlaybackSource, Playable, PlaybackState, Player, RemoteAudioSource,
+        };
+        use futures::future::BoxFuture;
+
+        const HOST: &str = "appleMusic";
+        // Keys that start with "other-" belong to this host.
+        const OTHER: &str = "otherHost";
+
+        #[derive(Default)]
+        struct FakeHost {
+            commands: Mutex<Vec<HostCommand>>,
+        }
+
+        impl HostBridge for FakeHost {
+            fn send(&self, command: HostCommand) {
+                self.commands.lock().unwrap().push(command);
+            }
+        }
+
+        impl FakeHost {
+            // Waits until the host was sent at least `count` batches since the last take, and
+            // returns all of them.
+            async fn take(&self, count: usize) -> Result<Vec<HostCommand>> {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        {
+                            let mut commands = self.commands.lock().unwrap();
+                            if commands.len() >= count {
+                                return commands.drain(..).collect();
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .context("the host was not sent its batches in time")
+            }
+
+            fn sent_nothing(&self) -> bool {
+                self.commands.lock().unwrap().is_empty()
+            }
+        }
+
+        // Tracks of `hosted_library` are hosted, and the others are local tracks of `local`.
+        struct MixedResolver {
+            local: Arc<DelayedResolver>,
+            hosted_library: Uuid,
+        }
+
+        impl PlaybackSourceResolver for MixedResolver {
+            fn resolve_track(
+                &self,
+                library_id: String,
+                track: String,
+            ) -> BoxFuture<'static, Result<LibraryTrackKey>> {
+                if library_id == self.hosted_library.to_string() {
+                    return Box::pin(async move { Ok(LibraryTrackKey::Subsonic(track)) });
+                }
+                self.local.resolve_track(library_id, track)
+            }
+
+            fn for_library(
+                &self,
+                library_id: String,
+            ) -> BoxFuture<'static, Result<Option<LibraryPlaybackSource>>> {
+                self.local.for_library(library_id)
+            }
+
+            fn resolve(&self, id: i32) -> BoxFuture<'static, Result<RemoteAudioSource>> {
+                self.local.resolve(id)
+            }
+
+            fn resolve_subsonic_target(
+                &self,
+                item: SubsonicItem,
+            ) -> BoxFuture<'static, Result<SubsonicTarget>> {
+                let host = if item.track_id.starts_with("other-") {
+                    OTHER
+                } else {
+                    HOST
+                };
+                Box::pin(async move {
+                    Ok(SubsonicTarget::Hosted(HostedTrack {
+                        host: host.to_owned(),
+                        key: item.track_id,
+                    }))
+                })
+            }
+        }
+
+        struct Fixture {
+            host: Arc<FakeHost>,
+            commands: mpsc::UnboundedSender<PlayerCommand>,
+            events: mpsc::UnboundedReceiver<PlayerEvent>,
+            local_library: Uuid,
+            local_uuids: Vec<Uuid>,
+            hosted_library: Uuid,
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+            wav_path: PathBuf,
+        }
+
+        impl Fixture {
+            fn local(&self, index: usize) -> PlayingItem {
+                library_item(self.local_library, self.local_uuids[index])
+            }
+
+            fn hosted(&self, key: &str) -> PlayingItem {
+                PlayingItem::LibraryTrack {
+                    library_id: self.hosted_library,
+                    track: key.to_owned(),
+                }
+            }
+
+            fn queue(&self, items: &[PlayingItem]) -> Result<()> {
+                self.send(PlayerCommand::AddToPlaylist {
+                    tracks: items
+                        .iter()
+                        .map(|item| (item.clone(), PlaybackSource::LibraryStream))
+                        .collect(),
+                    mode: AddMode::AppendToEnd,
+                })
+            }
+
+            fn send(&self, command: PlayerCommand) -> Result<()> {
+                self.commands.send(command)?;
+                Ok(())
+            }
+
+            fn report(&self, event: HostEvent) -> Result<()> {
+                self.send(PlayerCommand::Hosted(event))
+            }
+
+            // Waits until the player has handled every command sent so far.
+            async fn settle(&mut self) -> Result<()> {
+                let (response, _) = oneshot::channel();
+                self.send(PlayerCommand::StatusAfterPending(response))?;
+                wait_for(&mut self.events, |event| {
+                    matches!(event, PlayerEvent::StatusAfterPending(_))
+                })
+                .await?;
+                Ok(())
+            }
+
+            // Drops the events so far, and fails on any that marks a track unavailable.
+            fn assert_all_available(&mut self) {
+                while let Ok(event) = self.events.try_recv() {
+                    assert!(!matches!(event, PlayerEvent::Unavailable(..)), "{event:?}");
+                }
+            }
+        }
+
+        // An engine whose three local tracks have `samples` samples each, and whose local track
+        // ids in `blocked` load only once released. A fake host plays the hosted ones.
+        fn hosted_engine(samples: u32, blocked: &[i32]) -> (PlayerInternal, Fixture) {
+            let local_uuids = (0..3).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let (local, wav_path) = delayed_resolver_fixture_with_samples(
+                &local_uuids,
+                Arc::new(Mutex::new(Vec::new())),
+                started.clone(),
+                release.clone(),
+                blocked,
+                samples,
+            );
+            let hosted_library = Uuid::new_v4();
+            let host = Arc::new(FakeHost::default());
+            let (commands_sender, commands) = mpsc::unbounded_channel();
+            let (event_sender, events) = mpsc::unbounded_channel();
+            let internal = PlayerInternal::new(
+                commands,
+                event_sender,
+                CancellationToken::new(),
+                commands_sender.clone(),
+                Arc::new(FsIo::new_noop()),
+                PcmTap::new(),
+                Arc::new(RwLock::new(Some(Arc::new(MixedResolver {
+                    local,
+                    hosted_library,
+                })))),
+            )
+            .with_host_bridge(Arc::new(RwLock::new(Some(host.clone()))));
+            let fixture = Fixture {
+                host,
+                commands: commands_sender,
+                events,
+                local_library: Uuid::new_v4(),
+                local_uuids,
+                hosted_library,
+                started,
+                release,
+                wav_path,
+            };
+            (internal, fixture)
+        }
+
+        // Runs `test` against a running engine.
+        async fn with_engine(
+            internal: PlayerInternal,
+            mut f: Fixture,
+            test: impl AsyncFnOnce(&mut Fixture) -> Result<()>,
+        ) -> Result<()> {
+            let mut internal = internal;
+            LocalSet::new()
+                .run_until(async move {
+                    let runner = tokio::task::spawn_local(async move { internal.run().await });
+                    let result = test(&mut f).await;
+                    runner.abort();
+                    let _ = std::fs::remove_file(&f.wav_path);
+                    result
+                })
+                .await
+        }
+
+        fn batch(host: &str, revision: u64, actions: Vec<HostAction>) -> HostCommand {
+            HostCommand {
+                host: host.to_owned(),
+                revision,
+                actions,
+            }
+        }
+
+        // A batch of one action for the main host.
+        fn on(revision: u64, action: HostAction) -> HostCommand {
+            batch(HOST, revision, vec![action])
+        }
+
+        fn hand_over(
+            host: &str,
+            key: &str,
+            revision: u64,
+            offset_ms: u64,
+            gain: f32,
+            play: bool,
+        ) -> HostCommand {
+            batch(
+                host,
+                revision,
+                vec![
+                    HostAction::Set {
+                        ids: vec![key.to_owned()],
+                    },
+                    HostAction::Skip {
+                        index: 0,
+                        offset_ms,
+                    },
+                    HostAction::SetGain { gain },
+                    if play {
+                        HostAction::Start
+                    } else {
+                        HostAction::Stop
+                    },
+                ],
+            )
+        }
+
+        // A track handed to the main host to play from its start, at full volume.
+        fn handed_over(key: &str, revision: u64) -> HostCommand {
+            hand_over(HOST, key, revision, 0, 1.0, true)
+        }
+
+        // What the main host is sent when its track stops being current.
+        fn released(revision: u64) -> HostCommand {
+            batch(HOST, revision, vec![HostAction::Stop, HostAction::Clear])
+        }
+
+        fn status(revision: u64, playing: bool, position_ms: u64) -> HostEvent {
+            HostEvent::JukeboxStatus {
+                host: HOST.to_owned(),
+                revision,
+                current_index: Some(0),
+                playing,
+                position_ms,
+            }
+        }
+
+        fn lost(revision: u64) -> HostEvent {
+            HostEvent::JukeboxStatus {
+                host: HOST.to_owned(),
+                revision,
+                current_index: None,
+                playing: false,
+                position_ms: 0,
+            }
+        }
+
+        fn ended(revision: u64) -> HostEvent {
+            HostEvent::JukeboxEnded {
+                host: HOST.to_owned(),
+                revision,
+            }
+        }
+
+        fn failed(revision: u64, reason: HostFailure) -> HostEvent {
+            HostEvent::JukeboxItemFailed {
+                host: HOST.to_owned(),
+                revision,
+                index: 0,
+                reason,
+            }
+        }
+
+        fn ready(host: &str, authorized: bool, can_play: bool) -> HostEvent {
+            HostEvent::HostReady {
+                host: host.to_owned(),
+                authorized,
+                can_play,
+            }
+        }
+
+        // Waits for the next event that `wanted` picks.
+        async fn wait_for(
+            events: &mut mpsc::UnboundedReceiver<PlayerEvent>,
+            wanted: impl Fn(&PlayerEvent) -> bool,
+        ) -> Result<PlayerEvent> {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match events.recv().await {
+                        Some(event) if wanted(&event) => return Ok(event),
+                        Some(_) => {}
+                        None => bail!("player events closed"),
+                    }
+                }
+            })
+            .await?
+        }
+
+        async fn expect_unavailable(
+            events: &mut mpsc::UnboundedReceiver<PlayerEvent>,
+            track: &PlayingItem,
+        ) -> Result<UnavailableReason> {
+            match wait_for(
+                events,
+                |event| matches!(event, PlayerEvent::Unavailable(item, _) if item == track),
+            )
+            .await?
+            {
+                PlayerEvent::Unavailable(_, reason) => Ok(reason),
+                _ => unreachable!(),
+            }
+        }
+
+        // Starts the first queued track and checks that the host got it in one batch.
+        async fn start_first(f: &mut Fixture, items: &[PlayingItem], key: &str) -> Result<()> {
+            f.queue(items)?;
+            f.send(PlayerCommand::Switch(0))?;
+            expect_playing(&mut f.events, &items[0]).await?;
+            assert_eq!(f.host.take(1).await?, vec![handed_over(key, 1)]);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn a_hosted_track_between_local_ones_plays_on_its_host() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            let opens = internal.output_opens.clone();
+            with_engine(internal, f, async |f| {
+                let (first, hosted, last) = (f.local(0), f.hosted("1440"), f.local(1));
+                f.queue(&[first.clone(), hosted.clone(), last.clone()])?;
+                f.send(PlayerCommand::Switch(0))?;
+                expect_playing(&mut f.events, &first).await?;
+
+                // The local track plays to its end, and the host takes over.
+                let event = wait_for(
+                    &mut f.events,
+                    |event| matches!(event, PlayerEvent::Playing { item, .. } if *item == hosted),
+                )
+                .await?;
+                assert!(
+                    matches!(&event, PlayerEvent::Playing { path, position, .. }
+                        if path.as_os_str() == "hosted://appleMusic/1440" && position.is_zero()),
+                    "{event:?}"
+                );
+                assert_eq!(f.host.take(1).await?, vec![handed_over("1440", 1)]);
+
+                f.report(status(1, true, 1_000))?;
+                f.report(ended(1))?;
+                wait_for(&mut f.events, |event| {
+                    matches!(event, PlayerEvent::EndOfTrack { item, .. } if *item == hosted)
+                })
+                .await?;
+                expect_playing(&mut f.events, &last).await?;
+                assert_eq!(f.host.take(1).await?, vec![released(2)]);
+                // Only the local tracks opened an output.
+                assert_eq!(opens.load(Ordering::SeqCst), 2);
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn pause_play_seek_volume_and_stop_of_a_hosted_track_go_to_its_host() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            let opens = internal.output_opens.clone();
+            with_engine(internal, f, async |f| {
+                let hosted = f.hosted("1440");
+                start_first(f, std::slice::from_ref(&hosted), "1440").await?;
+
+                f.send(PlayerCommand::Pause)?;
+                expect_paused(&mut f.events, &hosted).await?;
+                assert_eq!(f.host.take(1).await?, vec![on(2, HostAction::Stop)]);
+
+                f.send(PlayerCommand::Play)?;
+                expect_playing(&mut f.events, &hosted).await?;
+                assert_eq!(f.host.take(1).await?, vec![on(3, HostAction::Start)]);
+
+                f.send(PlayerCommand::Seek(42.5))?;
+                assert_eq!(
+                    expect_playing(&mut f.events, &hosted).await?,
+                    Duration::from_millis(42_500)
+                );
+                let skip = HostAction::Skip {
+                    index: 0,
+                    offset_ms: 42_500,
+                };
+                assert_eq!(f.host.take(1).await?, vec![on(4, skip)]);
+
+                f.send(PlayerCommand::SetVolume(0.5))?;
+                let gain = HostAction::SetGain { gain: 0.5 };
+                assert_eq!(f.host.take(1).await?, vec![on(5, gain)]);
+
+                f.send(PlayerCommand::Stop)?;
+                wait_for(&mut f.events, |event| matches!(event, PlayerEvent::Stopped)).await?;
+                assert_eq!(f.host.take(1).await?, vec![released(6)]);
+                assert_eq!(opens.load(Ordering::SeqCst), 0);
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn the_hand_over_carries_the_volume() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let hosted = f.hosted("1440");
+                f.send(PlayerCommand::SetVolume(0.6))?;
+                f.queue(std::slice::from_ref(&hosted))?;
+                f.send(PlayerCommand::Switch(0))?;
+                expect_playing(&mut f.events, &hosted).await?;
+                assert_eq!(
+                    f.host.take(1).await?,
+                    vec![hand_over(HOST, "1440", 1, 0, 0.6, true)]
+                );
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn next_and_previous_move_between_hosted_and_local_tracks() -> Result<()> {
+            let (internal, f) = hosted_engine(LONG_TRACK_SAMPLES, &[]);
+            let suspends = internal.output_suspends.clone();
+            with_engine(internal, f, async |f| {
+                let (hosted, track) = (f.hosted("1440"), f.local(0));
+                start_first(f, &[hosted.clone(), track.clone()], "1440").await?;
+
+                f.send(PlayerCommand::Next)?;
+                expect_playing(&mut f.events, &track).await?;
+                assert_eq!(f.host.take(1).await?, vec![released(2)]);
+
+                // The local output stops before the host takes over again.
+                f.send(PlayerCommand::Previous)?;
+                expect_playing(&mut f.events, &hosted).await?;
+                assert_eq!(f.host.take(1).await?, vec![handed_over("1440", 3)]);
+                assert_eq!(suspends.load(Ordering::SeqCst), 1);
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_hosted_track_of_another_host_takes_over_from_the_first() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let (first, second) = (f.hosted("1440"), f.hosted("other-7"));
+                f.queue(&[first.clone(), second.clone()])?;
+                f.send(PlayerCommand::Switch(0))?;
+                wait_for(
+                    &mut f.events,
+                    |event| matches!(event, PlayerEvent::HostedChanged(Some(host)) if host == HOST),
+                )
+                .await?;
+                expect_playing(&mut f.events, &first).await?;
+                assert_eq!(f.host.take(1).await?, vec![handed_over("1440", 1)]);
+
+                f.send(PlayerCommand::Next)?;
+                wait_for(&mut f.events, |event| {
+                    matches!(event, PlayerEvent::HostedChanged(Some(host)) if host == OTHER)
+                })
+                .await?;
+                expect_playing(&mut f.events, &second).await?;
+                assert_eq!(
+                    f.host.take(2).await?,
+                    vec![released(2), hand_over(OTHER, "other-7", 3, 0, 1.0, true)]
+                );
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_restored_hosted_track_waits_as_a_local_one_does_until_play() -> Result<()> {
+            let (mut internal, mut f) = hosted_engine(2, &[]);
+            let hosted = f.hosted("1440");
+            f.send(PlayerCommand::Restore {
+                tracks: vec![(hosted.clone(), PlaybackSource::LibraryStream)],
+                index: Some(0),
+                position: Duration::from_millis(1_500),
+                mode: PlaybackMode::Sequential,
+            })?;
+            let event = run_until_track_state(&mut internal, &mut f.events).await?;
+            assert!(
+                matches!(&event, PlayerEvent::Loaded { item, position, .. }
+                    if *item == hosted && *position == Duration::from_millis(1_500)),
+                "{event:?}"
+            );
+            // Nothing goes to the host, and the player stands as after a local paused load.
+            assert!(f.host.sent_nothing());
+            assert!(internal.hosted.is_none());
+            assert_eq!(internal.state, InternalPlaybackState::Stopped);
+            assert!(internal.output_stale);
+            assert_eq!(
+                internal.restore_position,
+                Some(Duration::from_millis(1_500))
+            );
+            assert_eq!(internal.interrupted_item(), InterruptedItem::Nothing);
+
+            // A seek only moves the place it plays from.
+            f.send(PlayerCommand::Seek(3.0))?;
+            let event = run_until_track_state(&mut internal, &mut f.events).await?;
+            assert!(
+                matches!(&event, PlayerEvent::Paused { position, .. }
+                    if *position == Duration::from_secs(3)),
+                "{event:?}"
+            );
+            assert!(f.host.sent_nothing());
+
+            f.send(PlayerCommand::Play)?;
+            let event = run_until_track_state(&mut internal, &mut f.events).await?;
+            assert!(
+                matches!(&event, PlayerEvent::Playing { item, position, .. }
+                    if *item == hosted && *position == Duration::from_secs(3)),
+                "{event:?}"
+            );
+            assert_eq!(
+                f.host.take(1).await?,
+                vec![hand_over(HOST, "1440", 1, 3_000, 1.0, true)]
+            );
+            assert_eq!(internal.output_opens.load(Ordering::SeqCst), 0);
+            let _ = std::fs::remove_file(&f.wav_path);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn an_end_while_paused_brings_the_next_track_up_paused() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let (first, second) = (f.hosted("1440"), f.hosted("1441"));
+                start_first(f, &[first.clone(), second.clone()], "1440").await?;
+                f.send(PlayerCommand::Pause)?;
+                expect_paused(&mut f.events, &first).await?;
+                assert_eq!(f.host.take(1).await?, vec![on(2, HostAction::Stop)]);
+
+                // The host ended the track before it saw the pause.
+                f.report(ended(1))?;
+                wait_for(
+                    &mut f.events,
+                    |event| matches!(event, PlayerEvent::EndOfTrack { item, .. } if *item == first),
+                )
+                .await?;
+                expect_loaded(&mut f.events, &second).await?;
+                assert_eq!(f.host.take(1).await?, vec![released(3)]);
+
+                f.send(PlayerCommand::Play)?;
+                expect_playing(&mut f.events, &second).await?;
+                assert_eq!(f.host.take(1).await?, vec![handed_over("1441", 4)]);
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn the_end_of_a_hosted_last_track_ends_the_playlist() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let hosted = f.hosted("1440");
+                start_first(f, std::slice::from_ref(&hosted), "1440").await?;
+                f.report(ended(1))?;
+                wait_for(&mut f.events, |event| {
+                    matches!(event, PlayerEvent::EndOfPlaylist)
+                })
+                .await?;
+                wait_for(&mut f.events, |event| {
+                    matches!(event, PlayerEvent::HostedChanged(None))
+                })
+                .await?;
+                wait_for(&mut f.events, |event| matches!(event, PlayerEvent::Stopped)).await?;
+                assert_eq!(f.host.take(1).await?, vec![released(2)]);
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn pause_during_a_load_stops_the_host_and_the_new_track_comes_up_paused() -> Result<()>
+        {
+            let (internal, f) = hosted_engine(LONG_TRACK_SAMPLES, &[1]);
+            let opens = internal.output_opens.clone();
+            with_engine(internal, f, async |f| {
+                let (hosted, track) = (f.hosted("1440"), f.local(0));
+                start_first(f, &[hosted.clone(), track.clone()], "1440").await?;
+                f.send(PlayerCommand::Switch(1))?;
+                tokio::time::timeout(Duration::from_secs(2), f.started.notified()).await?;
+
+                f.send(PlayerCommand::Pause)?;
+                expect_paused(&mut f.events, &hosted).await?;
+                assert_eq!(f.host.take(1).await?, vec![on(2, HostAction::Stop)]);
+
+                f.release.notify_one();
+                expect_loaded(&mut f.events, &track).await?;
+                assert_eq!(f.host.take(1).await?, vec![released(3)]);
+                assert_eq!(opens.load(Ordering::SeqCst), 0);
+                Ok(())
+            })
+            .await
+        }
+
+        // Runs `event` while the second track loads behind a hosted one, and returns what the
+        // player reported until the second track plays.
+        async fn during_a_load(f: &mut Fixture, event: HostEvent) -> Result<Vec<PlayerEvent>> {
+            let (hosted, track) = (f.hosted("1440"), f.local(0));
+            start_first(f, &[hosted, track.clone(), f.local(1)], "1440").await?;
+            f.report(status(1, true, 0))?;
+            f.send(PlayerCommand::Switch(1))?;
+            tokio::time::timeout(Duration::from_secs(2), f.started.notified()).await?;
+            // The event is queued before the load can complete.
+            f.report(event)?;
+            f.release.notify_one();
+            let mut seen = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match f.events.recv().await {
+                        Some(PlayerEvent::Playing { item, .. }) if item == track => break,
+                        Some(event) => seen.push(event),
+                        None => bail!("player events closed"),
+                    }
+                }
+                Ok(())
+            })
+            .await??;
+            assert_eq!(f.host.take(1).await?, vec![released(2)]);
+            Ok(seen)
+        }
+
+        #[tokio::test]
+        async fn an_end_during_a_load_leaves_the_queue_to_the_load() -> Result<()> {
+            let (internal, f) = hosted_engine(LONG_TRACK_SAMPLES, &[1]);
+            with_engine(internal, f, async |f| {
+                let hosted = f.hosted("1440");
+                let seen = during_a_load(f, ended(1)).await?;
+                assert!(
+                    !seen.iter().any(|event| matches!(
+                        event,
+                        PlayerEvent::EndOfTrack { item, .. } if *item == hosted
+                    )),
+                    "{seen:?}"
+                );
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_failure_during_a_load_marks_the_track_and_leaves_the_queue_to_the_load()
+        -> Result<()> {
+            let (internal, f) = hosted_engine(LONG_TRACK_SAMPLES, &[1]);
+            with_engine(internal, f, async |f| {
+                let hosted = f.hosted("1440");
+                let seen = during_a_load(f, failed(1, HostFailure::Network)).await?;
+                assert!(
+                    seen.iter().any(|event| matches!(
+                        event,
+                        PlayerEvent::Unavailable(item, UnavailableReason::SourceUnreachable)
+                            if *item == hosted
+                    )),
+                    "{seen:?}"
+                );
+                assert!(
+                    !seen
+                        .iter()
+                        .any(|event| matches!(event, PlayerEvent::Stopped)),
+                    "{seen:?}"
+                );
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_track_the_host_fails_is_unavailable_and_the_next_one_plays() -> Result<()> {
+            let (internal, f) = hosted_engine(LONG_TRACK_SAMPLES, &[]);
+            with_engine(internal, f, async |f| {
+                let (hosted, track) = (f.hosted("1440"), f.local(0));
+                start_first(f, &[hosted.clone(), track.clone()], "1440").await?;
+                f.report(failed(1, HostFailure::NotAuthorized))?;
+                assert_eq!(
+                    expect_unavailable(&mut f.events, &hosted).await?,
+                    UnavailableReason::AccessRevoked
+                );
+                expect_playing(&mut f.events, &track).await?;
+                assert_eq!(f.host.take(1).await?, vec![released(2)]);
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_host_that_cannot_play_fails_its_tracks_until_it_can() -> Result<()> {
+            let (internal, f) = hosted_engine(LONG_TRACK_SAMPLES, &[]);
+            with_engine(internal, f, async |f| {
+                let (first, second, track) = (f.hosted("1440"), f.hosted("1441"), f.local(0));
+                start_first(f, &[first.clone(), second.clone(), track.clone()], "1440").await?;
+
+                // The next hosted track fails at once, without going to the host.
+                f.report(ready(HOST, true, false))?;
+                assert_eq!(
+                    expect_unavailable(&mut f.events, &first).await?,
+                    UnavailableReason::LibraryUnavailable
+                );
+                assert_eq!(
+                    expect_unavailable(&mut f.events, &second).await?,
+                    UnavailableReason::LibraryUnavailable
+                );
+                expect_playing(&mut f.events, &track).await?;
+                assert_eq!(f.host.take(1).await?, vec![released(2)]);
+
+                f.report(ready(HOST, true, true))?;
+                f.send(PlayerCommand::Switch(1))?;
+                expect_playing(&mut f.events, &second).await?;
+                assert_eq!(f.host.take(1).await?, vec![handed_over("1441", 3)]);
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_host_without_authorization_fails_its_tracks_as_access_revoked() -> Result<()> {
+            let (internal, f) = hosted_engine(LONG_TRACK_SAMPLES, &[]);
+            with_engine(internal, f, async |f| {
+                let (first, second, track) = (f.hosted("1440"), f.hosted("1441"), f.local(0));
+                start_first(f, &[first.clone(), second.clone(), track.clone()], "1440").await?;
+                f.report(ready(HOST, false, true))?;
+                assert_eq!(
+                    expect_unavailable(&mut f.events, &first).await?,
+                    UnavailableReason::AccessRevoked
+                );
+                assert_eq!(
+                    expect_unavailable(&mut f.events, &second).await?,
+                    UnavailableReason::AccessRevoked
+                );
+                expect_playing(&mut f.events, &track).await?;
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn without_a_host_bridge_a_hosted_track_is_unavailable() -> Result<()> {
+            let (mut internal, f) = hosted_engine(LONG_TRACK_SAMPLES, &[]);
+            internal.host_bridge = Arc::new(RwLock::new(None));
+            with_engine(internal, f, async |f| {
+                let (hosted, track) = (f.hosted("1440"), f.local(0));
+                f.queue(&[hosted.clone(), track.clone()])?;
+                f.send(PlayerCommand::Switch(0))?;
+                assert_eq!(
+                    expect_unavailable(&mut f.events, &hosted).await?,
+                    UnavailableReason::LibraryUnavailable
+                );
+                expect_playing(&mut f.events, &track).await?;
+                assert!(f.host.sent_nothing());
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_track_whose_host_never_reports_is_unreachable() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let (first, second) = (f.hosted("1440"), f.hosted("1441"));
+                start_first(f, &[first.clone(), second.clone()], "1440").await?;
+                tokio::time::sleep(Duration::from_secs(9)).await;
+                f.assert_all_available();
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                assert_eq!(
+                    expect_unavailable(&mut f.events, &first).await?,
+                    UnavailableReason::SourceUnreachable
+                );
+                expect_playing(&mut f.events, &second).await?;
+                assert_eq!(
+                    f.host.take(2).await?,
+                    vec![released(2), handed_over("1441", 3)]
+                );
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_paused_track_waits_for_its_host_without_a_deadline() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let hosted = f.hosted("1440");
+                start_first(f, std::slice::from_ref(&hosted), "1440").await?;
+                f.send(PlayerCommand::Pause)?;
+                expect_paused(&mut f.events, &hosted).await?;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                f.assert_all_available();
+
+                // The host has as long again once it is told to play.
+                f.send(PlayerCommand::Play)?;
+                expect_playing(&mut f.events, &hosted).await?;
+                tokio::time::sleep(Duration::from_secs(9)).await;
+                f.assert_all_available();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                assert_eq!(
+                    expect_unavailable(&mut f.events, &hosted).await?,
+                    UnavailableReason::SourceUnreachable
+                );
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_host_that_goes_quiet_while_playing_fails_its_track() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let (first, second) = (f.hosted("1440"), f.hosted("1441"));
+                start_first(f, &[first.clone(), second.clone()], "1440").await?;
+                f.report(status(1, true, 0))?;
+                f.settle().await?;
+                tokio::time::sleep(Duration::from_secs(14)).await;
+                f.assert_all_available();
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                assert_eq!(
+                    expect_unavailable(&mut f.events, &first).await?,
+                    UnavailableReason::SourceUnreachable
+                );
+                expect_playing(&mut f.events, &second).await?;
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_host_that_comes_up_again_gets_its_track_again_where_it_stood() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let hosted = f.hosted("1440");
+                start_first(f, std::slice::from_ref(&hosted), "1440").await?;
+                f.report(status(1, true, 5_000))?;
+                f.settle().await?;
+                tokio::time::advance(Duration::from_secs(2)).await;
+                f.report(ready(HOST, true, true))?;
+                assert_eq!(
+                    f.host.take(1).await?,
+                    vec![hand_over(HOST, "1440", 2, 7_000, 1.0, true)]
+                );
+
+                // A paused track goes back paused.
+                f.send(PlayerCommand::Pause)?;
+                let paused_at = expect_paused(&mut f.events, &hosted).await?;
+                assert_eq!(f.host.take(1).await?, vec![on(3, HostAction::Stop)]);
+                f.report(ready(HOST, true, true))?;
+                let offset = u64::try_from(paused_at.as_millis())?;
+                assert_eq!(
+                    f.host.take(1).await?,
+                    vec![hand_over(HOST, "1440", 4, offset, 1.0, false)]
+                );
+                f.assert_all_available();
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_host_that_loses_its_track_gets_it_again_once() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let hosted = f.hosted("1440");
+                start_first(f, std::slice::from_ref(&hosted), "1440").await?;
+                f.send(PlayerCommand::Pause)?;
+                expect_paused(&mut f.events, &hosted).await?;
+                assert_eq!(f.host.take(1).await?, vec![on(2, HostAction::Stop)]);
+
+                f.report(lost(2))?;
+                assert_eq!(
+                    f.host.take(1).await?,
+                    vec![hand_over(HOST, "1440", 3, 0, 1.0, false)]
+                );
+                f.report(lost(3))?;
+                assert_eq!(
+                    expect_unavailable(&mut f.events, &hosted).await?,
+                    UnavailableReason::SourceUnreachable
+                );
+                assert_eq!(f.host.take(1).await?, vec![released(4)]);
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn events_about_an_older_track_or_from_another_host_change_nothing() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let hosted = f.hosted("1440");
+                start_first(f, std::slice::from_ref(&hosted), "1440").await?;
+                f.send(PlayerCommand::Switch(0))?;
+                expect_playing(&mut f.events, &hosted).await?;
+                assert_eq!(f.host.take(1).await?, vec![handed_over("1440", 2)]);
+
+                let other = OTHER.to_owned();
+                for event in [
+                    ended(1),
+                    failed(1, HostFailure::Unplayable),
+                    status(1, false, 5_000),
+                    lost(1),
+                    HostEvent::JukeboxEnded {
+                        host: other.clone(),
+                        revision: 2,
+                    },
+                    HostEvent::JukeboxItemFailed {
+                        host: other.clone(),
+                        revision: 2,
+                        index: 0,
+                        reason: HostFailure::Network,
+                    },
+                    HostEvent::JukeboxStatus {
+                        host: other.clone(),
+                        revision: 2,
+                        current_index: None,
+                        playing: false,
+                        position_ms: 5_000,
+                    },
+                    ready(&other, false, false),
+                    HostEvent::Unknown,
+                ] {
+                    f.report(event)?;
+                }
+                f.settle().await?;
+                while let Ok(event) = f.events.try_recv() {
+                    match event {
+                        PlayerEvent::Progress { position, .. } => {
+                            assert!(position < Duration::from_secs(1), "{position:?}");
+                        }
+                        PlayerEvent::PlaylistUpdated(_) | PlayerEvent::RealtimeFFT(_) => {}
+                        event => panic!("{event:?}"),
+                    }
+                }
+                assert!(f.host.sent_nothing());
+
+                // An event about the latest batch still counts.
+                f.report(status(2, false, 1_000))?;
+                assert_eq!(
+                    expect_paused(&mut f.events, &hosted).await?,
+                    Duration::from_secs(1)
+                );
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_status_from_before_a_pause_or_a_seek_is_dropped() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let hosted = f.hosted("1440");
+                start_first(f, std::slice::from_ref(&hosted), "1440").await?;
+                f.send(PlayerCommand::Pause)?;
+                let paused_at = expect_paused(&mut f.events, &hosted).await?;
+                assert_eq!(f.host.take(1).await?, vec![on(2, HostAction::Stop)]);
+
+                // The host still played when it reported.
+                f.report(status(1, true, 3_000))?;
+                f.settle().await?;
+                while f.events.try_recv().is_ok() {}
+                assert_eq!(next_progress(&mut f.events).await?, paused_at);
+
+                f.send(PlayerCommand::Seek(30.0))?;
+                expect_paused(&mut f.events, &hosted).await?;
+                f.report(status(2, false, 600))?;
+                f.settle().await?;
+                while f.events.try_recv().is_ok() {}
+                assert_eq!(next_progress(&mut f.events).await?, Duration::from_secs(30));
+                f.assert_all_available();
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn repeat_one_hands_the_same_track_to_its_host_again() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let (hosted, track) = (f.hosted("1440"), f.local(0));
+                f.send(PlayerCommand::SetPlaybackMode(PlaybackMode::RepeatOne))?;
+                start_first(f, &[hosted.clone(), track], "1440").await?;
+                f.report(status(1, true, 0))?;
+                f.report(ended(1))?;
+                wait_for(&mut f.events, |event| {
+                    matches!(event, PlayerEvent::EndOfTrack { item, .. } if *item == hosted)
+                })
+                .await?;
+                expect_playing(&mut f.events, &hosted).await?;
+                assert_eq!(f.host.take(1).await?, vec![handed_over("1440", 2)]);
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_hosted_track_moves_on_from_its_report_while_it_plays_only() -> Result<()> {
+            let (internal, f) = hosted_engine(2, &[]);
+            with_engine(internal, f, async |f| {
+                let hosted = f.hosted("1440");
+                start_first(f, std::slice::from_ref(&hosted), "1440").await?;
+                f.report(status(1, true, 10_000))?;
+                f.settle().await?;
+                tokio::time::advance(Duration::from_millis(400)).await;
+
+                f.send(PlayerCommand::Pause)?;
+                let paused_at = expect_paused(&mut f.events, &hosted).await?;
+                assert_eq!(paused_at, Duration::from_millis(10_400));
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                while f.events.try_recv().is_ok() {}
+                assert_eq!(next_progress(&mut f.events).await?, paused_at);
+
+                // A report moves a paused track too.
+                f.report(status(2, false, 20_000))?;
+                f.settle().await?;
+                while f.events.try_recv().is_ok() {}
+                assert_eq!(next_progress(&mut f.events).await?, Duration::from_secs(20));
+                Ok(())
+            })
+            .await
+        }
+
+        async fn status_until(
+            player: &Player,
+            wanted: impl Fn(&PlayerStatus) -> bool,
+        ) -> Result<PlayerStatus> {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let status = player.get_status();
+                    if wanted(&status) {
+                        return status;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("the player status did not change in time")
+        }
+
+        #[tokio::test]
+        async fn the_status_names_the_host_while_a_hosted_track_is_current() -> Result<()> {
+            let local_uuid = Uuid::new_v4();
+            let (local, wav_path) = delayed_resolver_fixture_with_samples(
+                &[local_uuid],
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Notify::new()),
+                Arc::new(Notify::new()),
+                &[],
+                LONG_TRACK_SAMPLES,
+            );
+            let hosted_library = Uuid::new_v4();
+            let host = Arc::new(FakeHost::default());
+            let player = Player::new(Arc::new(FsIo::new_noop()), None);
+            player.set_source_resolver(Arc::new(MixedResolver {
+                local,
+                hosted_library,
+            }));
+            player.set_host_bridge(host.clone());
+
+            let hosted = PlayingItem::LibraryTrack {
+                library_id: hosted_library,
+                track: "1440".to_owned(),
+            };
+            let track = library_item(Uuid::new_v4(), local_uuid);
+            player.add_to_playlist_with_sources(
+                vec![
+                    (hosted.clone(), PlaybackSource::LibraryStream),
+                    (track.clone(), PlaybackSource::LibraryStream),
+                ],
+                AddMode::AppendToEnd,
+            );
+            player.switch(0);
+            let status = status_until(&player, |status| {
+                status.item.as_ref() == Some(&hosted) && status.state == PlaybackState::Playing
+            })
+            .await?;
+            assert_eq!(status.hosted_by.as_deref(), Some(HOST));
+            assert_eq!(host.take(1).await?, vec![handed_over("1440", 1)]);
+
+            player.deliver_host_event(ended(1));
+            let status = status_until(&player, |status| {
+                status.item.as_ref() == Some(&track) && status.state == PlaybackState::Playing
+            })
+            .await?;
+            assert_eq!(status.hosted_by, None);
+
+            player.terminate();
+            let _ = std::fs::remove_file(wav_path);
+            Ok(())
+        }
     }
 }

@@ -19,11 +19,15 @@ use uuid::Uuid;
 use anyhow::Result;
 use database::playing_item::PlayingItemMetadataSummary;
 use futures::{SinkExt, StreamExt, future::BoxFuture};
+use playback::hosted::HostedTrack;
 use playback::player::{
     AudioPlaybackNote, AudioRequest, AudioSourceMode, PlayingItem, RemoteAudioError,
-    RemoteAudioSource, SubsonicItem, UnavailableReason,
+    RemoteAudioSource, SubsonicItem, SubsonicTarget, UnavailableReason,
 };
-use subsonic::{SubsonicAlbum, SubsonicApi, SubsonicArtist, SubsonicJukebox, SubsonicSong};
+use subsonic::{
+    RunePlaybackMode, RunePlaybackReason, SubsonicAlbum, SubsonicApi, SubsonicArtist,
+    SubsonicJukebox, SubsonicSong,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::backends::remote::{deliver_visualizer_feed_frame, encode_message};
@@ -686,18 +690,49 @@ impl SubsonicBinding {
         self: &Arc<Self>,
         item: SubsonicItem,
     ) -> Result<RemoteAudioSource> {
-        let song = self
-            .client
-            .song(&item.track_id)
-            .await
-            .map_err(subsonic_playback_error)?;
+        let song = self.song(&item.track_id).await?;
+        Ok(self.audio_source(item, song))
+    }
+
+    /// Says how a track plays. Only a server that declares `runeService` can name a track that a
+    /// platform host plays, so any other server goes straight to its stream.
+    pub(crate) async fn playback_target(
+        self: &Arc<Self>,
+        item: SubsonicItem,
+    ) -> Result<SubsonicTarget> {
+        if !self.probe.supports_rune_service() {
+            return self.playback_source(item).await.map(SubsonicTarget::Stream);
+        }
+        let song = self.song(&item.track_id).await?;
+        let Some(playback) = song.rune_playback.clone() else {
+            return Ok(SubsonicTarget::Stream(self.audio_source(item, song)));
+        };
+        match playback.mode {
+            RunePlaybackMode::Hosted => match (playback.host, playback.key) {
+                (Some(host), Some(key)) if !host.is_empty() && !key.is_empty() => {
+                    Ok(SubsonicTarget::Hosted(HostedTrack { host, key }))
+                }
+                _ => Err(anyhow::Error::new(RemoteAudioError::TrackGone)),
+            },
+            RunePlaybackMode::Unavailable => Err(anyhow::Error::new(match playback.reason {
+                Some(RunePlaybackReason::NotSubscribed) => RemoteAudioError::AccessRevoked,
+                Some(RunePlaybackReason::Removed) => RemoteAudioError::TrackGone,
+                _ => RemoteAudioError::unreachable("Track unavailable in this region"),
+            })),
+            RunePlaybackMode::Stream | RunePlaybackMode::Unknown => {
+                Ok(SubsonicTarget::Stream(self.audio_source(item, song)))
+            }
+        }
+    }
+
+    fn audio_source(self: &Arc<Self>, item: SubsonicItem, song: SubsonicSong) -> RemoteAudioSource {
         let extension = song
             .suffix
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "audio".to_owned());
         let cancellation = CancellationToken::new();
         let failure_reason = Arc::new(Mutex::new(None));
-        Ok(RemoteAudioSource {
+        RemoteAudioSource {
             request: Arc::new(SubsonicAudioRequest {
                 client: Arc::clone(&self.client),
                 track_id: item.track_id,
@@ -710,7 +745,7 @@ impl SubsonicBinding {
             size: song.size.unwrap_or_default(),
             cancellation,
             failure_reason,
-        })
+        }
     }
 
     pub(crate) async fn song(&self, track_id: &str) -> Result<SubsonicSong> {

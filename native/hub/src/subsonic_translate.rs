@@ -3275,6 +3275,160 @@ mod tests {
         ));
     }
 
+    struct HostedCatalog {
+        playback: Option<subsonic::RunePlayback>,
+        song_calls: Arc<AtomicUsize>,
+    }
+
+    impl subsonic::api::Browsing for HostedCatalog {
+        fn song<'a>(&'a self, id: &'a str) -> subsonic::ApiFuture<'a, subsonic::SubsonicSong> {
+            self.song_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(subsonic::SubsonicSong {
+                    id: id.into(),
+                    title: "Song".into(),
+                    rune_playback: self.playback.clone(),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    impl subsonic::api::System for HostedCatalog {}
+    impl subsonic::api::Lists for HostedCatalog {}
+    impl subsonic::api::Searching for HostedCatalog {}
+    impl subsonic::api::Playlists for HostedCatalog {}
+    impl subsonic::api::Annotation for HostedCatalog {}
+    impl subsonic::api::MediaRetrieval for HostedCatalog {}
+    impl subsonic::api::Jukebox for HostedCatalog {}
+    impl subsonic::api::Scanning for HostedCatalog {}
+    impl subsonic::api::RuneVisualizerFeed for HostedCatalog {}
+
+    fn hosted_binding(
+        root: &TempDir,
+        playback: Option<subsonic::RunePlayback>,
+        rune_service: bool,
+    ) -> (Arc<SubsonicBinding>, Arc<AtomicUsize>) {
+        let song_calls = Arc::new(AtomicUsize::new(0));
+        let binding = SubsonicBinding::new(
+            Arc::new(HostedCatalog {
+                playback,
+                song_calls: song_calls.clone(),
+            }),
+            SubsonicProbe {
+                api_version: "1.16.1".into(),
+                open_subsonic: true,
+                server_type: None,
+                server_version: None,
+                extensions: if rune_service {
+                    vec![("runeService".into(), vec![1])]
+                } else {
+                    Vec::new()
+                },
+                roles: SubsonicRoles::default(),
+                roles_known: true,
+            },
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            false,
+            Arc::new(CountingBroadcaster(Arc::new(AtomicUsize::new(0)))),
+        );
+        (Arc::new(binding), song_calls)
+    }
+
+    fn hosted_playback(mode: subsonic::RunePlaybackMode) -> subsonic::RunePlayback {
+        subsonic::RunePlayback {
+            mode,
+            host: Some("appleMusic".into()),
+            key: Some("i.x".into()),
+            reason: None,
+        }
+    }
+
+    fn subsonic_item() -> playback::player::SubsonicItem {
+        playback::player::SubsonicItem {
+            library_id: Uuid::new_v4(),
+            track_id: "song-1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rune_service_server_hosts_a_hosted_song() {
+        let root = TempDir::new().unwrap();
+        let (binding, calls) = hosted_binding(
+            &root,
+            Some(hosted_playback(subsonic::RunePlaybackMode::Hosted)),
+            true,
+        );
+        match binding.playback_target(subsonic_item()).await.unwrap() {
+            playback::player::SubsonicTarget::Hosted(track) => {
+                assert_eq!(track.host, "appleMusic");
+                assert_eq!(track.key, "i.x");
+            }
+            playback::player::SubsonicTarget::Stream(_) => panic!("expected a hosted track"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rune_service_songs_without_hosting_stream_with_one_lookup() {
+        let root = TempDir::new().unwrap();
+        for playback in [
+            None,
+            Some(hosted_playback(subsonic::RunePlaybackMode::Stream)),
+            Some(hosted_playback(subsonic::RunePlaybackMode::Unknown)),
+        ] {
+            let (binding, calls) = hosted_binding(&root, playback, true);
+            assert!(matches!(
+                binding.playback_target(subsonic_item()).await.unwrap(),
+                playback::player::SubsonicTarget::Stream(_)
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_songs_fail_with_the_closest_reason() {
+        use playback::player::UnavailableReason;
+        use subsonic::RunePlaybackReason as Reason;
+        let root = TempDir::new().unwrap();
+        for (reason, expected) in [
+            (
+                Some(Reason::NotSubscribed),
+                UnavailableReason::AccessRevoked,
+            ),
+            (Some(Reason::Region), UnavailableReason::SourceUnreachable),
+            (Some(Reason::Removed), UnavailableReason::TrackGone),
+            (None, UnavailableReason::SourceUnreachable),
+        ] {
+            let mut playback = hosted_playback(subsonic::RunePlaybackMode::Unavailable);
+            playback.reason = reason;
+            let (binding, _) = hosted_binding(&root, Some(playback), true);
+            let error = binding
+                .playback_target(subsonic_item())
+                .await
+                .err()
+                .expect("unavailable songs do not play");
+            assert_eq!(UnavailableReason::classify(&error), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_without_rune_service_streams_and_never_looks_at_hosting() {
+        let root = TempDir::new().unwrap();
+        let (binding, calls) = hosted_binding(
+            &root,
+            Some(hosted_playback(subsonic::RunePlaybackMode::Hosted)),
+            false,
+        );
+        assert!(matches!(
+            binding.playback_target(subsonic_item()).await.unwrap(),
+            playback::player::SubsonicTarget::Stream(_)
+        ));
+        // The stream path looks the song up once for its size and suffix, as it always did.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     fn assert_secret_free(value: &str) {
         for secret in ["t=", "s=", "p=", "cover-secret-password"] {
             assert!(!value.contains(secret));

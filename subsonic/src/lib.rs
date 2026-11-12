@@ -928,6 +928,53 @@ pub struct SubsonicSong {
     pub cover_art: Option<String>,
     pub bit_rate: Option<u32>,
     pub starred: Option<String>,
+    /// Rune's `runeService` extension. Servers without it never send it.
+    pub rune_playback: Option<RunePlayback>,
+}
+
+/// How a song of a `runeService` server plays.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunePlayback {
+    #[serde(default)]
+    pub mode: RunePlaybackMode,
+    pub host: Option<String>,
+    pub key: Option<String>,
+    pub reason: Option<RunePlaybackReason>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RunePlaybackMode {
+    #[default]
+    Stream,
+    Hosted,
+    Unavailable,
+    /// A mode this client does not know. Treated as `Stream`.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RunePlaybackReason {
+    NotSubscribed,
+    Region,
+    Removed,
+    #[serde(other)]
+    Other,
+}
+
+impl SubsonicProbe {
+    /// Whether this OpenSubsonic server declares Rune's service extension version 1, so its songs
+    /// may carry [`SubsonicSong::rune_playback`].
+    pub fn supports_rune_service(&self) -> bool {
+        self.open_subsonic
+            && self
+                .extensions
+                .iter()
+                .any(|(name, versions)| name == "runeService" && versions.contains(&1))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1391,4 +1438,75 @@ struct RawUser {
     download_role: Option<bool>,
     #[serde(default, rename = "jukeboxRole")]
     jukebox_role: Option<bool>,
+}
+
+#[cfg(test)]
+mod rune_playback_tests {
+    use super::*;
+
+    fn song(extra: &str) -> SubsonicSong {
+        serde_json::from_str(&format!(r#"{{"id":"s1","title":"T"{extra}}}"#)).unwrap()
+    }
+
+    #[test]
+    fn songs_of_other_servers_carry_no_playback() {
+        assert_eq!(song("").rune_playback, None);
+    }
+
+    #[test]
+    fn hosted_and_unavailable_songs_parse() {
+        let hosted = song(r#","runePlayback":{"mode":"hosted","host":"appleMusic","key":"i.x"}"#);
+        assert_eq!(
+            hosted.rune_playback,
+            Some(RunePlayback {
+                mode: RunePlaybackMode::Hosted,
+                host: Some("appleMusic".into()),
+                key: Some("i.x".into()),
+                reason: None,
+            })
+        );
+        for (reason, expected) in [
+            ("notSubscribed", RunePlaybackReason::NotSubscribed),
+            ("region", RunePlaybackReason::Region),
+            ("removed", RunePlaybackReason::Removed),
+            ("later", RunePlaybackReason::Other),
+        ] {
+            let unavailable = song(&format!(
+                r#","runePlayback":{{"mode":"unavailable","reason":"{reason}"}}"#
+            ));
+            let playback = unavailable.rune_playback.unwrap();
+            assert_eq!(playback.mode, RunePlaybackMode::Unavailable);
+            assert_eq!(playback.reason, Some(expected));
+        }
+    }
+
+    #[test]
+    fn unknown_modes_stream() {
+        let future = song(r#","runePlayback":{"mode":"relay"}"#);
+        assert_eq!(
+            future.rune_playback.unwrap().mode,
+            RunePlaybackMode::Unknown
+        );
+        let stream = song(r#","runePlayback":{"mode":"stream"}"#);
+        assert_eq!(stream.rune_playback.unwrap().mode, RunePlaybackMode::Stream);
+    }
+
+    #[test]
+    fn service_extension_needs_version_one() {
+        let mut probe = SubsonicProbe {
+            api_version: "1.16.1".into(),
+            open_subsonic: true,
+            server_type: None,
+            server_version: None,
+            extensions: vec![("runeService".into(), vec![1])],
+            roles: SubsonicRoles::default(),
+            roles_known: true,
+        };
+        assert!(probe.supports_rune_service());
+        probe.extensions = vec![("runeService".into(), vec![2])];
+        assert!(!probe.supports_rune_service());
+        probe.extensions = vec![("runeService".into(), vec![1])];
+        probe.open_subsonic = false;
+        assert!(!probe.supports_rune_service());
+    }
 }
