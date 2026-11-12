@@ -8,7 +8,8 @@ use std::{
     sync::Arc,
 };
 use subsonic::{
-    SearchLimits, SubsonicAlbum, SubsonicArtist, SubsonicError, SubsonicServerError, SubsonicSong,
+    RuneEdit, RuneServiceDescriptor, SearchLimits, SubsonicAlbum, SubsonicArtist, SubsonicError,
+    SubsonicServerError, SubsonicSong,
 };
 
 use crate::TypedRequest;
@@ -224,10 +225,117 @@ async fn fetch_remote_playlist(
         .playlist(&remote_id)
         .await
         .map_err(subsonic_request_error)?;
+    remember_playlist_edit(binding, id, playlist.rune_edit)?;
     Ok((
         remote_id,
         playlist.songs.into_iter().map(|song| song.id).collect(),
     ))
+}
+
+/// Refuse a call the service says it cannot answer, when only part of a request needs it.
+fn require_endpoint(
+    binding: &SubsonicBinding,
+    endpoint: &'static str,
+    params: &[&str],
+) -> Result<()> {
+    if binding.rune_unsupported(endpoint, params) {
+        return Err(ExpectedRequestError::Unsupported {
+            request: endpoint,
+            reason: UnsupportedReason::NotImplemented,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// What an edit changes in a playlist, to compare with the server's `runeEdit`.
+#[derive(Clone, Copy)]
+enum PlaylistEdit {
+    Rename,
+    Delete,
+    Append,
+    RemoveItem,
+    Reorder,
+}
+
+fn remember_playlist_edit(
+    binding: &SubsonicBinding,
+    playlist: i32,
+    edit: Option<RuneEdit>,
+) -> Result<()> {
+    let mut catalog = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+    match edit {
+        Some(edit) => catalog.playlist_edits.insert(playlist, edit),
+        None => catalog.playlist_edits.remove(&playlist),
+    };
+    Ok(())
+}
+
+/// `appendOnly` playlists only take songs added at the end; `readOnly` ones take nothing. A
+/// playlist the server said nothing about is left to the server.
+fn edit_allowed(known: Option<RuneEdit>, edit: PlaylistEdit) -> bool {
+    match known {
+        Some(RuneEdit::ReadOnly) => false,
+        Some(RuneEdit::AppendOnly) => matches!(edit, PlaylistEdit::Append),
+        Some(RuneEdit::Full | RuneEdit::Unknown) | None => true,
+    }
+}
+
+/// Refuse an edit on what the server said when the playlist was just fetched, so the
+/// remembered value is fresh.
+fn check_playlist_edit(
+    binding: &SubsonicBinding,
+    playlist: i32,
+    edit: PlaylistEdit,
+    request: &'static str,
+) -> Result<()> {
+    let known = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?
+        .playlist_edits
+        .get(&playlist)
+        .copied();
+    if edit_allowed(known, edit) {
+        Ok(())
+    } else {
+        Err(ExpectedRequestError::Unsupported {
+            request,
+            reason: UnsupportedReason::NotImplemented,
+        }
+        .into())
+    }
+}
+
+/// For edits that do not read the playlist first. A remembered value can be stale, so it only
+/// lets the edit through; one that would refuse it is checked against a fresh read.
+async fn check_unfetched_playlist_edit(
+    binding: &SubsonicBinding,
+    playlist: i32,
+    remote_id: &str,
+    edit: PlaylistEdit,
+    request: &'static str,
+) -> Result<()> {
+    let remembered = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?
+        .playlist_edits
+        .get(&playlist)
+        .copied();
+    if edit_allowed(remembered, edit) {
+        return Ok(());
+    }
+    let fresh = binding
+        .client
+        .playlist(remote_id)
+        .await
+        .map_err(subsonic_request_error)?;
+    remember_playlist_edit(binding, playlist, fresh.rune_edit)?;
+    check_playlist_edit(binding, playlist, edit, request)
 }
 
 pub(crate) async fn fetch_all_playlists_request(
@@ -246,8 +354,13 @@ pub(crate) async fn fetch_all_playlists_request(
     let playlists = remote
         .into_iter()
         .map(|item| {
+            let id = catalog.ids.intern(SubsonicIdKind::Playlist, &item.id)?;
+            match item.rune_edit {
+                Some(edit) => catalog.playlist_edits.insert(id, edit),
+                None => catalog.playlist_edits.remove(&id),
+            };
             Ok(Playlist {
-                id: catalog.ids.intern(SubsonicIdKind::Playlist, &item.id)?,
+                id,
                 name: item.name,
                 group: String::new(),
             })
@@ -269,9 +382,11 @@ pub(crate) async fn get_playlist_by_id_request(
         .playlist(&remote_id)
         .await
         .map_err(subsonic_request_error)?;
+    let id = playlist_id(binding, &remote.id)?;
+    remember_playlist_edit(binding, id, remote.rune_edit)?;
     Ok(Some(GetPlaylistByIdResponse {
         playlist: Playlist {
-            id: playlist_id(binding, &remote.id)?,
+            id,
             name: remote.name,
             group: String::new(),
         },
@@ -323,6 +438,14 @@ pub(crate) async fn update_playlist_request(
     request: &UpdatePlaylistRequest,
 ) -> Result<Option<UpdatePlaylistResponse>> {
     let remote_id = resolve_playlist_id(binding, request.playlist_id)?;
+    check_unfetched_playlist_edit(
+        binding,
+        request.playlist_id,
+        &remote_id,
+        PlaylistEdit::Rename,
+        UpdatePlaylistRequest::wire_name(),
+    )
+    .await?;
     binding
         .client
         .update_playlist(&remote_id, Some(&request.name), &[], &[])
@@ -343,6 +466,14 @@ pub(crate) async fn remove_playlist_request(
     request: &RemovePlaylistRequest,
 ) -> Result<Option<RemovePlaylistResponse>> {
     let remote_id = resolve_playlist_id(binding, request.playlist_id)?;
+    check_unfetched_playlist_edit(
+        binding,
+        request.playlist_id,
+        &remote_id,
+        PlaylistEdit::Delete,
+        RemovePlaylistRequest::wire_name(),
+    )
+    .await?;
     binding
         .client
         .delete_playlist(&remote_id)
@@ -375,6 +506,13 @@ pub(crate) async fn add_item_to_playlist_request(
         .playlist(&playlist_remote)
         .await
         .map_err(subsonic_request_error)?;
+    remember_playlist_edit(binding, request.playlist_id, playlist.rune_edit)?;
+    check_playlist_edit(
+        binding,
+        request.playlist_id,
+        PlaylistEdit::Append,
+        AddItemToPlaylistRequest::wire_name(),
+    )?;
     let songs = playlist
         .songs
         .iter()
@@ -421,6 +559,12 @@ pub(crate) async fn remove_item_from_playlist_request(
     request: &RemoveItemFromPlaylistRequest,
 ) -> Result<Option<RemoveItemFromPlaylistResponse>> {
     let (remote_id, songs) = fetch_remote_playlist(binding, request.playlist_id).await?;
+    check_playlist_edit(
+        binding,
+        request.playlist_id,
+        PlaylistEdit::RemoveItem,
+        RemoveItemFromPlaylistRequest::wire_name(),
+    )?;
     let position = occurrence_position(&request.occurrence_id, songs.len())?;
     let position = u32::try_from(position)
         .map_err(|_| ExpectedRequestError::invalid_input("Subsonic playlist is too large"))?;
@@ -437,6 +581,12 @@ pub(crate) async fn reorder_playlist_item_position_request(
     request: &ReorderPlaylistItemPositionRequest,
 ) -> Result<Option<ReorderPlaylistItemPositionResponse>> {
     let (remote_id, songs) = fetch_remote_playlist(binding, request.playlist_id).await?;
+    check_playlist_edit(
+        binding,
+        request.playlist_id,
+        PlaylistEdit::Reorder,
+        ReorderPlaylistItemPositionRequest::wire_name(),
+    )?;
     let from = occurrence_position(&request.occurrence_id, songs.len())?;
     let target = usize::try_from(request.new_position)
         .map_err(|_| ExpectedRequestError::invalid_input("Invalid playlist position"))?;
@@ -975,6 +1125,7 @@ pub(crate) async fn fetch_collection_by_ids_request(
             Some(name) => name,
             None => match kind {
                 SubsonicIdKind::Artist => {
+                    require_endpoint(binding, "getArtist", &["id"])?;
                     let item = binding
                         .client
                         .artist(&remote_id)
@@ -997,6 +1148,7 @@ pub(crate) async fn fetch_collection_by_ids_request(
                     name
                 }
                 SubsonicIdKind::Album => {
+                    require_endpoint(binding, "getAlbum", &["id"])?;
                     let item = binding
                         .client
                         .album(&remote_id)
@@ -1346,6 +1498,7 @@ async fn ensure_artists(binding: &SubsonicBinding) -> Result<()> {
     if loaded {
         return Ok(());
     }
+    require_endpoint(binding, "getArtists", &[])?;
     let artists = binding
         .client
         .artists()
@@ -1372,6 +1525,7 @@ async fn ensure_albums(binding: &SubsonicBinding) -> Result<()> {
     if loaded {
         return Ok(());
     }
+    require_endpoint(binding, "getAlbumList2", &["type", "size", "offset"])?;
     let mut offset = 0_u32;
     loop {
         let albums = binding
@@ -1580,6 +1734,7 @@ async fn detail_songs(binding: &SubsonicBinding, query: DetailQuery) -> Result<V
                     .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
                 catalog.ids.resolve(SubsonicIdKind::Artist, id)?.to_owned()
             };
+            require_endpoint(binding, "getArtist", &["id"])?;
             let artist = binding
                 .client
                 .artist(&remote_id)
@@ -1687,6 +1842,16 @@ fn subsonic_request_error(error: SubsonicError) -> anyhow::Error {
             actual: "malformed response".into(),
         }
         .into(),
+        error if error.is_rune_credentials_expired() => {
+            ExpectedRequestError::SubsonicNotAuthorized.into()
+        }
+        SubsonicError::Server {
+            rune_reason: Some(subsonic::RuneReason::Removed),
+            ..
+        } => ExpectedError::NotFound {
+            what: "Subsonic item",
+        }
+        .into(),
         SubsonicError::Server {
             kind:
                 SubsonicServerError::WrongCredentials
@@ -1780,6 +1945,12 @@ macro_rules! subsonic_requests {
                 $(slots.set::<$native_request>(Slot::Native);)*
                 slots
             }
+
+            fn hide_player(&mut self) {
+                $(self.set::<$player_request>(Slot::Unsupported {
+                    reason: UnsupportedReason::NotImplemented,
+                });)*
+            }
         }
     };
 }
@@ -1848,6 +2019,194 @@ subsonic_requests! {
         CastPreflightRequest,
         RefreshSessionRequest,
         SessionSnapshotRequest,
+    }
+}
+
+/// The Subsonic endpoints, with the parameter that matters, each Rune request calls through the
+/// translator above. A `runeService` descriptor that lists any of them as unsupported hides the
+/// request. A whole-endpoint entry covers every parameter. Lyrics and the jukebox are handled
+/// apart in `hide_rune_unsupported`.
+/// A Subsonic endpoint and the parameters Rune sends to it. Entries of a descriptor narrowed to
+/// one of those parameters count; entries narrowed to others do not.
+type EndpointUse = (&'static str, &'static [&'static str]);
+
+/// Whether a request is hidden when any of its endpoints is unsupported, or only when all are.
+/// "All" is for requests that serve several kinds of item through different endpoints: they stay
+/// available and refuse at run time (`require_endpoint`) for the kind that is missing.
+#[derive(Clone, Copy)]
+enum Hides {
+    AnyEndpoint,
+    AllEndpoints,
+}
+
+type RequestEndpoints = (fn(&mut RequestSlots), Hides, &'static [EndpointUse]);
+
+/// The Subsonic endpoints each Rune request calls through the translator above. A `runeService`
+/// descriptor that lists them as unsupported hides the request. Lyrics and the jukebox are
+/// handled apart in `hide_rune_unsupported`.
+const REQUEST_ENDPOINTS: &[RequestEndpoints] = &[
+    (
+        hide::<SetLikedRequest>,
+        Hides::AnyEndpoint,
+        &[("star", &["id"]), ("unstar", &["id"])],
+    ),
+    (
+        hide::<GetLikedRequest>,
+        Hides::AnyEndpoint,
+        &[("getSong", &["id"])],
+    ),
+    (
+        hide::<FetchMediaFileByIdsRequest>,
+        Hides::AnyEndpoint,
+        &[("getSong", &["id"])],
+    ),
+    (
+        hide::<FetchParsedMediaFileRequest>,
+        Hides::AnyEndpoint,
+        &[("getSong", &["id"])],
+    ),
+    (
+        hide::<FetchAllPlaylistsRequest>,
+        Hides::AnyEndpoint,
+        &[("getPlaylists", &[])],
+    ),
+    (
+        hide::<GetPlaylistByIdRequest>,
+        Hides::AnyEndpoint,
+        &[("getPlaylist", &["id"])],
+    ),
+    (
+        hide::<CreatePlaylistRequest>,
+        Hides::AnyEndpoint,
+        &[("createPlaylist", &["name"]), ("getPlaylists", &[])],
+    ),
+    (
+        hide::<UpdatePlaylistRequest>,
+        Hides::AnyEndpoint,
+        &[("updatePlaylist", &["playlistId", "name"])],
+    ),
+    (
+        hide::<RemovePlaylistRequest>,
+        Hides::AnyEndpoint,
+        &[("deletePlaylist", &["id"])],
+    ),
+    (
+        hide::<AddItemToPlaylistRequest>,
+        Hides::AnyEndpoint,
+        &[
+            ("getPlaylist", &["id"]),
+            ("updatePlaylist", &["playlistId", "songIdToAdd"]),
+        ],
+    ),
+    (
+        hide::<RemoveItemFromPlaylistRequest>,
+        Hides::AnyEndpoint,
+        &[
+            ("getPlaylist", &["id"]),
+            ("updatePlaylist", &["playlistId", "songIndexToRemove"]),
+        ],
+    ),
+    // Reordering rewrites the playlist through createPlaylist with a playlistId.
+    (
+        hide::<ReorderPlaylistItemPositionRequest>,
+        Hides::AnyEndpoint,
+        &[
+            ("getPlaylist", &["id"]),
+            ("createPlaylist", &["playlistId", "songId"]),
+        ],
+    ),
+    (
+        hide::<GetMediaFilesCountRequest>,
+        Hides::AnyEndpoint,
+        &[("getScanStatus", &[])],
+    ),
+    (
+        hide::<SearchForRequest>,
+        Hides::AnyEndpoint,
+        &[("search3", &["query"])],
+    ),
+    (
+        hide::<SearchMediaFileSummaryRequest>,
+        Hides::AnyEndpoint,
+        &[("search3", &["query"])],
+    ),
+    (
+        hide::<SearchCollectionSummaryRequest>,
+        Hides::AnyEndpoint,
+        &[("search3", &["query"])],
+    ),
+    (
+        hide::<FetchMediaFilesRequest>,
+        Hides::AnyEndpoint,
+        &[("search3", &["query", "songOffset"])],
+    ),
+    // Artist groups come from getArtists and album groups from getAlbumList2.
+    (
+        hide::<FetchCollectionGroupSummaryRequest>,
+        Hides::AllEndpoints,
+        &[
+            ("getAlbumList2", &["type", "size", "offset"]),
+            ("getArtists", &[]),
+        ],
+    ),
+    (
+        hide::<FetchCollectionGroupsRequest>,
+        Hides::AllEndpoints,
+        &[
+            ("getAlbumList2", &["type", "size", "offset"]),
+            ("getArtists", &[]),
+        ],
+    ),
+    (
+        hide::<FetchCollectionByIdsRequest>,
+        Hides::AllEndpoints,
+        &[("getArtist", &["id"]), ("getAlbum", &["id"])],
+    ),
+    // Both kinds of query read albums; artists need getArtist on top, checked at run time.
+    (
+        hide::<MixQueryRequest>,
+        Hides::AnyEndpoint,
+        &[("getAlbum", &["id"])],
+    ),
+];
+
+fn hide<R: crate::rpc::TargetRequest>(slots: &mut RequestSlots) {
+    slots.set::<R>(Slot::Unsupported {
+        reason: UnsupportedReason::NotImplemented,
+    });
+}
+
+impl RequestSlots {
+    /// Hide the requests the service behind a `runeService` server cannot answer.
+    pub(crate) fn hide_rune_unsupported(
+        &mut self,
+        descriptor: &RuneServiceDescriptor,
+        has_song_lyrics: bool,
+    ) {
+        for (hide_request, hides, uses) in REQUEST_ENDPOINTS {
+            let missing =
+                |(endpoint, params): &EndpointUse| descriptor.is_unsupported(endpoint, params);
+            let hidden = match hides {
+                Hides::AnyEndpoint => uses.iter().any(missing),
+                Hides::AllEndpoints => uses.iter().all(missing),
+            };
+            if hidden {
+                hide_request(self);
+            }
+        }
+        // The translator asks getLyricsBySongId when the server has songLyrics and getLyrics
+        // otherwise, after reading the song, so only those can hide lyrics.
+        let lyrics_unsupported = if has_song_lyrics {
+            descriptor.is_unsupported("getLyricsBySongId", &["id"])
+        } else {
+            descriptor.is_unsupported("getLyrics", &["artist", "title"])
+        };
+        if lyrics_unsupported || descriptor.is_unsupported("getSong", &["id"]) {
+            hide::<GetLyricByTrackIdRequest>(self);
+        }
+        if descriptor.is_unsupported("jukeboxControl", &[]) {
+            self.hide_player();
+        }
     }
 }
 
@@ -3207,6 +3566,7 @@ mod tests {
     impl subsonic::api::Jukebox for InMemoryCatalog {}
     impl subsonic::api::Scanning for InMemoryCatalog {}
     impl subsonic::api::RuneVisualizerFeed for InMemoryCatalog {}
+    impl subsonic::api::RuneService for InMemoryCatalog {}
 
     #[tokio::test]
     async fn in_memory_api_serves_browse_and_search_and_reports_missing_facets_as_unsupported() {
@@ -3303,6 +3663,7 @@ mod tests {
     impl subsonic::api::Jukebox for HostedCatalog {}
     impl subsonic::api::Scanning for HostedCatalog {}
     impl subsonic::api::RuneVisualizerFeed for HostedCatalog {}
+    impl subsonic::api::RuneService for HostedCatalog {}
 
     fn hosted_binding(
         root: &TempDir,
@@ -3985,6 +4346,747 @@ mod tests {
         assert_eq!(server.state.cover_calls.load(Ordering::SeqCst), 2);
     }
 
+    fn descriptor(unsupported: &[(&str, Option<&str>)]) -> subsonic::RuneServiceDescriptor {
+        subsonic::RuneServiceDescriptor {
+            id: "appleMusic".into(),
+            name: "Apple Music".into(),
+            unsupported: unsupported
+                .iter()
+                .map(|(endpoint, param)| subsonic::RuneUnsupported {
+                    endpoint: (*endpoint).into(),
+                    param: param.map(Into::into),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn rune_slots(unsupported: &[(&str, Option<&str>)], has_song_lyrics: bool) -> RequestSlots {
+        let mut slots = RequestSlots::subsonic(&SubsonicProbe {
+            api_version: "1.16.1".into(),
+            open_subsonic: true,
+            server_type: None,
+            server_version: None,
+            extensions: vec![("runeService".into(), vec![1])],
+            roles: SubsonicRoles {
+                jukebox_role: true,
+                ..Default::default()
+            },
+            roles_known: true,
+        });
+        slots.hide_rune_unsupported(&descriptor(unsupported), has_song_lyrics);
+        slots
+    }
+
+    fn hidden() -> Slot {
+        Slot::Unsupported {
+            reason: UnsupportedReason::NotImplemented,
+        }
+    }
+
+    #[test]
+    fn descriptor_unsupported_entries_hide_the_requests_behind_them() {
+        let slots = rune_slots(
+            &[
+                ("deletePlaylist", None),
+                ("updatePlaylist", Some("songIndexToRemove")),
+                ("star", None),
+                ("search3", None),
+            ],
+            false,
+        );
+        for slot in [
+            RemovePlaylistRequest::slot(&slots),
+            RemoveItemFromPlaylistRequest::slot(&slots),
+            SetLikedRequest::slot(&slots),
+            SearchForRequest::slot(&slots),
+            SearchMediaFileSummaryRequest::slot(&slots),
+            SearchCollectionSummaryRequest::slot(&slots),
+            FetchMediaFilesRequest::slot(&slots),
+        ] {
+            assert_eq!(slot, hidden());
+        }
+        // A parameter entry hides only the requests that use that parameter.
+        for slot in [
+            UpdatePlaylistRequest::slot(&slots),
+            AddItemToPlaylistRequest::slot(&slots),
+            CreatePlaylistRequest::slot(&slots),
+            ReorderPlaylistItemPositionRequest::slot(&slots),
+            FetchAllPlaylistsRequest::slot(&slots),
+            GetLyricByTrackIdRequest::slot(&slots),
+            VolumeRequest::slot(&slots),
+        ] {
+            assert_ne!(slot, hidden());
+        }
+        assert_eq!(
+            crate::messages::RequestCapability::from(RemovePlaylistRequest::slot(&slots)),
+            crate::messages::RequestCapability::Hidden
+        );
+    }
+
+    #[test]
+    fn create_and_reorder_follow_the_create_playlist_endpoint() {
+        let slots = rune_slots(&[("createPlaylist", Some("playlistId"))], false);
+        assert_eq!(ReorderPlaylistItemPositionRequest::slot(&slots), hidden());
+        assert_eq!(CreatePlaylistRequest::slot(&slots), Slot::Translate);
+        let slots = rune_slots(&[("createPlaylist", None)], false);
+        assert_eq!(CreatePlaylistRequest::slot(&slots), hidden());
+        assert_eq!(ReorderPlaylistItemPositionRequest::slot(&slots), hidden());
+        assert_eq!(UpdatePlaylistRequest::slot(&slots), Slot::Translate);
+        let slots = rune_slots(&[("updatePlaylist", None)], false);
+        for slot in [
+            UpdatePlaylistRequest::slot(&slots),
+            AddItemToPlaylistRequest::slot(&slots),
+            RemoveItemFromPlaylistRequest::slot(&slots),
+        ] {
+            assert_eq!(slot, hidden());
+        }
+        assert_eq!(
+            ReorderPlaylistItemPositionRequest::slot(&slots),
+            Slot::Translate
+        );
+    }
+
+    #[test]
+    fn lyrics_hide_only_when_the_endpoint_the_translator_calls_is_unsupported() {
+        let get_lyrics = [("getLyrics", None)];
+        let by_song_id = [("getLyricsBySongId", None)];
+        let both = [("getLyrics", None), ("getLyricsBySongId", None)];
+        for (unsupported, has_song_lyrics, expected) in [
+            (&get_lyrics[..], false, hidden()),
+            (&get_lyrics[..], true, Slot::Translate),
+            (&by_song_id[..], false, Slot::Translate),
+            (&by_song_id[..], true, hidden()),
+            (&both[..], false, hidden()),
+            (&both[..], true, hidden()),
+        ] {
+            let slots = rune_slots(unsupported, has_song_lyrics);
+            assert_eq!(GetLyricByTrackIdRequest::slot(&slots), expected);
+        }
+    }
+
+    #[test]
+    fn unsupported_jukebox_control_hides_the_player_requests() {
+        let slots = rune_slots(&[("jukeboxControl", None)], false);
+        for slot in [
+            PlayRequest::slot(&slots),
+            LoadRequest::slot(&slots),
+            VolumeRequest::slot(&slots),
+            SessionSnapshotRequest::slot(&slots),
+        ] {
+            assert_eq!(slot, hidden());
+        }
+        let slots = rune_slots(&[], false);
+        assert_eq!(PlayRequest::slot(&slots), Slot::Translate);
+    }
+
+    #[test]
+    fn binding_without_a_descriptor_keeps_the_plain_slots() {
+        let root = TempDir::new().unwrap();
+        let (binding, _) = hosted_binding(&root, None, true);
+        let plain = RequestSlots::subsonic(&binding.probe);
+        assert_eq!(
+            RemovePlaylistRequest::slot(&binding.slots()),
+            RemovePlaylistRequest::slot(&plain)
+        );
+        let binding = Arc::try_unwrap(binding)
+            .ok()
+            .unwrap()
+            .with_rune_service(Some(descriptor(&[("deletePlaylist", None)])));
+        assert_eq!(RemovePlaylistRequest::slot(&binding.slots()), hidden());
+        assert_eq!(
+            FetchAllPlaylistsRequest::slot(&binding.slots()),
+            Slot::Translate
+        );
+    }
+
+    struct EditCatalog {
+        edit: Arc<Mutex<Option<subsonic::RuneEdit>>>,
+        writes: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl subsonic::api::Playlists for EditCatalog {
+        fn playlists<'a>(&'a self) -> subsonic::ApiFuture<'a, Vec<subsonic::SubsonicPlaylist>> {
+            let edit = *self.edit.lock().unwrap();
+            Box::pin(async move {
+                Ok(vec![subsonic::SubsonicPlaylist {
+                    id: "p1".into(),
+                    name: "P".into(),
+                    rune_edit: edit,
+                    ..Default::default()
+                }])
+            })
+        }
+
+        fn playlist<'a>(
+            &'a self,
+            id: &'a str,
+        ) -> subsonic::ApiFuture<'a, subsonic::SubsonicPlaylistDetail> {
+            let edit = *self.edit.lock().unwrap();
+            Box::pin(async move {
+                Ok(subsonic::SubsonicPlaylistDetail {
+                    id: id.into(),
+                    name: "P".into(),
+                    rune_edit: edit,
+                    songs: vec![
+                        subsonic::SubsonicSong {
+                            id: "s1".into(),
+                            ..Default::default()
+                        },
+                        subsonic::SubsonicSong {
+                            id: "s2".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn replace_playlist_songs<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a [&'a str],
+        ) -> subsonic::ApiFuture<'a, ()> {
+            self.writes.lock().unwrap().push("replace");
+            Box::pin(async { Ok(()) })
+        }
+
+        fn update_playlist<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<&'a str>,
+            _: &'a [&'a str],
+            _: &'a [u32],
+        ) -> subsonic::ApiFuture<'a, ()> {
+            self.writes.lock().unwrap().push("update");
+            Box::pin(async { Ok(()) })
+        }
+
+        fn delete_playlist<'a>(&'a self, _: &'a str) -> subsonic::ApiFuture<'a, ()> {
+            self.writes.lock().unwrap().push("delete");
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl subsonic::api::System for EditCatalog {}
+    impl subsonic::api::Browsing for EditCatalog {}
+    impl subsonic::api::Lists for EditCatalog {}
+    impl subsonic::api::Searching for EditCatalog {}
+    impl subsonic::api::Annotation for EditCatalog {}
+    impl subsonic::api::MediaRetrieval for EditCatalog {}
+    impl subsonic::api::Jukebox for EditCatalog {}
+    impl subsonic::api::Scanning for EditCatalog {}
+    impl subsonic::api::RuneVisualizerFeed for EditCatalog {}
+    impl subsonic::api::RuneService for EditCatalog {}
+
+    fn edit_binding(
+        root: &TempDir,
+        edit: Option<subsonic::RuneEdit>,
+    ) -> (SubsonicBinding, Arc<Mutex<Vec<&'static str>>>) {
+        let (binding, writes, _) = edit_binding_with_handle(root, edit);
+        (binding, writes)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn edit_binding_with_handle(
+        root: &TempDir,
+        edit: Option<subsonic::RuneEdit>,
+    ) -> (
+        SubsonicBinding,
+        Arc<Mutex<Vec<&'static str>>>,
+        Arc<Mutex<Option<subsonic::RuneEdit>>>,
+    ) {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let edit = Arc::new(Mutex::new(edit));
+        let binding = SubsonicBinding::new(
+            Arc::new(EditCatalog {
+                edit: edit.clone(),
+                writes: writes.clone(),
+            }),
+            SubsonicProbe {
+                api_version: "1.16.1".into(),
+                open_subsonic: true,
+                server_type: None,
+                server_version: None,
+                extensions: Vec::new(),
+                roles: SubsonicRoles::default(),
+                roles_known: true,
+            },
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            true,
+            Arc::new(CountingBroadcaster(Arc::new(AtomicUsize::new(0)))),
+        );
+        (binding, writes, edit)
+    }
+
+    fn assert_refused(result: anyhow::Result<impl Sized>) {
+        let error = result.err().expect("the edit must be refused");
+        assert!(matches!(
+            error.downcast_ref::<ExpectedRequestError>(),
+            Some(ExpectedRequestError::Unsupported {
+                reason: UnsupportedReason::NotImplemented,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_only_playlists_refuse_edits_before_calling_the_server() {
+        let root = TempDir::new().unwrap();
+        let (binding, writes) = edit_binding(&root, Some(subsonic::RuneEdit::ReadOnly));
+        let playlist_id =
+            fetch_all_playlists_request(&binding, &FetchAllPlaylistsRequest { call_id: None })
+                .await
+                .unwrap()
+                .unwrap()
+                .playlists[0]
+                .id;
+        assert_refused(
+            update_playlist_request(
+                &binding,
+                &UpdatePlaylistRequest {
+                    playlist_id,
+                    name: "New".into(),
+                    group: String::new(),
+                    call_id: None,
+                },
+            )
+            .await,
+        );
+        assert_refused(
+            remove_playlist_request(
+                &binding,
+                &RemovePlaylistRequest {
+                    playlist_id,
+                    call_id: None,
+                },
+            )
+            .await,
+        );
+        let track = binding
+            .catalog
+            .lock()
+            .unwrap()
+            .ids
+            .intern(SubsonicIdKind::Track, "s9")
+            .unwrap();
+        assert_refused(
+            add_item_to_playlist_request(
+                &binding,
+                &AddItemToPlaylistRequest {
+                    playlist_id,
+                    media_file_id: track,
+                    position: None,
+                    call_id: None,
+                },
+            )
+            .await,
+        );
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_only_playlists_allow_adding_but_not_removing_or_reordering() {
+        let root = TempDir::new().unwrap();
+        let (binding, writes) = edit_binding(&root, Some(subsonic::RuneEdit::AppendOnly));
+        let playlist_id =
+            fetch_all_playlists_request(&binding, &FetchAllPlaylistsRequest { call_id: None })
+                .await
+                .unwrap()
+                .unwrap()
+                .playlists[0]
+                .id;
+        let track = binding
+            .catalog
+            .lock()
+            .unwrap()
+            .ids
+            .intern(SubsonicIdKind::Track, "s9")
+            .unwrap();
+        add_item_to_playlist_request(
+            &binding,
+            &AddItemToPlaylistRequest {
+                playlist_id,
+                media_file_id: track,
+                position: None,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(writes.lock().unwrap().as_slice(), ["update"]);
+        assert_refused(
+            remove_item_from_playlist_request(
+                &binding,
+                &RemoveItemFromPlaylistRequest {
+                    playlist_id,
+                    occurrence_id: "0".into(),
+                    call_id: None,
+                },
+            )
+            .await,
+        );
+        assert_refused(
+            reorder_playlist_item_position_request(
+                &binding,
+                &ReorderPlaylistItemPositionRequest {
+                    playlist_id,
+                    occurrence_id: "0".into(),
+                    new_position: 1,
+                    call_id: None,
+                },
+            )
+            .await,
+        );
+        assert_eq!(writes.lock().unwrap().as_slice(), ["update"]);
+    }
+
+    #[tokio::test]
+    async fn playlists_without_rune_edit_are_left_to_the_server() {
+        let root = TempDir::new().unwrap();
+        let (binding, writes) = edit_binding(&root, None);
+        let playlist_id =
+            fetch_all_playlists_request(&binding, &FetchAllPlaylistsRequest { call_id: None })
+                .await
+                .unwrap()
+                .unwrap()
+                .playlists[0]
+                .id;
+        update_playlist_request(
+            &binding,
+            &UpdatePlaylistRequest {
+                playlist_id,
+                name: "New".into(),
+                group: String::new(),
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        remove_playlist_request(
+            &binding,
+            &RemovePlaylistRequest {
+                playlist_id,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(writes.lock().unwrap().as_slice(), ["update", "delete"]);
+    }
+
+    #[tokio::test]
+    async fn every_edit_mode_allows_exactly_its_edits() {
+        use subsonic::RuneEdit;
+        let append_only = [true, false, false, false, false];
+        let full = [true; 5];
+        let read_only = [false; 5];
+        // Add, rename, delete, remove an item, reorder.
+        for (edit, expected) in [
+            (Some(RuneEdit::Full), full),
+            (None, full),
+            (Some(RuneEdit::Unknown), full),
+            (Some(RuneEdit::AppendOnly), append_only),
+            (Some(RuneEdit::ReadOnly), read_only),
+        ] {
+            let root = TempDir::new().unwrap();
+            let (binding, writes) = edit_binding(&root, edit);
+            let playlist_id =
+                fetch_all_playlists_request(&binding, &FetchAllPlaylistsRequest { call_id: None })
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .playlists[0]
+                    .id;
+            let track = binding
+                .catalog
+                .lock()
+                .unwrap()
+                .ids
+                .intern(SubsonicIdKind::Track, "s9")
+                .unwrap();
+            let results = [
+                add_item_to_playlist_request(
+                    &binding,
+                    &AddItemToPlaylistRequest {
+                        playlist_id,
+                        media_file_id: track,
+                        position: None,
+                        call_id: None,
+                    },
+                )
+                .await
+                .is_ok(),
+                update_playlist_request(
+                    &binding,
+                    &UpdatePlaylistRequest {
+                        playlist_id,
+                        name: "New".into(),
+                        group: String::new(),
+                        call_id: None,
+                    },
+                )
+                .await
+                .is_ok(),
+                remove_playlist_request(
+                    &binding,
+                    &RemovePlaylistRequest {
+                        playlist_id,
+                        call_id: None,
+                    },
+                )
+                .await
+                .is_ok(),
+                remove_item_from_playlist_request(
+                    &binding,
+                    &RemoveItemFromPlaylistRequest {
+                        playlist_id,
+                        occurrence_id: "0".into(),
+                        call_id: None,
+                    },
+                )
+                .await
+                .is_ok(),
+                reorder_playlist_item_position_request(
+                    &binding,
+                    &ReorderPlaylistItemPositionRequest {
+                        playlist_id,
+                        occurrence_id: "0".into(),
+                        new_position: 1,
+                        call_id: None,
+                    },
+                )
+                .await
+                .is_ok(),
+            ];
+            assert_eq!(results, expected, "mode {edit:?}");
+            assert_eq!(
+                writes.lock().unwrap().len(),
+                expected.iter().filter(|allowed| **allowed).count(),
+                "mode {edit:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_read_only_memory_never_refuses_rename_or_delete() {
+        let root = TempDir::new().unwrap();
+        let (binding, writes, handle) =
+            edit_binding_with_handle(&root, Some(subsonic::RuneEdit::ReadOnly));
+        let playlist_id =
+            fetch_all_playlists_request(&binding, &FetchAllPlaylistsRequest { call_id: None })
+                .await
+                .unwrap()
+                .unwrap()
+                .playlists[0]
+                .id;
+        *handle.lock().unwrap() = Some(subsonic::RuneEdit::Full);
+        update_playlist_request(
+            &binding,
+            &UpdatePlaylistRequest {
+                playlist_id,
+                name: "New".into(),
+                group: String::new(),
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(writes.lock().unwrap().as_slice(), ["update"]);
+        // The fresh read replaced the memory, so a delete goes through as well.
+        remove_playlist_request(
+            &binding,
+            &RemovePlaylistRequest {
+                playlist_id,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(writes.lock().unwrap().as_slice(), ["update", "delete"]);
+    }
+
+    #[test]
+    fn parameter_entries_count_only_for_parameters_rune_sends() {
+        let slots = rune_slots(&[("star", Some("size"))], false);
+        assert_ne!(SetLikedRequest::slot(&slots), hidden());
+        let slots = rune_slots(&[("unstar", Some("id"))], false);
+        assert_eq!(SetLikedRequest::slot(&slots), hidden());
+        let slots = rune_slots(&[("search3", Some("songOffset"))], false);
+        assert_eq!(FetchMediaFilesRequest::slot(&slots), hidden());
+        assert_eq!(SearchForRequest::slot(&slots), Slot::Translate);
+        assert_eq!(SearchMediaFileSummaryRequest::slot(&slots), Slot::Translate);
+    }
+
+    #[test]
+    fn song_and_collection_reads_hide_the_requests_that_call_them() {
+        let slots = rune_slots(&[("getSong", None)], false);
+        for slot in [
+            GetLikedRequest::slot(&slots),
+            FetchMediaFileByIdsRequest::slot(&slots),
+            FetchParsedMediaFileRequest::slot(&slots),
+            GetLyricByTrackIdRequest::slot(&slots),
+        ] {
+            assert_eq!(slot, hidden());
+        }
+        let slots = rune_slots(&[("getAlbum", None)], false);
+        assert_eq!(MixQueryRequest::slot(&slots), hidden());
+        assert_eq!(
+            crate::messages::FetchCollectionByIdsRequest::slot(&slots),
+            Slot::Translate
+        );
+        let slots = rune_slots(&[("getAlbum", None), ("getArtist", None)], false);
+        assert_eq!(
+            crate::messages::FetchCollectionByIdsRequest::slot(&slots),
+            hidden()
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_groups_hide_only_when_no_kind_can_be_listed() {
+        let one = rune_slots(&[("getAlbumList2", None)], false);
+        assert_eq!(
+            FetchCollectionGroupSummaryRequest::slot(&one),
+            Slot::Translate
+        );
+        assert_eq!(FetchCollectionGroupsRequest::slot(&one), Slot::Translate);
+        let both = rune_slots(&[("getAlbumList2", None), ("getArtists", None)], false);
+        assert_eq!(FetchCollectionGroupSummaryRequest::slot(&both), hidden());
+        assert_eq!(FetchCollectionGroupsRequest::slot(&both), hidden());
+
+        // With one endpoint missing, the kind that needs it is refused at run time.
+        let root = TempDir::new().unwrap();
+        let binding = SubsonicBinding::new(
+            Arc::new(InMemoryCatalog),
+            SubsonicProbe {
+                api_version: "1.16.1".into(),
+                open_subsonic: true,
+                server_type: None,
+                server_version: None,
+                extensions: Vec::new(),
+                roles: SubsonicRoles::default(),
+                roles_known: true,
+            },
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            false,
+            Arc::new(CountingBroadcaster(Arc::new(AtomicUsize::new(0)))),
+        )
+        .with_rune_service(Some(descriptor(&[("getArtists", None)])));
+        let error = fetch_collection_group_summary_request(
+            &binding,
+            &FetchCollectionGroupSummaryRequest {
+                collection_type: CollectionType::Artist,
+                call_id: None,
+            },
+        )
+        .await
+        .err()
+        .expect("artists are refused");
+        assert!(matches!(
+            error.downcast_ref::<ExpectedRequestError>(),
+            Some(ExpectedRequestError::Unsupported {
+                request: "getArtists",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rune_reasons_map_onto_existing_request_errors() {
+        use subsonic::{RuneReason, SubsonicServerError};
+        let error = |kind, rune_reason| {
+            subsonic_request_error(SubsonicError::Server {
+                kind,
+                message: "no".into(),
+                rune_reason: Some(rune_reason),
+            })
+        };
+        assert!(matches!(
+            error(SubsonicServerError::Generic, RuneReason::CredentialsExpired)
+                .downcast_ref::<ExpectedRequestError>(),
+            Some(ExpectedRequestError::SubsonicNotAuthorized)
+        ));
+        assert!(matches!(
+            error(SubsonicServerError::Generic, RuneReason::Removed)
+                .downcast_ref::<database::error::ExpectedError>(),
+            Some(database::error::ExpectedError::NotFound { .. })
+        ));
+        for reason in [
+            RuneReason::NotSubscribed,
+            RuneReason::Region,
+            RuneReason::ServiceLimit,
+            RuneReason::Other,
+        ] {
+            assert!(matches!(
+                error(SubsonicServerError::Generic, reason).downcast_ref::<ExpectedRequestError>(),
+                Some(ExpectedRequestError::UnexpectedResponse { .. })
+            ));
+        }
+    }
+
+    struct DescribedCatalog(bool);
+
+    impl subsonic::api::RuneService for DescribedCatalog {
+        fn rune_service<'a>(&'a self) -> subsonic::ApiFuture<'a, subsonic::RuneServiceDescriptor> {
+            let works = self.0;
+            Box::pin(async move {
+                if works {
+                    Ok(descriptor(&[("getLyrics", None)]))
+                } else {
+                    Err(SubsonicError::Transport("offline".into()))
+                }
+            })
+        }
+    }
+
+    impl subsonic::api::System for DescribedCatalog {}
+    impl subsonic::api::Browsing for DescribedCatalog {}
+    impl subsonic::api::Lists for DescribedCatalog {}
+    impl subsonic::api::Searching for DescribedCatalog {}
+    impl subsonic::api::Playlists for DescribedCatalog {}
+    impl subsonic::api::Annotation for DescribedCatalog {}
+    impl subsonic::api::MediaRetrieval for DescribedCatalog {}
+    impl subsonic::api::Jukebox for DescribedCatalog {}
+    impl subsonic::api::Scanning for DescribedCatalog {}
+    impl subsonic::api::RuneVisualizerFeed for DescribedCatalog {}
+
+    #[tokio::test]
+    async fn descriptor_is_read_only_from_servers_that_declare_the_extension() {
+        let probe = |declares: bool| SubsonicProbe {
+            api_version: "1.16.1".into(),
+            open_subsonic: true,
+            server_type: None,
+            server_version: None,
+            extensions: if declares {
+                vec![("runeService".into(), vec![1])]
+            } else {
+                Vec::new()
+            },
+            roles: SubsonicRoles::default(),
+            roles_known: true,
+        };
+        let described = DescribedCatalog(true);
+        assert!(
+            crate::subsonic_binding::fetch_rune_service(&described, &probe(true))
+                .await
+                .is_some_and(|descriptor| descriptor.is_unsupported("getLyrics", &[]))
+        );
+        assert!(
+            crate::subsonic_binding::fetch_rune_service(&described, &probe(false))
+                .await
+                .is_none()
+        );
+        // A failed read opens the library without a descriptor.
+        assert!(
+            crate::subsonic_binding::fetch_rune_service(&DescribedCatalog(false), &probe(true))
+                .await
+                .is_none()
+        );
+    }
+
     #[test]
     fn rejected_request_credentials_are_typed_as_not_authorized() {
         use subsonic::SubsonicServerError;
@@ -3997,6 +5099,7 @@ mod tests {
             let error = subsonic_request_error(SubsonicError::Server {
                 kind,
                 message: "rejected".into(),
+                rune_reason: None,
             });
             assert!(matches!(
                 error.downcast_ref::<ExpectedRequestError>(),
@@ -4014,6 +5117,7 @@ mod tests {
             SubsonicError::Server {
                 kind: SubsonicServerError::WrongCredentials,
                 message: "rejected".into(),
+                rune_reason: None,
             },
             PlayRequest::wire_name(),
         );

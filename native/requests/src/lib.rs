@@ -1252,6 +1252,30 @@ pub fn define_request_types(_input: TokenStream) -> TokenStream {
             introduced_minor: None,
             receiver: RequestReceiver::Library,
         },
+        RequestResponse {
+            request: "LibraryLoginMethodsRequest".to_string(),
+            response: Some("LibraryLoginMethodsResponse".to_string()),
+            scope: RequestScope::Node,
+            access: RequestAccess::NodeLocal,
+            introduced_minor: None,
+            receiver: RequestReceiver::NodeLoop,
+        },
+        RequestResponse {
+            request: "StartLibraryLoginRequest".to_string(),
+            response: Some("StartLibraryLoginResponse".to_string()),
+            scope: RequestScope::Node,
+            access: RequestAccess::NodeLocal,
+            introduced_minor: None,
+            receiver: RequestReceiver::NodeLoop,
+        },
+        RequestResponse {
+            request: "CompleteLibraryLoginRequest".to_string(),
+            response: Some("CompleteLibraryLoginResponse".to_string()),
+            scope: RequestScope::Node,
+            access: RequestAccess::NodeLocal,
+            introduced_minor: None,
+            receiver: RequestReceiver::NodeLoop,
+        },
     ];
 
     let (with_response, without_response): (Vec<_>, Vec<_>) =

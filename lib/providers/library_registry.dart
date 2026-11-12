@@ -63,6 +63,17 @@ class LibraryRegistryProvider extends ChangeNotifier {
       String username,
       String password,
     )? replaceCredential,
+    Future<LibraryLoginMethodsResponse> Function(String recordId)? loginMethods,
+    Future<StartLibraryLoginResponse> Function(
+      String recordId,
+      LibraryLoginMethod method,
+    )? startLogin,
+    Future<CompleteLibraryLoginResponse> Function(
+      String recordId,
+      LibraryLoginMethod method,
+      String? token,
+      String? developerToken,
+    )? completeLogin,
     Future<RegisterLibraryResponse> Function(
       String path,
       String alias,
@@ -77,6 +88,9 @@ class LibraryRegistryProvider extends ChangeNotifier {
   }) : _loadRecords = loadRecords,
        _openRecord = openRecord,
        _replaceCredential = replaceCredential,
+       _loginMethods = loginMethods,
+       _startLogin = startLogin,
+       _completeLogin = completeLogin,
        _registerLocal = registerLocal,
        _registerRemote = registerRemote,
        _closeRecord = closeRecord,
@@ -105,6 +119,19 @@ class LibraryRegistryProvider extends ChangeNotifier {
   final Future<OpenLibraryResponse> Function(String, int)? _openRecord;
   final Future<ReplaceSubsonicCredentialResponse> Function(String, String, String)?
   _replaceCredential;
+  final Future<LibraryLoginMethodsResponse> Function(String)? _loginMethods;
+  final Future<StartLibraryLoginResponse> Function(
+    String,
+    LibraryLoginMethod,
+  )?
+  _startLogin;
+  final Future<CompleteLibraryLoginResponse> Function(
+    String,
+    LibraryLoginMethod,
+    String?,
+    String?,
+  )?
+  _completeLogin;
   final Future<RegisterLibraryResponse> Function(
     String,
     String,
@@ -196,6 +223,32 @@ class LibraryRegistryProvider extends ChangeNotifier {
       _replaceCredential == null
           ? library_api.replaceSubsonicCredential(recordId, username, password)
           : _replaceCredential(recordId, username, password);
+
+  Future<LibraryLoginMethodsResponse> libraryLoginMethods(String recordId) =>
+      _loginMethods == null
+      ? library_api.libraryLoginMethods(recordId)
+      : _loginMethods(recordId);
+
+  Future<StartLibraryLoginResponse> startLibraryLogin(
+    String recordId,
+    LibraryLoginMethod method,
+  ) => _startLogin == null
+      ? library_api.startLibraryLogin(recordId, method)
+      : _startLogin(recordId, method);
+
+  Future<CompleteLibraryLoginResponse> completeLibraryLogin(
+    String recordId,
+    LibraryLoginMethod method, {
+    String? token,
+    String? developerToken,
+  }) => _completeLogin == null
+      ? library_api.completeLibraryLogin(
+          recordId: recordId,
+          method: method,
+          token: token,
+          developerToken: developerToken,
+        )
+      : _completeLogin(recordId, method, token, developerToken);
 
   Future<RegisterLibraryResponse> registerLocalFolder(
     String path,

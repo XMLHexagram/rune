@@ -127,6 +127,118 @@ pub struct ReplaceSubsonicCredentialResponse {
     pub call_id: Option<u64>,
 }
 
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LibraryLoginMethod {
+    Password,
+    Platform,
+    Browser,
+    DeviceCode,
+    /// A method a newer server offers that this app does not know.
+    Other,
+}
+
+impl From<LibraryLoginMethod> for subsonic::RuneLoginMethod {
+    fn from(value: LibraryLoginMethod) -> Self {
+        match value {
+            LibraryLoginMethod::Password => Self::Password,
+            LibraryLoginMethod::Platform => Self::Platform,
+            LibraryLoginMethod::Browser => Self::Browser,
+            LibraryLoginMethod::DeviceCode => Self::DeviceCode,
+            LibraryLoginMethod::Other => Self::Other,
+        }
+    }
+}
+
+impl From<subsonic::RuneLoginMethod> for LibraryLoginMethod {
+    fn from(value: subsonic::RuneLoginMethod) -> Self {
+        match value {
+            subsonic::RuneLoginMethod::Password => Self::Password,
+            subsonic::RuneLoginMethod::Platform => Self::Platform,
+            subsonic::RuneLoginMethod::Browser => Self::Browser,
+            subsonic::RuneLoginMethod::DeviceCode => Self::DeviceCode,
+            subsonic::RuneLoginMethod::Other => Self::Other,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LibraryLoginFailure {
+    InvalidRecord,
+    Unsupported,
+    Rejected,
+    Unreachable,
+    Storage,
+}
+
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Debug, PartialEq, Eq)]
+pub enum LibraryLoginStart {
+    Platform,
+    Browser {
+        url: String,
+        state: String,
+    },
+    DeviceCode {
+        user_code: String,
+        verification_url: String,
+        interval_secs: u32,
+    },
+    Other,
+}
+
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct LibraryLoginMethodsRequest {
+    pub record_id: String,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, RustSignal)]
+pub struct LibraryLoginMethodsResponse {
+    pub methods: Vec<LibraryLoginMethod>,
+    /// Platform host families that can authorize for this library's service.
+    pub hosts: Vec<String>,
+    pub service_name: Option<String>,
+    pub failure: Option<LibraryLoginFailure>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct StartLibraryLoginRequest {
+    pub record_id: String,
+    pub method: LibraryLoginMethod,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, RustSignal)]
+pub struct StartLibraryLoginResponse {
+    pub start: Option<LibraryLoginStart>,
+    pub failure: Option<LibraryLoginFailure>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, DartSignal)]
+pub struct CompleteLibraryLoginRequest {
+    pub record_id: String,
+    pub method: LibraryLoginMethod,
+    pub state: Option<String>,
+    pub code: Option<String>,
+    pub token: Option<String>,
+    pub developer_token: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, RustSignal)]
+pub struct CompleteLibraryLoginResponse {
+    /// `None` when the sign-in completed.
+    pub failure: Option<LibraryLoginFailure>,
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
 #[derive(Serialize, Deserialize, SignalPiece, Clone, Debug, PartialEq, Eq)]
 pub enum OpenDalLibraryService {
     WebDav {

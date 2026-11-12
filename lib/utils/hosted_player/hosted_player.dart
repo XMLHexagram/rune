@@ -4,14 +4,30 @@ import 'dart:convert';
 import '../../bindings/bindings.dart';
 import '../logger.dart';
 
+/// What a platform host got when the user's account on its service was authorized.
+class HostAuthorization {
+  const HostAuthorization({required this.token, this.developerToken});
+
+  final String token;
+  final String? developerToken;
+}
+
 /// A platform host that plays tracks Rune cannot stream. Commands come from the player as JSON
 /// maps, and events go back the same way.
 abstract class HostedPlayerHost {
+  /// Authorizes the user's account on the host's service, or returns null when it cannot. Without
+  /// [interactive] it must not show anything to the user.
+  Future<HostAuthorization?> authorize({bool interactive = false});
+
   void handle(
     Map<String, dynamic> command,
     void Function(Map<String, dynamic>) emit,
   );
 }
+
+/// The hosts this platform provides, by family. Platform code adds its hosts here at startup,
+/// and the player bridge and the sign-in flow both look them up.
+final Map<String, HostedPlayerHost> platformHosts = {};
 
 /// Routes the player's commands to the host registered for each family.
 ///
@@ -40,7 +56,7 @@ class HostedPlayerBridge {
         (signal) => signal.message.payload,
       ),
       send: (payload) => HostedPlayerEvent(payload: payload).sendSignalToRust(),
-      hosts: hosts,
+      hosts: hosts.isEmpty ? platformHosts : hosts,
     );
   }
 

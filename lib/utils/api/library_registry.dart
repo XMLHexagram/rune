@@ -21,6 +21,55 @@ Future<ReplaceSubsonicCredentialResponse> replaceSubsonicCredential(
   return response.message;
 }
 
+Future<LibraryLoginMethodsResponse> libraryLoginMethods(
+  String recordId,
+) async {
+  final response = await awaitResponse(
+    'LibraryLoginMethodsRequest',
+    LibraryLoginMethodsResponse.rustSignalStream,
+    timeout: _timeout,
+    send: () =>
+        LibraryLoginMethodsRequest(recordId: recordId).sendSignalToRust(),
+  );
+  return response.message;
+}
+
+Future<StartLibraryLoginResponse> startLibraryLogin(
+  String recordId,
+  LibraryLoginMethod method,
+) async {
+  final response = await awaitResponse(
+    'StartLibraryLoginRequest',
+    StartLibraryLoginResponse.rustSignalStream,
+    timeout: _timeout,
+    send: () => StartLibraryLoginRequest(
+      recordId: recordId,
+      method: method,
+    ).sendSignalToRust(),
+  );
+  return response.message;
+}
+
+Future<CompleteLibraryLoginResponse> completeLibraryLogin({
+  required String recordId,
+  required LibraryLoginMethod method,
+  String? token,
+  String? developerToken,
+}) async {
+  final response = await awaitResponse(
+    'CompleteLibraryLoginRequest',
+    CompleteLibraryLoginResponse.rustSignalStream,
+    timeout: _timeout,
+    send: () => CompleteLibraryLoginRequest(
+      recordId: recordId,
+      method: method,
+      token: token,
+      developerToken: developerToken,
+    ).sendSignalToRust(),
+  );
+  return response.message;
+}
+
 Future<ListPeerLibrariesResponse> listPeerLibraries(String fingerprint) async {
   final response = awaitResponse(
     'ListPeerLibrariesRequest',

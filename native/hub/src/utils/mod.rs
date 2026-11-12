@@ -73,8 +73,10 @@ use crate::messages::*;
 use crate::request_error::ExpectedRequestError;
 use crate::request_owner::Implementation;
 use crate::server::ServerManager;
-use crate::subsonic_binding::SubsonicBinding;
-use subsonic::{SubsonicClient, SubsonicCredentials, SubsonicError, SubsonicServerError};
+use crate::subsonic_binding::{SubsonicBinding, fetch_rune_service};
+use subsonic::{
+    SubsonicApi, SubsonicClient, SubsonicCredentials, SubsonicError, SubsonicServerError,
+};
 use url::Url;
 
 #[cfg(target_os = "android")]
@@ -854,6 +856,56 @@ impl NodeRequestHandlers for ProductionNodeRequestHandlers {
             };
             Ok(Some(ReplaceSubsonicCredentialResponse {
                 result,
+                call_id: request.call_id,
+            }))
+        }
+    }
+
+    fn handle_library_login_methods_request(
+        &self,
+        node: &NodeSlot,
+        request: &LibraryLoginMethodsRequest,
+    ) -> impl Future<Output = Result<Option<LibraryLoginMethodsResponse>>> + Send {
+        async move {
+            let mut response = match node.current().await {
+                Ok(node) => library_login_methods_on_node(request, &node).await,
+                Err(_) => LibraryLoginMethodsResponse::failed(LibraryLoginFailure::Storage),
+            };
+            response.call_id = request.call_id;
+            Ok(Some(response))
+        }
+    }
+
+    fn handle_start_library_login_request(
+        &self,
+        node: &NodeSlot,
+        request: &StartLibraryLoginRequest,
+    ) -> impl Future<Output = Result<Option<StartLibraryLoginResponse>>> + Send {
+        async move {
+            let result = match node.current().await {
+                Ok(node) => start_library_login_on_node(request, &node).await,
+                Err(_) => Err(LibraryLoginFailure::Storage),
+            };
+            Ok(Some(StartLibraryLoginResponse {
+                start: result.as_ref().ok().cloned(),
+                failure: result.err(),
+                call_id: request.call_id,
+            }))
+        }
+    }
+
+    fn handle_complete_library_login_request(
+        &self,
+        node: &NodeSlot,
+        request: &CompleteLibraryLoginRequest,
+    ) -> impl Future<Output = Result<Option<CompleteLibraryLoginResponse>>> + Send {
+        async move {
+            let result = match node.current().await {
+                Ok(node) => complete_library_login_on_node(request, &node).await,
+                Err(_) => Err(LibraryLoginFailure::Storage),
+            };
+            Ok(Some(CompleteLibraryLoginResponse {
+                failure: result.err(),
                 call_id: request.call_id,
             }))
         }
@@ -1779,6 +1831,246 @@ pub(crate) async fn replace_subsonic_credential_on_node(
     }
 }
 
+impl LibraryLoginMethodsResponse {
+    fn failed(failure: LibraryLoginFailure) -> Self {
+        Self {
+            methods: Vec::new(),
+            hosts: Vec::new(),
+            service_name: None,
+            failure: Some(failure),
+            call_id: None,
+        }
+    }
+}
+
+fn login_failure(error: &SubsonicError) -> LibraryLoginFailure {
+    match error {
+        SubsonicError::Unsupported { .. } => LibraryLoginFailure::Unsupported,
+        // A server without the extension does not route its endpoints.
+        SubsonicError::HttpStatus(status) if matches!(status.as_u16(), 404 | 405 | 501) => {
+            LibraryLoginFailure::Unsupported
+        }
+        SubsonicError::Transport(_) | SubsonicError::HttpStatus(_) => {
+            LibraryLoginFailure::Unreachable
+        }
+        _ => LibraryLoginFailure::Rejected,
+    }
+}
+
+/// Records whose endpoint uses this scheme are servers that run inside the app. Only they may
+/// receive platform tokens, which must never be sent to a remote server.
+const IN_PROCESS_SCHEME: &str = "rune-service://";
+
+struct RecordApi {
+    api: Arc<dyn SubsonicApi>,
+    /// The open binding, when the record is the open library.
+    binding: Option<Arc<SubsonicBinding>>,
+    in_process: bool,
+}
+
+/// The API of a Subsonic library record. The open library's own instance is reused, because a
+/// server that lives in this process keeps its tokens there.
+async fn subsonic_api_for_record(
+    node: &Arc<NodeContext>,
+    record_id: &str,
+) -> StdResult<RecordApi, LibraryLoginFailure> {
+    let record_id = Uuid::parse_str(record_id)
+        .map(LibraryRecordId)
+        .map_err(|_| LibraryLoginFailure::InvalidRecord)?;
+    let record = LibraryRegistry::load(Path::new(&*node.config_path))
+        .and_then(|registry| registry.record(record_id).cloned())
+        .map_err(|_| LibraryLoginFailure::InvalidRecord)?;
+    let ProtocolAdapter::SubsonicTranslate {
+        endpoint,
+        credential,
+        ..
+    } = &record.protocol
+    else {
+        return Err(LibraryLoginFailure::InvalidRecord);
+    };
+    let in_process = endpoint.starts_with(IN_PROCESS_SCHEME);
+    if let Some(binding) = node
+        .subsonic_binding_for_record(record_id)
+        .map_err(|_| LibraryLoginFailure::Storage)?
+    {
+        return Ok(RecordApi {
+            api: Arc::clone(&binding.client),
+            binding: Some(binding),
+            in_process,
+        });
+    }
+    // No in-process server exists yet to hand out for such records.
+    if in_process {
+        return Err(LibraryLoginFailure::Unsupported);
+    }
+    let endpoint =
+        validate_subsonic_endpoint(endpoint).map_err(|()| LibraryLoginFailure::InvalidRecord)?;
+    let credential = node
+        .credentials
+        .get(*credential)
+        .await
+        .map_err(|_| LibraryLoginFailure::Storage)?;
+    let password = String::from_utf8(credential.secret.as_bytes().to_vec())
+        .map_err(|_| LibraryLoginFailure::Storage)?;
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| LibraryLoginFailure::Storage)?;
+    let client = SubsonicClient::new(
+        endpoint,
+        SubsonicCredentials::Password {
+            user: credential.username,
+            password,
+        },
+        http,
+    );
+    Ok(RecordApi {
+        api: Arc::new(client),
+        binding: None,
+        in_process: false,
+    })
+}
+
+pub(crate) async fn library_login_methods_on_node(
+    request: &LibraryLoginMethodsRequest,
+    node: &Arc<NodeContext>,
+) -> LibraryLoginMethodsResponse {
+    let RecordApi {
+        api,
+        binding,
+        in_process,
+    } = match subsonic_api_for_record(node, &request.record_id).await {
+        Ok(found) => found,
+        Err(failure) => return LibraryLoginMethodsResponse::failed(failure),
+    };
+    // The extension list is public, so a plain server is recognized without an authenticated
+    // call that could fail for the very reason the user is signing in again.
+    let declares_service = match &binding {
+        Some(binding) => binding.probe.supports_rune_service(),
+        None => match timeout(Duration::from_secs(5), api.extensions()).await {
+            Err(_) => {
+                return LibraryLoginMethodsResponse::failed(LibraryLoginFailure::Unreachable);
+            }
+            Ok(Err(error)) => return LibraryLoginMethodsResponse::failed(login_failure(&error)),
+            Ok(Ok(extensions)) => extensions
+                .iter()
+                .any(|(name, versions)| name == "runeService" && versions.contains(&1)),
+        },
+    };
+    if !declares_service {
+        return LibraryLoginMethodsResponse {
+            methods: vec![LibraryLoginMethod::Password],
+            hosts: Vec::new(),
+            service_name: None,
+            failure: None,
+            call_id: None,
+        };
+    }
+    let descriptor = match binding.as_ref().and_then(|binding| binding.rune_service()) {
+        Some(descriptor) => descriptor,
+        None => match timeout(Duration::from_secs(5), api.rune_service()).await {
+            Err(_) => {
+                return LibraryLoginMethodsResponse::failed(LibraryLoginFailure::Unreachable);
+            }
+            Ok(Err(error)) => return LibraryLoginMethodsResponse::failed(login_failure(&error)),
+            Ok(Ok(descriptor)) => descriptor,
+        },
+    };
+    LibraryLoginMethodsResponse {
+        methods: descriptor
+            .login
+            .methods
+            .iter()
+            .map(|method| LibraryLoginMethod::from(*method))
+            .filter(|method| in_process || *method != LibraryLoginMethod::Platform)
+            .collect(),
+        hosts: descriptor.hosts,
+        service_name: Some(descriptor.name).filter(|name| !name.is_empty()),
+        failure: None,
+        call_id: None,
+    }
+}
+
+pub(crate) async fn start_library_login_on_node(
+    request: &StartLibraryLoginRequest,
+    node: &Arc<NodeContext>,
+) -> StdResult<LibraryLoginStart, LibraryLoginFailure> {
+    // Passwords go through the credential replacement request.
+    if matches!(request.method, LibraryLoginMethod::Password) {
+        return Err(LibraryLoginFailure::Unsupported);
+    }
+    let found = subsonic_api_for_record(node, &request.record_id).await?;
+    if !found.in_process && matches!(request.method, LibraryLoginMethod::Platform) {
+        return Err(LibraryLoginFailure::Unsupported);
+    }
+    let start = timeout(
+        Duration::from_secs(10),
+        found.api.start_rune_login(request.method.into()),
+    )
+    .await
+    .map_err(|_| LibraryLoginFailure::Unreachable)?
+    .map_err(|error| login_failure(&error))?;
+    Ok(match start {
+        subsonic::RuneLoginStart::Platform => LibraryLoginStart::Platform,
+        subsonic::RuneLoginStart::Browser { url, state } => {
+            LibraryLoginStart::Browser { url, state }
+        }
+        subsonic::RuneLoginStart::DeviceCode {
+            user_code,
+            verification_url,
+            interval_secs,
+        } => LibraryLoginStart::DeviceCode {
+            user_code,
+            verification_url,
+            interval_secs,
+        },
+        subsonic::RuneLoginStart::Other => LibraryLoginStart::Other,
+    })
+}
+
+pub(crate) async fn complete_library_login_on_node(
+    request: &CompleteLibraryLoginRequest,
+    node: &Arc<NodeContext>,
+) -> StdResult<(), LibraryLoginFailure> {
+    if matches!(request.method, LibraryLoginMethod::Password) {
+        return Err(LibraryLoginFailure::Unsupported);
+    }
+    let found = subsonic_api_for_record(node, &request.record_id).await?;
+    // Platform tokens belong to this device and only go to servers inside this app.
+    if !found.in_process
+        && (matches!(request.method, LibraryLoginMethod::Platform)
+            || request.token.is_some()
+            || request.developer_token.is_some())
+    {
+        return Err(LibraryLoginFailure::Unsupported);
+    }
+    let completion = subsonic::RuneLoginCompletion {
+        method: request.method.into(),
+        state: request.state.clone(),
+        code: request.code.clone(),
+        token: request.token.clone(),
+        developer_token: request.developer_token.clone(),
+    };
+    timeout(
+        Duration::from_secs(10),
+        found.api.complete_rune_login(&completion),
+    )
+    .await
+    .map_err(|_| LibraryLoginFailure::Unreachable)?
+    .map_err(|error| login_failure(&error))?;
+    // A new sign-in can change what the service offers.
+    if let Some(binding) = found.binding
+        && let Some(descriptor) = fetch_rune_service(&*binding.client, &binding.probe).await
+    {
+        binding.set_rune_service(Some(descriptor));
+        if let Err(error) = node.publish_capabilities() {
+            log::warn!("Could not publish capabilities after sign-in: {error:#}");
+        }
+    }
+    Ok(())
+}
+
 fn validate_subsonic_endpoint(raw: &str) -> Result<Url, ()> {
     let endpoint = Url::parse(raw).map_err(|_| ())?;
     if !matches!(endpoint.scheme(), "http" | "https")
@@ -2083,6 +2375,9 @@ async fn open_subsonic_record(
         Ok(Err(error)) => {
             let kind = match error {
                 SubsonicError::Transport(_) => OpenLibraryFailureKind::RemoteUnreachable,
+                error if error.is_rune_credentials_expired() => {
+                    OpenLibraryFailureKind::RemoteNotAuthorized
+                }
                 SubsonicError::Server {
                     kind:
                         SubsonicServerError::WrongCredentials
@@ -2102,14 +2397,18 @@ async fn open_subsonic_record(
             return Err((kind, anyhow::anyhow!(detail)));
         }
     };
-    let binding = Arc::new(SubsonicBinding::new(
-        Arc::new(client),
-        probe,
-        Path::new(&*node.config_path).to_path_buf(),
-        library_id,
-        play_on_this_device,
-        Arc::clone(&node.gui_broadcaster),
-    ));
+    let rune_service = fetch_rune_service(&client, &probe).await;
+    let binding = Arc::new(
+        SubsonicBinding::new(
+            Arc::new(client),
+            probe,
+            Path::new(&*node.config_path).to_path_buf(),
+            library_id,
+            play_on_this_device,
+            Arc::clone(&node.gui_broadcaster),
+        )
+        .with_rune_service(rune_service),
+    );
     node.set_open_subsonic_catalog(Some(record_id), binding)
         .map_err(|error| (OpenLibraryFailureKind::Storage, error))
 }
@@ -2160,6 +2459,9 @@ pub(crate) async fn subsonic_binding_for_playback(
         .map_err(|error| match error {
             SubsonicError::Transport(_) | SubsonicError::HttpStatus(_) => {
                 anyhow::Error::new(RemoteAudioError::unreachable("Subsonic server unreachable"))
+            }
+            error if error.is_rune_credentials_expired() => {
+                anyhow::Error::new(RemoteAudioError::CredentialsRejected)
             }
             SubsonicError::Server {
                 kind:

@@ -41,6 +41,12 @@ LibraryRegistryProvider _registry({required bool succeed}) {
       callId,
       authorized: attempts++ > 0,
     ),
+    loginMethods: (_) async => const LibraryLoginMethodsResponse(
+      methods: [LibraryLoginMethod.password],
+      hosts: [],
+      serviceName: null,
+      failure: null,
+    ),
     replaceCredential: (_, _, _) async => ReplaceSubsonicCredentialResponse(
       result: succeed
           ? ReplaceSubsonicCredentialResult.updated

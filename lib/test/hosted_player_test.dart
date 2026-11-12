@@ -8,6 +8,9 @@ class _RecordingHost implements HostedPlayerHost {
   final commands = <Map<String, dynamic>>[];
 
   @override
+  Future<HostAuthorization?> authorize({bool interactive = false}) async => null;
+
+  @override
   void handle(
     Map<String, dynamic> command,
     void Function(Map<String, dynamic>) emit,

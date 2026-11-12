@@ -1,4 +1,5 @@
 use crate::{
+    macros::RequestSlots,
     messages::{
         LibraryContentChanged, PlaybackStatus, PlayingItemRef, PlaylistItem, PlaylistUpdate,
         RequestErrorKind, RequestFailedResponse, RequestFailureCause, SetRealtimeFFTEnabledRequest,
@@ -83,11 +84,35 @@ impl SubsonicIdMap {
     }
 }
 
+/// Read the service descriptor of a server that declares `runeService`. A failure is logged and
+/// the library opens without one.
+pub(crate) async fn fetch_rune_service(
+    client: &dyn SubsonicApi,
+    probe: &subsonic::SubsonicProbe,
+) -> Option<subsonic::RuneServiceDescriptor> {
+    if !probe.supports_rune_service() {
+        return None;
+    }
+    match tokio::time::timeout(Duration::from_secs(5), client.rune_service()).await {
+        Ok(Ok(descriptor)) => Some(descriptor),
+        Ok(Err(error)) => {
+            log::warn!("Could not read the Subsonic service descriptor: {error}");
+            None
+        }
+        Err(_) => {
+            log::warn!("Reading the Subsonic service descriptor timed out");
+            None
+        }
+    }
+}
+
 pub(crate) struct SubsonicBinding {
     pub(crate) library_id: Uuid,
     pub(crate) play_on_this_device: bool,
     pub(crate) client: Arc<dyn SubsonicApi>,
     pub(crate) probe: subsonic::SubsonicProbe,
+    /// What the service behind a `runeService` server says about itself, read once on open.
+    rune_service: Mutex<Option<subsonic::RuneServiceDescriptor>>,
     pub(crate) catalog: Mutex<SubsonicCatalog>,
     pub(crate) covers: Arc<SubsonicCoverCache>,
     jukebox_poll: Mutex<Option<CancellationToken>>,
@@ -333,6 +358,8 @@ pub(crate) struct SubsonicCatalog {
     pub(crate) artists: HashMap<i32, SubsonicArtist>,
     pub(crate) albums: HashMap<i32, SubsonicAlbum>,
     pub(crate) songs: HashMap<i32, SubsonicSong>,
+    /// What the server last said about editing each playlist, when it says.
+    pub(crate) playlist_edits: HashMap<i32, subsonic::RuneEdit>,
     pub(crate) artists_loaded: bool,
     pub(crate) albums_loaded: bool,
 }
@@ -351,6 +378,7 @@ impl SubsonicBinding {
             play_on_this_device,
             client,
             probe,
+            rune_service: Mutex::new(None),
             catalog: Mutex::new(SubsonicCatalog::default()),
             covers: Arc::new(SubsonicCoverCache {
                 root: config_dir
@@ -366,6 +394,47 @@ impl SubsonicBinding {
             playback_starts: Mutex::new(HashMap::new()),
             visualizer_feed: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn with_rune_service(
+        self,
+        rune_service: Option<subsonic::RuneServiceDescriptor>,
+    ) -> Self {
+        self.set_rune_service(rune_service);
+        self
+    }
+
+    pub(crate) fn rune_service(&self) -> Option<subsonic::RuneServiceDescriptor> {
+        self.rune_service
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_rune_service(&self, rune_service: Option<subsonic::RuneServiceDescriptor>) {
+        *self
+            .rune_service
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = rune_service;
+    }
+
+    /// Whether the service says a call to `endpoint` sending `params` is not available.
+    pub(crate) fn rune_unsupported(&self, endpoint: &str, params: &[&str]) -> bool {
+        self.rune_service()
+            .is_some_and(|descriptor| descriptor.is_unsupported(endpoint, params))
+    }
+
+    /// The slots of this library: the Subsonic ones, minus what the service says it cannot do.
+    pub(crate) fn slots(&self) -> RequestSlots {
+        let mut slots = RequestSlots::subsonic(&self.probe);
+        if let Some(descriptor) = self.rune_service() {
+            slots.hide_rune_unsupported(&descriptor, self.has_extension("songLyrics"));
+        }
+        slots
+    }
+
+    fn has_extension(&self, name: &str) -> bool {
+        self.probe.extensions.iter().any(|(known, _)| known == name)
     }
 
     pub(crate) fn start_jukebox_polling(self: &Arc<Self>) {
@@ -627,15 +696,17 @@ impl SubsonicBinding {
         }
         if let Err(error) = self.client.scrobble(track_id, time, submission).await {
             log::warn!("Subsonic scrobble failed: {error:?}");
-            if matches!(
-                error,
-                subsonic::SubsonicError::Server {
-                    kind: subsonic::SubsonicServerError::WrongCredentials
-                        | subsonic::SubsonicServerError::NotAuthorized
-                        | subsonic::SubsonicServerError::InvalidApiKey,
-                    ..
-                }
-            ) {
+            if error.is_rune_credentials_expired()
+                || matches!(
+                    error,
+                    subsonic::SubsonicError::Server {
+                        kind: subsonic::SubsonicServerError::WrongCredentials
+                            | subsonic::SubsonicServerError::NotAuthorized
+                            | subsonic::SubsonicServerError::InvalidApiKey,
+                        ..
+                    }
+                )
+            {
                 self.covers.broadcaster.broadcast(&RequestFailedResponse {
                     request: "Subsonic scrobble".into(),
                     call_id: None,
@@ -848,6 +919,9 @@ fn subsonic_playback_error(error: subsonic::SubsonicError) -> anyhow::Error {
     match error {
         subsonic::SubsonicError::Transport(_) | subsonic::SubsonicError::HttpStatus(_) => {
             anyhow::Error::new(RemoteAudioError::unreachable("Subsonic server unreachable"))
+        }
+        error if error.is_rune_credentials_expired() => {
+            anyhow::Error::new(RemoteAudioError::CredentialsRejected)
         }
         subsonic::SubsonicError::Server {
             kind:

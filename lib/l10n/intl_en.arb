@@ -1734,6 +1734,22 @@
   "subsonicSubtitle": "Connect to a Subsonic music server.",
   "playOnThisDevice": "Play on This Device",
   "controlServerPlayer": "Control the Server's Player",
-  "howDoYouWantToUseIt": "How do you want to use it?"
-
+  "howDoYouWantToUseIt": "How do you want to use it?",
+  "signInAgain": "Sign In Again",
+  "@signInAgain": {
+    "description": "The title and confirm button of the dialog shown when Rune could not renew a library's sign-in by itself."
+  },
+  "signInAgainSubtitle": "Rune could not sign in to {service} automatically. Sign in again to keep using this library.",
+  "@signInAgainSubtitle": {
+    "description": "Explains why the sign-in dialog appeared for a library of an online service.",
+    "placeholders": {
+      "service": {
+        "type": "String"
+      }
+    }
+  },
+  "signInMethodUnsupported": "This library needs a sign-in method that this version of Rune does not support.",
+  "@signInMethodUnsupported": {
+    "description": "Shown when a library's server only offers sign-in methods this app cannot perform."
+  }
 }

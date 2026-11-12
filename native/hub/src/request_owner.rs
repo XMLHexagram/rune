@@ -192,7 +192,7 @@ impl Implementation {
                 slots
             }
             Self::RunePeer { .. } => RequestSlots::rune(),
-            Self::Subsonic(binding) => RequestSlots::subsonic(&binding.probe),
+            Self::Subsonic(binding) => binding.slots(),
             #[cfg(test)]
             Self::TestOverride { slots, .. } => *slots,
         }

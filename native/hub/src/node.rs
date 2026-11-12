@@ -932,6 +932,25 @@ impl NodeContext {
         })
     }
 
+    /// The open Subsonic binding, when it belongs to the library record `record_id`.
+    pub(crate) fn subsonic_binding_for_record(
+        &self,
+        record_id: LibraryRecordId,
+    ) -> Result<Option<Arc<SubsonicBinding>>> {
+        let ui = self
+            .ui_library
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UI library lock poisoned"))?;
+        Ok(match &*ui {
+            UiLibrary::Open(OpenLibraryState {
+                record_id: Some(open_id),
+                catalog: LibraryBinding::Subsonic(binding),
+                ..
+            }) if *open_id == record_id => Some(Arc::clone(binding)),
+            _ => None,
+        })
+    }
+
     pub(crate) fn open_subsonic_binding(&self) -> Result<Option<Arc<SubsonicBinding>>> {
         let ui = self
             .ui_library

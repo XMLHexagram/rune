@@ -1073,6 +1073,338 @@ async fn subsonic_relogin_replaces_only_a_verified_secret() -> Result<()> {
     Ok(())
 }
 
+struct LoginApi {
+    descriptor: StdMutex<subsonic::RuneServiceDescriptor>,
+    completions: StdMutex<Vec<subsonic::RuneLoginCompletion>>,
+    reject: AtomicBool,
+}
+
+impl subsonic::api::RuneService for LoginApi {
+    fn rune_service<'a>(&'a self) -> subsonic::ApiFuture<'a, subsonic::RuneServiceDescriptor> {
+        Box::pin(async move { Ok(self.descriptor.lock().unwrap().clone()) })
+    }
+
+    fn start_rune_login<'a>(
+        &'a self,
+        method: subsonic::RuneLoginMethod,
+    ) -> subsonic::ApiFuture<'a, subsonic::RuneLoginStart> {
+        Box::pin(async move {
+            Ok(match method {
+                subsonic::RuneLoginMethod::Browser => subsonic::RuneLoginStart::Browser {
+                    url: "https://example.test/login".into(),
+                    state: "st".into(),
+                },
+                _ => subsonic::RuneLoginStart::Platform,
+            })
+        })
+    }
+
+    fn complete_rune_login<'a>(
+        &'a self,
+        completion: &'a subsonic::RuneLoginCompletion,
+    ) -> subsonic::ApiFuture<'a, ()> {
+        Box::pin(async move {
+            self.completions.lock().unwrap().push(completion.clone());
+            if self.reject.load(Ordering::SeqCst) {
+                return Err(subsonic::SubsonicError::Server {
+                    kind: subsonic::SubsonicServerError::NotAuthorized,
+                    message: "token rejected".into(),
+                    rune_reason: Some(subsonic::RuneReason::CredentialsExpired),
+                });
+            }
+            Ok(())
+        })
+    }
+}
+
+impl subsonic::api::System for LoginApi {}
+impl subsonic::api::Browsing for LoginApi {}
+impl subsonic::api::Lists for LoginApi {}
+impl subsonic::api::Searching for LoginApi {}
+impl subsonic::api::Playlists for LoginApi {}
+impl subsonic::api::Annotation for LoginApi {}
+impl subsonic::api::MediaRetrieval for LoginApi {}
+impl subsonic::api::Jukebox for LoginApi {}
+impl subsonic::api::Scanning for LoginApi {}
+impl subsonic::api::RuneVisualizerFeed for LoginApi {}
+
+/// A server that answers the public endpoints, declares `runeService` or not, and fails
+/// `getRuneService`. Every requested action is recorded.
+async fn extensions_mock(declares_service: bool) -> (String, Arc<StdMutex<Vec<String>>>, JoinHandle<()>) {
+    #[derive(Clone)]
+    struct State_(bool, Arc<StdMutex<Vec<String>>>);
+    async fn answer(
+        AxumPath(action): AxumPath<String>,
+        State(state): State<State_>,
+    ) -> impl IntoResponse {
+        let action = action.strip_suffix(".view").unwrap_or(&action).to_owned();
+        state.1.lock().unwrap().push(action.clone());
+        let body = match action.as_str() {
+            "getOpenSubsonicExtensions" if state.0 => json!({"subsonic-response":{"status":"ok","version":"1.16.1","openSubsonicExtensions":[{"name":"runeService","versions":[1]}]}}),
+            "getOpenSubsonicExtensions" => json!({"subsonic-response":{"status":"ok","version":"1.16.1","openSubsonicExtensions":[{"name":"songLyrics","versions":[1]}]}}),
+            "ping" => json!({"subsonic-response":{"status":"ok","version":"1.16.1","openSubsonic":true}}),
+            _ => json!({"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":40,"message":"no"}}}),
+        };
+        (StatusCode::OK, axum::Json(body))
+    }
+    let calls = Arc::new(StdMutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/rest/{*action}", get(answer))
+        .with_state(State_(declares_service, calls.clone()));
+    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{address}"), calls, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_login_requests_use_the_open_api_and_keep_platform_tokens_in_process() -> Result<()> {
+    use crate::messages::{
+        CompleteLibraryLoginRequest, LibraryLoginFailure, LibraryLoginMethod,
+        LibraryLoginMethodsRequest, LibraryLoginStart, StartLibraryLoginRequest,
+    };
+    use crate::subsonic_binding::SubsonicBinding;
+    use crate::utils::{
+        complete_library_login_on_node, library_login_methods_on_node, start_library_login_on_node,
+    };
+    use database::library_registry::{
+        CatalogPlacement, LibraryRecord, LibraryRecordId, LibraryRegistry, ProtocolAdapter,
+        SubsonicOpenMode,
+    };
+
+    let dir = tempfile::tempdir()?;
+    let fixture = super::fixture(dir.path()).await?;
+    let node = fixture.global_params.node.clone();
+    let (plain_endpoint, plain_calls, plain_server) = extensions_mock(false).await;
+    let (service_endpoint, service_calls, service_server) = extensions_mock(true).await;
+    let credential = node
+        .credentials
+        .put(Credential {
+            username: "alice".into(),
+            secret: Secret::new(b"password".to_vec()),
+        })
+        .await?;
+    let add_record = |endpoint: String| {
+        let record = LibraryRecord {
+            record_id: LibraryRecordId(Uuid::new_v4()),
+            alias: "Login".into(),
+            library_id: None,
+            protocol: ProtocolAdapter::SubsonicTranslate {
+                endpoint,
+                credential,
+                mode: SubsonicOpenMode::PlayOnThisDevice,
+            },
+            fs: Vec::new(),
+            catalog: CatalogPlacement::None,
+            background_sync: false,
+        };
+        let stored = record.clone();
+        let config = node.config_path.clone();
+        async move {
+            LibraryRegistry::update(Path::new(&*config), |registry| {
+                registry.libraries.push(stored);
+                Ok(())
+            })
+            .await?;
+            Ok::<_, anyhow::Error>(record.record_id.0.to_string())
+        }
+    };
+    let in_process_id = add_record("rune-service://appleMusic".into()).await?;
+    let remote_id = add_record("http://127.0.0.1:9".into()).await?;
+    let plain_id = add_record(plain_endpoint).await?;
+    let failing_id = add_record(service_endpoint).await?;
+
+    let api = Arc::new(LoginApi {
+        descriptor: StdMutex::new(subsonic::RuneServiceDescriptor {
+            id: "appleMusic".into(),
+            name: "Apple Music".into(),
+            login: subsonic::RuneLoginMethods {
+                methods: vec![
+                    subsonic::RuneLoginMethod::Platform,
+                    subsonic::RuneLoginMethod::Browser,
+                    subsonic::RuneLoginMethod::Other,
+                ],
+            },
+            hosts: vec!["appleMusic".into()],
+            ..Default::default()
+        }),
+        completions: StdMutex::new(Vec::new()),
+        reject: AtomicBool::new(false),
+    });
+    let probe = subsonic::SubsonicProbe {
+        api_version: "1.16.1".into(),
+        open_subsonic: true,
+        server_type: None,
+        server_version: None,
+        extensions: vec![("runeService".into(), vec![1])],
+        roles: subsonic::SubsonicRoles::default(),
+        roles_known: true,
+    };
+    let open = |record_id: &str| -> Result<Arc<SubsonicBinding>> {
+        let binding = Arc::new(
+            SubsonicBinding::new(
+                api.clone(),
+                probe.clone(),
+                dir.path().to_path_buf(),
+                Uuid::new_v4(),
+                true,
+                Arc::clone(&node.gui_broadcaster),
+            )
+            .with_rune_service(Some(api.descriptor.lock().unwrap().clone())),
+        );
+        node.set_open_subsonic_catalog(
+            Some(LibraryRecordId(Uuid::parse_str(record_id)?)),
+            binding.clone(),
+        )?;
+        Ok(binding)
+    };
+    let methods = |record_id: &str| LibraryLoginMethodsRequest {
+        record_id: record_id.into(),
+        call_id: None,
+    };
+    let start = |record_id: &str, method| StartLibraryLoginRequest {
+        record_id: record_id.into(),
+        method,
+        call_id: None,
+    };
+    let complete = |record_id: &str, method, token: Option<&str>| CompleteLibraryLoginRequest {
+        record_id: record_id.into(),
+        method,
+        state: None,
+        code: None,
+        token: token.map(Into::into),
+        developer_token: token.map(|_| "dev-token".into()),
+        call_id: None,
+    };
+
+    // A server inside the app, open: platform stays on offer and tokens may reach it.
+    let binding = open(&in_process_id)?;
+    let response = library_login_methods_on_node(&methods(&in_process_id), &node).await;
+    assert_eq!(response.failure, None);
+    assert_eq!(
+        response.methods,
+        [
+            LibraryLoginMethod::Platform,
+            LibraryLoginMethod::Browser,
+            LibraryLoginMethod::Other
+        ]
+    );
+    assert_eq!(response.hosts, ["appleMusic"]);
+    assert_eq!(response.service_name.as_deref(), Some("Apple Music"));
+    assert_eq!(
+        start_library_login_on_node(&start(&in_process_id, LibraryLoginMethod::Platform), &node)
+            .await,
+        Ok(LibraryLoginStart::Platform)
+    );
+    assert_eq!(
+        start_library_login_on_node(&start(&in_process_id, LibraryLoginMethod::Browser), &node)
+            .await,
+        Ok(LibraryLoginStart::Browser {
+            url: "https://example.test/login".into(),
+            state: "st".into(),
+        })
+    );
+    assert_eq!(
+        start_library_login_on_node(&start(&in_process_id, LibraryLoginMethod::Password), &node)
+            .await,
+        Err(LibraryLoginFailure::Unsupported)
+    );
+    // A successful sign-in refreshes what the service says it can do.
+    api.descriptor.lock().unwrap().unsupported = vec![subsonic::RuneUnsupported {
+        endpoint: "deletePlaylist".into(),
+        param: None,
+    }];
+    assert_eq!(binding.rune_service().unwrap().unsupported.len(), 0);
+    assert_eq!(
+        complete_library_login_on_node(
+            &complete(&in_process_id, LibraryLoginMethod::Platform, Some("user-token")),
+            &node
+        )
+        .await,
+        Ok(())
+    );
+    {
+        let completions = api.completions.lock().unwrap();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].token.as_deref(), Some("user-token"));
+        assert_eq!(completions[0].developer_token.as_deref(), Some("dev-token"));
+    }
+    assert_eq!(binding.rune_service().unwrap().unsupported.len(), 1);
+    api.reject.store(true, Ordering::SeqCst);
+    assert_eq!(
+        complete_library_login_on_node(
+            &complete(&in_process_id, LibraryLoginMethod::Platform, Some("user-token")),
+            &node
+        )
+        .await,
+        Err(LibraryLoginFailure::Rejected)
+    );
+    api.reject.store(false, Ordering::SeqCst);
+    api.completions.lock().unwrap().clear();
+
+    // A remote server never gets platform tokens, whatever its descriptor lists.
+    open(&remote_id)?;
+    let response = library_login_methods_on_node(&methods(&remote_id), &node).await;
+    assert_eq!(
+        response.methods,
+        [LibraryLoginMethod::Browser, LibraryLoginMethod::Other]
+    );
+    assert_eq!(
+        start_library_login_on_node(&start(&remote_id, LibraryLoginMethod::Platform), &node).await,
+        Err(LibraryLoginFailure::Unsupported)
+    );
+    for (method, token) in [
+        (LibraryLoginMethod::Platform, Some("user-token")),
+        (LibraryLoginMethod::Platform, None),
+        (LibraryLoginMethod::Browser, Some("user-token")),
+    ] {
+        assert_eq!(
+            complete_library_login_on_node(&complete(&remote_id, method, token), &node).await,
+            Err(LibraryLoginFailure::Unsupported)
+        );
+    }
+    assert!(api.completions.lock().unwrap().is_empty());
+
+    // Records that are not open: a plain server is recognized from its public extension list.
+    let response = library_login_methods_on_node(&methods(&plain_id), &node).await;
+    assert_eq!(response.failure, None);
+    assert_eq!(response.methods, [LibraryLoginMethod::Password]);
+    assert_eq!(
+        plain_calls.lock().unwrap().as_slice(),
+        ["ping", "getOpenSubsonicExtensions"]
+    );
+    // A runeService server that cannot describe itself is a failure, not a password prompt.
+    let response = library_login_methods_on_node(&methods(&failing_id), &node).await;
+    assert!(response.failure.is_some());
+    assert!(response.methods.is_empty());
+    assert!(
+        service_calls
+            .lock()
+            .unwrap()
+            .contains(&"getRuneService".to_owned())
+    );
+    // Platform is refused for these too, and bad records are typed.
+    assert_eq!(
+        complete_library_login_on_node(
+            &complete(&plain_id, LibraryLoginMethod::Platform, Some("user-token")),
+            &node
+        )
+        .await,
+        Err(LibraryLoginFailure::Unsupported)
+    );
+    assert_eq!(
+        library_login_methods_on_node(&methods("not-a-record"), &node)
+            .await
+            .failure,
+        Some(LibraryLoginFailure::InvalidRecord)
+    );
+    node.close_ui(&fixture.global_params.main_token).await;
+    plain_server.abort();
+    service_server.abort();
+    node.shutdown().await?;
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn session_threads_stop_with_node() -> Result<()> {

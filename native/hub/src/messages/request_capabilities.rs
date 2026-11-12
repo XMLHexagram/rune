@@ -175,6 +175,10 @@ pub struct RequestCapabilities {
     pub open_library_request: RequestCapability,
     pub initialize_node_request: RequestCapability,
     pub run_fs_self_test_request: RequestCapability,
+    // New fields go last so older controllers still decode the ones before them.
+    pub library_login_methods_request: RequestCapability,
+    pub start_library_login_request: RequestCapability,
+    pub complete_library_login_request: RequestCapability,
 }
 
 impl From<Slot> for RequestCapability {

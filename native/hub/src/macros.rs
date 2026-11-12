@@ -353,6 +353,43 @@ mod node_request_loop_tests {
             };
             async move { Ok(Some(response)) }
         }
+        fn handle_library_login_methods_request(
+            &self,
+            _: &NodeSlot,
+            request: &LibraryLoginMethodsRequest,
+        ) -> impl Future<Output = Result<Option<LibraryLoginMethodsResponse>>> + Send {
+            let response = LibraryLoginMethodsResponse {
+                methods: vec![LibraryLoginMethod::Password],
+                hosts: Vec::new(),
+                service_name: None,
+                failure: None,
+                call_id: request.call_id,
+            };
+            async move { Ok(Some(response)) }
+        }
+        fn handle_start_library_login_request(
+            &self,
+            _: &NodeSlot,
+            request: &StartLibraryLoginRequest,
+        ) -> impl Future<Output = Result<Option<StartLibraryLoginResponse>>> + Send {
+            let response = StartLibraryLoginResponse {
+                start: None,
+                failure: Some(LibraryLoginFailure::Unsupported),
+                call_id: request.call_id,
+            };
+            async move { Ok(Some(response)) }
+        }
+        fn handle_complete_library_login_request(
+            &self,
+            _: &NodeSlot,
+            request: &CompleteLibraryLoginRequest,
+        ) -> impl Future<Output = Result<Option<CompleteLibraryLoginResponse>>> + Send {
+            let response = CompleteLibraryLoginResponse {
+                failure: Some(LibraryLoginFailure::Unsupported),
+                call_id: request.call_id,
+            };
+            async move { Ok(Some(response)) }
+        }
         fn handle_register_open_dal_library_request(
             &self,
             _: &NodeSlot,
@@ -458,6 +495,9 @@ mod node_request_loop_tests {
         let (remote_tx, remote_rx) = signal_channel();
         let (subsonic_tx, subsonic_rx) = signal_channel();
         let (_replace_subsonic_tx, replace_subsonic_rx) = signal_channel();
+        let (_login_methods_tx, login_methods_rx) = signal_channel();
+        let (_start_login_tx, start_login_rx) = signal_channel();
+        let (_complete_login_tx, complete_login_rx) = signal_channel();
         let (opendal_tx, opendal_rx) = signal_channel();
         let (_detect_share_tx, detect_share_rx) = signal_channel();
         let (open_tx, open_rx) = signal_channel();
@@ -521,6 +561,9 @@ mod node_request_loop_tests {
                 register_remote_control_request_receiver: remote_rx,
                 register_subsonic_library_request_receiver: subsonic_rx,
                 replace_subsonic_credential_request_receiver: replace_subsonic_rx,
+                library_login_methods_request_receiver: login_methods_rx,
+                start_library_login_request_receiver: start_login_rx,
+                complete_library_login_request_receiver: complete_login_rx,
                 register_open_dal_library_request_receiver: opendal_rx,
                 detect_open_dal_share_data_request_receiver: detect_share_rx,
                 open_library_request_receiver: open_rx,
