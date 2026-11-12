@@ -26,6 +26,10 @@ Future<bool> showSubsonicReloginDialog(
   }
   if (!context.mounted) return false;
   if (methods == null || methods.failure != null) {
+    // A service inside the app has no password to ask for.
+    if (_isInProcessRecord(registry, recordId)) {
+      return _showLoginFailed(context);
+    }
     return _showPasswordReloginDialog(context, registry, recordId);
   }
   if (methods.methods.contains(LibraryLoginMethod.platform)) {
@@ -146,6 +150,27 @@ Future<bool> _platformRelogin(
     context: context,
     title: s.loginFailed,
     subtitle: s.loginFailedSubtitle,
+    errorMessage: s.loginFailedSubtitle,
+  );
+  return false;
+}
+
+bool _isInProcessRecord(LibraryRegistryProvider registry, String recordId) {
+  for (final record in registry.records) {
+    final kind = record.kind;
+    if (record.recordId == recordId &&
+        kind is LibraryRecordKindSummarySubsonic) {
+      return kind.endpoint.startsWith('rune-service://');
+    }
+  }
+  return false;
+}
+
+Future<bool> _showLoginFailed(BuildContext context) async {
+  final s = S.of(context);
+  await showErrorDialog(
+    context: context,
+    title: s.loginFailed,
     errorMessage: s.loginFailedSubtitle,
   );
   return false;

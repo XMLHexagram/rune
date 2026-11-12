@@ -1,0 +1,22 @@
+[package]
+name = "subsonic-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Serves an in-process Subsonic API over HTTP"
+
+[dependencies]
+axum = "0.8.1"
+reqwest = { version = "0.12.18", default-features = false, features = ["stream"] }
+serde_json = "1.0.140"
+subsonic = { path = "../subsonic" }
+url = "2.5.4"
+
+[dev-dependencies]
+bytes = "1"
+apple-music = { path = "../apple-music" }
+reqwest = { version = "0.12.18", features = ["rustls-tls"] }
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "net"] }
+
+[lints]
+workspace = true

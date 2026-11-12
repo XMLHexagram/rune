@@ -1,0 +1,12 @@
+{
+  "data": [
+    {
+      "id": "i.lib1",
+      "type": "ratings",
+      "href": "/v1/me/ratings/library-songs/i.lib1",
+      "attributes": {
+        "value": 1
+      }
+    }
+  ]
+}

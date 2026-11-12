@@ -1,0 +1,21 @@
+{
+  "data": [
+    {
+      "id": "p.new1",
+      "type": "library-playlists",
+      "href": "/v1/me/library/playlists/p.new1",
+      "attributes": {
+        "name": "Mix",
+        "canEdit": true,
+        "hasCatalog": false,
+        "isPublic": false,
+        "playParams": {
+          "id": "p.new1",
+          "kind": "playlist",
+          "isLibrary": true
+        },
+        "dateAdded": "2024-01-02T03:04:05Z"
+      }
+    }
+  ]
+}

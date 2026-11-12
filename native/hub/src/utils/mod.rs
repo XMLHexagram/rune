@@ -67,6 +67,7 @@ use crate::backends::{
     local::local_player_loop,
     remote::{RemoteConnectError, open_remote_library_for_fingerprint},
 };
+use crate::in_process_servers::is_in_process_endpoint;
 use crate::library_pool::{LibraryHandle, LibraryPool};
 use crate::macros::NodeRequestHandlers;
 use crate::messages::*;
@@ -1587,6 +1588,9 @@ pub(crate) async fn register_subsonic_library_on_node(
     request: &RegisterSubsonicLibraryRequest,
     node: &Arc<NodeContext>,
 ) -> RegisterLibraryResponse {
+    if is_in_process_endpoint(&request.endpoint) {
+        return register_in_process_library_on_node(request, node).await;
+    }
     let endpoint = match validate_subsonic_endpoint(&request.endpoint) {
         Ok(endpoint) => endpoint,
         Err(()) => {
@@ -1627,18 +1631,7 @@ pub(crate) async fn register_subsonic_library_on_node(
         Ok(Err(error)) => return subsonic_probe_failure(error),
         Ok(Ok(probe)) => probe,
     };
-    let allowed = if probe.roles_known {
-        let mut allowed = Vec::with_capacity(2);
-        if probe.roles.stream_role {
-            allowed.push(SubsonicOpenMode::PlayOnThisDevice);
-        }
-        if probe.roles.jukebox_role {
-            allowed.push(SubsonicOpenMode::RemoteControl);
-        }
-        allowed
-    } else {
-        vec![SubsonicOpenMode::PlayOnThisDevice]
-    };
+    let allowed = allowed_subsonic_modes(&probe);
     if allowed.is_empty() {
         return subsonic_registration_failure(
             RegisterLibraryFailureKind::SubsonicRoleMissing,
@@ -1754,6 +1747,161 @@ pub(crate) async fn register_subsonic_library_on_node(
     }
 }
 
+fn allowed_subsonic_modes(probe: &subsonic::SubsonicProbe) -> Vec<SubsonicOpenMode> {
+    if probe.roles_known {
+        let mut allowed = Vec::with_capacity(2);
+        if probe.roles.stream_role {
+            allowed.push(SubsonicOpenMode::PlayOnThisDevice);
+        }
+        if probe.roles.jukebox_role {
+            allowed.push(SubsonicOpenMode::RemoteControl);
+        }
+        allowed
+    } else {
+        vec![SubsonicOpenMode::PlayOnThisDevice]
+    }
+}
+
+/// Registers a library served inside this process. It needs no network and no credentials,
+/// and a device has at most one record per service.
+async fn register_in_process_library_on_node(
+    request: &RegisterSubsonicLibraryRequest,
+    node: &Arc<NodeContext>,
+) -> RegisterLibraryResponse {
+    let config = Path::new(&*node.config_path);
+    let registered = |record: &LibraryRecord| RegisterLibraryResponse {
+        call_id: None,
+        record: Some(record.into()),
+        outcome: RegisterLibraryOutcome::Registered,
+        detail: None,
+    };
+    match LibraryRegistry::load(config) {
+        Ok(registry) => {
+            if let Some(existing) = registry.libraries.iter().find(|record| {
+                matches!(
+                    &record.protocol,
+                    ProtocolAdapter::SubsonicTranslate { endpoint, .. }
+                        if *endpoint == request.endpoint
+                )
+            }) {
+                return registered(existing);
+            }
+        }
+        Err(_) => {
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::Storage,
+                "Could not read library storage",
+            );
+        }
+    }
+    let server = match node.in_process_servers.create(&request.endpoint) {
+        Ok(server) => server,
+        Err(_) => {
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::SubsonicNotSubsonic,
+                "Unknown in-process service",
+            );
+        }
+    };
+    let probe = match server.probe().await {
+        Ok(probe) => probe,
+        Err(error) => return subsonic_probe_failure(error),
+    };
+    let allowed = allowed_subsonic_modes(&probe);
+    let mode = match (request.mode.map(SubsonicOpenMode::from), allowed.as_slice()) {
+        (Some(mode), allowed) if allowed.contains(&mode) => mode,
+        (None, [only]) => *only,
+        (None, [_, ..]) => {
+            return RegisterLibraryResponse {
+                call_id: None,
+                record: None,
+                outcome: RegisterLibraryOutcome::NeedsSubsonicMode {
+                    allowed: allowed.into_iter().map(Into::into).collect(),
+                },
+                detail: None,
+            };
+        }
+        _ => {
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::SubsonicRoleMissing,
+                "The service does not support that mode",
+            );
+        }
+    };
+    // The record needs a credential reference, but sign-in tokens stay on the device.
+    let credential = match node
+        .credentials
+        .put(Credential {
+            username: String::new(),
+            secret: Secret::new(Vec::new()),
+        })
+        .await
+    {
+        Ok(credential) => credential,
+        Err(_) => {
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::Storage,
+                "Could not store credentials",
+            );
+        }
+    };
+    let record = LibraryRecord {
+        record_id: LibraryRecordId(Uuid::new_v4()),
+        alias: request.alias.clone(),
+        library_id: None,
+        protocol: ProtocolAdapter::SubsonicTranslate {
+            endpoint: request.endpoint.clone(),
+            credential,
+            mode,
+        },
+        fs: Vec::new(),
+        catalog: CatalogPlacement::None,
+        background_sync: false,
+    };
+    if record.validate().is_err() {
+        let _ = node.credentials.remove(credential).await;
+        return subsonic_registration_failure(
+            RegisterLibraryFailureKind::InvalidRecord,
+            "The library record is invalid",
+        );
+    }
+    // The registry reloads under its write lock, so concurrent registrations store one record.
+    let stored = LibraryRegistry::update(config, |registry| {
+        let existing = registry.libraries.iter().find(|stored| {
+            matches!(
+                &stored.protocol,
+                ProtocolAdapter::SubsonicTranslate { endpoint, .. }
+                    if *endpoint == request.endpoint
+            )
+        });
+        if let Some(existing) = existing {
+            return Ok((existing.clone(), false));
+        }
+        registry.libraries.push(record.clone());
+        Ok((record.clone(), true))
+    })
+    .await;
+    let record = match stored {
+        Ok((record, true)) => record,
+        Ok((existing, false)) => {
+            let _ = node.credentials.remove(credential).await;
+            return registered(&existing);
+        }
+        Err(_) => {
+            let _ = node.credentials.remove(credential).await;
+            return subsonic_registration_failure(
+                RegisterLibraryFailureKind::Storage,
+                "Could not write library storage",
+            );
+        }
+    };
+    node.in_process_servers.insert(record.record_id, server);
+    if let Err(error) = publish_library_records_changed(node).await {
+        log::warn!("Could not publish library record change: {error:#}");
+    }
+    registered(&record)
+}
+
 pub(crate) async fn replace_subsonic_credential_on_node(
     request: &ReplaceSubsonicCredentialRequest,
     node: &Arc<NodeContext>,
@@ -1775,6 +1923,10 @@ pub(crate) async fn replace_subsonic_credential_on_node(
     else {
         return ReplaceSubsonicCredentialResult::InvalidRecord;
     };
+    // A service inside this app has no password to replace.
+    if is_in_process_endpoint(endpoint) {
+        return ReplaceSubsonicCredentialResult::InvalidRecord;
+    }
     let endpoint = match validate_subsonic_endpoint(endpoint) {
         Ok(endpoint) => endpoint,
         Err(()) => return ReplaceSubsonicCredentialResult::InvalidRecord,
@@ -1857,12 +2009,8 @@ fn login_failure(error: &SubsonicError) -> LibraryLoginFailure {
     }
 }
 
-/// Records whose endpoint uses this scheme are servers that run inside the app. Only they may
-/// receive platform tokens, which must never be sent to a remote server.
-const IN_PROCESS_SCHEME: &str = "rune-service://";
-
-struct RecordApi {
-    api: Arc<dyn SubsonicApi>,
+pub(crate) struct RecordApi {
+    pub(crate) api: Arc<dyn SubsonicApi>,
     /// The open binding, when the record is the open library.
     binding: Option<Arc<SubsonicBinding>>,
     in_process: bool,
@@ -1870,7 +2018,7 @@ struct RecordApi {
 
 /// The API of a Subsonic library record. The open library's own instance is reused, because a
 /// server that lives in this process keeps its tokens there.
-async fn subsonic_api_for_record(
+pub(crate) async fn subsonic_api_for_record(
     node: &Arc<NodeContext>,
     record_id: &str,
 ) -> StdResult<RecordApi, LibraryLoginFailure> {
@@ -1888,7 +2036,8 @@ async fn subsonic_api_for_record(
     else {
         return Err(LibraryLoginFailure::InvalidRecord);
     };
-    let in_process = endpoint.starts_with(IN_PROCESS_SCHEME);
+    // Only in-process servers may receive platform tokens, which must never go to a remote one.
+    let in_process = is_in_process_endpoint(endpoint);
     if let Some(binding) = node
         .subsonic_binding_for_record(record_id)
         .map_err(|_| LibraryLoginFailure::Storage)?
@@ -1899,9 +2048,16 @@ async fn subsonic_api_for_record(
             in_process,
         });
     }
-    // No in-process server exists yet to hand out for such records.
     if in_process {
-        return Err(LibraryLoginFailure::Unsupported);
+        let api = node
+            .in_process_servers
+            .get_or_create(record_id, endpoint)
+            .map_err(|_| LibraryLoginFailure::InvalidRecord)?;
+        return Ok(RecordApi {
+            api,
+            binding: None,
+            in_process: true,
+        });
     }
     let endpoint =
         validate_subsonic_endpoint(endpoint).map_err(|()| LibraryLoginFailure::InvalidRecord)?;
@@ -2330,6 +2486,30 @@ pub(crate) async fn open_library_by_record_on_node(
     }
 }
 
+/// A binding over the record's in-process server, which needs no credential.
+async fn in_process_binding(
+    node: &NodeContext,
+    record_id: LibraryRecordId,
+    library_id: Uuid,
+    endpoint: &str,
+    play_on_this_device: bool,
+) -> Result<Arc<SubsonicBinding>> {
+    let api = node.in_process_servers.get_or_create(record_id, endpoint)?;
+    let probe = api.probe().await?;
+    let rune_service = fetch_rune_service(&*api, &probe).await;
+    Ok(Arc::new(
+        SubsonicBinding::new(
+            api,
+            probe,
+            Path::new(&*node.config_path).to_path_buf(),
+            library_id,
+            play_on_this_device,
+            Arc::clone(&node.gui_broadcaster),
+        )
+        .with_rune_service(rune_service),
+    ))
+}
+
 async fn open_subsonic_record(
     node: &Arc<NodeContext>,
     record_id: LibraryRecordId,
@@ -2338,6 +2518,15 @@ async fn open_subsonic_record(
     credential_ref: CredentialRef,
     play_on_this_device: bool,
 ) -> StdResult<u64, (OpenLibraryFailureKind, anyhow::Error)> {
+    if is_in_process_endpoint(endpoint) {
+        let binding =
+            in_process_binding(node, record_id, library_id, endpoint, play_on_this_device)
+                .await
+                .map_err(|error| (OpenLibraryFailureKind::RemoteProtocol, error))?;
+        return node
+            .set_open_subsonic_catalog(Some(record_id), binding)
+            .map_err(|error| (OpenLibraryFailureKind::Storage, error));
+    }
     let credential = node
         .credentials
         .get(credential_ref)
@@ -2432,6 +2621,17 @@ pub(crate) async fn subsonic_binding_for_playback(
     else {
         return Err(anyhow::Error::new(RemoteAudioError::LibraryUnavailable));
     };
+    if is_in_process_endpoint(endpoint) {
+        return in_process_binding(
+            node,
+            record.record_id,
+            library_id,
+            endpoint,
+            *mode == SubsonicOpenMode::PlayOnThisDevice,
+        )
+        .await
+        .map_err(|_| anyhow::Error::new(RemoteAudioError::LibraryUnavailable));
+    }
     let credential = node
         .credentials
         .get(*credential)

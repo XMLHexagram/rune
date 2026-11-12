@@ -1,4 +1,5 @@
 import 'package:fluent_ui/fluent_ui.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rune/bindings/bindings.dart';
 import 'package:rune/l10n/app_localizations.dart';
@@ -120,5 +121,124 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(registry.openRecordId, isNull);
+  });
+
+  group('when the methods request fails', () {
+    Future<Object? Function()> openAndFail(
+      WidgetTester tester, {
+      required String endpoint,
+      required Future<LibraryLoginMethodsResponse> Function(String) methods,
+    }) async {
+      final registry = LibraryRegistryProvider(
+        loadRecords: () async => ListLibraryRecordsResponse(
+          records: [
+            LibraryRecordSummary(
+              recordId: 'subsonic-record',
+              alias: 'Library',
+              kind: LibraryRecordKindSummarySubsonic(
+                endpoint: endpoint,
+                account: '',
+              ),
+            ),
+          ],
+          invalidRecords: const [],
+          lastOpenRecord: null,
+        ),
+        openRecord: (_, callId) async =>
+            _openResponse(callId, authorized: false),
+        loginMethods: methods,
+      );
+      addTearDown(registry.dispose);
+      await registry.ready;
+      Object? thrown;
+      await tester.pumpWidget(
+        _app(
+          Builder(
+            builder: (context) => FilledButton(
+              onPressed: () async {
+                try {
+                  await openLibraryWithSubsonicRelogin(
+                    context,
+                    registry,
+                    'subsonic-record',
+                  );
+                } catch (error) {
+                  thrown = error;
+                }
+              },
+              child: const Text('Open'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Open'));
+      await tester.pumpAndSettle();
+      return () => thrown;
+    }
+
+    /// Closes the open dialog; the open then fails with the original authorization error.
+    Future<void> dismissAndExpectFailure(
+      WidgetTester tester,
+      Object? Function() thrown,
+    ) async {
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pumpAndSettle();
+      expect(
+        thrown(),
+        isA<LibraryRegistryFailure>().having(
+          (failure) => failure.kind,
+          'kind',
+          OpenLibraryFailureKind.remoteNotAuthorized,
+        ),
+      );
+    }
+
+    Future<LibraryLoginMethodsResponse> failed(String _) async =>
+        const LibraryLoginMethodsResponse(
+          methods: [],
+          hosts: [],
+          serviceName: null,
+          failure: LibraryLoginFailure.unreachable,
+        );
+
+    Future<LibraryLoginMethodsResponse> throwing(String _) async =>
+        throw StateError('no answer');
+
+    for (final (name, methods) in [
+      ('throws', throwing),
+      ('reports failure', failed),
+    ]) {
+      testWidgets('an in-process record shows an error when it $name', (
+        tester,
+      ) async {
+        final thrown = await openAndFail(
+          tester,
+          endpoint: 'rune-service://apple-music',
+          methods: methods,
+        );
+
+        expect(find.text('Login Failed'), findsOneWidget);
+        expect(
+          find.text('An error occurred while trying to login'),
+          findsOneWidget,
+        );
+        expect(find.byType(TextBox), findsNothing);
+        await dismissAndExpectFailure(tester, thrown);
+      });
+
+      testWidgets(
+        'a plain record still shows the password dialog when it $name',
+        (tester) async {
+          await openAndFail(
+            tester,
+            endpoint: 'https://music.example',
+            methods: methods,
+          );
+
+          expect(find.byType(TextBox), findsWidgets);
+          expect(find.text('Login Failed'), findsNothing);
+        },
+      );
+    }
   });
 }

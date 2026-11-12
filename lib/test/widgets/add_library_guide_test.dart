@@ -10,6 +10,7 @@ import 'package:rune/providers/library_registry.dart';
 import 'package:rune/providers/broadcast.dart';
 import 'package:rune/utils/add_library_flows.dart';
 import 'package:rune/utils/dialogs/add_library/add_library_guide.dart';
+import 'package:rune/utils/hosted_player/hosted_player.dart';
 import 'package:rune/providers/responsive_providers.dart';
 
 LibraryRecordSummary _record() => const LibraryRecordSummary(
@@ -1176,4 +1177,274 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Check the username and password.'), findsOneWidget);
   });
+
+  group('Apple Music', () {
+    final strings = lookupAppLocalizations(const Locale('en'));
+
+    Future<void> openGuide(
+      WidgetTester tester, {
+      required LibraryRegistryProvider registry,
+      required AddLibraryGuideDependencies dependencies,
+    }) async {
+      final manager = _testManager();
+      addTearDown(registry.dispose);
+      addTearDown(manager.dispose);
+      await tester.pumpWidget(
+        _app(
+          registry: registry,
+          manager: manager,
+          home: Builder(
+            builder: (context) => Button(
+              onPressed: () =>
+                  showAddLibraryGuide(context, dependencies: dependencies),
+              child: const Text('Open guide'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Open guide'));
+      await tester.pumpAndSettle();
+    }
+
+    Future<void> addAppleMusic(WidgetTester tester) async {
+      await tester.tap(find.text(strings.appleMusic));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(Button, 'Confirm'));
+      await tester.pumpAndSettle();
+    }
+
+    LibraryRegistryProvider registryWith(
+      List<String> steps, {
+      LibraryLoginFailure? startFailure,
+      LibraryLoginFailure? completeFailure,
+    }) => LibraryRegistryProvider(
+      loadRecords: () async => const ListLibraryRecordsResponse(
+        records: [],
+        invalidRecords: [],
+        lastOpenRecord: null,
+      ),
+      startLogin: (recordId, method) async {
+        steps.add('start $recordId ${method.name}');
+        return StartLibraryLoginResponse(
+          start: const LibraryLoginStartPlatform(),
+          failure: startFailure,
+        );
+      },
+      completeLogin: (recordId, method, token, developerToken) async {
+        steps.add('complete $recordId ${method.name} $token $developerToken');
+        return CompleteLibraryLoginResponse(failure: completeFailure);
+      },
+    );
+
+    AddLibraryGuideDependencies dependenciesWith(
+      List<String> steps, {
+      HostAuthorization? authorization = const HostAuthorization(
+        token: 'user',
+        developerToken: 'dev',
+      ),
+      RegisterLibraryResponse? registration,
+    }) => AddLibraryGuideDependencies(
+      hosts: {'appleMusic': _FakeHost(authorization, steps)},
+      registerSubsonic: (request) async {
+        steps.add(
+          'register ${request.endpoint} ${request.alias} '
+          '"${request.username}" "${request.password}"',
+        );
+        return registration ??
+            RegisterLibraryResponse(
+              record: _record(),
+              outcome: const RegisterLibraryOutcomeRegistered(),
+            );
+      },
+      openRecord: (recordId) async => steps.add('open $recordId'),
+    );
+
+    testWidgets('authorizes, registers, signs in and opens the record', (
+      tester,
+    ) async {
+      final steps = <String>[];
+      await openGuide(
+        tester,
+        registry: registryWith(steps),
+        dependencies: dependenciesWith(steps),
+      );
+      await addAppleMusic(tester);
+      expect(steps, [
+        'authorize interactive',
+        'register rune-service://apple-music ${strings.appleMusic} "" ""',
+        'start record-1 platform',
+        'complete record-1 platform user dev',
+        'open record-1',
+      ]);
+    });
+
+    testWidgets('adding it again signs in again and opens the same record', (
+      tester,
+    ) async {
+      final steps = <String>[];
+      final registry = registryWith(steps);
+      final dependencies = dependenciesWith(steps);
+      for (var round = 0; round < 2; round++) {
+        await openGuide(
+          tester,
+          registry: round == 0 ? registry : registryWith(steps),
+          dependencies: dependencies,
+        );
+        await addAppleMusic(tester);
+        await tester.pumpWidget(const SizedBox());
+      }
+      const round = [
+        'authorize interactive',
+        'register rune-service://apple-music Apple Music "" ""',
+        'start record-1 platform',
+        'complete record-1 platform user dev',
+        'open record-1',
+      ];
+      expect(steps, [...round, ...round]);
+      expect(find.byType(ContentDialog), findsNothing);
+    });
+
+    final failures =
+        <
+          String,
+          ({
+            HostAuthorization? authorization,
+            RegisterLibraryResponse? registration,
+            LibraryLoginFailure? startFailure,
+            LibraryLoginFailure? completeFailure,
+            String message,
+            List<String> steps,
+          })
+        >{
+          'a refused authorization': (
+            authorization: null,
+            registration: null,
+            startFailure: null,
+            completeFailure: null,
+            message: strings.appleMusicAccessDenied,
+            steps: ['authorize interactive'],
+          ),
+          'a missing developer token': (
+            authorization: const HostAuthorization(token: 'user'),
+            registration: null,
+            startFailure: null,
+            completeFailure: null,
+            message: strings.appleMusicNoToken,
+            steps: ['authorize interactive'],
+          ),
+          'a failed registration': (
+            authorization: const HostAuthorization(
+              token: 'user',
+              developerToken: 'dev',
+            ),
+            registration: const RegisterLibraryResponse(
+              outcome: RegisterLibraryOutcomeFailed(
+                value: RegisterLibraryFailureKind.storage,
+              ),
+              detail: 'disk full',
+            ),
+            startFailure: null,
+            completeFailure: null,
+            message: strings.appleMusicRegisterFailed,
+            steps: ['authorize interactive', 'register'],
+          ),
+          'an unexpected mode question': (
+            authorization: const HostAuthorization(
+              token: 'user',
+              developerToken: 'dev',
+            ),
+            registration: const RegisterLibraryResponse(
+              outcome: RegisterLibraryOutcomeNeedsSubsonicMode(allowed: []),
+            ),
+            startFailure: null,
+            completeFailure: null,
+            message: strings.appleMusicUnexpectedMode,
+            steps: ['authorize interactive', 'register'],
+          ),
+          'a sign-in that cannot start': (
+            authorization: const HostAuthorization(
+              token: 'user',
+              developerToken: 'dev',
+            ),
+            registration: null,
+            startFailure: LibraryLoginFailure.unsupported,
+            completeFailure: null,
+            message: strings.appleMusicSignInStartFailed,
+            steps: ['authorize interactive', 'register', 'start'],
+          ),
+          'a sign-in that is refused': (
+            authorization: const HostAuthorization(
+              token: 'user',
+              developerToken: 'dev',
+            ),
+            registration: null,
+            startFailure: null,
+            completeFailure: LibraryLoginFailure.rejected,
+            message: strings.appleMusicSignInFailed,
+            steps: ['authorize interactive', 'register', 'start', 'complete'],
+          ),
+        };
+    for (final entry in failures.entries) {
+      testWidgets('${entry.key} is explained and nothing is opened', (
+        tester,
+      ) async {
+        final failure = entry.value;
+        final steps = <String>[];
+        await openGuide(
+          tester,
+          registry: registryWith(
+            steps,
+            startFailure: failure.startFailure,
+            completeFailure: failure.completeFailure,
+          ),
+          dependencies: dependenciesWith(
+            steps,
+            authorization: failure.authorization,
+            registration: failure.registration,
+          ),
+        );
+        await addAppleMusic(tester);
+        expect(
+          steps.map((step) => step.split(' ').first),
+          failure.steps.map((step) => step.split(' ').first),
+        );
+        expect(steps, isNot(contains(startsWith('open'))));
+        expect(find.textContaining(failure.message), findsOneWidget);
+        if (failure.registration?.detail case final detail?) {
+          expect(find.textContaining(detail), findsOneWidget);
+        }
+      });
+    }
+
+    testWidgets('the row is hidden without a host', (tester) async {
+      await openGuide(
+        tester,
+        registry: registryWith([]),
+        dependencies: const AddLibraryGuideDependencies(hosts: {}),
+      );
+      expect(find.text('Subsonic'), findsOneWidget);
+      expect(find.text(strings.appleMusic), findsNothing);
+      // Lets the screen-size provider's debounce timer fire before the test ends.
+      await tester.pump(const Duration(seconds: 2));
+    });
+  });
+}
+
+class _FakeHost implements HostedPlayerHost {
+  _FakeHost(this.authorization, this.steps);
+
+  final HostAuthorization? authorization;
+  final List<String> steps;
+
+  @override
+  Future<HostAuthorization?> authorize({bool interactive = false}) async {
+    steps.add(interactive ? 'authorize interactive' : 'authorize');
+    return authorization;
+  }
+
+  @override
+  void handle(
+    Map<String, dynamic> command,
+    void Function(Map<String, dynamic>) emit,
+  ) {}
 }

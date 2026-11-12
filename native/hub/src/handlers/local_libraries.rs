@@ -222,7 +222,14 @@ impl Signal for RemoveLibraryRecordRequest {
             matches!(&record.protocol, ProtocolAdapter::SubsonicTranslate { .. })
                 .then(|| record.catalog_library_id().unwrap_or(record.record_id.0))
         });
-        if !LibraryRegistry::remove_record(config, LibraryRecordId(id), &node.credentials).await? {
+        let removed =
+            LibraryRegistry::remove_record(config, LibraryRecordId(id), &node.credentials).await;
+        // A signed-in instance must not outlive its record, even when removal failed halfway.
+        match &removed {
+            Ok(_) => node.in_process_servers.retire(LibraryRecordId(id)),
+            Err(_) => node.in_process_servers.drop_instance(LibraryRecordId(id)),
+        }
+        if !removed? {
             return Ok(Some(RemoveLibraryRecordResponse {
                 call_id: None,
                 outcome: RemoveLibraryRecordOutcome::Failed(

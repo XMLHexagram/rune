@@ -1,0 +1,18 @@
+{
+  "data": [
+    {
+      "id": "p.RB1AAkGsv74Zkl",
+      "type": "library-playlists",
+      "href": "/v1/me/library/playlists/p.RB1AAkGsv74Zkl",
+      "attributes": {
+        "hasCatalog": false,
+        "description": {"standard": "My library playlist"},
+        "name": "New Playlist",
+        "canEdit": true,
+        "isPublic": false,
+        "playParams": {"id": "p.RB1AAkGsv74Zkl", "kind": "playlist", "isLibrary": true},
+        "dateAdded": "2021-09-30T13:28:29Z"
+      }
+    }
+  ]
+}

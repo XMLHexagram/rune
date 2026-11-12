@@ -1,0 +1,4 @@
+{
+  "data": [],
+  "meta": {"filters": {"identity": {"playlistsroot": [{"id": "p.playlistsroot", "type": "library-playlist-folders", "href": "/v1/me/library/playlist-folders/p.playlistsroot"}]}}}
+}
