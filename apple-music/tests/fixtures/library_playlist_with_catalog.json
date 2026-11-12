@@ -1,0 +1,8 @@
+{
+  "data": [{
+    "id": "p.lib1",
+    "type": "library-playlists",
+    "attributes": {"hasCatalog": true, "name": "Subscribed", "canEdit": false},
+    "relationships": {"catalog": {"data": [{"id": "pl.cat1", "type": "playlists"}]}}
+  }]
+}
