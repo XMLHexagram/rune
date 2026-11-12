@@ -183,7 +183,11 @@ impl Implementation {
 
     pub(crate) fn slots(&self) -> RequestSlots {
         match self {
-            Self::Local => RequestSlots::local(),
+            Self::Local => {
+                let mut slots = RequestSlots::local();
+                slots.hide_service_catalogue();
+                slots
+            }
             Self::RunePeer {
                 link: Some(link), ..
             } => {

@@ -176,6 +176,8 @@ RequestCapabilities snapshot({
     libraryLoginMethodsRequest: capability,
     startLibraryLoginRequest: capability,
     completeLibraryLoginRequest: capability,
+    fetchLibraryMembershipRequest: capability,
+    addToLibraryRequest: capability,
     registerOpenDalLibraryRequest: capability,
     detectOpenDalShareDataRequest: capability,
     initializeNodeRequest: capability,

@@ -46,6 +46,16 @@ class RequestCapabilitiesProvider extends ChangeNotifier {
       _snapshot?.movePlaylistItemRequest ?? const RequestCapabilityAvailable();
   RequestCapability get setLikedRequest =>
       _snapshot?.setLikedRequest ?? const RequestCapabilityAvailable();
+  RequestCapability get createMixRequest =>
+      _snapshot?.createMixRequest ?? const RequestCapabilityAvailable();
+
+  // These two exist only for a service library with catalogue search, so a
+  // missing snapshot means they are not available.
+  RequestCapability get fetchLibraryMembershipRequest =>
+      _snapshot?.fetchLibraryMembershipRequest ??
+      const RequestCapabilityHidden();
+  RequestCapability get addToLibraryRequest =>
+      _snapshot?.addToLibraryRequest ?? const RequestCapabilityHidden();
 
   void _update(RequestCapabilities snapshot) {
     _snapshot = snapshot;
@@ -83,6 +93,18 @@ RequestCapability capabilityForRequest(
   return capabilities == null
       ? const RequestCapabilityAvailable()
       : select(capabilities);
+}
+
+/// Whether a catalogue request is available. Unlike the playback controls,
+/// these stay off without a provider or a snapshot.
+bool catalogueRequestAvailable(
+  BuildContext context,
+  RequestCapability Function(RequestCapabilitiesProvider provider) select, {
+  bool listen = true,
+}) {
+  final capabilities = requestCapabilitiesOf(context, listen: listen);
+  return capabilities != null &&
+      select(capabilities) is RequestCapabilityAvailable;
 }
 
 RequestCapability _playPauseCapability(

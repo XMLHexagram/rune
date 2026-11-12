@@ -9,11 +9,11 @@ use reqwest::header::HeaderMap;
 use url::Url;
 
 use crate::{
-    RuneLoginCompletion, RuneLoginMethod, RuneLoginStart, RuneServiceDescriptor, SearchLimits,
-    StreamError, SubsonicAlbum, SubsonicAlbumDetail, SubsonicArtist, SubsonicArtistDetail,
-    SubsonicClient, SubsonicError, SubsonicJukebox, SubsonicJukeboxStatus, SubsonicLyrics,
-    SubsonicPlaylist, SubsonicPlaylistDetail, SubsonicProbe, SubsonicScanStatus,
-    SubsonicSearchResult, SubsonicSong,
+    RuneLoginCompletion, RuneLoginMethod, RuneLoginStart, RuneRecommendationGroup, RuneScope,
+    RuneServiceDescriptor, SearchLimits, StreamError, SubsonicAlbum, SubsonicAlbumDetail,
+    SubsonicArtist, SubsonicArtistDetail, SubsonicClient, SubsonicError, SubsonicJukebox,
+    SubsonicJukeboxStatus, SubsonicLyrics, SubsonicPlaylist, SubsonicPlaylistDetail, SubsonicProbe,
+    SubsonicScanStatus, SubsonicSearchResult, SubsonicSong,
 };
 
 pub type ApiFuture<'a, T, E = SubsonicError> =
@@ -322,6 +322,36 @@ pub trait RuneService: Send + Sync {
     }
 }
 
+/// Rune catalogue extension: search beyond the library and add catalogue items to it.
+#[allow(unused_variables)]
+pub trait RuneCatalog: Send + Sync {
+    /// `search3` with `runeScope`, taking the same limits as
+    /// [`Searching::search_with_song_offset`].
+    fn search_in_scope<'a>(
+        &'a self,
+        query: &'a str,
+        limits: SearchLimits,
+        song_offset: u32,
+        scope: RuneScope,
+    ) -> ApiFuture<'a, SubsonicSearchResult> {
+        unsupported("search3")
+    }
+
+    /// Adds catalogue songs, albums or playlists, by id, to the user's library.
+    fn add_to_library<'a>(&'a self, ids: &'a [&'a str]) -> ApiFuture<'a, ()> {
+        unsupported("addToRuneLibrary")
+    }
+}
+
+/// Rune recommendations extension.
+#[allow(unused_variables)]
+pub trait RuneRecommendations: Send + Sync {
+    /// Up to `count` titled groups of recommended albums and playlists.
+    fn recommendations<'a>(&'a self, count: u32) -> ApiFuture<'a, Vec<RuneRecommendationGroup>> {
+        unsupported("getRuneRecommendations")
+    }
+}
+
 /// Everything the hub needs from a Subsonic-shaped server.
 pub trait SubsonicApi:
     System
@@ -335,6 +365,8 @@ pub trait SubsonicApi:
     + Scanning
     + RuneVisualizerFeed
     + RuneService
+    + RuneCatalog
+    + RuneRecommendations
     + Send
     + Sync
 {
@@ -352,6 +384,8 @@ impl<T> SubsonicApi for T where
         + Scanning
         + RuneVisualizerFeed
         + RuneService
+        + RuneCatalog
+        + RuneRecommendations
         + Send
         + Sync
 {
@@ -359,8 +393,8 @@ impl<T> SubsonicApi for T where
 
 pub mod prelude {
     pub use super::{
-        Annotation, Browsing, Jukebox, Lists, MediaRetrieval, Playlists, RuneService,
-        RuneVisualizerFeed, Scanning, Searching, System,
+        Annotation, Browsing, Jukebox, Lists, MediaRetrieval, Playlists, RuneCatalog,
+        RuneRecommendations, RuneService, RuneVisualizerFeed, Scanning, Searching, System,
     };
 }
 
@@ -586,5 +620,33 @@ impl RuneService for SubsonicClient {
 
     fn complete_rune_login<'a>(&'a self, completion: &'a RuneLoginCompletion) -> ApiFuture<'a, ()> {
         Box::pin(SubsonicClient::complete_rune_login(self, completion))
+    }
+}
+
+impl RuneCatalog for SubsonicClient {
+    fn search_in_scope<'a>(
+        &'a self,
+        query: &'a str,
+        limits: SearchLimits,
+        song_offset: u32,
+        scope: RuneScope,
+    ) -> ApiFuture<'a, SubsonicSearchResult> {
+        Box::pin(SubsonicClient::search_in_scope(
+            self,
+            query,
+            limits,
+            song_offset,
+            scope,
+        ))
+    }
+
+    fn add_to_library<'a>(&'a self, ids: &'a [&'a str]) -> ApiFuture<'a, ()> {
+        Box::pin(SubsonicClient::add_to_library(self, ids))
+    }
+}
+
+impl RuneRecommendations for SubsonicClient {
+    fn recommendations<'a>(&'a self, count: u32) -> ApiFuture<'a, Vec<RuneRecommendationGroup>> {
+        Box::pin(SubsonicClient::recommendations(self, count))
     }
 }

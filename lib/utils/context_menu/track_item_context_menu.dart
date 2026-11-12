@@ -25,6 +25,7 @@ import '../router/query_tracks_parameter.dart';
 import '../router/router_aware_flyout_controller.dart';
 import '../dialogs/playlist/create_edit_playlist.dart';
 import 'offline_selection.dart';
+import 'add_to_library_item.dart';
 
 Future<void> _showRequestFailure(
   BuildContext context,
@@ -86,8 +87,9 @@ void openTrackItemContextMenu(
   String? occurrenceId,
   int fileId,
   int? playlistId,
-  void Function()? refreshList,
-) async {
+  void Function()? refreshList, {
+  void Function()? onAddedToLibrary,
+}) async {
   final targetContext = contextAttachKey.currentContext;
 
   if (targetContext == null) return;
@@ -158,6 +160,7 @@ void openTrackItemContextMenu(
           playlistId: playlistId,
           occurrenceId: occurrenceId,
           refreshList: refreshList,
+          onAddedToLibrary: onAddedToLibrary,
         );
       },
     );
@@ -176,6 +179,7 @@ void openTrackItemContextMenu(
       occurrenceId,
       playlistId,
       refreshList,
+      onAddedToLibrary: onAddedToLibrary,
     ),
   );
 }
@@ -188,8 +192,15 @@ Widget buildTrackItemContextMenu(
   bool analyzed,
   String? occurrenceId,
   int? playlistId,
-  void Function()? refreshList,
-) {
+  void Function()? refreshList, {
+  void Function()? onAddedToLibrary,
+}) {
+  final addToLibraryItem = addToLibraryMenuItem(
+    context,
+    type: CollectionType.track,
+    id: item.file.id,
+    onAdded: onAddedToLibrary,
+  );
   final List<MenuFlyoutItem> playlistItems = playlists.map((playlist) {
     return MenuFlyoutItem(
       leading: const Icon(Symbols.list_alt),
@@ -278,6 +289,7 @@ Widget buildTrackItemContextMenu(
           );
         },
       ),
+      if (addToLibraryItem != null) addToLibraryItem,
       if (!context.read<LibraryOpenStateProvider>().isReadOnlyReplica &&
           playlistId != null &&
           occurrenceId != null)
@@ -425,6 +437,7 @@ FlyoutContent buildBandScreenTrackItemContextMenu(
   int? playlistId,
   String? occurrenceId,
   void Function()? refreshList,
+  void Function()? onAddedToLibrary,
 }) {
   final libraryState = context.read<LibraryOpenStateProvider>();
   final castLibraryId = libraryState.catalogLibraryId ?? libraryState.openRecord?.recordId;
@@ -486,6 +499,12 @@ FlyoutContent buildBandScreenTrackItemContextMenu(
           ),
         );
       },
+    ),
+    ?addToLibraryCommandButton(
+      context,
+      type: CollectionType.track,
+      id: item.file.id,
+      onAdded: onAddedToLibrary,
     ),
     if (!context.read<LibraryOpenStateProvider>().isReadOnlyReplica &&
         playlistId != null &&

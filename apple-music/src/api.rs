@@ -12,15 +12,19 @@ use serde_json::{json, Value};
 use crate::client::{AppleMusicClient, Auth};
 use crate::error::{Error, Result};
 use crate::models::{
-    CatalogCollection, LibraryAlbum, LibraryArtist, LibraryEntry, LibraryPlaylist,
-    LibraryPlaylistFolder, LibrarySearchResults, LibrarySearchType, LibrarySong, Page, Rating,
-    RatingValue, Recommendation, Song, SongSearchResult, Storefront, TrackRef,
+    Album, Artist, CatalogSearchResults, CatalogSearchType, LibraryAlbum, LibraryArtist,
+    LibraryEntry, LibraryPlaylist, LibraryPlaylistFolder, LibrarySearchResults, LibrarySearchType,
+    LibrarySong, Page, Playlist, Rating, RatingValue, Recommendation, Song, SongSearchResult,
+    Storefront, TrackRef,
 };
 use crate::{
-    CATALOG_SONGS_BATCH, ID_BATCH, LIBRARY_PAGE_SIZE, LIBRARY_SEARCH_LIMIT, LIBRARY_SONGS_BATCH,
-    RECENTLY_ADDED_LIMIT, RECENTLY_ADDED_MAX_PAGES, RECOMMENDATIONS_LIMIT,
+    CATALOG_SEARCH_LIMIT, CATALOG_SONGS_BATCH, ID_BATCH, LIBRARY_PAGE_SIZE, LIBRARY_SEARCH_LIMIT,
+    LIBRARY_SONGS_BATCH, RECENTLY_ADDED_LIMIT, RECENTLY_ADDED_MAX_PAGES, RECOMMENDATIONS_LIMIT,
     RECOMMENDATIONS_MAX_PAGES,
 };
+
+/// The id prefix of a catalog playlist that is a personal mix.
+const PERSONAL_MIX: &str = "pl.pm-";
 
 /// Percent-encodes `s`; `keep` lists extra bytes left as they are.
 fn encode(s: &str, keep: &[u8], space_as_plus: bool) -> String {
@@ -504,6 +508,58 @@ impl AppleMusicClient {
         })
     }
 
+    /// `GET /v1/catalog/{storefront}/search`: searches the catalog for `types`. Apple applies
+    /// `limit` (at most [`CATALOG_SEARCH_LIMIT`]) and `offset` to every type. Needs only the
+    /// developer token.
+    pub async fn search_catalog(
+        &self,
+        term: &str,
+        types: &[CatalogSearchType],
+        limit: u32,
+        offset: u32,
+    ) -> Result<CatalogSearchResults> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(default)]
+            results: Results,
+        }
+        #[derive(Default, Deserialize)]
+        struct Results {
+            #[serde(default)]
+            songs: Page<Song>,
+            #[serde(default)]
+            albums: Page<Album>,
+            #[serde(default)]
+            artists: Page<Artist>,
+        }
+        let storefront = self.storefront().await?;
+        let types = types
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let q = [
+            ("term", term.to_owned()),
+            ("types", types),
+            ("limit", limit.min(CATALOG_SEARCH_LIMIT).to_string()),
+            ("offset", offset.to_string()),
+        ];
+        let response: Response = self
+            .execute_json(
+                Method::GET,
+                &target(&format!("/v1/catalog/{}/search", segment(&storefront)), &q),
+                None,
+                Auth::Developer,
+            )
+            .await?;
+        let results = response.results;
+        Ok(CatalogSearchResults {
+            songs: results.songs,
+            albums: results.albums,
+            artists: results.artists,
+        })
+    }
+
     /// `GET /v1/catalog/{storefront}/songs?ids=...`: catalog songs by id, in
     /// batches of 300. Ids the catalog does not know are absent from the result.
     pub async fn catalog_songs(&self, ids: &[String]) -> Result<Vec<Song>> {
@@ -565,26 +621,61 @@ impl AppleMusicClient {
     }
 
     /// `GET /v1/catalog/{storefront}/playlists/{id}`: a catalog playlist without its tracks.
-    pub async fn catalog_playlist(&self, id: &str) -> Result<CatalogCollection> {
-        self.catalog_collection("playlists", id).await
+    /// A personal mix (`pl.pm-` id) is read with the user token, other playlists without it.
+    pub async fn catalog_playlist(&self, id: &str) -> Result<Playlist> {
+        self.catalog_resource("playlists", id, &[], "catalog playlist")
+            .await
     }
 
-    /// `GET /v1/catalog/{storefront}/albums/{id}`: a catalog album without its tracks.
-    pub async fn catalog_album(&self, id: &str) -> Result<CatalogCollection> {
-        self.catalog_collection("albums", id).await
+    /// `GET /v1/catalog/{storefront}/albums/{id}?include=artists`: a catalog album with its
+    /// artists. Read its tracks with [`Self::catalog_album_tracks`].
+    pub async fn catalog_album(&self, id: &str) -> Result<Album> {
+        self.catalog_resource("albums", id, &["artists"], "catalog album")
+            .await
     }
 
-    async fn catalog_collection(&self, kind: &str, id: &str) -> Result<CatalogCollection> {
+    /// `GET /v1/catalog/{storefront}/artists/{id}`: a catalog artist.
+    pub async fn catalog_artist(&self, id: &str) -> Result<Artist> {
+        self.catalog_resource("artists", id, &[], "catalog artist")
+            .await
+    }
+
+    /// `GET /v1/catalog/{storefront}/artists/{id}/albums`: the albums of a catalog artist,
+    /// following `next`.
+    pub async fn catalog_artist_albums(&self, id: &str) -> Result<Vec<Album>> {
+        let storefront = self.storefront().await?;
+        let path = format!(
+            "/v1/catalog/{}/artists/{}/albums",
+            segment(&storefront),
+            segment(id)
+        );
+        self.paged(path, Vec::new()).try_collect().await
+    }
+
+    async fn catalog_resource<T: DeserializeOwned>(
+        &self,
+        kind: &str,
+        id: &str,
+        include: &[&str],
+        what: &str,
+    ) -> Result<T> {
         let storefront = self.storefront().await?;
         let path = format!(
             "/v1/catalog/{}/{kind}/{}",
             segment(&storefront),
             segment(id)
         );
-        let page: Page<CatalogCollection> = self
-            .execute_json(Method::GET, &path, None, Auth::User)
+        let q: Vec<_> = include_query(include).into_iter().collect();
+        // The catalog needs only the developer token; personal mixes belong to the user.
+        let auth = if kind == "playlists" && id.starts_with(PERSONAL_MIX) {
+            Auth::User
+        } else {
+            Auth::Developer
+        };
+        let page: Page<T> = self
+            .execute_json(Method::GET, &target(&path, &q), None, auth)
             .await?;
-        first_of(page, "catalog collection")
+        first_of(page, what)
     }
 
     async fn catalog_songs_of(&self, path: String) -> Result<Vec<Song>> {
@@ -696,17 +787,52 @@ impl AppleMusicClient {
         self.add_to_library("albums", catalog_ids).await
     }
 
+    /// `POST /v1/me/library?ids[songs]=...&ids[albums]=...&ids[playlists]=...`: adds catalog
+    /// songs, albums and playlists in as few requests as the batch size allows. Apple answers
+    /// 202; the items may show up later.
+    pub async fn add_catalog_items_to_library(
+        &self,
+        songs: &[String],
+        albums: &[String],
+        playlists: &[String],
+    ) -> Result<()> {
+        self.add_kinds_to_library(&[
+            ("songs", songs),
+            ("albums", albums),
+            ("playlists", playlists),
+        ])
+        .await
+    }
+
     async fn add_to_library(&self, kind: &str, ids: &[String]) -> Result<()> {
-        let mut seen = HashSet::new();
-        let unique: Vec<&String> = ids.iter().filter(|id| seen.insert(*id)).collect();
-        for chunk in unique.chunks(ID_BATCH) {
-            let joined = chunk
+        self.add_kinds_to_library(&[(kind, ids)]).await
+    }
+
+    /// One request per batch of every kind at once, kinds in the order given.
+    async fn add_kinds_to_library(&self, kinds: &[(&str, &[String])]) -> Result<()> {
+        let batches: Vec<(String, Vec<Vec<&str>>)> = kinds
+            .iter()
+            .map(|(kind, ids)| {
+                let mut seen = HashSet::new();
+                let unique: Vec<&str> = ids
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| seen.insert(*id))
+                    .collect();
+                let chunks = unique.chunks(ID_BATCH).map(<[&str]>::to_vec).collect();
+                (format!("ids[{kind}]"), chunks)
+            })
+            .collect();
+        let rounds = batches
+            .iter()
+            .map(|(_, chunks)| chunks.len())
+            .max()
+            .unwrap_or(0);
+        for round in 0..rounds {
+            let q: Vec<(&str, String)> = batches
                 .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            let key = format!("ids[{kind}]");
-            let q = [(key.as_str(), joined)];
+                .filter_map(|(key, chunks)| Some((key.as_str(), chunks.get(round)?.join(","))))
+                .collect();
             self.execute(
                 Method::POST,
                 &target("/v1/me/library", &q),

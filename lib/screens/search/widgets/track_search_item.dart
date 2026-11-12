@@ -34,6 +34,9 @@ class TrackSearchItemState extends SearchCardState<TrackSearchItem> {
   String getItemTitle() => widget.item.title;
 
   @override
+  CollectionType getItemType() => CollectionType.track;
+
+  @override
   Widget buildLeadingWidget(double size) {
     return CoverArt(
       path: widget.item.coverArtPath,
@@ -73,6 +76,7 @@ class TrackSearchItemState extends SearchCardState<TrackSearchItem> {
       widget.item.id,
       null,
       null,
+      onAddedToLibrary: addedToLibraryCallback(context),
     );
   }
 

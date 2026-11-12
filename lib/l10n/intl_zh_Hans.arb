@@ -1736,5 +1736,7 @@
   "howDoYouWantToUseIt": "您想如何使用？",
   "signInAgain": "重新登录",
   "signInAgainSubtitle": "Rune 无法自动登录 {service}。请重新登录以继续使用此音乐库。",
-  "signInMethodUnsupported": "此音乐库需要的登录方式在当前版本的 Rune 中不受支持。"
+  "signInMethodUnsupported": "此音乐库需要的登录方式在当前版本的 Rune 中不受支持。",
+  "addToLibrary": "加入资料库",
+  "notInYourLibrary": "不在资料库中"
 }

@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use apple_music::AppleMusicServer;
 use axum::Router;
-use axum::http::{HeaderMap, StatusCode, Uri};
-use axum::routing::get;
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::routing::any;
 use common::serve;
 use subsonic::{
-    RuneLoginCompletion, RuneLoginMethod, RuneLoginStart, RunePlaybackMode, RuneReason,
-    SubsonicError, SubsonicServerError,
+    RuneEdit, RuneLoginCompletion, RuneLoginMethod, RuneLoginStart, RunePlaybackMode, RuneReason,
+    RuneRecommendationKind, RuneScope, SubsonicError, SubsonicServerError,
 };
 
 fn platform(token: Option<&str>, developer: Option<&str>) -> RuneLoginCompletion {
@@ -32,13 +32,19 @@ async fn probe_and_extensions_declare_rune_service() {
     let probe = client.probe().await.unwrap();
     assert!(probe.open_subsonic);
     assert!(probe.supports_rune_service());
+    assert!(probe.supports_rune_catalog());
+    assert!(probe.supports_rune_recommendations());
     assert!(!probe.supports_rune_visualizer_feed());
     assert_eq!(probe.server_type.as_deref(), Some("rune-apple-music"));
     assert!(probe.roles.stream_role);
     assert!(probe.roles_known);
     assert_eq!(
         client.extensions().await.unwrap(),
-        [("runeService".to_owned(), vec![1])]
+        [
+            ("runeService".to_owned(), vec![1]),
+            ("runeCatalog".to_owned(), vec![1]),
+            ("runeRecommendations".to_owned(), vec![1]),
+        ]
     );
 }
 
@@ -125,8 +131,9 @@ async fn login_starts_on_the_platform_only() {
 const USER_TOKEN: &str = "music-user/token+==";
 const DEVELOPER_TOKEN: &str = "developer.jwt";
 
-/// A request Apple saw: path and query as sent, and the two token headers.
+/// A request Apple saw: method, path and query as sent, and the two token headers.
 struct Request {
+    method: Method,
     target: String,
     path: String,
     authorization: Option<String>,
@@ -164,7 +171,7 @@ async fn apple(routes: Vec<(&'static str, u16, String)>) -> Apple {
             .map(|(path, status, body)| (path, (status, body)))
             .collect(),
     );
-    let app = Router::new().fallback(get(move |uri: Uri, headers: HeaderMap| {
+    let app = Router::new().fallback(any(move |method: Method, uri: Uri, headers: HeaderMap| {
         let log = log.clone();
         let routes = routes.clone();
         async move {
@@ -175,6 +182,7 @@ async fn apple(routes: Vec<(&'static str, u16, String)>) -> Apple {
                     .map(str::to_owned)
             };
             log.lock().unwrap().push(Request {
+                method,
                 target: uri.to_string(),
                 path: uri.path().to_owned(),
                 authorization: header("authorization"),
@@ -361,5 +369,111 @@ async fn other_refusals_keep_their_meaning() {
             }
         ),
         "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_search_additions_and_recommendations_through_the_facade() {
+    let apple = apple(vec![
+        (
+            "/v1/me/library/search",
+            200,
+            fixture("server/library_search.json"),
+        ),
+        (
+            "/v1/catalog/it/search",
+            200,
+            fixture("server/catalog_search.json"),
+        ),
+        ("/v1/me/library", 202, String::new()),
+        (
+            "/v1/me/recommendations",
+            200,
+            fixture("recommendations_page2.json"),
+        ),
+    ])
+    .await;
+    let (client, served) = signed_in(&apple).await;
+    let limits = subsonic::SearchLimits {
+        artists: 5,
+        albums: 5,
+        songs: 5,
+    };
+
+    let found = client
+        .search_in_scope("dawn*", limits, 0, RuneScope::All)
+        .await
+        .unwrap();
+    let songs: Vec<(&str, Option<bool>)> = found
+        .songs
+        .iter()
+        .map(|song| (song.id.as_str(), song.rune_in_library))
+        .collect();
+    assert_eq!(
+        songs,
+        [("i.lib1", Some(true)), ("catalog:song:6001", Some(false))]
+    );
+    assert_eq!(found.albums[1].id, "catalog:album:7002");
+    assert_eq!(found.artists[1].rune_in_library, Some(false));
+
+    // The plain search3 the hub sends to other servers stays a library search.
+    let plain = client.search("dawn", limits).await.unwrap();
+    assert_eq!(plain.songs.len(), 1);
+    assert_eq!(plain.songs[0].rune_in_library, Some(true));
+
+    client
+        .add_to_library(&["catalog:song:6001", "catalog:album:7002"])
+        .await
+        .unwrap();
+
+    let groups = client.recommendations(5).await.unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].kind, RuneRecommendationKind::Recent);
+    assert_eq!(groups[0].albums[0].id, "catalog:album:alb1");
+    assert_eq!(groups[0].albums[0].rune_in_library, Some(false));
+
+    let requests = apple.requests();
+    let posts: Vec<&str> = requests
+        .iter()
+        .filter(|request| request.method == Method::POST)
+        .map(|request| request.target.as_str())
+        .collect();
+    assert_eq!(posts, ["/v1/me/library?ids[songs]=6001&ids[albums]=7002"]);
+    let catalog_searches = requests
+        .iter()
+        .filter(|request| request.path == "/v1/catalog/it/search")
+        .count();
+    assert_eq!(catalog_searches, 1);
+    assert_tokens_travel_in_headers(&requests, &served);
+
+    // A catalog playlist, read through the facade, can only be read.
+    let apple = self::apple(vec![
+        (
+            "/v1/catalog/it/playlists/pl.morning",
+            200,
+            fixture("server/catalog_playlist.json"),
+        ),
+        (
+            "/v1/catalog/it/playlists/pl.morning/tracks",
+            200,
+            fixture("catalog_collection_tracks_page2.json"),
+        ),
+    ])
+    .await;
+    let (client, _served) = signed_in(&apple).await;
+    let playlist = client
+        .playlist("catalog:playlist:pl.morning")
+        .await
+        .unwrap();
+    assert_eq!(playlist.rune_edit, Some(RuneEdit::ReadOnly));
+    assert_eq!(playlist.rune_in_library, Some(false));
+    assert_eq!(
+        playlist.songs[0]
+            .rune_playback
+            .as_ref()
+            .unwrap()
+            .key
+            .as_deref(),
+        Some("catalog:t2")
     );
 }

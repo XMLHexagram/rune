@@ -46,6 +46,7 @@ class CollectionSearchItemState extends SearchCardState<CollectionSearchItem> {
       widget.collectionType,
       getItemId(),
       widget.item.name,
+      onAddedToLibrary: addedToLibraryCallback(context),
     );
   }
 
@@ -63,6 +64,9 @@ class CollectionSearchItemState extends SearchCardState<CollectionSearchItem> {
 
   @override
   String getItemTitle() => widget.item.name;
+
+  @override
+  CollectionType getItemType() => widget.collectionType;
 
   @override
   Widget buildLeadingWidget(double size) {

@@ -2,15 +2,15 @@
 //! `Unsupported`: streaming, lyrics, jukebox, playlist deletion and song replacement.
 
 use subsonic::api::{
-    Annotation, Browsing, Jukebox, Lists, MediaRetrieval, Playlists, RuneService,
-    RuneVisualizerFeed, Scanning, Searching, System,
+    Annotation, Browsing, Jukebox, Lists, MediaRetrieval, Playlists, RuneCatalog,
+    RuneRecommendations, RuneService, RuneVisualizerFeed, Scanning, Searching, System,
 };
 use subsonic::{
     ApiFuture, RuneAttribution, RuneLoginCompletion, RuneLoginMethod, RuneLoginMethods,
-    RuneLoginStart, RuneServiceDescriptor, RuneUnsupported, SearchLimits, SubsonicAlbum,
-    SubsonicAlbumDetail, SubsonicArtist, SubsonicArtistDetail, SubsonicPlaylist,
-    SubsonicPlaylistDetail, SubsonicProbe, SubsonicRoles, SubsonicScanStatus, SubsonicSearchResult,
-    SubsonicSong,
+    RuneLoginStart, RuneRecommendationGroup, RuneScope, RuneServiceDescriptor, RuneUnsupported,
+    SearchLimits, SubsonicAlbum, SubsonicAlbumDetail, SubsonicArtist, SubsonicArtistDetail,
+    SubsonicPlaylist, SubsonicPlaylistDetail, SubsonicProbe, SubsonicRoles, SubsonicScanStatus,
+    SubsonicSearchResult, SubsonicSong,
 };
 
 use super::{map, AppleMusicServer};
@@ -18,7 +18,14 @@ use super::{map, AppleMusicServer};
 /// The Subsonic API version Rune's client speaks.
 const API_VERSION: &str = "1.16.1";
 const SERVER_TYPE: &str = "rune-apple-music";
-const RUNE_SERVICE: &str = "runeService";
+
+/// The OpenSubsonic extensions this server declares, with their versions.
+fn declared_extensions() -> Vec<(String, Vec<u32>)> {
+    ["runeService", "runeCatalog", "runeRecommendations"]
+        .into_iter()
+        .map(|name| (name.to_owned(), vec![1]))
+        .collect()
+}
 
 fn ready<'a, T: Send + 'a>(value: T) -> ApiFuture<'a, T> {
     Box::pin(async move { Ok(value) })
@@ -31,7 +38,7 @@ impl System for AppleMusicServer {
             open_subsonic: true,
             server_type: Some(SERVER_TYPE.into()),
             server_version: Some(env!("CARGO_PKG_VERSION").into()),
-            extensions: vec![(RUNE_SERVICE.into(), vec![1])],
+            extensions: declared_extensions(),
             roles: SubsonicRoles {
                 // Songs do play on this device, through the platform host, which is
                 // what Rune's open mode asks; only the `stream` endpoint is unsupported.
@@ -44,7 +51,7 @@ impl System for AppleMusicServer {
     }
 
     fn extensions<'a>(&'a self) -> ApiFuture<'a, Vec<(String, Vec<u32>)>> {
-        ready(vec![(RUNE_SERVICE.into(), vec![1])])
+        ready(declared_extensions())
     }
 }
 
@@ -128,6 +135,34 @@ impl Searching for AppleMusicServer {
         song_offset: u32,
     ) -> ApiFuture<'a, SubsonicSearchResult> {
         Box::pin(self.signed_in(AppleMusicServer::search(self, query, limits, song_offset)))
+    }
+}
+
+impl RuneCatalog for AppleMusicServer {
+    fn search_in_scope<'a>(
+        &'a self,
+        query: &'a str,
+        limits: SearchLimits,
+        song_offset: u32,
+        scope: RuneScope,
+    ) -> ApiFuture<'a, SubsonicSearchResult> {
+        Box::pin(self.signed_in(AppleMusicServer::search_in_scope(
+            self,
+            query,
+            limits,
+            song_offset,
+            scope,
+        )))
+    }
+
+    fn add_to_library<'a>(&'a self, ids: &'a [&'a str]) -> ApiFuture<'a, ()> {
+        Box::pin(self.signed_in(AppleMusicServer::add_to_library(self, ids)))
+    }
+}
+
+impl RuneRecommendations for AppleMusicServer {
+    fn recommendations<'a>(&'a self, count: u32) -> ApiFuture<'a, Vec<RuneRecommendationGroup>> {
+        Box::pin(self.signed_in(AppleMusicServer::recommendations(self, count)))
     }
 }
 

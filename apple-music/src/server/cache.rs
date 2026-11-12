@@ -6,14 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use subsonic::{SubsonicAlbum, SubsonicSong};
+use subsonic::{RuneRecommendationGroup, SubsonicAlbum, SubsonicSong};
 
 use super::map::{Artworks, SongRef};
 use super::Outcome;
 use crate::models::LibraryPlaylist;
 
-/// How long the song union and the album list are kept, so changes made in the Apple
-/// Music app show up.
+/// How long the song union, the album list and the recommendations are kept, so changes
+/// made in the Apple Music app show up.
 pub(super) const TTL: Duration = Duration::from_secs(10 * 60);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -25,7 +25,13 @@ pub(super) struct Caches {
     /// Counts sign-ins with new tokens; reads that started before one are not kept.
     session: AtomicU64,
     pub(super) songs: Slot<SongUnion>,
-    pub(super) albums: Slot<Vec<SubsonicAlbum>>,
+    pub(super) albums: Slot<AlbumList>,
+    pub(super) recommendations: Slot<Vec<RuneRecommendationGroup>>,
+    /// Catalog items added to the library here, which Apple may list only a while later.
+    added: Mutex<Added>,
+    /// The catalog ids of the songs of catalog albums read or added during this sign-in, by
+    /// album catalog id.
+    album_tracks: Mutex<HashMap<String, Vec<String>>>,
     /// Apple rating by song id, 0 for a song known to be unrated.
     ratings: Mutex<HashMap<String, i8>>,
     /// Playlists created here that Apple may not list yet.
@@ -42,11 +48,40 @@ impl Caches {
     pub(super) fn start_session(&self) {
         let mut ratings = lock(&self.ratings);
         let mut created = lock(&self.created);
+        let mut added = lock(&self.added);
+        let mut album_tracks = lock(&self.album_tracks);
         self.session.fetch_add(1, Ordering::AcqRel);
         self.songs.invalidate();
         self.albums.invalidate();
+        self.recommendations.invalidate();
         ratings.clear();
         created.clear();
+        *added = Added::default();
+        album_tracks.clear();
+    }
+
+    pub(super) fn added(&self) -> MutexGuard<'_, Added> {
+        lock(&self.added)
+    }
+
+    pub(super) fn album_tracks(&self) -> MutexGuard<'_, HashMap<String, Vec<String>>> {
+        lock(&self.album_tracks)
+    }
+
+    /// Records the songs of a catalog album, unless a sign-in happened since `session`.
+    pub(super) fn remember_album_tracks(&self, session: u64, album: &str, tracks: Vec<String>) {
+        let mut album_tracks = lock(&self.album_tracks);
+        if self.session() == session {
+            album_tracks.insert(album.to_owned(), tracks);
+        }
+    }
+
+    /// Records catalog items added to the library, unless a sign-in happened since `session`.
+    pub(super) fn remember_added(&self, session: u64, update: impl FnOnce(&mut Added)) {
+        let mut added = lock(&self.added);
+        if self.session() == session {
+            update(&mut added);
+        }
     }
 
     pub(super) fn ratings(&self) -> MutexGuard<'_, HashMap<String, i8>> {
@@ -75,6 +110,22 @@ impl Caches {
             created.push(playlist);
         }
     }
+}
+
+/// The user's albums in Rune's order, and the catalog ids the library albums among them name.
+/// Albums added here are listed under their catalog ids, and are not among those catalog ids.
+#[derive(Clone, Default)]
+pub(super) struct AlbumList {
+    pub(super) albums: Vec<SubsonicAlbum>,
+    pub(super) library_catalog_ids: HashSet<String>,
+}
+
+/// Catalog ids added to the library during this sign-in, by kind.
+#[derive(Default)]
+pub(super) struct Added {
+    pub(super) songs: HashSet<String>,
+    pub(super) albums: HashSet<String>,
+    pub(super) playlists: HashSet<String>,
 }
 
 /// A value built on demand and kept for [`TTL`]. One build runs at a time, and the
@@ -191,6 +242,11 @@ impl SongUnion {
     /// Records the catalog id of a library song.
     pub(super) fn add_library_catalog_id(&mut self, catalog_id: &str) {
         self.library_catalog_ids.insert(catalog_id.to_owned());
+    }
+
+    /// The catalog ids of the library songs known so far.
+    pub(super) fn library_catalog_ids(&self) -> &HashSet<String> {
+        &self.library_catalog_ids
     }
 }
 

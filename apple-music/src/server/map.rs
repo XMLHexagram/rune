@@ -5,20 +5,24 @@ use std::sync::{Mutex, PoisonError};
 
 use reqwest::StatusCode;
 use subsonic::{
-    RuneEdit, RunePlayback, RunePlaybackMode, RuneReason, SubsonicAlbum, SubsonicArtist,
-    SubsonicError, SubsonicPlaylist, SubsonicServerError, SubsonicSong,
+    RuneEdit, RunePlayback, RunePlaybackMode, RuneReason, RuneRecommendationGroup,
+    RuneRecommendationKind, SubsonicAlbum, SubsonicArtist, SubsonicError, SubsonicPlaylist,
+    SubsonicServerError, SubsonicSong,
 };
 
 use crate::error::Error;
 use crate::models::{
-    Artwork, LibraryAlbum, LibraryArtist, LibraryPlaylist, LibrarySong, LibrarySongAttributes,
-    Relationship, Song, SongAttributes, TrackRef,
+    Album, Artist, Artwork, LibraryAlbum, LibraryArtist, LibraryPlaylist, LibrarySong,
+    LibrarySongAttributes, Playlist, Recommendation, Relationship, Song, SongAttributes, TrackRef,
 };
 
 /// The platform host family that plays this server's songs.
 pub(super) const HOST: &str = "appleMusic";
 
 const CATALOG_SONG: &str = "catalog:song:";
+const CATALOG_ALBUM: &str = "catalog:album:";
+const CATALOG_ARTIST: &str = "catalog:artist:";
+const CATALOG_PLAYLIST: &str = "catalog:playlist:";
 const CATALOG: &str = "catalog:";
 const LIBRARY_SONG: &str = "i.";
 const ARTWORK: &str = "art:";
@@ -59,6 +63,37 @@ impl<'a> SongRef<'a> {
 /// The song id for a catalog id.
 pub(super) fn catalog_song_id(catalog_id: &str) -> String {
     format!("{CATALOG_SONG}{catalog_id}")
+}
+
+/// What a catalog id of this server names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CatalogKind {
+    Song,
+    Album,
+    Artist,
+    Playlist,
+}
+
+impl CatalogKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Song => CATALOG_SONG,
+            Self::Album => CATALOG_ALBUM,
+            Self::Artist => CATALOG_ARTIST,
+            Self::Playlist => CATALOG_PLAYLIST,
+        }
+    }
+}
+
+/// The Apple catalog id inside one of this server's ids of `kind`, if it is one.
+pub(super) fn catalog_part(id: &str, kind: CatalogKind) -> Option<&str> {
+    id.strip_prefix(kind.prefix())
+        .filter(|catalog_id| !catalog_id.is_empty())
+}
+
+/// This server's id for the Apple catalog id of a `kind`.
+pub(super) fn catalog_id_of(kind: CatalogKind, catalog_id: &str) -> String {
+    format!("{}{catalog_id}", kind.prefix())
 }
 
 /// Whether an Apple id names a song in the user's library.
@@ -179,6 +214,7 @@ fn song(
     track: Track<'_>,
     album_id: Option<String>,
     artist_id: Option<String>,
+    in_library: bool,
 ) -> SubsonicSong {
     SubsonicSong {
         id,
@@ -201,6 +237,7 @@ fn song(
             key: Some(key),
             reason: None,
         }),
+        rune_in_library: Some(in_library),
         ..SubsonicSong::default()
     }
 }
@@ -229,6 +266,7 @@ pub(super) fn library_song(entry: &LibrarySong, artworks: &Artworks) -> Option<S
         Track::from(&attributes),
         album_id,
         artist_id,
+        is_library_song_id(&entry.id),
     ))
 }
 
@@ -238,16 +276,26 @@ fn first_id<A>(relationship: Option<&Relationship<A>>) -> Option<String> {
         .map(|resource| resource.id.clone())
 }
 
-/// A catalog song. It has no library album or artist to browse.
+/// A catalog song, outside the library until marked otherwise. Its catalog album and artist
+/// are known only when Apple sends the song's relationships.
 pub(super) fn catalog_song(entry: &Song, artworks: &Artworks) -> SubsonicSong {
     let attributes = entry.attributes.clone().unwrap_or_default();
+    let related = |relationship: &str, kind: CatalogKind| {
+        let id = entry
+            .relationships
+            .as_ref()?
+            .pointer(&format!("/{relationship}/data/0/id"))?
+            .as_str()?;
+        Some(catalog_id_of(kind, id))
+    };
     song(
         artworks,
         catalog_song_id(&entry.id),
         format!("{CATALOG}{}", entry.id),
         Track::from(&attributes),
-        None,
-        None,
+        related("albums", CatalogKind::Album),
+        related("artists", CatalogKind::Artist),
+        false,
     )
 }
 
@@ -268,6 +316,7 @@ pub(super) fn album(entry: &LibraryAlbum, artworks: &Artworks) -> SubsonicAlbum 
         year: year(attributes.release_date.as_deref()),
         genre: attributes.genre_names.first().cloned(),
         cover_art: artworks.register(attributes.artwork.as_ref()),
+        rune_in_library: Some(true),
     }
 }
 
@@ -281,6 +330,58 @@ pub(super) fn artist(entry: &LibraryArtist) -> SubsonicArtist {
             .unwrap_or_default(),
         album_count: None,
         cover_art: None,
+        rune_in_library: Some(true),
+    }
+}
+
+/// A catalog album, outside the library until marked otherwise.
+pub(super) fn catalog_album(entry: &Album, artworks: &Artworks) -> SubsonicAlbum {
+    let attributes = entry.attributes.clone().unwrap_or_default();
+    SubsonicAlbum {
+        id: catalog_id_of(CatalogKind::Album, &entry.id),
+        name: attributes.name.unwrap_or_default(),
+        artist: attributes.artist_name,
+        artist_id: entry
+            .relationships
+            .as_ref()
+            .and_then(|relationships| first_id(relationships.artists.as_ref()))
+            .map(|id| catalog_id_of(CatalogKind::Artist, &id)),
+        song_count: attributes.track_count,
+        duration: None,
+        year: year(attributes.release_date.as_deref()),
+        genre: attributes.genre_names.first().cloned(),
+        cover_art: artworks.register(attributes.artwork.as_ref()),
+        rune_in_library: Some(false),
+    }
+}
+
+/// A catalog artist, outside the library until marked otherwise.
+pub(super) fn catalog_artist(entry: &Artist, artworks: &Artworks) -> SubsonicArtist {
+    let attributes = entry.attributes.as_ref();
+    SubsonicArtist {
+        id: catalog_id_of(CatalogKind::Artist, &entry.id),
+        name: attributes
+            .and_then(|attributes| attributes.name.clone())
+            .unwrap_or_default(),
+        album_count: None,
+        cover_art: artworks.register(attributes.and_then(|attributes| attributes.artwork.as_ref())),
+        rune_in_library: Some(false),
+    }
+}
+
+/// A catalog playlist: nothing of it can be changed through Apple's API.
+pub(super) fn catalog_playlist(entry: &Playlist, artworks: &Artworks) -> SubsonicPlaylist {
+    let attributes = entry.attributes.clone().unwrap_or_default();
+    SubsonicPlaylist {
+        id: catalog_id_of(CatalogKind::Playlist, &entry.id),
+        name: attributes.name.unwrap_or_default(),
+        song_count: None,
+        duration: None,
+        owner: attributes.curator_name,
+        public: None,
+        cover_art: artworks.register(attributes.artwork.as_ref()),
+        rune_edit: Some(RuneEdit::ReadOnly),
+        rune_in_library: Some(false),
     }
 }
 
@@ -300,6 +401,7 @@ pub(super) fn playlist(entry: &LibraryPlaylist, artworks: &Artworks) -> Subsonic
         } else {
             RuneEdit::ReadOnly
         }),
+        rune_in_library: Some(true),
     }
 }
 
@@ -316,6 +418,98 @@ pub(super) fn can_append(entry: &LibraryPlaylist) -> bool {
 pub(super) fn joins_song_union(entry: &LibraryPlaylist) -> bool {
     let attributes = entry.attributes.as_ref();
     can_append(entry) || attributes.and_then(|attributes| attributes.has_catalog) != Some(true)
+}
+
+/// A recommendation as a group of albums and playlists, or `None` when it holds neither.
+/// Stations and other kinds of item are left out; membership of catalog items is marked
+/// by the caller.
+pub(super) fn recommendation_group(
+    entry: &Recommendation,
+    artworks: &Artworks,
+) -> Option<RuneRecommendationGroup> {
+    let attributes = entry.attributes.clone().unwrap_or_default();
+    let mut group = RuneRecommendationGroup {
+        id: entry.id.clone(),
+        title: attributes
+            .title
+            .and_then(|title| title.string_for_display)
+            .unwrap_or_default(),
+        kind: recommendation_kind(attributes.kind.as_deref()),
+        albums: Vec::new(),
+        playlists: Vec::new(),
+    };
+    let items = entry
+        .relationships
+        .as_ref()
+        .and_then(|relationships| relationships.contents.as_ref())
+        .map(|contents| contents.data.as_slice())
+        .unwrap_or_default();
+    for item in items {
+        let attributes = item.attributes.clone().unwrap_or_default();
+        let name = attributes.name.unwrap_or_default();
+        let cover_art = artworks.register(attributes.artwork.as_ref());
+        let (library, catalog) = match item.kind.as_str() {
+            "albums" | "playlists" => (false, true),
+            // Not documented as recommendation contents; taken as library items if they come.
+            "library-albums" | "library-playlists" => (true, false),
+            _ => (false, false),
+        };
+        if !library && !catalog {
+            continue;
+        }
+        if item.kind.ends_with("albums") {
+            group.albums.push(SubsonicAlbum {
+                id: if library {
+                    item.id.clone()
+                } else {
+                    catalog_id_of(CatalogKind::Album, &item.id)
+                },
+                name,
+                artist: attributes.artist_name,
+                cover_art,
+                rune_in_library: Some(library),
+                ..SubsonicAlbum::default()
+            });
+        } else {
+            group.playlists.push(SubsonicPlaylist {
+                id: if library {
+                    item.id.clone()
+                } else {
+                    catalog_id_of(CatalogKind::Playlist, &item.id)
+                },
+                name,
+                owner: attributes.curator_name,
+                cover_art,
+                // How far a library playlist can be edited is known only once it is read.
+                rune_edit: (!library).then_some(RuneEdit::ReadOnly),
+                rune_in_library: Some(library),
+                ..SubsonicPlaylist::default()
+            });
+        }
+    }
+    (!group.albums.is_empty() || !group.playlists.is_empty()).then_some(group)
+}
+
+/// Apple's recommendation kinds onto the extension's. Apple documents `music-recommendations`
+/// and `recently-played`; the others are guesses at undocumented values.
+fn recommendation_kind(kind: Option<&str>) -> RuneRecommendationKind {
+    match kind.unwrap_or_default() {
+        "music-recommendations" => RuneRecommendationKind::Personal,
+        "recently-played" => RuneRecommendationKind::Recent,
+        // Undocumented.
+        "heavy-rotation" => RuneRecommendationKind::Recent,
+        // Undocumented.
+        kind if kind.contains("genre") => RuneRecommendationKind::Genre,
+        _ => RuneRecommendationKind::Other,
+    }
+}
+
+/// A name as it is compared across library and catalog: case and spacing ignored.
+pub(super) fn name_key(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 pub(super) fn starred(rating: Option<i8>) -> Option<String> {
@@ -388,7 +582,13 @@ mod tests {
             SongRef::parse("catalog:song:123"),
             Ok(SongRef::Catalog("123"))
         );
-        for id in ["", "catalog:song:", "catalog:album:1", "art:00"] {
+        for id in [
+            "",
+            "catalog:song:",
+            "catalog:album:1",
+            "catalog:playlist:1",
+            "art:00",
+        ] {
             assert!(
                 matches!(
                     SongRef::parse(id),
@@ -400,6 +600,54 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn catalog_ids_name_their_kind() {
+        assert_eq!(
+            catalog_part("catalog:album:12", CatalogKind::Album),
+            Some("12")
+        );
+        assert_eq!(catalog_part("catalog:album:12", CatalogKind::Song), None);
+        assert_eq!(catalog_part("catalog:album:", CatalogKind::Album), None);
+        assert_eq!(catalog_part("l.12", CatalogKind::Album), None);
+        for kind in [
+            CatalogKind::Song,
+            CatalogKind::Album,
+            CatalogKind::Artist,
+            CatalogKind::Playlist,
+        ] {
+            assert_eq!(catalog_part(&catalog_id_of(kind, "7"), kind), Some("7"));
+        }
+        assert_eq!(catalog_id_of(CatalogKind::Song, "7"), catalog_song_id("7"));
+        assert!(library_id("catalog:artist:7", "artist").is_err());
+    }
+
+    #[test]
+    fn names_compare_without_case_or_spacing() {
+        assert_eq!(name_key("  The   Dawn  Album "), "the dawn album");
+        assert_eq!(name_key("ÉCLAT"), name_key("éclat"));
+    }
+
+    #[test]
+    fn recommendation_kinds_map_as_far_as_known() {
+        assert_eq!(
+            recommendation_kind(Some("music-recommendations")),
+            RuneRecommendationKind::Personal
+        );
+        assert_eq!(
+            recommendation_kind(Some("recently-played")),
+            RuneRecommendationKind::Recent
+        );
+        assert_eq!(
+            recommendation_kind(Some("genre-picks")),
+            RuneRecommendationKind::Genre
+        );
+        assert_eq!(
+            recommendation_kind(Some("unknown")),
+            RuneRecommendationKind::Other
+        );
+        assert_eq!(recommendation_kind(None), RuneRecommendationKind::Other);
     }
 
     #[test]

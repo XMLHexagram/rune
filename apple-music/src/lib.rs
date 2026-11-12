@@ -6,7 +6,8 @@
 //! retries and a cap on concurrent requests.
 //!
 //! [`AppleMusicServer`] serves the Subsonic API facets of the `subsonic` crate from
-//! the user's library, so Rune can open Apple Music like any Subsonic server.
+//! the user's library, and Apple's catalog and recommendations through Rune's extensions,
+//! so Rune can open Apple Music like any Subsonic server.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -45,6 +46,8 @@ pub const LIBRARY_PAGE_SIZE: u32 = 100;
 pub const ID_BATCH: usize = 100;
 /// Largest `limit` of a library search.
 pub const LIBRARY_SEARCH_LIMIT: u32 = 25;
+/// Largest `limit` of a catalog search, per type.
+pub const CATALOG_SEARCH_LIMIT: u32 = 25;
 /// Page size of recently added resources, Apple's largest.
 pub const RECENTLY_ADDED_LIMIT: u32 = 25;
 /// Pages of recently added resources that are read.

@@ -89,8 +89,8 @@ class _CollectionItemState extends State<CollectionItem> {
                 widget.collectionType,
                 widget.collection.id,
                 widget.collection.name,
-                widget.refreshList,
-                widget.collection.readonly,
+                refreshList: widget.refreshList,
+                readonly: widget.collection.readonly,
               );
             } else {
               openTrackItemContextMenu(

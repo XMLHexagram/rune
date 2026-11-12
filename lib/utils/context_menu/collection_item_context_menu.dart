@@ -30,6 +30,7 @@ import '../dialogs/play_on/play_on_dialog.dart';
 import '../router/router_aware_flyout_controller.dart';
 import 'utils/build_m3u8.dart';
 import 'offline_selection.dart';
+import 'add_to_library_item.dart';
 
 Future<void> _handleCollectionRequest(
   BuildContext context,
@@ -118,10 +119,11 @@ void openCollectionItemContextMenu(
   RouterAwareFlyoutController contextController,
   CollectionType type,
   int id,
-  String title, [
+  String title, {
   void Function()? refreshList,
   bool? readonly,
-]) async {
+  void Function()? onAddedToLibrary,
+}) async {
   final targetContext = contextAttachKey.currentContext;
 
   if (targetContext == null) return;
@@ -149,6 +151,7 @@ void openCollectionItemContextMenu(
           type,
           id,
           isBand,
+          onAddedToLibrary: onAddedToLibrary,
         );
       },
     );
@@ -179,8 +182,9 @@ void openCollectionItemContextMenu(
       id,
       title,
       mixes,
-      refreshList,
-      readonly,
+      refreshList: refreshList,
+      readonly: readonly,
+      onAddedToLibrary: onAddedToLibrary,
     ),
   );
 }
@@ -190,11 +194,12 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
   CollectionType type,
   int id,
   String title,
-  List<Mix> mixes, [
+  List<Mix> mixes, {
   void Function()? refreshList,
   bool? readonly,
   List<int> fallbackFileIds = const [],
-]) {
+  void Function()? onAddedToLibrary,
+}) {
   final operator = typeToOperator[type];
   final edit = typeToEdit[type];
   final remove = typeToRemove[type];
@@ -271,6 +276,14 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
       },
     ),
   ];
+
+  final addToLibraryItem = addToLibraryMenuItem(
+    context,
+    type: type,
+    id: id,
+    onAdded: onAddedToLibrary,
+  );
+  if (addToLibraryItem != null) items.add(addToLibraryItem);
 
   if (edit != null && !context.read<LibraryOpenStateProvider>().isReadOnlyReplica) {
     items.add(const MenuFlyoutSeparator());
@@ -396,9 +409,10 @@ FlyoutContent buildBandScreenCollectionItemContextMenu(
   BuildContext context,
   CollectionType type,
   int id,
-  bool isBand, [
+  bool isBand, {
   List<int> fallbackFileIds = const [],
-]) {
+  void Function()? onAddedToLibrary,
+}) {
   final libraryState = context.read<LibraryOpenStateProvider>();
   final castLibraryId = libraryState.catalogLibraryId ?? libraryState.openRecord?.recordId;
   List<CommandBarButton> items = [
@@ -459,6 +473,12 @@ FlyoutContent buildBandScreenCollectionItemContextMenu(
           () => startRoaming(context, type, id, fallbackFileIds),
         );
       },
+    ),
+    ?addToLibraryCommandButton(
+      context,
+      type: type,
+      id: id,
+      onAdded: onAddedToLibrary,
     ),
   ];
 

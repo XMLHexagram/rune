@@ -156,6 +156,8 @@ class TurntileScreenImplementationState
                         hasRecommendation: false,
                         reloadData: data.reloadData,
                         userGenerated: isUserGenerated,
+                        showDetail: !isUserGenerated ||
+                            canCreateCollection(context, data.collectionType),
                       )
                     : Container(),
               ),

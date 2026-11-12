@@ -320,6 +320,23 @@ pub struct LibraryAlbumAttributes {
 /// An album in the user's library.
 pub type LibraryAlbum = Resource<LibraryAlbumAttributes>;
 
+impl LibraryAlbum {
+    /// The catalog id of this album: `playParams.catalogId`, else the id of the `catalog`
+    /// relationship when it was included.
+    pub fn catalog_id(&self) -> Option<&str> {
+        self.attributes
+            .as_ref()
+            .and_then(|attributes| attributes.play_params.as_ref())
+            .and_then(|params| params.catalog_id.as_deref())
+            .or_else(|| {
+                self.relationships
+                    .as_ref()?
+                    .pointer("/catalog/data/0/id")?
+                    .as_str()
+            })
+    }
+}
+
 /// Attributes of a library artist.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LibraryArtistAttributes {
@@ -612,13 +629,120 @@ pub struct RecommendationRelationships {
 /// A personal recommendation: a titled group of playlists, albums and stations.
 pub type Recommendation = Resource<RecommendationAttributes, RecommendationRelationships>;
 
-/// Attributes of a catalog playlist or album that matter for naming it.
+/// Attributes of a catalog album.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CollectionAttributes {
-    /// The name.
+pub struct AlbumAttributes {
+    /// Artist name.
+    pub artist_name: Option<String>,
+    /// Artwork.
+    pub artwork: Option<Artwork>,
+    /// `clean` or `explicit`; absent when unrated.
+    pub content_rating: Option<String>,
+    /// Genre names.
+    #[serde(default)]
+    pub genre_names: Vec<String>,
+    /// Whether the album is a compilation.
+    pub is_compilation: Option<bool>,
+    /// Whether the album is a single.
+    pub is_single: Option<bool>,
+    /// Album name.
     pub name: Option<String>,
+    /// Playback parameters; present when the album can be played.
+    pub play_params: Option<PlayParams>,
+    /// Record label.
+    pub record_label: Option<String>,
+    /// Release date, `YYYY-MM-DD` or `YYYY`.
+    pub release_date: Option<String>,
+    /// Number of tracks.
+    pub track_count: Option<u32>,
+    /// Apple Music web URL.
+    pub url: Option<String>,
 }
 
-/// A catalog playlist or album, without its tracks.
-pub type CatalogCollection = Resource<CollectionAttributes>;
+/// Relationships of a catalog album, present when requested with `include`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AlbumRelationships {
+    /// The album's artists.
+    pub artists: Option<Relationship<ArtistAttributes>>,
+}
+
+/// A catalog album.
+pub type Album = Resource<AlbumAttributes, AlbumRelationships>;
+
+/// Attributes of a catalog artist.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistAttributes {
+    /// Artwork, when the artist has an image.
+    pub artwork: Option<Artwork>,
+    /// Genre names.
+    #[serde(default)]
+    pub genre_names: Vec<String>,
+    /// Artist name.
+    pub name: Option<String>,
+    /// Apple Music web URL.
+    pub url: Option<String>,
+}
+
+/// A catalog artist.
+pub type Artist = Resource<ArtistAttributes>;
+
+/// Attributes of a catalog playlist.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistAttributes {
+    /// Artwork.
+    pub artwork: Option<Artwork>,
+    /// Who curated the playlist.
+    pub curator_name: Option<String>,
+    /// Description.
+    pub description: Option<Description>,
+    /// When the playlist last changed.
+    pub last_modified_date: Option<String>,
+    /// Playlist name.
+    pub name: Option<String>,
+    /// Playback parameters.
+    pub play_params: Option<PlayParams>,
+    /// `editorial`, `external`, `personal-mix`, `replay` or `user-shared`.
+    pub playlist_type: Option<String>,
+    /// Apple Music web URL.
+    pub url: Option<String>,
+}
+
+/// A catalog playlist.
+pub type Playlist = Resource<PlaylistAttributes>;
+
+/// A resource type the catalog search can return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogSearchType {
+    /// `songs`.
+    Songs,
+    /// `albums`.
+    Albums,
+    /// `artists`.
+    Artists,
+}
+
+impl CatalogSearchType {
+    /// The `types` value of the request.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CatalogSearchType::Songs => "songs",
+            CatalogSearchType::Albums => "albums",
+            CatalogSearchType::Artists => "artists",
+        }
+    }
+}
+
+/// What a catalog search found, one page per requested type. Types that were not
+/// requested or matched nothing are empty.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CatalogSearchResults {
+    /// Matching songs.
+    pub songs: Page<Song>,
+    /// Matching albums.
+    pub albums: Page<Album>,
+    /// Matching artists.
+    pub artists: Page<Artist>,
+}

@@ -7,8 +7,10 @@ use ::database::actions::search::convert_to_collection_types;
 use ::database::actions::search::search_for;
 
 use crate::{
-    Session, Signal,
+    Session, Signal, TypedRequest,
     messages::*,
+    request_error::ExpectedRequestError,
+    rpc::UnsupportedReason,
     utils::{GlobalParams, ParamsExtractor, require_library},
 };
 
@@ -51,6 +53,43 @@ impl Signal for SearchForRequest {
 
         Ok(Some(search_response(request.call_id, results)))
     }
+}
+
+/// A Rune library holds everything it lists: it has no catalogue beyond it, so these requests
+/// are only served by libraries of services that have one.
+macro_rules! catalogue_only {
+    ($($request:ty => $response:ty),* $(,)?) => {
+        $(
+            impl ParamsExtractor for $request {
+                type Params = ();
+
+                fn extract_params(&self, _: &GlobalParams) -> Self::Params {}
+            }
+
+            impl Signal for $request {
+                type Params = ();
+                type Response = $response;
+
+                async fn handle(
+                    &self,
+                    _params: Self::Params,
+                    _session: Option<Session>,
+                    _dart_signal: &Self,
+                ) -> Result<Option<Self::Response>> {
+                    Err(ExpectedRequestError::Unsupported {
+                        request: <$request as TypedRequest>::wire_name(),
+                        reason: UnsupportedReason::NotImplemented,
+                    }
+                    .into())
+                }
+            }
+        )*
+    };
+}
+
+catalogue_only! {
+    FetchLibraryMembershipRequest => FetchLibraryMembershipResponse,
+    AddToLibraryRequest => AddToLibraryResponse,
 }
 
 fn search_response(

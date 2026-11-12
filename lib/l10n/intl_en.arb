@@ -1759,5 +1759,13 @@
   "signInMethodUnsupported": "This library needs a sign-in method that this version of Rune does not support.",
   "@signInMethodUnsupported": {
     "description": "Shown when a library's server only offers sign-in methods this app cannot perform."
+  },
+  "addToLibrary": "Add to Library",
+  "@addToLibrary": {
+    "description": "An entry in the context menu of a search result that is not in the library. Pressing it adds the track or album to the library."
+  },
+  "notInYourLibrary": "Not in Your Library",
+  "@notInYourLibrary": {
+    "description": "Tooltip of the marker beside a search result that is not in the library."
   }
 }
