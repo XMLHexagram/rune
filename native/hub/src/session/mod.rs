@@ -1,4 +1,5 @@
 //! Node-owned render state. Catalog resources are leased only while resolving an item.
+pub(crate) mod hosted;
 pub(crate) mod store;
 
 use std::{
@@ -448,6 +449,11 @@ impl PlayerSession {
                 Arc::downgrade(node),
                 String::new(),
             )));
+        // Only this device's own player: the host that plays a hosted track is the app here.
+        player
+            .lock()
+            .await
+            .set_host_bridge(Arc::new(hosted::JsonHostBridge::to_app()));
         let controls = if os_media_controls {
             match MediaControlManager::with_name(&format!(
                 "rune_player_{}_{}",
@@ -702,6 +708,8 @@ struct ItemEventState {
     request_ui_library: Option<Uuid>,
     feed_item: Option<PlayingItemRef>,
     feed_controller_count: usize,
+    /// The OS media controls skipped this item's metadata because a host publishes its own.
+    controls_skipped: bool,
 }
 
 struct ResolvedLibrary {
@@ -723,7 +731,15 @@ async fn handle_status_event(
     broadcaster: &Arc<dyn Broadcaster>,
     session_id: &str,
 ) {
+    // A host that plays a track publishes its own now-playing, so the controls stay out of it.
+    let hosted = value.hosted_by.is_some();
+    let controls = if hosted { &None } else { controls };
     let item_changed = value.item != item_state.last_item;
+    if hosted {
+        item_state.controls_skipped = true;
+    }
+    let republish_controls =
+        !hosted && !item_changed && std::mem::take(&mut item_state.controls_skipped);
     if item_changed {
         item_state.metadata = PlayingItemMetadataSummary::default();
         item_state.cover = None;
@@ -774,6 +790,13 @@ async fn handle_status_event(
         }
         playing_cover_changed(value.item.as_ref(), item_state.cover.as_deref());
         item_state.last_item = value.item.clone();
+    } else if republish_controls && let Some(manager) = controls {
+        let _ = update_media_controls_metadata(
+            manager.clone(),
+            &item_state.metadata,
+            item_state.cover.as_ref(),
+        )
+        .await;
     }
     if value.state == PlaybackState::Playing && !item_state.track_started {
         let start_time = SystemTime::now()

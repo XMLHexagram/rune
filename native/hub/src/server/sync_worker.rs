@@ -35,7 +35,7 @@ use futures::future::{AbortHandle, Abortable, Aborted};
 use http_request::sync::PageCursor;
 use playback::player::{
     LibraryPlaybackSource, LibraryTrackKey, PlaybackSourceResolver, RemoteAudioError,
-    RemoteAudioSource, SubsonicItem,
+    RemoteAudioSource, SubsonicItem, SubsonicTarget,
 };
 use rand::rngs::OsRng;
 use reqwest::header::HeaderMap;
@@ -2553,6 +2553,18 @@ impl PlaybackSourceResolver for PairedAudioResolver {
             let owner = node.upgrade().context("Node stopped")?;
             let binding = subsonic_binding_for_playback(&owner, item.library_id).await?;
             binding.playback_source(item).await
+        })
+    }
+
+    fn resolve_subsonic_target(
+        &self,
+        item: SubsonicItem,
+    ) -> BoxFuture<'static, Result<SubsonicTarget>> {
+        let node = self.0.clone();
+        Box::pin(async move {
+            let owner = node.upgrade().context("Node stopped")?;
+            let binding = subsonic_binding_for_playback(&owner, item.library_id).await?;
+            binding.playback_target(item).await
         })
     }
 }
