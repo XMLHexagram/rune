@@ -1,6 +1,7 @@
 import 'dart:math';
 
 import 'package:fluent_ui/fluent_ui.dart';
+import 'package:provider/provider.dart';
 
 import '../../../utils/router/router_aware_flyout_controller.dart';
 import '../../../widgets/ax_pressure.dart';
@@ -8,6 +9,9 @@ import '../../../widgets/hover_opacity.dart';
 import '../../../widgets/ax_reveal/ax_reveal.dart';
 import '../../../widgets/context_menu_wrapper.dart';
 import '../../../providers/responsive_providers.dart';
+import '../../../bindings/bindings.dart';
+import '../utils/search_membership.dart';
+import 'not_in_library_marker.dart';
 
 abstract class SearchCard extends StatefulWidget {
   final int index;
@@ -22,6 +26,21 @@ abstract class SearchCardState<T extends SearchCard> extends State<T> {
   int getItemId();
 
   String getItemTitle();
+
+  CollectionType getItemType();
+
+  /// The callback for the context menu when this item is outside the library,
+  /// otherwise null.
+  ///
+  /// The membership is looked up now, while the menu opens. The callback runs
+  /// after the add finished, when this card may be gone.
+  void Function()? addedToLibraryCallback(BuildContext context) {
+    final membership = context.read<SearchMembership?>();
+    final type = getItemType();
+    final id = getItemId();
+    if (membership == null || !membership.isOutside(type, id)) return null;
+    return () => membership.markAdded(type, id);
+  }
 
   Widget buildLeadingWidget(double size);
 
@@ -39,6 +58,12 @@ abstract class SearchCardState<T extends SearchCard> extends State<T> {
 
   @override
   Widget build(BuildContext context) {
+    final outside =
+        context.watch<SearchMembership?>()?.isOutside(
+          getItemType(),
+          getItemId(),
+        ) ??
+        false;
     return ContextMenuWrapper(
       contextAttachKey: contextAttachKey,
       contextController: contextController,
@@ -97,11 +122,11 @@ abstract class SearchCardState<T extends SearchCard> extends State<T> {
                       child: Padding(
                         padding: const EdgeInsets.all(8),
                         child: HoverOpacity(
-                          child: Text(
-                            getItemTitle(),
+                          child: SearchItemTitle(
+                            title: getItemTitle(),
+                            outside: outside,
                             style: typography.bodyLarge
                                 ?.apply(fontSizeFactor: 0.9),
-                            overflow: TextOverflow.ellipsis,
                           ),
                         ),
                       ),
@@ -133,9 +158,9 @@ abstract class SearchCardState<T extends SearchCard> extends State<T> {
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
-                                  Text(
-                                    getItemTitle(),
-                                    overflow: TextOverflow.ellipsis,
+                                  SearchItemTitle(
+                                    title: getItemTitle(),
+                                    outside: outside,
                                   ),
                                 ],
                               ),

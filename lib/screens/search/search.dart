@@ -16,10 +16,12 @@ import '../../screens/search/widgets/small_screen_search_track_list.dart';
 import '../../screens/search/constants/search_categories.dart';
 import '../../bindings/bindings.dart';
 import '../../providers/responsive_providers.dart';
+import '../../providers/request_capabilities.dart';
 import '../../utils/rune_log.dart';
 
 import 'utils/track_items_to_search_card.dart';
 import 'utils/collection_items_to_search_card.dart';
+import 'utils/search_membership.dart';
 import 'widgets/search_card.dart';
 import 'widgets/search_suggest_box.dart';
 import 'widgets/collection_search_item.dart';
@@ -81,6 +83,9 @@ class _SearchPageImplementationState extends State<SearchPageImplementation> {
 
   String _lastSearched = '';
 
+  // The shown results that are not in the open library.
+  final membership = SearchMembership();
+
   final bandScreenLayoutManager = StartScreenLayoutManager();
   final largeScreenLayoutManager = StartScreenLayoutManager();
   final mediumScreenLayoutManager = StartScreenLayoutManager();
@@ -97,6 +102,7 @@ class _SearchPageImplementationState extends State<SearchPageImplementation> {
   void dispose() {
     super.dispose();
     _debounce?.cancel();
+    membership.dispose();
     searchController.dispose();
     bandScreenLayoutManager.dispose();
     largeScreenLayoutManager.dispose();
@@ -167,6 +173,8 @@ class _SearchPageImplementationState extends State<SearchPageImplementation> {
   Future<void> _performSearch(String query) async {
     if (_isRequestInProgress) return;
     _isRequestInProgress = true;
+    // Whatever the membership request of the last search answers is stale now.
+    membership.invalidate();
 
     try {
       final response = await searchFor(query);
@@ -207,16 +215,13 @@ class _SearchPageImplementationState extends State<SearchPageImplementation> {
       // and the new text is searched below.
       if (!mounted || searchController.text != query) return;
 
-      // The text changed while this search ran; its results are out of date
-      // and the new text is searched below.
-      if (!mounted || searchController.text != query) return;
-
       setState(() {
         _searchResults = response;
         items = found;
         resetAnimations();
         playAnimations();
       });
+      _refreshMembership(response);
     } catch (e) {
       // A failed request is reported by the hub; the page keeps searching.
       error$('Search for "$query" failed: $e');
@@ -228,7 +233,23 @@ class _SearchPageImplementationState extends State<SearchPageImplementation> {
     }
   }
 
+  // Only a service library with catalogue search answers this; for any other
+  // library nothing is asked and nothing is marked.
+  void _refreshMembership(SearchForResponse response) {
+    membership.updateForResults(
+      available: catalogueRequestAvailable(
+        context,
+        (provider) => provider.fetchLibraryMembershipRequest,
+        listen: false,
+      ),
+      trackIds: response.tracks,
+      albumIds: response.albums,
+      artistIds: response.artists,
+    );
+  }
+
   void _clearResults() {
+    membership.reset();
     setState(() {
       _searchResults = null;
       items = {};
@@ -258,6 +279,13 @@ class _SearchPageImplementationState extends State<SearchPageImplementation> {
 
   @override
   Widget build(BuildContext context) {
+    return ChangeNotifierProvider<SearchMembership>.value(
+      value: membership,
+      child: _buildLayout(context),
+    );
+  }
+
+  Widget _buildLayout(BuildContext context) {
     final autoSuggestBox = SearchSuggestBox(
       key: _searchBoxKey,
       controller: searchController,

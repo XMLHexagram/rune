@@ -42,6 +42,8 @@ class _CardState extends SearchCardState<_Card> {
   @override
   String getItemTitle() => 'Item ${widget.index}';
   @override
+  CollectionType getItemType() => CollectionType.track;
+  @override
   Widget buildLeadingWidget(double size) => SizedBox.square(dimension: size);
   @override
   void onPressed(BuildContext context) {}
