@@ -728,6 +728,11 @@ impl SubsonicClient {
         let mut response = response
             .error_for_status()
             .map_err(|error| SubsonicError::Transport(error.without_url().to_string()))?;
+        let not_an_image = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("json") || value.contains("xml"));
         const MAX_COVER_BYTES: usize = 8 * 1024 * 1024;
         if response
             .content_length()
@@ -746,7 +751,37 @@ impl SubsonicClient {
             }
             bytes.extend_from_slice(&chunk);
         }
+        if not_an_image {
+            // Servers report a missing image as an error document with a success status.
+            return Err(self.error_document(&bytes));
+        }
         Ok(bytes)
+    }
+
+    /// The error a JSON error document carries, or `Malformed` for any other document.
+    fn error_document(&self, bytes: &[u8]) -> SubsonicError {
+        let Ok(envelope) = serde_json::from_slice::<RawEnvelope>(bytes) else {
+            return SubsonicError::Malformed("cover art response is not an image".into());
+        };
+        let Some(error) = envelope
+            .response
+            .error
+            .filter(|_| envelope.response.status == "failed")
+        else {
+            return SubsonicError::Malformed("cover art response is not an image".into());
+        };
+        let mut message = error.message;
+        let secrets = match &self.credentials {
+            SubsonicCredentials::Password { password, .. } => password.clone(),
+            SubsonicCredentials::ApiKey { key } => key.clone(),
+        };
+        if !secrets.is_empty() {
+            message = message.replace(&secrets, "[REDACTED]");
+        }
+        SubsonicError::Server {
+            kind: error.code.into(),
+            message,
+        }
     }
 
     fn endpoint_url(&self, endpoint: &str) -> Url {
