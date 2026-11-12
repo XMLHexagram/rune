@@ -1149,6 +1149,8 @@ impl<'de> Deserialize<'de> for SubsonicSyncedLyrics {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct SubsonicSyncedLine {
+    /// Unsynced lines carry no start.
+    #[serde(default)]
     pub start: u32,
     pub value: String,
 }
@@ -1314,18 +1316,34 @@ struct RawOpenSubsonicPlainLyrics {
 }
 impl From<RawLyricsList> for SubsonicLyrics {
     fn from(raw: RawLyricsList) -> Self {
+        let synced_lyrics = raw
+            .structured_lyrics
+            .map(OneOrMany::into_vec)
+            .unwrap_or_default();
+        let plain_lyrics = raw
+            .plain_lyrics
+            .map(OneOrMany::into_vec)
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+            .map(|lyrics| lyrics.text)
+            // OpenSubsonic sends plain text as an entry that is not synced.
+            .or_else(|| {
+                synced_lyrics
+                    .iter()
+                    .find(|lyrics| !lyrics.synced)
+                    .map(|lyrics| {
+                        lyrics
+                            .lines
+                            .iter()
+                            .map(|line| line.value.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+            });
         Self {
-            plain_lyrics: raw
-                .plain_lyrics
-                .map(OneOrMany::into_vec)
-                .unwrap_or_default()
-                .into_iter()
-                .next()
-                .map(|lyrics| lyrics.text),
-            synced_lyrics: raw
-                .structured_lyrics
-                .map(OneOrMany::into_vec)
-                .unwrap_or_default(),
+            plain_lyrics,
+            synced_lyrics,
         }
     }
 }
@@ -1649,5 +1667,68 @@ mod rune_playback_tests {
         probe.extensions = vec![("runeService".into(), vec![1])];
         probe.open_subsonic = false;
         assert!(!probe.supports_rune_service());
+    }
+}
+
+#[cfg(test)]
+mod opensubsonic_lyrics_tests {
+    use super::*;
+
+    /// The `getLyricsBySongId` example of the OpenSubsonic documentation: one synced entry
+    /// and one whose lines carry no `start`.
+    const SAMPLE: &str = r#"{
+      "lyricsList": {
+        "structuredLyrics": [
+          {
+            "displayArtist": "Muse",
+            "displayTitle": "Hysteria",
+            "lang": "eng",
+            "offset": -100,
+            "synced": true,
+            "line": [
+              {"start": 0, "value": "It's bugging me"},
+              {"start": 2000, "value": "Grating me"},
+              {"start": 3001, "value": "And twisting me around..."}
+            ]
+          },
+          {
+            "displayArtist": "Muse",
+            "displayTitle": "Hysteria",
+            "lang": "und",
+            "offset": 100,
+            "synced": false,
+            "line": [
+              {"value": "It's bugging me"},
+              {"value": "Grating me"},
+              {"value": "And twisting me around..."}
+            ]
+          }
+        ]
+      }
+    }"#;
+
+    #[test]
+    fn unsynced_entries_parse_and_become_plain_lyrics() {
+        let response: LyricsBySongIdResponse = serde_json::from_str(SAMPLE).unwrap();
+        let lyrics = SubsonicLyrics::from(response.lyrics_list.unwrap());
+        assert_eq!(
+            lyrics.plain_lyrics.as_deref(),
+            Some("It's bugging me\nGrating me\nAnd twisting me around...")
+        );
+        assert_eq!(lyrics.synced_lyrics.len(), 2);
+        assert!(lyrics.synced_lyrics[0].synced);
+        assert_eq!(lyrics.synced_lyrics[0].lines[1].start, 2000);
+        assert!(!lyrics.synced_lyrics[1].synced);
+        assert_eq!(lyrics.synced_lyrics[1].lines[2].start, 0);
+    }
+
+    #[test]
+    fn the_plain_lyrics_extension_wins_when_present() {
+        let response: LyricsBySongIdResponse = serde_json::from_str(
+            r#"{"lyricsList":{"plainLyrics":{"text":"extension"},"structuredLyrics":[{"synced":false,"line":[{"value":"entry"}]}]}}"#,
+        )
+        .unwrap();
+        let lyrics = SubsonicLyrics::from(response.lyrics_list.unwrap());
+        assert_eq!(lyrics.plain_lyrics.as_deref(), Some("extension"));
     }
 }
