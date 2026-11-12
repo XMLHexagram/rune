@@ -1276,6 +1276,22 @@ pub fn define_request_types(_input: TokenStream) -> TokenStream {
             introduced_minor: None,
             receiver: RequestReceiver::NodeLoop,
         },
+        RequestResponse {
+            request: "FetchLibraryMembershipRequest".to_string(),
+            response: Some("FetchLibraryMembershipResponse".to_string()),
+            scope: RequestScope::Library,
+            access: RequestAccess::ConnectionView,
+            introduced_minor: None,
+            receiver: RequestReceiver::Library,
+        },
+        RequestResponse {
+            request: "AddToLibraryRequest".to_string(),
+            response: Some("AddToLibraryResponse".to_string()),
+            scope: RequestScope::Library,
+            access: RequestAccess::ConnectionEdit,
+            introduced_minor: None,
+            receiver: RequestReceiver::Library,
+        },
     ];
 
     let (with_response, without_response): (Vec<_>, Vec<_>) =

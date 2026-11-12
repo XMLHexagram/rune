@@ -1231,6 +1231,8 @@ mod access_policy_tests {
             "LibraryLoginMethodsRequest" => RequestAccess::NodeLocal,
             "StartLibraryLoginRequest" => RequestAccess::NodeLocal,
             "CompleteLibraryLoginRequest" => RequestAccess::NodeLocal,
+            "FetchLibraryMembershipRequest" => RequestAccess::ConnectionView,
+            "AddToLibraryRequest" => RequestAccess::ConnectionEdit,
             "RegisterOpenDalLibraryRequest" => RequestAccess::NodeLocal,
             "DetectOpenDalShareDataRequest" => RequestAccess::NodeLocal,
             "OpenLibraryRequest" => RequestAccess::NodeLocal,

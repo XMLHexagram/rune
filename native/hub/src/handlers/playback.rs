@@ -44,6 +44,8 @@ use crate::{
 };
 
 const HANDOFF_START_TIMEOUT: Duration = Duration::from_secs(30);
+/// The playback mode a request sends to leave the player's mode as it is.
+pub(crate) const KEEP_PLAYBACK_MODE: u32 = 99;
 
 pub async fn playing_item_from_request(
     request: PlayingItemRef,
@@ -143,7 +145,9 @@ fn edit_playlist(
     player.edit_playlist(PlaylistEdit {
         tracks: prepared.to_vec(),
         placement,
-        playback_mode: playback_mode.filter(|mode| *mode != 99).map(Into::into),
+        playback_mode: playback_mode
+            .filter(|mode| *mode != KEEP_PLAYBACK_MODE)
+            .map(Into::into),
         load,
         block: None,
     });
@@ -1297,7 +1301,7 @@ async fn apply_resolved_items_load(
                 play,
                 playback_mode: request
                     .playback_mode
-                    .filter(|mode| *mode != 99)
+                    .filter(|mode| *mode != KEEP_PLAYBACK_MODE)
                     .map(Into::into),
             })
             .await?;

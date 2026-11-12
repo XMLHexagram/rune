@@ -179,6 +179,8 @@ pub struct RequestCapabilities {
     pub library_login_methods_request: RequestCapability,
     pub start_library_login_request: RequestCapability,
     pub complete_library_login_request: RequestCapability,
+    pub fetch_library_membership_request: RequestCapability,
+    pub add_to_library_request: RequestCapability,
 }
 
 impl From<Slot> for RequestCapability {

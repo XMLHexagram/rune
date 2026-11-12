@@ -12,7 +12,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -27,7 +27,7 @@ use playback::player::{
 };
 use subsonic::{
     RunePlaybackMode, RunePlaybackReason, SubsonicAlbum, SubsonicApi, SubsonicArtist,
-    SubsonicJukebox, SubsonicSong,
+    SubsonicJukebox, SubsonicPlaylistDetail, SubsonicSong,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -50,6 +50,8 @@ pub(crate) enum SubsonicIdKind {
     Track,
     Playlist,
     CoverArt,
+    /// A mix made from a recommended album or playlist, keyed `album:<id>` or `playlist:<id>`.
+    Mix,
 }
 
 impl SubsonicIdMap {
@@ -362,6 +364,122 @@ pub(crate) struct SubsonicCatalog {
     pub(crate) playlist_edits: HashMap<i32, subsonic::RuneEdit>,
     pub(crate) artists_loaded: bool,
     pub(crate) albums_loaded: bool,
+    /// What the Artists and Albums pages list: what the library's own lists (getArtists,
+    /// getAlbumList2) named, and albums added to the library here. Artists and albums known
+    /// only from searches or detail pages are not listed.
+    pub(crate) listed_artists: HashSet<i32>,
+    pub(crate) listed_albums: HashSet<i32>,
+    /// The songs of the last detail query read, for its following pages.
+    pub(crate) recent_detail: Option<RecentRead<DetailQuery, Vec<SubsonicSong>>>,
+    /// Playlists read for occurrence pages, by playlist id, for their following pages.
+    pub(crate) recent_playlists: HashMap<i32, RecentRead<(), SubsonicPlaylistDetail>>,
+    /// Items a `runeCatalog` server last said are outside the user's library. Every other
+    /// item counts as in it.
+    pub(crate) outside_library: HashSet<(SubsonicIdKind, i32)>,
+    /// Mixes made from a `runeRecommendations` server's recommendations, by mix id. Mixes
+    /// of earlier reads stay, so that pages open on them keep working.
+    pub(crate) mixes: HashMap<i32, RecommendedMix>,
+    /// The groups of the last read of recommendations, in the server's order.
+    pub(crate) mix_groups: Vec<(String, Vec<i32>)>,
+    pub(crate) mixes_loaded: bool,
+}
+
+/// What a detail query (an artist's, album's or playlist's songs) asks for, by interned id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetailQuery {
+    Artist(i32),
+    Album(i32),
+    Playlist(i32),
+}
+
+/// Something read from the server for `key`, kept briefly so that the following pages of one
+/// listing read it once.
+pub(crate) struct RecentRead<K, T> {
+    pub(crate) key: K,
+    pub(crate) read: Instant,
+    pub(crate) value: Arc<T>,
+}
+
+impl<K: PartialEq, T> RecentRead<K, T> {
+    /// The value, when it was read for `key` less than `age` before `now`.
+    pub(crate) fn fresh(&self, key: &K, now: Instant, age: Duration) -> Option<Arc<T>> {
+        (self.key == *key && now.saturating_duration_since(self.read) < age)
+            .then(|| Arc::clone(&self.value))
+    }
+}
+
+/// A recommended album or playlist, shown as a mix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecommendedMix {
+    pub(crate) name: String,
+    pub(crate) group: String,
+    pub(crate) target: MixTarget,
+    pub(crate) cover_art: Option<String>,
+}
+
+/// What a recommended mix plays, by interned id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MixTarget {
+    Album(i32),
+    Playlist(i32),
+}
+
+impl SubsonicCatalog {
+    /// Remembers what a `runeCatalog` server said about an item's place in the user's
+    /// library. Servers without the extension never say, and nothing changes.
+    pub(crate) fn note_membership(
+        &mut self,
+        kind: SubsonicIdKind,
+        id: i32,
+        in_library: Option<bool>,
+    ) {
+        match in_library {
+            Some(false) => {
+                self.outside_library.insert((kind, id));
+            }
+            Some(true) => {
+                self.outside_library.remove(&(kind, id));
+            }
+            None => {}
+        }
+    }
+
+    pub(crate) fn is_outside_library(&self, kind: SubsonicIdKind, id: i32) -> bool {
+        self.outside_library.contains(&(kind, id))
+    }
+
+    pub(crate) fn remember_song(&mut self, id: i32, song: SubsonicSong) {
+        self.note_membership(SubsonicIdKind::Track, id, song.rune_in_library);
+        self.songs.insert(id, song);
+    }
+
+    pub(crate) fn remember_album(&mut self, id: i32, album: SubsonicAlbum) {
+        self.note_membership(SubsonicIdKind::Album, id, album.rune_in_library);
+        self.albums.insert(id, album);
+    }
+
+    pub(crate) fn remember_artist(&mut self, id: i32, artist: SubsonicArtist) {
+        self.note_membership(SubsonicIdKind::Artist, id, artist.rune_in_library);
+        self.artists.insert(id, artist);
+    }
+
+    /// Forgets what was read of a playlist, after an edit that may change it.
+    pub(crate) fn forget_playlist_reads(&mut self, playlist: i32) {
+        self.recent_playlists.remove(&playlist);
+        if self
+            .recent_detail
+            .as_ref()
+            .is_some_and(|recent| recent.key == DetailQuery::Playlist(playlist))
+        {
+            self.recent_detail = None;
+        }
+    }
+
+    /// Forgets every kept read, after a change to what the library holds.
+    pub(crate) fn forget_recent_reads(&mut self) {
+        self.recent_playlists.clear();
+        self.recent_detail = None;
+    }
 }
 
 impl SubsonicBinding {
@@ -428,7 +546,7 @@ impl SubsonicBinding {
     pub(crate) fn slots(&self) -> RequestSlots {
         let mut slots = RequestSlots::subsonic(&self.probe);
         if let Some(descriptor) = self.rune_service() {
-            slots.hide_rune_unsupported(&descriptor, self.has_extension("songLyrics"));
+            slots.hide_rune_unsupported(&descriptor, &self.probe, self.has_extension("songLyrics"));
         }
         slots
     }

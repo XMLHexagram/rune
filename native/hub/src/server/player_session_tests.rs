@@ -1127,6 +1127,8 @@ impl subsonic::api::MediaRetrieval for LoginApi {}
 impl subsonic::api::Jukebox for LoginApi {}
 impl subsonic::api::Scanning for LoginApi {}
 impl subsonic::api::RuneVisualizerFeed for LoginApi {}
+impl subsonic::api::RuneCatalog for LoginApi {}
+impl subsonic::api::RuneRecommendations for LoginApi {}
 
 /// A server that answers the public endpoints, declares `runeService` or not, and fails
 /// `getRuneService`. Every requested action is recorded.
@@ -11240,10 +11242,11 @@ async fn local_capability_snapshot_marks_every_request_available() -> Result<()>
     )
     .await?;
 
-    assert_eq!(
-        capability_snapshot(&fixture.global_params.node)?,
-        RequestCapabilities::all_available()
-    );
+    // A local library holds everything it lists: it has no service catalogue beyond it.
+    let mut expected = RequestCapabilities::all_available();
+    expected.fetch_library_membership_request = RequestCapability::Hidden;
+    expected.add_to_library_request = RequestCapability::Hidden;
+    assert_eq!(capability_snapshot(&fixture.global_params.node)?, expected);
     assert_eq!(
         signals
             .decoded::<RequestCapabilities>("RequestCapabilities")
@@ -11304,13 +11307,21 @@ async fn controller_capabilities_follow_catalogue_access_grants() -> Result<()> 
     let mut my_device =
         node.capabilities_for_peer(capability_snapshot(node)?, &peer, Some(library_id));
     let mut my_device_count = 0;
+    let mut hidden_count = 0;
     my_device.for_each_capability_mut(|access, capability| {
         if matches!(access, RequestAccess::ConnectionEdit | RequestAccess::Control) {
+            if *capability == RequestCapability::Hidden {
+                hidden_count += 1;
+                return;
+            }
             my_device_count += 1;
             assert_eq!(*capability, RequestCapability::Available);
         }
     });
     assert!(my_device_count > 0);
+    // Only adding catalogue items, which a local library has none of, stays hidden.
+    assert_eq!(hidden_count, 1);
+    assert_eq!(my_device.add_to_library_request, RequestCapability::Hidden);
     node.shutdown().await?;
     Ok(())
 }

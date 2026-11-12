@@ -6,41 +6,51 @@ use lyric::lrc::parse_lrc;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
+    time::{Duration, Instant},
 };
+
+use futures::{StreamExt, TryStreamExt, stream};
 use subsonic::{
-    RuneEdit, RuneServiceDescriptor, SearchLimits, SubsonicAlbum, SubsonicArtist, SubsonicError,
-    SubsonicServerError, SubsonicSong,
+    RuneEdit, RuneScope, RuneServiceDescriptor, SearchLimits, SubsonicAlbum, SubsonicArtist,
+    SubsonicError, SubsonicProbe, SubsonicServerError, SubsonicSong,
 };
 
 use crate::TypedRequest;
+use crate::handlers::playback::KEEP_PLAYBACK_MODE;
 use crate::macros::{RequestSlots, RequestTranslator};
 use crate::messages::{
-    AddItemToPlaylistRequest, AddItemToPlaylistResponse, Album, Artist, AudioAvailability,
-    AudioOrigin, CastPreflightRequest, Collection, CollectionGroup, CollectionGroupSummary,
-    CollectionGroupSummaryResponse, CollectionType, CreatePlaylistRequest, CreatePlaylistResponse,
-    FetchAllPlaylistsRequest, FetchAllPlaylistsResponse, FetchCollectionByIdsRequest,
-    FetchCollectionByIdsResponse, FetchCollectionGroupSummaryRequest, FetchCollectionGroupsRequest,
-    FetchCollectionGroupsResponse, FetchMediaFileByIdsRequest, FetchMediaFileByIdsResponse,
-    FetchMediaFilesRequest, FetchMediaFilesResponse, FetchParsedMediaFileRequest,
-    FetchParsedMediaFileResponse, GetLikedRequest, GetLikedResponse, GetLyricByTrackIdRequest,
+    AddItemToPlaylistRequest, AddItemToPlaylistResponse, AddToLibraryRequest, AddToLibraryResponse,
+    Album, Artist, AudioAvailability, AudioOrigin, CastPreflightRequest, Collection,
+    CollectionGroup, CollectionGroupSummary, CollectionGroupSummaryResponse, CollectionType,
+    CreatePlaylistRequest, CreatePlaylistResponse, FetchAllPlaylistsRequest,
+    FetchAllPlaylistsResponse, FetchCollectionByIdsRequest, FetchCollectionByIdsResponse,
+    FetchCollectionGroupSummaryRequest, FetchCollectionGroupsRequest,
+    FetchCollectionGroupsResponse, FetchLibraryMembershipRequest, FetchLibraryMembershipResponse,
+    FetchMediaFileByIdsRequest, FetchMediaFileByIdsResponse, FetchMediaFilesRequest,
+    FetchMediaFilesResponse, FetchMixQueriesRequest, FetchMixQueriesResponse,
+    FetchParsedMediaFileRequest, FetchParsedMediaFileResponse, FetchPlaylistOccurrencesRequest,
+    FetchPlaylistOccurrencesResponse, GetLikedRequest, GetLikedResponse, GetLyricByTrackIdRequest,
     GetLyricByTrackIdResponse, GetMediaFilesCountRequest, GetMediaFilesCountResponse,
-    GetPlaylistByIdRequest, GetPlaylistByIdResponse, HandoffLoadRequest, LoadRequest,
-    LoadResolvedItemsRequest, LoadResolvedItemsResponse, LyricContentLine, LyricContentLineSection,
-    MediaFile, MediaFileSummary, MixQueryRequest, MixQueryResponse, MovePlaylistItemRequest,
-    NextRequest, PauseRequest, PlayRequest, PlayingItemRef, Playlist, PlaylistOperateMode,
-    PreviousRequest, RefreshSessionRequest, RemoveItemFromPlaylistRequest,
+    GetMixByIdRequest, GetMixByIdResponse, GetPlaylistByIdRequest, GetPlaylistByIdResponse,
+    HandoffLoadRequest, LoadRequest, LoadResolvedItemsRequest, LoadResolvedItemsResponse,
+    LyricContentLine, LyricContentLineSection, MediaFile, MediaFileSummary, Mix, MixQuery,
+    MixQueryRequest, MixQueryResponse, MovePlaylistItemRequest, NextRequest, PauseRequest,
+    PlayRequest, PlayingItemRef, Playlist, PlaylistOccurrence, PlaylistOccurrenceCursor,
+    PlaylistOperateMode, PreviousRequest, RefreshSessionRequest, RemoveItemFromPlaylistRequest,
     RemoveItemFromPlaylistResponse, RemovePlaylistRequest, RemovePlaylistResponse, RemoveRequest,
     ReorderPlaylistItemPositionRequest, ReorderPlaylistItemPositionResponse,
     SearchCollectionSummaryRequest, SearchCollectionSummaryResponse, SearchForRequest,
     SearchForResponse, SearchMediaFileSummaryRequest, SearchMediaFileSummaryResponse, SeekRequest,
     SessionSnapshotRequest, SessionSnapshotResponse, SetAdaptiveSwitchingEnabledRequest,
     SetLikedRequest, SetLikedResponse, SetPlaybackModeRequest, SetRealtimeFFTEnabledRequest,
-    SwitchRequest, TakeBackHandoffBlockRequest, UpdatePlaylistRequest, UpdatePlaylistResponse,
-    VolumeRequest, VolumeResponse,
+    StoredMixQuery, SwitchRequest, TakeBackHandoffBlockRequest, UpdatePlaylistRequest,
+    UpdatePlaylistResponse, VolumeRequest, VolumeResponse,
 };
 use crate::request_error::ExpectedRequestError;
 use crate::rpc::{RequestTranslationFuture, Slot, UnsupportedReason};
-use crate::subsonic_binding::{SubsonicBinding, SubsonicIdKind};
+use crate::subsonic_binding::{
+    DetailQuery, MixTarget, RecentRead, RecommendedMix, SubsonicBinding, SubsonicIdKind,
+};
 use database::actions::mixes::{QueryOperator, parse_query};
 use uuid::Uuid;
 
@@ -274,6 +284,16 @@ fn remember_playlist_edit(
     Ok(())
 }
 
+/// Forgets the pages kept of a playlist once an edit of it was sent, whatever the answer.
+fn forget_playlist_reads(binding: &SubsonicBinding, playlist: i32) -> Result<()> {
+    binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?
+        .forget_playlist_reads(playlist);
+    Ok(())
+}
+
 /// `appendOnly` playlists only take songs added at the end; `readOnly` ones take nothing. A
 /// playlist the server said nothing about is left to the server.
 fn edit_allowed(known: Option<RuneEdit>, edit: PlaylistEdit) -> bool {
@@ -446,11 +466,12 @@ pub(crate) async fn update_playlist_request(
         UpdatePlaylistRequest::wire_name(),
     )
     .await?;
-    binding
+    let renamed = binding
         .client
         .update_playlist(&remote_id, Some(&request.name), &[], &[])
-        .await
-        .map_err(subsonic_request_error)?;
+        .await;
+    forget_playlist_reads(binding, request.playlist_id)?;
+    renamed.map_err(subsonic_request_error)?;
     Ok(Some(UpdatePlaylistResponse {
         playlist: Playlist {
             id: request.playlist_id,
@@ -474,11 +495,9 @@ pub(crate) async fn remove_playlist_request(
         RemovePlaylistRequest::wire_name(),
     )
     .await?;
-    binding
-        .client
-        .delete_playlist(&remote_id)
-        .await
-        .map_err(subsonic_request_error)?;
+    let deleted = binding.client.delete_playlist(&remote_id).await;
+    forget_playlist_reads(binding, request.playlist_id)?;
+    deleted.map_err(subsonic_request_error)?;
     Ok(Some(RemovePlaylistResponse {
         playlist_id: request.playlist_id,
         success: true,
@@ -530,11 +549,12 @@ pub(crate) async fn add_item_to_playlist_request(
         }
         .into());
     }
-    binding
+    let added = binding
         .client
         .update_playlist(&playlist_remote, None, &[&track_remote], &[])
-        .await
-        .map_err(subsonic_request_error)?;
+        .await;
+    forget_playlist_reads(binding, request.playlist_id)?;
+    added.map_err(subsonic_request_error)?;
     Ok(Some(AddItemToPlaylistResponse {
         success: true,
         occurrence_id: append_position.to_string(),
@@ -568,11 +588,12 @@ pub(crate) async fn remove_item_from_playlist_request(
     let position = occurrence_position(&request.occurrence_id, songs.len())?;
     let position = u32::try_from(position)
         .map_err(|_| ExpectedRequestError::invalid_input("Subsonic playlist is too large"))?;
-    binding
+    let removed = binding
         .client
         .update_playlist(&remote_id, None, &[], &[position])
-        .await
-        .map_err(subsonic_request_error)?;
+        .await;
+    forget_playlist_reads(binding, request.playlist_id)?;
+    removed.map_err(subsonic_request_error)?;
     Ok(Some(RemoveItemFromPlaylistResponse { call_id: None }))
 }
 
@@ -597,15 +618,157 @@ pub(crate) async fn reorder_playlist_item_position_request(
     let song = reordered.remove(from);
     reordered.insert(target, song);
     let refs = reordered.iter().map(String::as_str).collect::<Vec<_>>();
-    binding
+    let reordered = binding
         .client
         .replace_playlist_songs(&remote_id, &refs)
-        .await
-        .map_err(subsonic_request_error)?;
+        .await;
+    forget_playlist_reads(binding, request.playlist_id)?;
+    reordered.map_err(subsonic_request_error)?;
     Ok(Some(ReorderPlaylistItemPositionResponse {
         success: true,
         call_id: None,
     }))
+}
+
+/// The largest page of playlist occurrences, as for Rune's own playlists.
+const MAX_OCCURRENCE_PAGE: u32 = 128;
+
+/// A page of a playlist's entries in the server's order. Subsonic entries have no ids of their
+/// own, so an occurrence is named by its 0-based position, as the playlist edits above take it.
+/// The playlist read for a page serves the following pages for [`RECENT_READ`]; edits of it
+/// forget it.
+pub(crate) async fn fetch_playlist_occurrences_request(
+    binding: &SubsonicBinding,
+    request: &FetchPlaylistOccurrencesRequest,
+) -> Result<Option<FetchPlaylistOccurrencesResponse>> {
+    if !(1..=MAX_OCCURRENCE_PAGE).contains(&request.page_size) {
+        return Err(ExpectedRequestError::invalid_input(format!(
+            "Playlist page size must be 1..={MAX_OCCURRENCE_PAGE}"
+        ))
+        .into());
+    }
+    let start = match &request.after {
+        None => 0,
+        Some(cursor) => usize::try_from(cursor.position)
+            .ok()
+            .filter(|position| cursor.occurrence_id == position.to_string())
+            .ok_or_else(|| ExpectedRequestError::invalid_input("Invalid Subsonic playlist cursor"))?
+            .saturating_add(1),
+    };
+    let playlist = recent_playlist(binding, request.playlist_id).await?;
+    let total = playlist.songs.len();
+    // A cursor names an entry of this playlist: the last of the page before.
+    if request.after.is_some() && start > total {
+        return Err(ExpectedRequestError::invalid_input("Invalid Subsonic playlist cursor").into());
+    }
+    let mut catalog = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+    let entries = playlist
+        .songs
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(usize::try_from(request.page_size).unwrap_or(usize::MAX))
+        .map(|(position, song)| {
+            let id = catalog.ids.intern(SubsonicIdKind::Track, &song.id)?;
+            catalog.remember_song(id, song.clone());
+            let cover_art_id = song
+                .cover_art
+                .as_deref()
+                .map(|cover| catalog.ids.intern(SubsonicIdKind::CoverArt, cover))
+                .transpose()?
+                .unwrap_or_default();
+            let position = i32::try_from(position).map_err(|_| {
+                ExpectedRequestError::invalid_input("Subsonic playlist is too large")
+            })?;
+            let occurrence = PlaylistOccurrence {
+                occurrence_id: position.to_string(),
+                position,
+                track_uuid: song.id.clone(),
+                file: Some(subsonic_media_file(binding, id, cover_art_id, song)),
+            };
+            Ok((occurrence, id, song.cover_art.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    drop(catalog);
+    let next = entries
+        .last()
+        .filter(|_| start.saturating_add(entries.len()) < total)
+        .map(|(last, _, _)| PlaylistOccurrenceCursor {
+            position: last.position,
+            occurrence_id: last.occurrence_id.clone(),
+        });
+    let cover_art_map = if request.bake_cover_arts {
+        subsonic_cover_map(
+            binding,
+            entries
+                .iter()
+                .filter_map(|(_, id, cover)| cover.clone().map(|cover| (*id, cover)))
+                .collect(),
+        )
+    } else {
+        HashMap::new()
+    };
+    Ok(Some(FetchPlaylistOccurrencesResponse {
+        request_id: request.request_id.clone(),
+        entries: entries
+            .into_iter()
+            .map(|(occurrence, _, _)| occurrence)
+            .collect(),
+        next,
+        cover_art_map,
+        call_id: None,
+    }))
+}
+
+/// A playlist as read for occurrence pages: the one kept from a read less than
+/// [`RECENT_READ`] ago, else read afresh and kept.
+async fn recent_playlist(
+    binding: &SubsonicBinding,
+    playlist_id: i32,
+) -> Result<Arc<subsonic::SubsonicPlaylistDetail>> {
+    let now = Instant::now();
+    let recent = {
+        let mut catalog = binding
+            .catalog
+            .lock()
+            .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+        catalog
+            .recent_playlists
+            .retain(|_, recent| recent.fresh(&(), now, RECENT_READ).is_some());
+        catalog
+            .recent_playlists
+            .get(&playlist_id)
+            .and_then(|recent| recent.fresh(&(), now, RECENT_READ))
+    };
+    if let Some(playlist) = recent {
+        return Ok(playlist);
+    }
+    let remote_id = resolve_playlist_id(binding, playlist_id)?;
+    let playlist = Arc::new(
+        binding
+            .client
+            .playlist(&remote_id)
+            .await
+            .map_err(subsonic_request_error)?,
+    );
+    remember_playlist_edit(binding, playlist_id, playlist.rune_edit)?;
+    binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?
+        .recent_playlists
+        .insert(
+            playlist_id,
+            RecentRead {
+                key: (),
+                read: now,
+                value: Arc::clone(&playlist),
+            },
+        );
+    Ok(playlist)
 }
 
 fn subsonic_cover_map(
@@ -649,11 +812,18 @@ pub(crate) async fn search_for_request(
             0
         },
     };
-    let results = binding
-        .client
-        .search(&request.query_str, limits)
-        .await
-        .map_err(subsonic_request_error)?;
+    // A service with a catalogue answers from it too, after the library and marked apart.
+    let scoped = binding.probe.supports_rune_catalog()
+        && !binding.rune_unsupported("search3", &["runeScope"]);
+    let results = if scoped {
+        binding
+            .client
+            .search_in_scope(&request.query_str, limits, 0, RuneScope::All)
+            .await
+    } else {
+        binding.client.search(&request.query_str, limits).await
+    }
+    .map_err(subsonic_request_error)?;
     let mut catalog = binding
         .catalog
         .lock()
@@ -664,7 +834,7 @@ pub(crate) async fn search_for_request(
         .take(limits.artists as usize)
         .map(|item| {
             let id = catalog.ids.intern(SubsonicIdKind::Artist, &item.id)?;
-            catalog.artists.insert(id, item.clone());
+            catalog.remember_artist(id, item.clone());
             Ok(id)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -674,7 +844,7 @@ pub(crate) async fn search_for_request(
         .take(limits.albums as usize)
         .map(|item| {
             let id = catalog.ids.intern(SubsonicIdKind::Album, &item.id)?;
-            catalog.albums.insert(id, item.clone());
+            catalog.remember_album(id, item.clone());
             Ok(id)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -684,7 +854,7 @@ pub(crate) async fn search_for_request(
         .take(limits.songs as usize)
         .map(|item| {
             let id = catalog.ids.intern(SubsonicIdKind::Track, &item.id)?;
-            catalog.songs.insert(id, item.clone());
+            catalog.remember_song(id, item.clone());
             Ok(id)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -728,7 +898,7 @@ pub(crate) async fn fetch_media_file_by_ids_request(
                     .lock()
                     .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
                 let id = catalog.ids.intern(SubsonicIdKind::Track, &song.id)?;
-                catalog.songs.insert(id, song.clone());
+                catalog.remember_song(id, song.clone());
                 song
             }
         };
@@ -848,7 +1018,7 @@ pub(crate) async fn fetch_media_files_request(
                 .lock()
                 .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
             let id = catalog.ids.intern(SubsonicIdKind::Track, &song.id)?;
-            catalog.songs.insert(id, song.clone());
+            catalog.remember_song(id, song.clone());
             id
         };
         if let Some(cover) = song.cover_art.clone() {
@@ -915,7 +1085,7 @@ pub(crate) async fn fetch_parsed_media_file_request(
         .lock()
         .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
     let id = catalog.ids.intern(SubsonicIdKind::Track, &song.id)?;
-    catalog.songs.insert(id, song.clone());
+    catalog.remember_song(id, song.clone());
     let artists = song
         .artist
         .as_ref()
@@ -984,7 +1154,7 @@ pub(crate) async fn search_media_file_summary_request(
                 .map(|cover| catalog.ids.intern(SubsonicIdKind::CoverArt, cover))
                 .transpose()?
                 .unwrap_or_default();
-            catalog.songs.insert(id, song.clone());
+            catalog.remember_song(id, song.clone());
             Ok(MediaFileSummary {
                 id,
                 name: song.title,
@@ -1048,7 +1218,7 @@ pub(crate) async fn search_collection_summary_request(
             .map(|item| {
                 let id = catalog.ids.intern(kind, &item.id)?;
                 let cover = item.cover_art.clone();
-                catalog.albums.insert(id, item.clone());
+                catalog.remember_album(id, item.clone());
                 Ok((id, item.name, cover))
             })
             .collect::<Result<Vec<_>>>()?,
@@ -1058,7 +1228,7 @@ pub(crate) async fn search_collection_summary_request(
             .map(|item| {
                 let id = catalog.ids.intern(kind, &item.id)?;
                 let cover = item.cover_art.clone();
-                catalog.artists.insert(id, item.clone());
+                catalog.remember_artist(id, item.clone());
                 Ok((id, item.name, cover))
             })
             .collect::<Result<Vec<_>>>()?,
@@ -1098,6 +1268,9 @@ pub(crate) async fn fetch_collection_by_ids_request(
     let kind = match request.collection_type {
         CollectionType::Artist => SubsonicIdKind::Artist,
         CollectionType::Album => SubsonicIdKind::Album,
+        CollectionType::Mix if binding.probe.supports_rune_recommendations() => {
+            return mixes_by_ids(binding, request).await;
+        }
         _ => {
             return Err(ExpectedRequestError::Unsupported {
                 request: FetchCollectionByIdsRequest::wire_name(),
@@ -1117,7 +1290,10 @@ pub(crate) async fn fetch_collection_by_ids_request(
             let cached_name = match kind {
                 SubsonicIdKind::Artist => catalog.artists.get(id).map(|artist| artist.name.clone()),
                 SubsonicIdKind::Album => catalog.albums.get(id).map(|album| album.name.clone()),
-                SubsonicIdKind::Track | SubsonicIdKind::CoverArt | SubsonicIdKind::Playlist => None,
+                SubsonicIdKind::Track
+                | SubsonicIdKind::CoverArt
+                | SubsonicIdKind::Playlist
+                | SubsonicIdKind::Mix => None,
             };
             (remote_id, cached_name)
         };
@@ -1136,13 +1312,14 @@ pub(crate) async fn fetch_collection_by_ids_request(
                         .catalog
                         .lock()
                         .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
-                    catalog.artists.insert(
+                    catalog.remember_artist(
                         *id,
                         SubsonicArtist {
                             id: item.id,
                             name: item.name,
                             album_count: item.album_count,
                             cover_art: item.cover_art,
+                            rune_in_library: item.rune_in_library,
                         },
                     );
                     name
@@ -1159,7 +1336,7 @@ pub(crate) async fn fetch_collection_by_ids_request(
                         .catalog
                         .lock()
                         .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
-                    catalog.albums.insert(
+                    catalog.remember_album(
                         *id,
                         SubsonicAlbum {
                             id: item.id,
@@ -1171,6 +1348,7 @@ pub(crate) async fn fetch_collection_by_ids_request(
                             year: item.year,
                             genre: item.genre,
                             cover_art: item.cover_art,
+                            rune_in_library: item.rune_in_library,
                         },
                     );
                     name
@@ -1178,7 +1356,7 @@ pub(crate) async fn fetch_collection_by_ids_request(
                 SubsonicIdKind::Track | SubsonicIdKind::CoverArt => {
                     return Err(anyhow!("Unexpected Subsonic track collection"));
                 }
-                SubsonicIdKind::Playlist => {
+                SubsonicIdKind::Playlist | SubsonicIdKind::Mix => {
                     return Err(anyhow!("Unexpected Subsonic playlist collection"));
                 }
             },
@@ -1197,7 +1375,10 @@ pub(crate) async fn fetch_collection_by_ids_request(
                     .albums
                     .get(id)
                     .and_then(|item| item.cover_art.clone()),
-                SubsonicIdKind::Track | SubsonicIdKind::CoverArt | SubsonicIdKind::Playlist => None,
+                SubsonicIdKind::Track
+                | SubsonicIdKind::CoverArt
+                | SubsonicIdKind::Playlist
+                | SubsonicIdKind::Mix => None,
             };
             if let Some(cover_id) = cover.as_deref() {
                 catalog.ids.intern(SubsonicIdKind::CoverArt, cover_id)?;
@@ -1510,7 +1691,8 @@ async fn ensure_artists(binding: &SubsonicBinding) -> Result<()> {
         .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
     for artist in artists {
         let id = catalog.ids.intern(SubsonicIdKind::Artist, &artist.id)?;
-        catalog.artists.insert(id, artist);
+        catalog.remember_artist(id, artist);
+        catalog.listed_artists.insert(id);
     }
     catalog.artists_loaded = true;
     Ok(())
@@ -1540,7 +1722,8 @@ async fn ensure_albums(binding: &SubsonicBinding) -> Result<()> {
             .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
         for album in albums {
             let id = catalog.ids.intern(SubsonicIdKind::Album, &album.id)?;
-            catalog.albums.insert(id, album);
+            catalog.remember_album(id, album);
+            catalog.listed_albums.insert(id);
         }
         if count < 500 {
             catalog.albums_loaded = true;
@@ -1563,9 +1746,12 @@ fn collection_groups(
         .lock()
         .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
     let entries: Vec<(i32, String, String, Option<String>)> = match collection_type {
+        // Only what the library's own lists named; artists and albums met on searches and
+        // detail pages are not listed.
         CollectionType::Artist => catalog
             .artists
             .iter()
+            .filter(|(id, _)| catalog.listed_artists.contains(*id))
             .map(|(id, artist)| {
                 (
                     *id,
@@ -1578,6 +1764,7 @@ fn collection_groups(
         CollectionType::Album => catalog
             .albums
             .iter()
+            .filter(|(id, _)| catalog.listed_albums.contains(*id))
             .map(|(id, album)| {
                 (
                     *id,
@@ -1638,6 +1825,11 @@ pub(crate) async fn fetch_collection_group_summary_request(
     match request.collection_type {
         CollectionType::Artist => ensure_artists(binding).await?,
         CollectionType::Album => ensure_albums(binding).await?,
+        // The summary is where the Mixes page starts, so recommendations are read afresh.
+        CollectionType::Mix if binding.probe.supports_rune_recommendations() => {
+            load_recommendations(binding).await?;
+            return mix_group_summary(binding).map(Some);
+        }
         _ => {
             return Err(ExpectedRequestError::Unsupported {
                 request: FetchCollectionGroupSummaryRequest::wire_name(),
@@ -1653,13 +1845,15 @@ pub(crate) async fn fetch_collection_group_summary_request(
     let names = match request.collection_type {
         CollectionType::Artist => catalog
             .artists
-            .values()
-            .map(|item| item.name.as_str())
+            .iter()
+            .filter(|(id, _)| catalog.listed_artists.contains(*id))
+            .map(|(_, item)| item.name.as_str())
             .collect(),
         CollectionType::Album => catalog
             .albums
-            .values()
-            .map(|item| item.name.as_str())
+            .iter()
+            .filter(|(id, _)| catalog.listed_albums.contains(*id))
+            .map(|(_, item)| item.name.as_str())
             .collect(),
         _ => Vec::new(),
     };
@@ -1684,6 +1878,13 @@ pub(crate) async fn fetch_collection_groups_request(
     match request.collection_type {
         CollectionType::Artist => ensure_artists(binding).await?,
         CollectionType::Album => ensure_albums(binding).await?,
+        CollectionType::Mix if binding.probe.supports_rune_recommendations() => {
+            ensure_recommendations(binding).await?;
+            return Ok(Some(FetchCollectionGroupsResponse {
+                call_id: None,
+                groups: mix_collection_groups(binding, &request.group_titles)?,
+            }));
+        }
         _ => {
             return Err(ExpectedRequestError::Unsupported {
                 request: FetchCollectionGroupsRequest::wire_name(),
@@ -1698,12 +1899,6 @@ pub(crate) async fn fetch_collection_groups_request(
     }))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DetailQuery {
-    Artist(i32),
-    Album(i32),
-}
-
 fn parse_detail_query(request: &MixQueryRequest) -> Result<DetailQuery> {
     let [query] = request.queries.as_slice() else {
         return Err(unsupported_detail_query().into());
@@ -1712,6 +1907,7 @@ fn parse_detail_query(request: &MixQueryRequest) -> Result<DetailQuery> {
     match operator {
         QueryOperator::LibArtist(id) => Ok(DetailQuery::Artist(id)),
         QueryOperator::LibAlbum(id) => Ok(DetailQuery::Album(id)),
+        QueryOperator::LibPlaylist(id) => Ok(DetailQuery::Playlist(id)),
         _ => Err(unsupported_detail_query().into()),
     }
 }
@@ -1723,8 +1919,68 @@ fn unsupported_detail_query() -> ExpectedRequestError {
     }
 }
 
-async fn detail_songs(binding: &SubsonicBinding, query: DetailQuery) -> Result<Vec<SubsonicSong>> {
+/// How long a read serves the following pages of the same listing.
+const RECENT_READ: Duration = Duration::from_secs(30);
+/// Albums of an artist read at once.
+const PARALLEL_ALBUM_READS: usize = 4;
+
+/// The songs of a playlist, in its order.
+async fn playlist_songs(binding: &SubsonicBinding, id: i32) -> Result<Vec<SubsonicSong>> {
+    let remote_id = resolve_playlist_id(binding, id)?;
+    require_endpoint(binding, "getPlaylist", &["id"])?;
+    let playlist = binding
+        .client
+        .playlist(&remote_id)
+        .await
+        .map_err(subsonic_request_error)?;
+    remember_playlist_edit(binding, id, playlist.rune_edit)?;
+    let mut catalog = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+    for song in &playlist.songs {
+        let id = catalog.ids.intern(SubsonicIdKind::Track, &song.id)?;
+        catalog.remember_song(id, song.clone());
+    }
+    Ok(playlist.songs)
+}
+
+/// The songs of a detail query. The last query's songs serve its following pages for
+/// [`RECENT_READ`]; playlist edits and library additions forget them.
+async fn detail_songs(
+    binding: &SubsonicBinding,
+    query: DetailQuery,
+) -> Result<Arc<Vec<SubsonicSong>>> {
+    let recent = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?
+        .recent_detail
+        .as_ref()
+        .and_then(|recent| recent.fresh(&query, Instant::now(), RECENT_READ));
+    if let Some(songs) = recent {
+        return Ok(songs);
+    }
+    let read = Instant::now();
+    let songs = Arc::new(read_detail_songs(binding, query).await?);
+    binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?
+        .recent_detail = Some(RecentRead {
+        key: query,
+        read,
+        value: Arc::clone(&songs),
+    });
+    Ok(songs)
+}
+
+async fn read_detail_songs(
+    binding: &SubsonicBinding,
+    query: DetailQuery,
+) -> Result<Vec<SubsonicSong>> {
     let albums = match query {
+        DetailQuery::Playlist(id) => return playlist_songs(binding, id).await,
         DetailQuery::Album(id) => vec![id],
         DetailQuery::Artist(id) => {
             let remote_id = {
@@ -1747,42 +2003,49 @@ async fn detail_songs(binding: &SubsonicBinding, query: DetailQuery) -> Result<V
             let mut albums = Vec::with_capacity(artist.albums.len());
             for album in artist.albums {
                 let id = catalog.ids.intern(SubsonicIdKind::Album, &album.id)?;
-                catalog.albums.insert(id, album);
+                catalog.remember_album(id, album);
                 albums.push(id);
             }
             albums
         }
     };
+    let remote_ids = {
+        let catalog = binding
+            .catalog
+            .lock()
+            .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+        albums
+            .iter()
+            .map(|id| Ok(catalog.ids.resolve(SubsonicIdKind::Album, *id)?.to_owned()))
+            .collect::<Result<Vec<_>>>()?
+    };
+    // A few at a time, in the artist's album order.
+    let albums: Vec<_> = stream::iter(remote_ids)
+        .map(|remote_id| async move {
+            binding
+                .client
+                .album(&remote_id)
+                .await
+                .map_err(subsonic_request_error)
+        })
+        .buffered(PARALLEL_ALBUM_READS)
+        .try_collect()
+        .await?;
     let mut songs = Vec::new();
-    for album_id in albums {
-        let remote_id = {
-            let catalog = binding
-                .catalog
-                .lock()
-                .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
-            catalog
-                .ids
-                .resolve(SubsonicIdKind::Album, album_id)?
-                .to_owned()
-        };
-        let mut album = binding
-            .client
-            .album(&remote_id)
-            .await
-            .map_err(subsonic_request_error)?;
+    let mut catalog = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+    for mut album in albums {
         album.songs.sort_by_key(|song| {
             (
                 song.disc.unwrap_or_default(),
                 song.track.unwrap_or_default(),
             )
         });
-        let mut catalog = binding
-            .catalog
-            .lock()
-            .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
         for song in album.songs {
             let id = catalog.ids.intern(SubsonicIdKind::Track, &song.id)?;
-            catalog.songs.insert(id, song.clone());
+            catalog.remember_song(id, song.clone());
             songs.push(song);
         }
     }
@@ -1800,20 +2063,20 @@ pub(crate) async fn mix_query_request(
         .lock()
         .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
     let translated = songs
-        .into_iter()
+        .iter()
         .skip(usize::try_from(request.cursor.max(0)).unwrap_or(usize::MAX))
         .take(usize::try_from(request.page_size.max(0)).unwrap_or(usize::MAX))
         .map(|song| {
             let id = catalog.ids.intern(SubsonicIdKind::Track, &song.id)?;
-            catalog.songs.insert(id, song.clone());
+            catalog.remember_song(id, song.clone());
             let cover_art_id = song
                 .cover_art
                 .as_deref()
                 .map(|cover| catalog.ids.intern(SubsonicIdKind::CoverArt, cover))
                 .transpose()?
                 .unwrap_or_default();
-            let media_file = subsonic_media_file(binding, id, cover_art_id, &song);
-            Ok((media_file, song.cover_art))
+            let media_file = subsonic_media_file(binding, id, cover_art_id, song);
+            Ok((media_file, song.cover_art.clone()))
         })
         .collect::<Result<Vec<_>>>()?;
     drop(catalog);
@@ -1826,6 +2089,365 @@ pub(crate) async fn mix_query_request(
         call_id: None,
         files,
         cover_art_map: subsonic_cover_map(binding, covers),
+    }))
+}
+
+// Catalogue -----------------------------------------------------------------
+
+/// Which of the given items a `runeCatalog` server said are outside the user's library. Items
+/// it never said that about are in it.
+pub(crate) async fn fetch_library_membership_request(
+    binding: &SubsonicBinding,
+    request: &FetchLibraryMembershipRequest,
+) -> Result<Option<FetchLibraryMembershipResponse>> {
+    let catalog = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+    let outside = |kind: SubsonicIdKind, ids: &[i32]| -> Result<Vec<i32>> {
+        let mut found = Vec::new();
+        for &id in ids {
+            catalog.ids.resolve(kind, id)?;
+            if catalog.is_outside_library(kind, id) {
+                found.push(id);
+            }
+        }
+        Ok(found)
+    };
+    Ok(Some(FetchLibraryMembershipResponse {
+        outside_track_ids: outside(SubsonicIdKind::Track, &request.track_ids)?,
+        outside_album_ids: outside(SubsonicIdKind::Album, &request.album_ids)?,
+        outside_artist_ids: outside(SubsonicIdKind::Artist, &request.artist_ids)?,
+        call_id: None,
+    }))
+}
+
+/// Adds catalogue tracks and albums to the user's library in one call, then counts them, and
+/// the known tracks of the added albums, as in it.
+pub(crate) async fn add_to_library_request(
+    binding: &SubsonicBinding,
+    request: &AddToLibraryRequest,
+) -> Result<Option<AddToLibraryResponse>> {
+    let (tracks, albums) = {
+        let catalog = binding
+            .catalog
+            .lock()
+            .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+        let resolve = |kind: SubsonicIdKind, ids: &[i32]| -> Result<Vec<(i32, String)>> {
+            ids.iter()
+                .map(|&id| Ok((id, catalog.ids.resolve(kind, id)?.to_owned())))
+                .collect()
+        };
+        (
+            resolve(SubsonicIdKind::Track, &request.track_ids)?,
+            resolve(SubsonicIdKind::Album, &request.album_ids)?,
+        )
+    };
+    let remote: Vec<&str> = tracks
+        .iter()
+        .chain(&albums)
+        .map(|(_, remote)| remote.as_str())
+        .collect();
+    if !remote.is_empty() {
+        binding
+            .client
+            .add_to_library(&remote)
+            .await
+            .map_err(subsonic_request_error)?;
+    }
+    let mut catalog = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+    // Kept pages carry what the server said before the addition.
+    catalog.forget_recent_reads();
+    let mut added: Vec<(SubsonicIdKind, i32)> = tracks
+        .iter()
+        .map(|(id, _)| (SubsonicIdKind::Track, *id))
+        .collect();
+    for (id, remote) in &albums {
+        catalog.listed_albums.insert(*id);
+        added.push((SubsonicIdKind::Album, *id));
+        added.extend(
+            catalog
+                .songs
+                .iter()
+                .filter(|(_, song)| song.album_id.as_deref() == Some(remote.as_str()))
+                .map(|(id, _)| (SubsonicIdKind::Track, *id)),
+        );
+    }
+    for (kind, id) in added {
+        catalog.note_membership(kind, id, Some(true));
+        match kind {
+            SubsonicIdKind::Track => {
+                if let Some(song) = catalog.songs.get_mut(&id) {
+                    song.rune_in_library = Some(true);
+                }
+            }
+            SubsonicIdKind::Album => {
+                if let Some(album) = catalog.albums.get_mut(&id) {
+                    album.rune_in_library = Some(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(AddToLibraryResponse {
+        success: true,
+        call_id: None,
+    }))
+}
+
+// Recommendations -----------------------------------------------------------
+
+/// Groups asked of `getRuneRecommendations`; the server decides how many it has.
+const RECOMMENDATION_GROUPS: u32 = 50;
+
+/// Reads the recommendations and makes a mix of every recommended album and playlist. Groups
+/// of the same title are merged, and a group without a title is named by its id.
+async fn load_recommendations(binding: &SubsonicBinding) -> Result<()> {
+    require_endpoint(binding, "getRuneRecommendations", &["count"])?;
+    let groups = binding
+        .client
+        .recommendations(RECOMMENDATION_GROUPS)
+        .await
+        .map_err(subsonic_request_error)?;
+    let mut catalog = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+    let mut mix_groups: Vec<(String, Vec<i32>)> = Vec::new();
+    for group in groups {
+        let title = if group.title.trim().is_empty() {
+            group.id.clone()
+        } else {
+            group.title.clone()
+        };
+        let mut mixes = Vec::new();
+        for album in group.albums {
+            let id = catalog.ids.intern(SubsonicIdKind::Album, &album.id)?;
+            catalog.note_membership(SubsonicIdKind::Album, id, album.rune_in_library);
+            let mix_id = catalog
+                .ids
+                .intern(SubsonicIdKind::Mix, &format!("album:{}", album.id))?;
+            catalog.mixes.insert(
+                mix_id,
+                RecommendedMix {
+                    name: album.name,
+                    group: title.clone(),
+                    target: MixTarget::Album(id),
+                    cover_art: album.cover_art,
+                },
+            );
+            mixes.push(mix_id);
+        }
+        for playlist in group.playlists {
+            let id = catalog.ids.intern(SubsonicIdKind::Playlist, &playlist.id)?;
+            if let Some(edit) = playlist.rune_edit {
+                catalog.playlist_edits.insert(id, edit);
+            }
+            let mix_id = catalog
+                .ids
+                .intern(SubsonicIdKind::Mix, &format!("playlist:{}", playlist.id))?;
+            catalog.mixes.insert(
+                mix_id,
+                RecommendedMix {
+                    name: playlist.name,
+                    group: title.clone(),
+                    target: MixTarget::Playlist(id),
+                    cover_art: playlist.cover_art,
+                },
+            );
+            mixes.push(mix_id);
+        }
+        let index = match mix_groups.iter().position(|(known, _)| *known == title) {
+            Some(index) => index,
+            None => {
+                mix_groups.push((title, Vec::new()));
+                mix_groups.len() - 1
+            }
+        };
+        let ids = &mut mix_groups[index].1;
+        for mix_id in mixes {
+            if !ids.contains(&mix_id) {
+                ids.push(mix_id);
+            }
+        }
+    }
+    mix_groups.retain(|(_, ids)| !ids.is_empty());
+    catalog.mix_groups = mix_groups;
+    catalog.mixes_loaded = true;
+    Ok(())
+}
+
+async fn ensure_recommendations(binding: &SubsonicBinding) -> Result<()> {
+    let loaded = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?
+        .mixes_loaded;
+    if loaded {
+        return Ok(());
+    }
+    load_recommendations(binding).await
+}
+
+fn mix_group_summary(binding: &SubsonicBinding) -> Result<CollectionGroupSummaryResponse> {
+    let catalog = binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+    Ok(CollectionGroupSummaryResponse {
+        call_id: None,
+        collection_type: CollectionType::Mix,
+        groups: catalog
+            .mix_groups
+            .iter()
+            .map(|(title, ids)| CollectionGroupSummary {
+                group_title: title.clone(),
+                count: i32::try_from(ids.len()).unwrap_or(i32::MAX),
+            })
+            .collect(),
+    })
+}
+
+/// A recommended mix as Rune's local mixes are listed: one query naming what it plays,
+/// read only.
+fn mix_collection(binding: &SubsonicBinding, id: i32, mix: &RecommendedMix) -> Collection {
+    let (operator, parameter) = match mix.target {
+        MixTarget::Album(album) => ("lib::album", album),
+        MixTarget::Playlist(playlist) => ("lib::playlist", playlist),
+    };
+    Collection {
+        id,
+        name: mix.name.clone(),
+        queries: vec![MixQuery {
+            operator: operator.to_owned(),
+            parameter: parameter.to_string(),
+        }],
+        collection_type: CollectionType::Mix,
+        cover_art_map: subsonic_cover_map(
+            binding,
+            mix.cover_art
+                .clone()
+                .map(|cover| vec![(id, cover)])
+                .unwrap_or_default(),
+        ),
+        readonly: true,
+    }
+}
+
+fn mix_collection_groups(
+    binding: &SubsonicBinding,
+    group_titles: &[String],
+) -> Result<Vec<CollectionGroup>> {
+    let groups: Vec<(String, Vec<(i32, RecommendedMix)>)> = {
+        let catalog = binding
+            .catalog
+            .lock()
+            .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?;
+        group_titles
+            .iter()
+            .map(|title| {
+                let mixes = catalog
+                    .mix_groups
+                    .iter()
+                    .find(|(known, _)| known == title)
+                    .map(|(_, ids)| {
+                        ids.iter()
+                            .filter_map(|id| Some((*id, catalog.mixes.get(id)?.clone())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (title.clone(), mixes)
+            })
+            .collect()
+    };
+    Ok(groups
+        .into_iter()
+        .map(|(group_title, mixes)| CollectionGroup {
+            group_title,
+            collections: mixes
+                .iter()
+                .map(|(id, mix)| mix_collection(binding, *id, mix))
+                .collect(),
+        })
+        .collect())
+}
+
+/// A recommended mix by id, reading the recommendations once when none were read yet.
+async fn recommended_mix(binding: &SubsonicBinding, id: i32) -> Result<Option<RecommendedMix>> {
+    ensure_recommendations(binding).await?;
+    Ok(binding
+        .catalog
+        .lock()
+        .map_err(|_| anyhow!("Subsonic catalog lock poisoned"))?
+        .mixes
+        .get(&id)
+        .cloned())
+}
+
+/// The known mixes among `ids`; others are left out, as Rune's own mixes are.
+async fn mixes_by_ids(
+    binding: &SubsonicBinding,
+    request: &FetchCollectionByIdsRequest,
+) -> Result<Option<FetchCollectionByIdsResponse>> {
+    let mut result = Vec::with_capacity(request.ids.len());
+    for &id in &request.ids {
+        if let Some(mix) = recommended_mix(binding, id).await? {
+            result.push(mix_collection(binding, id, &mix));
+        }
+    }
+    Ok(Some(FetchCollectionByIdsResponse {
+        call_id: None,
+        collection_type: CollectionType::Mix,
+        result,
+    }))
+}
+
+fn mix_not_found() -> anyhow::Error {
+    ExpectedError::NotFound { what: "mix" }.into()
+}
+
+pub(crate) async fn get_mix_by_id_request(
+    binding: &SubsonicBinding,
+    request: &GetMixByIdRequest,
+) -> Result<Option<GetMixByIdResponse>> {
+    let mix = recommended_mix(binding, request.mix_id)
+        .await?
+        .ok_or_else(mix_not_found)?;
+    Ok(Some(GetMixByIdResponse {
+        mix: Mix {
+            id: request.mix_id,
+            name: mix.name,
+            group: mix.group,
+            locked: true,
+            // As Rune's album and playlist pages play: in the player's current mode.
+            mode: KEEP_PLAYBACK_MODE as i32,
+        },
+        call_id: None,
+    }))
+}
+
+pub(crate) async fn fetch_mix_queries_request(
+    binding: &SubsonicBinding,
+    request: &FetchMixQueriesRequest,
+) -> Result<Option<FetchMixQueriesResponse>> {
+    let mix = recommended_mix(binding, request.mix_id)
+        .await?
+        .ok_or_else(mix_not_found)?;
+    let query = mix_collection(binding, request.mix_id, &mix)
+        .queries
+        .remove(0);
+    Ok(Some(FetchMixQueriesResponse {
+        result: vec![StoredMixQuery {
+            clause_id: request.mix_id.to_string(),
+            operator: query.operator,
+            parameter: query.parameter,
+            target_uuid: None,
+            available: true,
+        }],
+        call_id: None,
     }))
 }
 
@@ -1908,6 +2530,8 @@ macro_rules! subsonic_requests {
         supported { $($request:ty => $handler:ident as $method:ident),* $(,)? }
         routed_native { $($native_request:ty),* $(,)? }
         jukebox_supported { $($jukebox_request:ty => $jukebox_handler:ident as $jukebox_method:ident),* $(,)? }
+        catalog_supported { $($catalog_request:ty => $catalog_handler:ident as $catalog_method:ident),* $(,)? }
+        recommendations_supported { $($recommendations_request:ty => $recommendations_handler:ident as $recommendations_method:ident),* $(,)? }
         player { $($player_request:ty),* $(,)? }
     ) => {
         impl RequestTranslator for SubsonicBinding {
@@ -1927,6 +2551,22 @@ macro_rules! subsonic_requests {
                     Box::pin($jukebox_handler(self, request))
                 }
             )*
+            $(
+                fn $catalog_method<'a>(
+                    &'a self,
+                    request: &'a $catalog_request,
+                ) -> RequestTranslationFuture<'a, <$catalog_request as crate::TypedRequest>::Response> {
+                    Box::pin($catalog_handler(self, request))
+                }
+            )*
+            $(
+                fn $recommendations_method<'a>(
+                    &'a self,
+                    request: &'a $recommendations_request,
+                ) -> RequestTranslationFuture<'a, <$recommendations_request as crate::TypedRequest>::Response> {
+                    Box::pin($recommendations_handler(self, request))
+                }
+            )*
         }
 
         impl RequestSlots {
@@ -1943,11 +2583,25 @@ macro_rules! subsonic_requests {
                 }
                 $(slots.set::<$request>(Slot::Translate);)*
                 $(slots.set::<$native_request>(Slot::Native);)*
+                if probe.supports_rune_catalog() {
+                    $(slots.set::<$catalog_request>(Slot::Translate);)*
+                }
+                if probe.supports_rune_recommendations() {
+                    $(slots.set::<$recommendations_request>(Slot::Translate);)*
+                }
                 slots
             }
 
             fn hide_player(&mut self) {
                 $(self.set::<$player_request>(Slot::Unsupported {
+                    reason: UnsupportedReason::NotImplemented,
+                });)*
+            }
+
+            /// Hide the requests about a service's catalogue beyond the library, which only
+            /// `runeCatalog` servers answer.
+            pub(crate) fn hide_service_catalogue(&mut self) {
+                $(self.set::<$catalog_request>(Slot::Unsupported {
                     reason: UnsupportedReason::NotImplemented,
                 });)*
             }
@@ -1968,6 +2622,7 @@ subsonic_requests! {
         AddItemToPlaylistRequest => add_item_to_playlist_request as translate_add_item_to_playlist_request,
         RemoveItemFromPlaylistRequest => remove_item_from_playlist_request as translate_remove_item_from_playlist_request,
         ReorderPlaylistItemPositionRequest => reorder_playlist_item_position_request as translate_reorder_playlist_item_position_request,
+        FetchPlaylistOccurrencesRequest => fetch_playlist_occurrences_request as translate_fetch_playlist_occurrences_request,
         FetchMediaFileByIdsRequest => fetch_media_file_by_ids_request as translate_fetch_media_file_by_ids_request,
         FetchMediaFilesRequest => fetch_media_files_request as translate_fetch_media_files_request,
         GetMediaFilesCountRequest => get_media_files_count_request as translate_get_media_files_count_request,
@@ -1998,6 +2653,14 @@ subsonic_requests! {
         LoadResolvedItemsRequest => jukebox_load_resolved_items_request as translate_load_resolved_items_request,
         RefreshSessionRequest => jukebox_refresh_session_request as translate_refresh_session_request,
         SessionSnapshotRequest => jukebox_session_snapshot_request as translate_session_snapshot_request,
+    }
+    catalog_supported {
+        FetchLibraryMembershipRequest => fetch_library_membership_request as translate_fetch_library_membership_request,
+        AddToLibraryRequest => add_to_library_request as translate_add_to_library_request,
+    }
+    recommendations_supported {
+        GetMixByIdRequest => get_mix_by_id_request as translate_get_mix_by_id_request,
+        FetchMixQueriesRequest => fetch_mix_queries_request as translate_fetch_mix_queries_request,
     }
     player {
         VolumeRequest,
@@ -2076,6 +2739,11 @@ const REQUEST_ENDPOINTS: &[RequestEndpoints] = &[
         &[("getPlaylist", &["id"])],
     ),
     (
+        hide::<FetchPlaylistOccurrencesRequest>,
+        Hides::AnyEndpoint,
+        &[("getPlaylist", &["id"])],
+    ),
+    (
         hide::<CreatePlaylistRequest>,
         Hides::AnyEndpoint,
         &[("createPlaylist", &["name"]), ("getPlaylists", &[])],
@@ -2140,13 +2808,15 @@ const REQUEST_ENDPOINTS: &[RequestEndpoints] = &[
         Hides::AnyEndpoint,
         &[("search3", &["query", "songOffset"])],
     ),
-    // Artist groups come from getArtists and album groups from getAlbumList2.
+    // Artist groups come from getArtists, album groups from getAlbumList2 and mix groups from
+    // getRuneRecommendations.
     (
         hide::<FetchCollectionGroupSummaryRequest>,
         Hides::AllEndpoints,
         &[
             ("getAlbumList2", &["type", "size", "offset"]),
             ("getArtists", &[]),
+            ("getRuneRecommendations", &["count"]),
         ],
     ),
     (
@@ -2155,12 +2825,17 @@ const REQUEST_ENDPOINTS: &[RequestEndpoints] = &[
         &[
             ("getAlbumList2", &["type", "size", "offset"]),
             ("getArtists", &[]),
+            ("getRuneRecommendations", &["count"]),
         ],
     ),
     (
         hide::<FetchCollectionByIdsRequest>,
         Hides::AllEndpoints,
-        &[("getArtist", &["id"]), ("getAlbum", &["id"])],
+        &[
+            ("getArtist", &["id"]),
+            ("getAlbum", &["id"]),
+            ("getRuneRecommendations", &["count"]),
+        ],
     ),
     // Both kinds of query read albums; artists need getArtist on top, checked at run time.
     (
@@ -2168,7 +2843,43 @@ const REQUEST_ENDPOINTS: &[RequestEndpoints] = &[
         Hides::AnyEndpoint,
         &[("getAlbum", &["id"])],
     ),
+    // Membership comes from searches with a scope.
+    (
+        hide::<FetchLibraryMembershipRequest>,
+        Hides::AnyEndpoint,
+        &[("search3", &["query", "runeScope"])],
+    ),
+    (
+        hide::<AddToLibraryRequest>,
+        Hides::AnyEndpoint,
+        &[("addToRuneLibrary", &["id"])],
+    ),
+    (
+        hide::<GetMixByIdRequest>,
+        Hides::AnyEndpoint,
+        &[("getRuneRecommendations", &["count"])],
+    ),
+    (
+        hide::<FetchMixQueriesRequest>,
+        Hides::AnyEndpoint,
+        &[("getRuneRecommendations", &["count"])],
+    ),
 ];
+
+/// Whether a call to `endpoint` sending `params` cannot be made: the descriptor lists it as
+/// unsupported, or it belongs to a Rune extension the server does not declare.
+fn endpoint_missing(
+    descriptor: &RuneServiceDescriptor,
+    probe: &SubsonicProbe,
+    (endpoint, params): &EndpointUse,
+) -> bool {
+    let declared = match *endpoint {
+        "addToRuneLibrary" => probe.supports_rune_catalog(),
+        "getRuneRecommendations" => probe.supports_rune_recommendations(),
+        _ => true,
+    };
+    !declared || descriptor.is_unsupported(endpoint, params)
+}
 
 fn hide<R: crate::rpc::TargetRequest>(slots: &mut RequestSlots) {
     slots.set::<R>(Slot::Unsupported {
@@ -2181,11 +2892,11 @@ impl RequestSlots {
     pub(crate) fn hide_rune_unsupported(
         &mut self,
         descriptor: &RuneServiceDescriptor,
+        probe: &SubsonicProbe,
         has_song_lyrics: bool,
     ) {
         for (hide_request, hides, uses) in REQUEST_ENDPOINTS {
-            let missing =
-                |(endpoint, params): &EndpointUse| descriptor.is_unsupported(endpoint, params);
+            let missing = |used: &EndpointUse| endpoint_missing(descriptor, probe, used);
             let hidden = match hides {
                 Hides::AnyEndpoint => uses.iter().any(missing),
                 Hides::AllEndpoints => uses.iter().all(missing),
@@ -2243,12 +2954,13 @@ mod tests {
         add_item_to_playlist_request, create_playlist_request, fetch_all_playlists_request,
         fetch_collection_group_summary_request, fetch_collection_groups_request,
         fetch_media_file_by_ids_request, fetch_media_files_request,
-        fetch_parsed_media_file_request, fetch_remote_playlist, get_liked_request,
-        get_lyric_request, get_media_files_count_request, get_playlist_by_id_request,
-        jukebox_error, mix_query_request, remove_item_from_playlist_request,
-        remove_playlist_request, reorder_playlist_item_position_request,
-        search_collection_summary_request, search_for_request, search_media_file_summary_request,
-        set_liked_request, subsonic_request_error, update_playlist_request,
+        fetch_parsed_media_file_request, fetch_playlist_occurrences_request, fetch_remote_playlist,
+        get_liked_request, get_lyric_request, get_media_files_count_request,
+        get_playlist_by_id_request, jukebox_error, mix_query_request,
+        remove_item_from_playlist_request, remove_playlist_request,
+        reorder_playlist_item_position_request, search_collection_summary_request,
+        search_for_request, search_media_file_summary_request, set_liked_request,
+        subsonic_request_error, update_playlist_request,
     };
     use crate::{
         TypedRequest,
@@ -2262,7 +2974,7 @@ mod tests {
             GetLyricByTrackIdRequest, GetMediaFilesCountRequest, GetPlaylistByIdRequest,
             HandoffLoadRequest, LoadRequest, LoadResolvedItemsRequest, MixQuery, MixQueryRequest,
             MovePlaylistItemRequest, NextRequest, PauseRequest, PlayRequest, PlayingItemRef,
-            PlaylistOperateMode, PreviousRequest, RefreshSessionRequest,
+            PlaylistOccurrenceCursor, PlaylistOperateMode, PreviousRequest, RefreshSessionRequest,
             RemoveItemFromPlaylistRequest, RemovePlaylistRequest, RemoveRequest,
             ReorderPlaylistItemPositionRequest, SearchCollectionSummaryRequest, SearchForRequest,
             SearchMediaFileSummaryRequest, SeekRequest, SessionSnapshotRequest,
@@ -3039,20 +3751,370 @@ mod tests {
             AddItemToPlaylistRequest::slot(&slots),
             RemoveItemFromPlaylistRequest::slot(&slots),
             ReorderPlaylistItemPositionRequest::slot(&slots),
+            FetchPlaylistOccurrencesRequest::slot(&slots),
         ] {
             assert_eq!(slot, Slot::Translate);
         }
-        for slot in [
-            FetchPlaylistOccurrencesRequest::slot(&slots),
+        assert_eq!(
             CreateM3u8PlaylistRequest::slot(&slots),
-        ] {
-            assert_eq!(
-                slot,
-                Slot::Unsupported {
-                    reason: UnsupportedReason::NotImplemented
-                }
-            );
+            Slot::Unsupported {
+                reason: UnsupportedReason::NotImplemented
+            }
+        );
+    }
+
+    fn occurrences_request(
+        playlist_id: i32,
+        after: Option<PlaylistOccurrenceCursor>,
+        page_size: u32,
+    ) -> FetchPlaylistOccurrencesRequest {
+        FetchPlaylistOccurrencesRequest {
+            request_id: "page".into(),
+            playlist_id,
+            after,
+            page_size,
+            bake_cover_arts: true,
+            call_id: None,
         }
+    }
+
+    /// `(occurrence id, position, track)` of every entry of a page.
+    fn occurrence_rows(
+        response: &crate::messages::FetchPlaylistOccurrencesResponse,
+    ) -> Vec<(String, i32, String)> {
+        response
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.occurrence_id.clone(),
+                    entry.position,
+                    entry.track_uuid.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn row(occurrence: &str, position: i32, track: &str) -> (String, i32, String) {
+        (occurrence.into(), position, track.into())
+    }
+
+    #[tokio::test]
+    async fn subsonic_playlist_occurrences_page_by_position_and_keep_duplicates_apart() {
+        let root = TempDir::new().unwrap();
+        let (binding, _server) = mock_subsonic(&root, false).await;
+        let playlists =
+            fetch_all_playlists_request(&binding, &FetchAllPlaylistsRequest { call_id: None })
+                .await
+                .unwrap()
+                .unwrap();
+        let playlist_id = playlists.playlists[0].id;
+
+        let first = fetch_playlist_occurrences_request(
+            &binding,
+            &occurrences_request(playlist_id, None, 2),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.request_id, "page");
+        assert_eq!(
+            occurrence_rows(&first),
+            [row("0", 0, "song-1"), row("1", 1, "song-2")]
+        );
+        let next = first.next.clone().expect("a second page");
+        assert_eq!((next.position, next.occurrence_id.as_str()), (1, "1"));
+        let file = first.entries[0].file.as_ref().unwrap();
+        assert_eq!(file.track, "song-1");
+        assert_eq!(file.title, "song-1");
+        assert_eq!(file.library_id, binding.library_id.to_string());
+        assert_eq!(
+            binding.catalog.lock().unwrap().songs[&file.id].title,
+            "song-1"
+        );
+
+        let second = fetch_playlist_occurrences_request(
+            &binding,
+            &occurrences_request(playlist_id, Some(next), 2),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(occurrence_rows(&second), [row("2", 2, "song-1")]);
+        assert!(second.next.is_none());
+        // The same song twice: one file, two occurrences.
+        assert_eq!(
+            second.entries[0].file.as_ref().unwrap().id,
+            first.entries[0].file.as_ref().unwrap().id
+        );
+        assert_ne!(
+            second.entries[0].occurrence_id,
+            first.entries[0].occurrence_id
+        );
+
+        // A page that fits the whole playlist names no next page.
+        let whole = fetch_playlist_occurrences_request(
+            &binding,
+            &occurrences_request(playlist_id, None, 3),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(whole.entries.len(), 3);
+        assert!(whole.next.is_none());
+
+        for request in [
+            occurrences_request(playlist_id, None, 0),
+            occurrences_request(playlist_id, None, 129),
+            occurrences_request(
+                playlist_id,
+                Some(PlaylistOccurrenceCursor {
+                    position: 1,
+                    occurrence_id: "2".into(),
+                }),
+                2,
+            ),
+            occurrences_request(
+                playlist_id,
+                Some(PlaylistOccurrenceCursor {
+                    position: -1,
+                    occurrence_id: "-1".into(),
+                }),
+                2,
+            ),
+        ] {
+            let error = fetch_playlist_occurrences_request(&binding, &request)
+                .await
+                .err()
+                .expect("bad pages are refused");
+            assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
+    async fn subsonic_occurrence_ids_are_what_playlist_edits_take() {
+        let root = TempDir::new().unwrap();
+        let (binding, server) = mock_subsonic(&root, false).await;
+        let playlists =
+            fetch_all_playlists_request(&binding, &FetchAllPlaylistsRequest { call_id: None })
+                .await
+                .unwrap()
+                .unwrap();
+        let playlist_id = playlists.playlists[0].id;
+        let before = fetch_playlist_occurrences_request(
+            &binding,
+            &occurrences_request(playlist_id, None, 10),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Remove the second copy of song-1, by the id the page gave it.
+        let duplicate = before.entries[2].occurrence_id.clone();
+        remove_item_from_playlist_request(
+            &binding,
+            &RemoveItemFromPlaylistRequest {
+                playlist_id,
+                occurrence_id: duplicate,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let removal = server
+            .state
+            .playlist_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(endpoint, _)| endpoint == "updatePlaylist")
+            .cloned()
+            .unwrap();
+        assert!(
+            removal
+                .1
+                .contains(&("songIndexToRemove".to_owned(), "2".to_owned()))
+        );
+
+        let after = fetch_playlist_occurrences_request(
+            &binding,
+            &occurrences_request(playlist_id, None, 10),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            occurrence_rows(&after),
+            [row("0", 0, "song-1"), row("1", 1, "song-2")]
+        );
+    }
+
+    fn get_playlist_calls(server: &MockServer) -> usize {
+        server
+            .state
+            .playlist_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(endpoint, _)| endpoint == "getPlaylist")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn occurrence_pages_read_the_playlist_once_until_an_edit() {
+        let root = TempDir::new().unwrap();
+        let (binding, server) = mock_subsonic(&root, false).await;
+        let playlist_id =
+            fetch_all_playlists_request(&binding, &FetchAllPlaylistsRequest { call_id: None })
+                .await
+                .unwrap()
+                .unwrap()
+                .playlists[0]
+                .id;
+        let mut after = None;
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            let page = fetch_playlist_occurrences_request(
+                &binding,
+                &occurrences_request(playlist_id, after.clone(), 1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            rows.extend(occurrence_rows(&page));
+            after = page.next;
+        }
+        assert!(after.is_none());
+        assert_eq!(
+            rows,
+            [
+                row("0", 0, "song-1"),
+                row("1", 1, "song-2"),
+                row("2", 2, "song-1")
+            ]
+        );
+        assert_eq!(get_playlist_calls(&server), 1);
+
+        remove_item_from_playlist_request(
+            &binding,
+            &RemoveItemFromPlaylistRequest {
+                playlist_id,
+                occurrence_id: "0".into(),
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reads = get_playlist_calls(&server);
+        let fresh = fetch_playlist_occurrences_request(
+            &binding,
+            &occurrences_request(playlist_id, None, 10),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(get_playlist_calls(&server), reads + 1);
+        assert_eq!(
+            occurrence_rows(&fresh),
+            [row("0", 0, "song-2"), row("1", 1, "song-1")]
+        );
+
+        // A cursor past this playlist's entries is another playlist's.
+        let error = fetch_playlist_occurrences_request(
+            &binding,
+            &occurrences_request(
+                playlist_id,
+                Some(PlaylistOccurrenceCursor {
+                    position: 5,
+                    occurrence_id: "5".into(),
+                }),
+                10,
+            ),
+        )
+        .await
+        .err()
+        .expect("a cursor of another playlist is refused");
+        assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_server_opens_a_playlist_detail_query() {
+        let root = TempDir::new().unwrap();
+        let (binding, server) = mock_subsonic(&root, false).await;
+        let playlist_id =
+            fetch_all_playlists_request(&binding, &FetchAllPlaylistsRequest { call_id: None })
+                .await
+                .unwrap()
+                .unwrap()
+                .playlists[0]
+                .id;
+        let page = |cursor| MixQueryRequest {
+            queries: vec![MixQuery {
+                operator: "lib::playlist".into(),
+                parameter: playlist_id.to_string(),
+            }],
+            cursor,
+            page_size: 2,
+            bake_cover_arts: false,
+            call_id: None,
+        };
+        let titles = |response: crate::messages::MixQueryResponse| {
+            response
+                .files
+                .into_iter()
+                .map(|file| file.title)
+                .collect::<Vec<_>>()
+        };
+        let first = mix_query_request(&binding, &page(0))
+            .await
+            .unwrap()
+            .unwrap();
+        let second = mix_query_request(&binding, &page(2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(titles(first), ["song-1", "song-2"]);
+        assert_eq!(titles(second), ["song-1"]);
+        assert_eq!(get_playlist_calls(&server), 1);
+
+        // An edit of the playlist makes the next page read it again.
+        remove_item_from_playlist_request(
+            &binding,
+            &RemoveItemFromPlaylistRequest {
+                playlist_id,
+                occurrence_id: "1".into(),
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reads = get_playlist_calls(&server);
+        let edited = mix_query_request(&binding, &page(0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(get_playlist_calls(&server), reads + 1);
+        assert_eq!(titles(edited), ["song-1", "song-1"]);
+    }
+
+    #[test]
+    fn playlist_occurrences_hide_with_get_playlist() {
+        assert_eq!(
+            FetchPlaylistOccurrencesRequest::slot(&rune_slots(&[], false)),
+            Slot::Translate
+        );
+        assert_eq!(
+            FetchPlaylistOccurrencesRequest::slot(&rune_slots(&[("getPlaylist", None)], false)),
+            hidden()
+        );
+        // Only the parameter Rune sends counts.
+        assert_eq!(
+            FetchPlaylistOccurrencesRequest::slot(&rune_slots(
+                &[("getPlaylist", Some("other"))],
+                false
+            )),
+            Slot::Translate
+        );
     }
 
     #[tokio::test]
@@ -3566,6 +4628,8 @@ mod tests {
     impl subsonic::api::Jukebox for InMemoryCatalog {}
     impl subsonic::api::Scanning for InMemoryCatalog {}
     impl subsonic::api::RuneVisualizerFeed for InMemoryCatalog {}
+    impl subsonic::api::RuneCatalog for InMemoryCatalog {}
+    impl subsonic::api::RuneRecommendations for InMemoryCatalog {}
     impl subsonic::api::RuneService for InMemoryCatalog {}
 
     #[tokio::test]
@@ -3663,6 +4727,8 @@ mod tests {
     impl subsonic::api::Jukebox for HostedCatalog {}
     impl subsonic::api::Scanning for HostedCatalog {}
     impl subsonic::api::RuneVisualizerFeed for HostedCatalog {}
+    impl subsonic::api::RuneCatalog for HostedCatalog {}
+    impl subsonic::api::RuneRecommendations for HostedCatalog {}
     impl subsonic::api::RuneService for HostedCatalog {}
 
     fn hosted_binding(
@@ -4362,19 +5428,31 @@ mod tests {
     }
 
     fn rune_slots(unsupported: &[(&str, Option<&str>)], has_song_lyrics: bool) -> RequestSlots {
-        let mut slots = RequestSlots::subsonic(&SubsonicProbe {
+        rune_slots_with(unsupported, has_song_lyrics, &[])
+    }
+
+    pub(super) fn rune_slots_with(
+        unsupported: &[(&str, Option<&str>)],
+        has_song_lyrics: bool,
+        extensions: &[&str],
+    ) -> RequestSlots {
+        let probe = SubsonicProbe {
             api_version: "1.16.1".into(),
             open_subsonic: true,
             server_type: None,
             server_version: None,
-            extensions: vec![("runeService".into(), vec![1])],
+            extensions: std::iter::once("runeService")
+                .chain(extensions.iter().copied())
+                .map(|name| (name.into(), vec![1]))
+                .collect(),
             roles: SubsonicRoles {
                 jukebox_role: true,
                 ..Default::default()
             },
             roles_known: true,
-        });
-        slots.hide_rune_unsupported(&descriptor(unsupported), has_song_lyrics);
+        };
+        let mut slots = RequestSlots::subsonic(&probe);
+        slots.hide_rune_unsupported(&descriptor(unsupported), &probe, has_song_lyrics);
         slots
     }
 
@@ -4578,6 +5656,8 @@ mod tests {
     impl subsonic::api::Jukebox for EditCatalog {}
     impl subsonic::api::Scanning for EditCatalog {}
     impl subsonic::api::RuneVisualizerFeed for EditCatalog {}
+    impl subsonic::api::RuneCatalog for EditCatalog {}
+    impl subsonic::api::RuneRecommendations for EditCatalog {}
     impl subsonic::api::RuneService for EditCatalog {}
 
     fn edit_binding(
@@ -5052,6 +6132,8 @@ mod tests {
     impl subsonic::api::Jukebox for DescribedCatalog {}
     impl subsonic::api::Scanning for DescribedCatalog {}
     impl subsonic::api::RuneVisualizerFeed for DescribedCatalog {}
+    impl subsonic::api::RuneCatalog for DescribedCatalog {}
+    impl subsonic::api::RuneRecommendations for DescribedCatalog {}
 
     #[tokio::test]
     async fn descriptor_is_read_only_from_servers_that_declare_the_extension() {
@@ -5141,5 +6223,1198 @@ mod tests {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod catalogue_tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use subsonic::{
+        ApiFuture, RuneRecommendationGroup, RuneRecommendationKind, RuneUnsupported,
+        SubsonicAlbumDetail, SubsonicArtistDetail, SubsonicPlaylist, SubsonicPlaylistDetail,
+        SubsonicRoles, SubsonicSearchResult,
+    };
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::messages::RequestErrorKind;
+    use crate::request_error::classify;
+    use crate::request_owner::Implementation;
+    use crate::rpc::TargetRequest;
+    use crate::utils::{Broadcaster, RinfRustSignal};
+
+    struct Silent;
+
+    impl Broadcaster for Silent {
+        fn broadcast(&self, _: &dyn RinfRustSignal) {}
+    }
+
+    fn song(id: &str, album_id: Option<&str>, in_library: Option<bool>) -> SubsonicSong {
+        SubsonicSong {
+            id: id.into(),
+            title: format!("Title of {id}"),
+            album_id: album_id.map(Into::into),
+            rune_in_library: in_library,
+            ..SubsonicSong::default()
+        }
+    }
+
+    fn album(id: &str, name: &str, in_library: Option<bool>) -> SubsonicAlbum {
+        SubsonicAlbum {
+            id: id.into(),
+            name: name.into(),
+            cover_art: Some(format!("cover-{id}")),
+            rune_in_library: in_library,
+            ..SubsonicAlbum::default()
+        }
+    }
+
+    fn artist(id: &str, in_library: Option<bool>) -> SubsonicArtist {
+        SubsonicArtist {
+            id: id.into(),
+            name: format!("Name of {id}"),
+            rune_in_library: in_library,
+            ..SubsonicArtist::default()
+        }
+    }
+
+    /// A service with a library and a catalogue beyond it, recording what it is asked.
+    #[derive(Default)]
+    struct CatalogueApi {
+        calls: Mutex<Vec<String>>,
+        recommendation_reads: AtomicUsize,
+        refuse_additions: AtomicBool,
+        refuse_recommendations: AtomicBool,
+    }
+
+    fn refused() -> SubsonicError {
+        SubsonicError::Server {
+            kind: SubsonicServerError::Generic,
+            message: "refused".into(),
+            rune_reason: None,
+        }
+    }
+
+    impl CatalogueApi {
+        fn record(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    fn ready<'a, T: Send + 'a>(value: T) -> ApiFuture<'a, T> {
+        Box::pin(async move { Ok(value) })
+    }
+
+    impl subsonic::api::Searching for CatalogueApi {
+        fn search_with_song_offset<'a>(
+            &'a self,
+            query: &'a str,
+            _limits: SearchLimits,
+            _song_offset: u32,
+        ) -> ApiFuture<'a, SubsonicSearchResult> {
+            self.record(format!("search3:{query}"));
+            ready(SubsonicSearchResult {
+                artists: vec![artist("artist-lib", None)],
+                albums: vec![album("album-lib", "Near", None)],
+                songs: vec![song("song-lib", None, None)],
+            })
+        }
+    }
+
+    impl subsonic::api::RuneCatalog for CatalogueApi {
+        fn search_in_scope<'a>(
+            &'a self,
+            query: &'a str,
+            _limits: SearchLimits,
+            song_offset: u32,
+            scope: RuneScope,
+        ) -> ApiFuture<'a, SubsonicSearchResult> {
+            self.record(format!("search3 {}:{query}:{song_offset}", scope.as_str()));
+            ready(SubsonicSearchResult {
+                artists: vec![
+                    artist("artist-lib", Some(true)),
+                    artist("catalog:artist:1", Some(false)),
+                ],
+                albums: vec![
+                    album("album-lib", "Near", Some(true)),
+                    album("catalog:album:1", "Far", Some(false)),
+                ],
+                songs: vec![
+                    song("song-lib", None, Some(true)),
+                    song("catalog:song:1", None, Some(false)),
+                    song("song-unsaid", None, None),
+                ],
+            })
+        }
+
+        fn add_to_library<'a>(&'a self, ids: &'a [&'a str]) -> ApiFuture<'a, ()> {
+            self.record(format!("add:{}", ids.join(",")));
+            if self.refuse_additions.load(Ordering::SeqCst) {
+                return Box::pin(async { Err(refused()) });
+            }
+            ready(())
+        }
+    }
+
+    impl subsonic::api::RuneRecommendations for CatalogueApi {
+        fn recommendations<'a>(
+            &'a self,
+            count: u32,
+        ) -> ApiFuture<'a, Vec<RuneRecommendationGroup>> {
+            self.record(format!("recommendations:{count}"));
+            self.recommendation_reads.fetch_add(1, Ordering::SeqCst);
+            if self.refuse_recommendations.load(Ordering::SeqCst) {
+                return Box::pin(async { Err(refused()) });
+            }
+            let far_mix = SubsonicPlaylist {
+                id: "catalog:playlist:1".into(),
+                name: "Far Mix".into(),
+                cover_art: Some("cover-mix".into()),
+                rune_edit: Some(RuneEdit::ReadOnly),
+                rune_in_library: Some(false),
+                ..SubsonicPlaylist::default()
+            };
+            ready(vec![
+                RuneRecommendationGroup {
+                    id: "g1".into(),
+                    title: "Made for You".into(),
+                    kind: RuneRecommendationKind::Personal,
+                    albums: vec![album("catalog:album:1", "Far", Some(false))],
+                    playlists: vec![far_mix],
+                },
+                RuneRecommendationGroup {
+                    id: "g2".into(),
+                    title: " ".into(),
+                    kind: RuneRecommendationKind::Recent,
+                    albums: vec![album("album-lib", "Near", Some(true))],
+                    playlists: Vec::new(),
+                },
+                // Same title as the first: merged into it, without repeating its album.
+                RuneRecommendationGroup {
+                    id: "g3".into(),
+                    title: "Made for You".into(),
+                    kind: RuneRecommendationKind::Personal,
+                    albums: vec![
+                        album("catalog:album:1", "Far", Some(false)),
+                        album("catalog:album:2", "Farther", Some(false)),
+                    ],
+                    playlists: Vec::new(),
+                },
+                RuneRecommendationGroup {
+                    id: "g4".into(),
+                    title: "Nothing to Show".into(),
+                    ..RuneRecommendationGroup::default()
+                },
+            ])
+        }
+    }
+
+    impl subsonic::api::Browsing for CatalogueApi {
+        fn artists<'a>(&'a self) -> ApiFuture<'a, Vec<SubsonicArtist>> {
+            ready(vec![artist("artist-lib", Some(true))])
+        }
+
+        fn artist<'a>(&'a self, id: &'a str) -> ApiFuture<'a, SubsonicArtistDetail> {
+            self.record(format!("getArtist:{id}"));
+            ready(SubsonicArtistDetail {
+                id: id.into(),
+                name: "Far Artist".into(),
+                rune_in_library: Some(false),
+                albums: vec![
+                    album("catalog:album:slow", "Slow", Some(false)),
+                    // The catalogue copy of the library's album "Near", which the service
+                    // knows to be in the library.
+                    album("catalog:album:near", "Near", Some(true)),
+                    album("catalog:album:last", "Last", Some(false)),
+                ],
+                ..SubsonicArtistDetail::default()
+            })
+        }
+
+        fn album<'a>(&'a self, id: &'a str) -> ApiFuture<'a, SubsonicAlbumDetail> {
+            self.record(format!("getAlbum:{id}"));
+            Box::pin(async move {
+                // The first album answers last, so the order must not follow the answers.
+                if id == "catalog:album:slow" {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Ok(SubsonicAlbumDetail {
+                    id: id.into(),
+                    name: "Far".into(),
+                    rune_in_library: Some(false),
+                    songs: vec![
+                        song(&format!("{id}/1"), Some(id), Some(false)),
+                        song(&format!("{id}/2"), Some(id), Some(false)),
+                    ],
+                    ..SubsonicAlbumDetail::default()
+                })
+            })
+        }
+    }
+
+    impl subsonic::api::Playlists for CatalogueApi {
+        fn playlist<'a>(&'a self, id: &'a str) -> ApiFuture<'a, SubsonicPlaylistDetail> {
+            self.record(format!("getPlaylist:{id}"));
+            ready(SubsonicPlaylistDetail {
+                id: id.into(),
+                name: "Far Mix".into(),
+                rune_edit: Some(RuneEdit::ReadOnly),
+                rune_in_library: Some(false),
+                songs: vec![
+                    song("catalog:song:9", None, Some(false)),
+                    song("song-lib", None, Some(true)),
+                ],
+                ..SubsonicPlaylistDetail::default()
+            })
+        }
+    }
+
+    impl subsonic::api::Lists for CatalogueApi {
+        fn album_list<'a>(&'a self, _size: u32, offset: u32) -> ApiFuture<'a, Vec<SubsonicAlbum>> {
+            ready(if offset == 0 {
+                vec![album("album-lib", "Near", Some(true))]
+            } else {
+                Vec::new()
+            })
+        }
+    }
+
+    impl subsonic::api::System for CatalogueApi {}
+    impl subsonic::api::Annotation for CatalogueApi {}
+    impl subsonic::api::MediaRetrieval for CatalogueApi {}
+    impl subsonic::api::Jukebox for CatalogueApi {}
+    impl subsonic::api::Scanning for CatalogueApi {}
+    impl subsonic::api::RuneVisualizerFeed for CatalogueApi {}
+    impl subsonic::api::RuneService for CatalogueApi {}
+
+    fn probe(extensions: &[&str]) -> SubsonicProbe {
+        SubsonicProbe {
+            api_version: "1.16.1".into(),
+            open_subsonic: true,
+            server_type: None,
+            server_version: None,
+            extensions: extensions
+                .iter()
+                .map(|name| ((*name).into(), vec![1]))
+                .collect(),
+            roles: SubsonicRoles::default(),
+            roles_known: true,
+        }
+    }
+
+    fn binding(root: &TempDir, extensions: &[&str]) -> (SubsonicBinding, Arc<CatalogueApi>) {
+        let api = Arc::new(CatalogueApi::default());
+        let binding = SubsonicBinding::new(
+            api.clone(),
+            probe(extensions),
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            true,
+            Arc::new(Silent),
+        );
+        (binding, api)
+    }
+
+    const BOTH: &[&str] = &["runeCatalog", "runeRecommendations"];
+
+    async fn search(binding: &SubsonicBinding) -> SearchForResponse {
+        search_for_request(
+            binding,
+            &SearchForRequest {
+                call_id: None,
+                query_str: "far*".into(),
+                fields: Vec::new(),
+                n: 10,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn membership(
+        binding: &SubsonicBinding,
+        found: &SearchForResponse,
+    ) -> FetchLibraryMembershipResponse {
+        fetch_library_membership_request(
+            binding,
+            &FetchLibraryMembershipRequest {
+                track_ids: found.tracks.clone(),
+                album_ids: found.albums.clone(),
+                artist_ids: found.artists.clone(),
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    fn interned(binding: &SubsonicBinding, kind: SubsonicIdKind, remote: &str) -> i32 {
+        binding
+            .catalog
+            .lock()
+            .unwrap()
+            .ids
+            .intern(kind, remote)
+            .unwrap()
+    }
+
+    fn assert_unsupported(error: anyhow::Error) {
+        assert!(
+            matches!(
+                error.downcast_ref::<ExpectedRequestError>(),
+                Some(ExpectedRequestError::Unsupported {
+                    reason: UnsupportedReason::NotImplemented,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_covers_the_catalogue_only_with_the_extension() {
+        let root = TempDir::new().unwrap();
+        let (plain, api) = binding(&root, &["runeService", "runeRecommendations"]);
+        let found = search(&plain).await;
+        assert_eq!(api.calls(), ["search3:far*"]);
+        assert_eq!(found.tracks.len(), 1);
+        // Nothing was said about the library, so nothing is outside it.
+        let outside = membership(&plain, &found).await;
+        assert!(outside.outside_track_ids.is_empty());
+        assert!(outside.outside_album_ids.is_empty());
+        assert!(outside.outside_artist_ids.is_empty());
+
+        let (catalogue, api) = binding(&root, &["runeCatalog"]);
+        let found = search(&catalogue).await;
+        assert_eq!(api.calls(), ["search3 all:far*:0"]);
+        assert_eq!(found.tracks.len(), 3);
+        assert_eq!(found.albums.len(), 2);
+        assert_eq!(found.artists.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn membership_follows_what_the_search_said() {
+        let root = TempDir::new().unwrap();
+        let (binding, _) = binding(&root, BOTH);
+        let found = search(&binding).await;
+        let outside = membership(&binding, &found).await;
+        assert_eq!(
+            outside.outside_track_ids,
+            [interned(&binding, SubsonicIdKind::Track, "catalog:song:1")]
+        );
+        assert_eq!(
+            outside.outside_album_ids,
+            [interned(&binding, SubsonicIdKind::Album, "catalog:album:1")]
+        );
+        assert_eq!(
+            outside.outside_artist_ids,
+            [interned(
+                &binding,
+                SubsonicIdKind::Artist,
+                "catalog:artist:1"
+            )]
+        );
+
+        let error = fetch_library_membership_request(
+            &binding,
+            &FetchLibraryMembershipRequest {
+                track_ids: vec![9999],
+                album_ids: Vec::new(),
+                artist_ids: Vec::new(),
+                call_id: None,
+            },
+        )
+        .await
+        .err()
+        .expect("unknown ids are refused");
+        assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn catalogue_items_stay_out_of_the_library_lists_until_added() {
+        let root = TempDir::new().unwrap();
+        let (binding, _) = binding(&root, BOTH);
+        search(&binding).await;
+        let summary = |binding, collection_type| async move {
+            fetch_collection_group_summary_request(
+                binding,
+                &FetchCollectionGroupSummaryRequest {
+                    collection_type,
+                    call_id: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .groups
+            .iter()
+            .map(|group| group.count)
+            .sum::<i32>()
+        };
+        assert_eq!(summary(&binding, CollectionType::Album).await, 1);
+        assert_eq!(summary(&binding, CollectionType::Artist).await, 1);
+        let groups = fetch_collection_groups_request(
+            &binding,
+            &FetchCollectionGroupsRequest {
+                collection_type: CollectionType::Album,
+                bake_cover_arts: false,
+                group_titles: vec![generate_group_name("Far"), generate_group_name("Near")],
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .groups;
+        let names: Vec<&str> = groups
+            .iter()
+            .flat_map(|group| &group.collections)
+            .map(|collection| collection.name.as_str())
+            .collect();
+        assert_eq!(names, ["Near"]);
+
+        let far = interned(&binding, SubsonicIdKind::Album, "catalog:album:1");
+        add_to_library_request(
+            &binding,
+            &AddToLibraryRequest {
+                track_ids: Vec::new(),
+                album_ids: vec![far],
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary(&binding, CollectionType::Album).await, 2);
+    }
+
+    #[tokio::test]
+    async fn adding_resolves_remote_ids_and_counts_the_items_in() {
+        let root = TempDir::new().unwrap();
+        let (binding, api) = binding(&root, BOTH);
+        let found = search(&binding).await;
+        let far_song = interned(&binding, SubsonicIdKind::Track, "catalog:song:1");
+        let far_album = interned(&binding, SubsonicIdKind::Album, "catalog:album:1");
+        // The album's songs, read through its detail query, are outside too.
+        let files = mix_query_request(
+            &binding,
+            &MixQueryRequest {
+                queries: vec![MixQuery {
+                    operator: "lib::album".into(),
+                    parameter: far_album.to_string(),
+                }],
+                cursor: 0,
+                page_size: 10,
+                bake_cover_arts: false,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .files;
+        let album_songs: Vec<i32> = files.iter().map(|file| file.id).collect();
+        let outside = fetch_library_membership_request(
+            &binding,
+            &FetchLibraryMembershipRequest {
+                track_ids: album_songs.clone(),
+                album_ids: Vec::new(),
+                artist_ids: Vec::new(),
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(outside.outside_track_ids, album_songs);
+
+        let response = add_to_library_request(
+            &binding,
+            &AddToLibraryRequest {
+                track_ids: vec![far_song],
+                album_ids: vec![far_album],
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.success);
+        assert_eq!(
+            api.calls().last().unwrap(),
+            "add:catalog:song:1,catalog:album:1"
+        );
+
+        let mut all = found.tracks.clone();
+        all.extend(&album_songs);
+        let outside = fetch_library_membership_request(
+            &binding,
+            &FetchLibraryMembershipRequest {
+                track_ids: all,
+                album_ids: found.albums.clone(),
+                artist_ids: Vec::new(),
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(outside.outside_track_ids.is_empty());
+        assert!(outside.outside_album_ids.is_empty());
+        assert_eq!(
+            binding.catalog.lock().unwrap().songs[&far_song].rune_in_library,
+            Some(true)
+        );
+
+        // Unknown ids fail before the server is asked.
+        let calls = api.calls().len();
+        let error = add_to_library_request(
+            &binding,
+            &AddToLibraryRequest {
+                track_ids: vec![9999],
+                album_ids: Vec::new(),
+                call_id: None,
+            },
+        )
+        .await
+        .err()
+        .expect("unknown ids are refused");
+        assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
+        assert_eq!(api.calls().len(), calls);
+    }
+
+    #[tokio::test]
+    async fn recommendations_are_mix_groups_of_album_and_playlist_mixes() {
+        let root = TempDir::new().unwrap();
+        let (binding, api) = binding(&root, BOTH);
+
+        let summary = fetch_collection_group_summary_request(
+            &binding,
+            &FetchCollectionGroupSummaryRequest {
+                collection_type: CollectionType::Mix,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(summary.collection_type, CollectionType::Mix);
+        let groups: Vec<(&str, i32)> = summary
+            .groups
+            .iter()
+            .map(|group| (group.group_title.as_str(), group.count))
+            .collect();
+        // Apple's order; a blank title is replaced by the group's id; empty groups are left out.
+        assert_eq!(groups, [("Made for You", 3), ("g2", 1)]);
+        assert_eq!(api.calls(), ["recommendations:50"]);
+
+        let groups = fetch_collection_groups_request(
+            &binding,
+            &FetchCollectionGroupsRequest {
+                collection_type: CollectionType::Mix,
+                bake_cover_arts: true,
+                group_titles: vec!["Made for You".into(), "g2".into(), "Missing".into()],
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .groups;
+        assert_eq!(groups.len(), 3);
+        assert!(groups[2].collections.is_empty());
+        let made = &groups[0].collections;
+        let names: Vec<&str> = made
+            .iter()
+            .map(|collection| collection.name.as_str())
+            .collect();
+        assert_eq!(names, ["Far", "Far Mix", "Farther"]);
+        let far = interned(&binding, SubsonicIdKind::Album, "catalog:album:1");
+        let far_mix = interned(&binding, SubsonicIdKind::Playlist, "catalog:playlist:1");
+        let queries = |collection: &Collection| {
+            collection
+                .queries
+                .iter()
+                .map(|query| (query.operator.clone(), query.parameter.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            queries(&made[0]),
+            [("lib::album".to_owned(), far.to_string())]
+        );
+        assert_eq!(
+            queries(&made[1]),
+            [("lib::playlist".to_owned(), far_mix.to_string())]
+        );
+        for collection in made.iter().chain(&groups[1].collections) {
+            assert_eq!(collection.collection_type, CollectionType::Mix);
+            assert!(collection.readonly);
+        }
+        // Groups come from the read the summary made.
+        assert_eq!(api.recommendation_reads.load(Ordering::SeqCst), 1);
+
+        let by_ids = fetch_collection_by_ids_request(
+            &binding,
+            &FetchCollectionByIdsRequest {
+                collection_type: CollectionType::Mix,
+                bake_cover_arts: false,
+                ids: vec![made[1].id, 9999],
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(by_ids.collection_type, CollectionType::Mix);
+        assert_eq!(by_ids.result.len(), 1);
+        assert_eq!(by_ids.result[0].name, "Far Mix");
+
+        let mix = get_mix_by_id_request(
+            &binding,
+            &GetMixByIdRequest {
+                mix_id: made[1].id,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .mix;
+        assert_eq!(mix.name, "Far Mix");
+        assert_eq!(mix.group, "Made for You");
+        assert!(mix.locked);
+        assert_eq!(mix.mode, 99);
+        let stored = fetch_mix_queries_request(
+            &binding,
+            &FetchMixQueriesRequest {
+                mix_id: made[1].id,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .result;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].operator, "lib::playlist");
+        assert_eq!(stored[0].parameter, far_mix.to_string());
+        assert!(stored[0].available);
+        let missing = get_mix_by_id_request(
+            &binding,
+            &GetMixByIdRequest {
+                mix_id: 9999,
+                call_id: None,
+            },
+        )
+        .await
+        .err()
+        .expect("unknown mixes are not found");
+        assert_eq!(classify(&missing), RequestErrorKind::NotFound);
+
+        // The playlist mix's query reads the playlist, in its order.
+        let files = mix_query_request(
+            &binding,
+            &MixQueryRequest {
+                queries: made[1]
+                    .queries
+                    .iter()
+                    .map(|query| MixQuery {
+                        operator: query.operator.clone(),
+                        parameter: query.parameter.clone(),
+                    })
+                    .collect(),
+                cursor: 0,
+                page_size: 10,
+                bake_cover_arts: false,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .files;
+        let titles: Vec<&str> = files.iter().map(|file| file.title.as_str()).collect();
+        assert_eq!(titles, ["Title of catalog:song:9", "Title of song-lib"]);
+        assert!(
+            api.calls()
+                .contains(&"getPlaylist:catalog:playlist:1".to_owned())
+        );
+        // A recommended playlist the service calls read-only refuses edits before any call.
+        assert_eq!(
+            binding.catalog.lock().unwrap().playlist_edits.get(&far_mix),
+            Some(&RuneEdit::ReadOnly)
+        );
+
+        // A later summary reads the recommendations again; the mix ids stay the same.
+        fetch_collection_group_summary_request(
+            &binding,
+            &FetchCollectionGroupSummaryRequest {
+                collection_type: CollectionType::Mix,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.recommendation_reads.load(Ordering::SeqCst), 2);
+        let again = fetch_collection_by_ids_request(
+            &binding,
+            &FetchCollectionByIdsRequest {
+                collection_type: CollectionType::Mix,
+                bake_cover_arts: false,
+                ids: vec![made[0].id],
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(again.result[0].name, "Far");
+    }
+
+    #[tokio::test]
+    async fn mixes_stay_unsupported_without_recommendations() {
+        let root = TempDir::new().unwrap();
+        let (binding, api) = binding(&root, &["runeService", "runeCatalog"]);
+        let summary = fetch_collection_group_summary_request(
+            &binding,
+            &FetchCollectionGroupSummaryRequest {
+                collection_type: CollectionType::Mix,
+                call_id: None,
+            },
+        )
+        .await
+        .err()
+        .expect("mixes are unsupported");
+        assert_unsupported(summary);
+        let groups = fetch_collection_groups_request(
+            &binding,
+            &FetchCollectionGroupsRequest {
+                collection_type: CollectionType::Mix,
+                bake_cover_arts: false,
+                group_titles: vec!["Made for You".into()],
+                call_id: None,
+            },
+        )
+        .await
+        .err()
+        .expect("mixes are unsupported");
+        assert_unsupported(groups);
+        let by_ids = fetch_collection_by_ids_request(
+            &binding,
+            &FetchCollectionByIdsRequest {
+                collection_type: CollectionType::Mix,
+                bake_cover_arts: false,
+                ids: vec![1],
+                call_id: None,
+            },
+        )
+        .await
+        .err()
+        .expect("mixes are unsupported");
+        assert_unsupported(by_ids);
+        assert!(api.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recommended_playlist_mix_opens_as_playlist_occurrences() {
+        let root = TempDir::new().unwrap();
+        let (binding, api) = binding(&root, BOTH);
+        fetch_collection_group_summary_request(
+            &binding,
+            &FetchCollectionGroupSummaryRequest {
+                collection_type: CollectionType::Mix,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mix = fetch_collection_groups_request(
+            &binding,
+            &FetchCollectionGroupsRequest {
+                collection_type: CollectionType::Mix,
+                bake_cover_arts: true,
+                group_titles: vec!["Made for You".into()],
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .groups
+        .remove(0)
+        .collections
+        .into_iter()
+        .find(|collection| collection.name == "Far Mix")
+        .unwrap();
+        // Dart's track list opens a single `lib::playlist` query as playlist occurrences.
+        let [query] = mix.queries.as_slice() else {
+            panic!("a mix plays one query");
+        };
+        assert_eq!(query.operator, "lib::playlist");
+        let playlist_id: i32 = query.parameter.parse().unwrap();
+
+        let page = fetch_playlist_occurrences_request(
+            &binding,
+            &FetchPlaylistOccurrencesRequest {
+                request_id: "mix".into(),
+                playlist_id,
+                after: None,
+                page_size: 50,
+                bake_cover_arts: false,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let rows: Vec<(&str, i32, &str)> = page
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.occurrence_id.as_str(),
+                    entry.position,
+                    entry.track_uuid.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(rows, [("0", 0, "catalog:song:9"), ("1", 1, "song-lib")]);
+        assert!(page.next.is_none());
+        assert!(page.cover_art_map.is_empty());
+        assert_eq!(
+            page.entries[0].file.as_ref().unwrap().title,
+            "Title of catalog:song:9"
+        );
+        assert!(
+            api.calls()
+                .contains(&"getPlaylist:catalog:playlist:1".to_owned())
+        );
+    }
+
+    fn detail_page(query: MixQuery, cursor: i32, page_size: i32) -> MixQueryRequest {
+        MixQueryRequest {
+            queries: vec![query],
+            cursor,
+            page_size,
+            bake_cover_arts: false,
+            call_id: None,
+        }
+    }
+
+    fn query(operator: &str, id: i32) -> MixQuery {
+        MixQuery {
+            operator: operator.into(),
+            parameter: id.to_string(),
+        }
+    }
+
+    async fn page_titles(binding: &SubsonicBinding, request: &MixQueryRequest) -> Vec<String> {
+        mix_query_request(binding, request)
+            .await
+            .unwrap()
+            .unwrap()
+            .files
+            .into_iter()
+            .map(|file| file.title)
+            .collect()
+    }
+
+    async fn album_page(binding: &SubsonicBinding) -> Vec<String> {
+        let summary = fetch_collection_group_summary_request(
+            binding,
+            &FetchCollectionGroupSummaryRequest {
+                collection_type: CollectionType::Album,
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let groups = fetch_collection_groups_request(
+            binding,
+            &FetchCollectionGroupsRequest {
+                collection_type: CollectionType::Album,
+                bake_cover_arts: false,
+                group_titles: summary
+                    .groups
+                    .iter()
+                    .map(|group| group.group_title.clone())
+                    .collect(),
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut names: Vec<String> = groups
+            .groups
+            .into_iter()
+            .flat_map(|group| group.collections)
+            .map(|collection| collection.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            summary.groups.iter().map(|group| group.count).sum::<i32>(),
+            i32::try_from(names.len()).unwrap()
+        );
+        names
+    }
+
+    #[tokio::test]
+    async fn artist_pages_read_albums_in_order_once_for_all_pages() {
+        let root = TempDir::new().unwrap();
+        let (binding, api) = binding(&root, BOTH);
+        search(&binding).await;
+        let artist = interned(&binding, SubsonicIdKind::Artist, "catalog:artist:1");
+        let first = page_titles(&binding, &detail_page(query("lib::artist", artist), 0, 4)).await;
+        let calls = api.calls().len();
+        let second = page_titles(&binding, &detail_page(query("lib::artist", artist), 4, 4)).await;
+        // The following page comes from the songs the first one read.
+        assert_eq!(api.calls().len(), calls);
+        let all: Vec<String> = first.into_iter().chain(second).collect();
+        assert_eq!(
+            all,
+            [
+                "Title of catalog:album:slow/1",
+                "Title of catalog:album:slow/2",
+                "Title of catalog:album:near/1",
+                "Title of catalog:album:near/2",
+                "Title of catalog:album:last/1",
+                "Title of catalog:album:last/2",
+            ]
+        );
+        let reads = api
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with("getArtist") || call.starts_with("getAlbum"))
+            .count();
+        assert_eq!(reads, 4);
+    }
+
+    #[tokio::test]
+    async fn library_pages_list_only_the_library_lists_and_additions() {
+        let root = TempDir::new().unwrap();
+        let (binding, _) = binding(&root, BOTH);
+        search(&binding).await;
+        // A catalogue artist's page brings in a catalogue copy of the library's "Near",
+        // which the service says is in the library.
+        let artist = interned(&binding, SubsonicIdKind::Artist, "catalog:artist:1");
+        page_titles(&binding, &detail_page(query("lib::artist", artist), 0, 10)).await;
+        assert_eq!(album_page(&binding).await, ["Near"]);
+
+        // An added catalogue album shows once.
+        let far = interned(&binding, SubsonicIdKind::Album, "catalog:album:1");
+        add_to_library_request(
+            &binding,
+            &AddToLibraryRequest {
+                track_ids: Vec::new(),
+                album_ids: vec![far],
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(album_page(&binding).await, ["Far", "Near"]);
+    }
+
+    #[tokio::test]
+    async fn a_service_that_refuses_the_scope_is_searched_plainly() {
+        let root = TempDir::new().unwrap();
+        let (binding, api) = binding(&root, &["runeService", "runeCatalog"]);
+        let binding = binding.with_rune_service(Some(RuneServiceDescriptor {
+            unsupported: vec![RuneUnsupported {
+                endpoint: "search3".into(),
+                param: Some("runeScope".into()),
+            }],
+            ..RuneServiceDescriptor::default()
+        }));
+        search(&binding).await;
+        assert_eq!(api.calls(), ["search3:far*"]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_addition_changes_nothing() {
+        let root = TempDir::new().unwrap();
+        let (binding, api) = binding(&root, BOTH);
+        let found = search(&binding).await;
+        let far_song = interned(&binding, SubsonicIdKind::Track, "catalog:song:1");
+        let far_album = interned(&binding, SubsonicIdKind::Album, "catalog:album:1");
+        api.refuse_additions.store(true, Ordering::SeqCst);
+        add_to_library_request(
+            &binding,
+            &AddToLibraryRequest {
+                track_ids: vec![far_song],
+                album_ids: vec![far_album],
+                call_id: None,
+            },
+        )
+        .await
+        .err()
+        .expect("the service refused");
+        let outside = membership(&binding, &found).await;
+        assert_eq!(outside.outside_track_ids, [far_song]);
+        assert_eq!(outside.outside_album_ids, [far_album]);
+        let catalog = binding.catalog.lock().unwrap();
+        assert_eq!(catalog.songs[&far_song].rune_in_library, Some(false));
+        assert_eq!(catalog.albums[&far_album].rune_in_library, Some(false));
+        assert!(!catalog.listed_albums.contains(&far_album));
+    }
+
+    #[tokio::test]
+    async fn additions_without_items_or_cached_songs() {
+        let root = TempDir::new().unwrap();
+        let (binding, api) = binding(&root, BOTH);
+        add_to_library_request(
+            &binding,
+            &AddToLibraryRequest {
+                track_ids: Vec::new(),
+                album_ids: Vec::new(),
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(api.calls().is_empty());
+
+        // An album whose songs were never read is added on its own.
+        let found = search(&binding).await;
+        let far_album = interned(&binding, SubsonicIdKind::Album, "catalog:album:1");
+        add_to_library_request(
+            &binding,
+            &AddToLibraryRequest {
+                track_ids: Vec::new(),
+                album_ids: vec![far_album],
+                call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.calls().last().unwrap(), "add:catalog:album:1");
+        let outside = membership(&binding, &found).await;
+        assert!(outside.outside_album_ids.is_empty());
+        // The search's catalogue song is not one of its songs.
+        assert_eq!(outside.outside_track_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_recommendations_are_read_again() {
+        let root = TempDir::new().unwrap();
+        let (binding, api) = binding(&root, BOTH);
+        api.refuse_recommendations.store(true, Ordering::SeqCst);
+        let summary = FetchCollectionGroupSummaryRequest {
+            collection_type: CollectionType::Mix,
+            call_id: None,
+        };
+        fetch_collection_group_summary_request(&binding, &summary)
+            .await
+            .err()
+            .expect("the service refused");
+        assert!(!binding.catalog.lock().unwrap().mixes_loaded);
+        let groups = FetchCollectionGroupsRequest {
+            collection_type: CollectionType::Mix,
+            bake_cover_arts: false,
+            group_titles: vec!["Made for You".into()],
+            call_id: None,
+        };
+        fetch_collection_groups_request(&binding, &groups)
+            .await
+            .err()
+            .expect("still refused");
+
+        api.refuse_recommendations.store(false, Ordering::SeqCst);
+        let made = fetch_collection_groups_request(&binding, &groups)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(made.groups[0].collections.len(), 3);
+        assert!(binding.catalog.lock().unwrap().mixes_loaded);
+        assert_eq!(api.recommendation_reads.load(Ordering::SeqCst), 3);
+    }
+
+    fn catalogue_slots(slots: &RequestSlots) -> [Slot; 4] {
+        [
+            FetchLibraryMembershipRequest::slot(slots),
+            AddToLibraryRequest::slot(slots),
+            GetMixByIdRequest::slot(slots),
+            FetchMixQueriesRequest::slot(slots),
+        ]
+    }
+
+    fn hidden() -> Slot {
+        Slot::Unsupported {
+            reason: UnsupportedReason::NotImplemented,
+        }
+    }
+
+    #[test]
+    fn catalogue_requests_show_only_for_servers_that_declare_them() {
+        let plain = RequestSlots::subsonic(&probe(&["runeService", "songLyrics"]));
+        assert_eq!(catalogue_slots(&plain), [hidden(); 4]);
+        let catalogue = RequestSlots::subsonic(&probe(&["runeCatalog"]));
+        assert_eq!(
+            catalogue_slots(&catalogue),
+            [Slot::Translate, Slot::Translate, hidden(), hidden()]
+        );
+        let recommendations = RequestSlots::subsonic(&probe(&["runeRecommendations"]));
+        assert_eq!(
+            catalogue_slots(&recommendations),
+            [hidden(), hidden(), Slot::Translate, Slot::Translate]
+        );
+        // A plain Subsonic server cannot declare extensions at all.
+        let mut legacy = probe(BOTH);
+        legacy.open_subsonic = false;
+        assert_eq!(
+            catalogue_slots(&RequestSlots::subsonic(&legacy)),
+            [hidden(); 4]
+        );
+
+        // A local library has no catalogue, and keeps its own mixes.
+        let local = Implementation::Local.slots();
+        assert_eq!(
+            catalogue_slots(&local),
+            [hidden(), hidden(), Slot::Native, Slot::Native]
+        );
+        assert_eq!(SearchForRequest::slot(&local), Slot::Native);
+    }
+
+    #[test]
+    fn a_descriptor_hides_what_the_service_refuses_of_the_extensions() {
+        let slots = super::tests::rune_slots_with(&[("addToRuneLibrary", None)], false, BOTH);
+        assert_eq!(
+            catalogue_slots(&slots),
+            [Slot::Translate, hidden(), Slot::Translate, Slot::Translate]
+        );
+        let slots = super::tests::rune_slots_with(&[("search3", Some("runeScope"))], false, BOTH);
+        assert_eq!(FetchLibraryMembershipRequest::slot(&slots), hidden());
+        assert_eq!(SearchForRequest::slot(&slots), Slot::Translate);
+
+        let slots = super::tests::rune_slots_with(&[("getRuneRecommendations", None)], false, BOTH);
+        assert_eq!(GetMixByIdRequest::slot(&slots), hidden());
+        assert_eq!(FetchMixQueriesRequest::slot(&slots), hidden());
+        assert_eq!(
+            FetchCollectionGroupSummaryRequest::slot(&slots),
+            Slot::Translate
+        );
+
+        // Without albums or artists to list, recommendations keep the collection pages.
+        let no_lists = [("getAlbumList2", None), ("getArtists", None)];
+        let slots = super::tests::rune_slots_with(&no_lists, false, BOTH);
+        assert_eq!(
+            FetchCollectionGroupSummaryRequest::slot(&slots),
+            Slot::Translate
+        );
+        assert_eq!(FetchCollectionGroupsRequest::slot(&slots), Slot::Translate);
+        let slots = super::tests::rune_slots_with(&no_lists, false, &[]);
+        assert_eq!(FetchCollectionGroupSummaryRequest::slot(&slots), hidden());
+        assert_eq!(FetchCollectionGroupsRequest::slot(&slots), hidden());
     }
 }
