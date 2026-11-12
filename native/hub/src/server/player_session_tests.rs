@@ -1209,6 +1209,7 @@ fn recorded_handoff_order(
     signals: &RecordedSignals,
     source_session_id: &str,
     target_session_id: &str,
+    merged_len: usize,
 ) -> Result<(usize, usize)> {
     let recorded = signals.0.lock().unwrap();
     let source_paused_at = recorded
@@ -1223,6 +1224,8 @@ fn recorded_handoff_order(
         })
         .next()
         .context("source pause status during handoff")?;
+    // The target broadcasts its earlier queue edit from its event task, which can land after
+    // `clear`, so only the update carrying the merged queue counts as the load.
     let target_loaded_at = recorded
         .iter()
         .enumerate()
@@ -1230,7 +1233,9 @@ fn recorded_handoff_order(
         .filter_map(|(index, (_, payload))| {
             rinf::deserialize::<PlaylistUpdate>(payload)
                 .ok()
-                .filter(|update| update.session_id == target_session_id)
+                .filter(|update| {
+                    update.session_id == target_session_id && update.items.len() == merged_len
+                })
                 .map(|_| index)
         })
         .next()
@@ -6300,8 +6305,12 @@ async fn handoff_dispatch_appends_to_idle_renderer_queue_and_starts_source_curso
         .session_id()
         .await
         .to_string();
-    let (source_paused_at, target_loaded_at) =
-        recorded_handoff_order(&signals, &source_session_id, &target_session_id)?;
+    let (source_paused_at, target_loaded_at) = recorded_handoff_order(
+        &signals,
+        &source_session_id,
+        &target_session_id,
+        expected_target_queue.len() + source_queue.len(),
+    )?;
     assert!(
         source_paused_at < target_loaded_at,
         "source paused at {source_paused_at}, target loaded at {target_loaded_at}"
