@@ -1,8 +1,11 @@
-//! Types of Rune's `runeService` OpenSubsonic extension, version 1.
+//! Types of Rune's OpenSubsonic extensions `runeService`, `runeCatalog` and
+//! `runeRecommendations`, version 1.
 
 use std::fmt;
 
 use serde::{Deserialize, Deserializer};
+
+use crate::{OneOrMany, SubsonicAlbum, SubsonicPlaylist};
 
 /// A way to sign in to a service. Values this client does not know become `Other`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -194,4 +197,98 @@ pub enum RuneEdit {
     ReadOnly,
     #[serde(other)]
     Unknown,
+}
+
+/// What a `runeCatalog` search covers. Servers without the extension search the library.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RuneScope {
+    /// The user's library only, as plain `search3`.
+    #[default]
+    Library,
+    /// The service's catalogue only.
+    Catalog,
+    /// Library matches first, then catalogue matches that are not in the library.
+    All,
+}
+
+impl RuneScope {
+    /// The `runeScope` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Library => "library",
+            Self::Catalog => "catalog",
+            Self::All => "all",
+        }
+    }
+
+    /// The scope a `runeScope` value names, or `None` for a value this client does not know.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "library" => Some(Self::Library),
+            "catalog" => Some(Self::Catalog),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// What a recommendation group is about. Values this client does not know become `Other`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuneRecommendationKind {
+    Personal,
+    Recent,
+    Genre,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+impl RuneRecommendationKind {
+    /// The wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Personal => "personal",
+            Self::Recent => "recent",
+            Self::Genre => "genre",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One titled group of `getRuneRecommendations`. Its albums and playlists open with
+/// `getAlbum` and `getPlaylist`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuneRecommendationGroup {
+    pub id: String,
+    pub title: String,
+    pub kind: RuneRecommendationKind,
+    pub albums: Vec<SubsonicAlbum>,
+    pub playlists: Vec<SubsonicPlaylist>,
+}
+
+impl<'de> Deserialize<'de> for RuneRecommendationGroup {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            id: String,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            kind: RuneRecommendationKind,
+            #[serde(default)]
+            album: Option<OneOrMany<SubsonicAlbum>>,
+            #[serde(default)]
+            playlist: Option<OneOrMany<SubsonicPlaylist>>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            id: raw.id,
+            title: raw.title,
+            kind: raw.kind,
+            albums: raw.album.map(OneOrMany::into_vec).unwrap_or_default(),
+            playlists: raw.playlist.map(OneOrMany::into_vec).unwrap_or_default(),
+        })
+    }
 }

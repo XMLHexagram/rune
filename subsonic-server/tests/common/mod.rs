@@ -14,9 +14,10 @@ use subsonic::api::prelude::*;
 use subsonic::{
     ApiFuture, RuneAttribution, RuneEdit, RuneLoginCompletion, RuneLoginMethod, RuneLoginMethods,
     RuneLoginStart, RunePlayback, RunePlaybackMode, RunePlaybackReason, RuneReason,
-    RuneServiceDescriptor, RuneUnsupported, SearchLimits, StreamBody, StreamError, SubsonicAlbum,
-    SubsonicAlbumDetail, SubsonicArtist, SubsonicArtistDetail, SubsonicClient, SubsonicCredentials,
-    SubsonicError, SubsonicJukebox, SubsonicJukeboxPlaylist, SubsonicJukeboxStatus, SubsonicLyrics,
+    RuneRecommendationGroup, RuneRecommendationKind, RuneScope, RuneServiceDescriptor,
+    RuneUnsupported, SearchLimits, StreamBody, StreamError, SubsonicAlbum, SubsonicAlbumDetail,
+    SubsonicArtist, SubsonicArtistDetail, SubsonicClient, SubsonicCredentials, SubsonicError,
+    SubsonicJukebox, SubsonicJukeboxPlaylist, SubsonicJukeboxStatus, SubsonicLyrics,
     SubsonicPlaylist, SubsonicPlaylistDetail, SubsonicProbe, SubsonicRoles, SubsonicScanStatus,
     SubsonicSearchResult, SubsonicServerError, SubsonicSong, SubsonicSyncedLine,
     SubsonicSyncedLyrics,
@@ -68,6 +69,7 @@ pub fn songs() -> Vec<SubsonicSong> {
                 key: Some("i.abc".into()),
                 reason: None,
             }),
+            rune_in_library: Some(true),
         },
         SubsonicSong {
             id: "s2".into(),
@@ -89,6 +91,7 @@ pub fn songs() -> Vec<SubsonicSong> {
                 key: None,
                 reason: None,
             }),
+            rune_in_library: Some(false),
             ..SubsonicSong::default()
         },
         SubsonicSong {
@@ -106,18 +109,21 @@ pub fn artists() -> Vec<SubsonicArtist> {
             name: "Ada".into(),
             album_count: Some(2),
             cover_art: Some("c1".into()),
+            rune_in_library: Some(true),
         },
         SubsonicArtist {
             id: "ar2".into(),
             name: "Alma".into(),
             album_count: None,
             cover_art: None,
+            rune_in_library: None,
         },
         SubsonicArtist {
             id: "ar3".into(),
             name: "Zed".into(),
             album_count: Some(1),
             cover_art: None,
+            rune_in_library: Some(false),
         },
     ]
 }
@@ -134,6 +140,7 @@ pub fn albums() -> Vec<SubsonicAlbum> {
             year: Some(1999),
             genre: Some("Jazz".into()),
             cover_art: Some("c1".into()),
+            rune_in_library: Some(true),
         },
         SubsonicAlbum {
             id: "al2".into(),
@@ -154,6 +161,7 @@ pub fn artist_detail() -> SubsonicArtistDetail {
         name: "Ada".into(),
         album_count: Some(2),
         cover_art: Some("c1".into()),
+        rune_in_library: Some(true),
         albums: albums()[..2].to_vec(),
     }
 }
@@ -170,6 +178,7 @@ pub fn album_detail() -> SubsonicAlbumDetail {
         year: album.year,
         genre: album.genre,
         cover_art: album.cover_art,
+        rune_in_library: album.rune_in_library,
         songs: songs()[..2].to_vec(),
     }
 }
@@ -185,6 +194,7 @@ pub fn playlists() -> Vec<SubsonicPlaylist> {
             public: Some(false),
             cover_art: Some("c1".into()),
             rune_edit: Some(RuneEdit::Full),
+            rune_in_library: Some(true),
         },
         SubsonicPlaylist {
             id: "p2".into(),
@@ -218,6 +228,7 @@ pub fn playlist_detail() -> SubsonicPlaylistDetail {
         public: playlist.public,
         cover_art: playlist.cover_art,
         rune_edit: playlist.rune_edit,
+        rune_in_library: playlist.rune_in_library,
         songs: songs()[..2].to_vec(),
     }
 }
@@ -232,6 +243,8 @@ pub fn probe() -> SubsonicProbe {
             ("runeService".into(), vec![1]),
             ("runeVisualizerFeed".into(), vec![1]),
             ("songLyrics".into(), vec![1, 2]),
+            ("runeCatalog".into(), vec![1]),
+            ("runeRecommendations".into(), vec![1]),
         ],
         roles: SubsonicRoles {
             stream_role: true,
@@ -240,6 +253,72 @@ pub fn probe() -> SubsonicProbe {
         },
         roles_known: true,
     }
+}
+
+/// The probe of a server without Rune's catalogue and recommendations extensions.
+pub fn plain_probe() -> SubsonicProbe {
+    let mut probe = probe();
+    probe
+        .extensions
+        .retain(|(name, _)| name != "runeCatalog" && name != "runeRecommendations");
+    probe
+}
+
+/// Catalogue items, outside the user's library.
+pub fn catalog_result() -> SubsonicSearchResult {
+    SubsonicSearchResult {
+        artists: vec![SubsonicArtist {
+            id: "catalog:artist:9".into(),
+            name: "Far Artist".into(),
+            rune_in_library: Some(false),
+            ..SubsonicArtist::default()
+        }],
+        albums: vec![SubsonicAlbum {
+            id: "catalog:album:9".into(),
+            name: "Far Album".into(),
+            artist: Some("Far Artist".into()),
+            rune_in_library: Some(false),
+            ..SubsonicAlbum::default()
+        }],
+        songs: vec![SubsonicSong {
+            id: "catalog:song:9".into(),
+            title: "Far Song".into(),
+            rune_in_library: Some(false),
+            ..SubsonicSong::default()
+        }],
+    }
+}
+
+pub fn recommendation_groups() -> Vec<RuneRecommendationGroup> {
+    vec![
+        RuneRecommendationGroup {
+            id: "g1".into(),
+            title: "Made for You".into(),
+            kind: RuneRecommendationKind::Personal,
+            albums: vec![albums().remove(0), catalog_result().albums.remove(0)],
+            playlists: vec![SubsonicPlaylist {
+                id: "catalog:playlist:9".into(),
+                name: "Far Mix".into(),
+                rune_edit: Some(RuneEdit::ReadOnly),
+                rune_in_library: Some(false),
+                ..SubsonicPlaylist::default()
+            }],
+        },
+        RuneRecommendationGroup {
+            id: "g2".into(),
+            title: "Recently Played".into(),
+            kind: RuneRecommendationKind::Recent,
+            albums: Vec::new(),
+            playlists: vec![playlists().remove(0)],
+        },
+        RuneRecommendationGroup {
+            id: "g3".into(),
+            title: "Elsewhere".into(),
+            kind: RuneRecommendationKind::Other,
+            albums: Vec::new(),
+            playlists: Vec::new(),
+        },
+    ]
 }
 
 pub fn descriptor() -> RuneServiceDescriptor {
@@ -320,10 +399,21 @@ pub struct JukeboxState {
 pub struct Fake {
     pub calls: Mutex<Vec<String>>,
     pub jukebox: Mutex<JukeboxState>,
+    /// Probes as [`plain_probe`] instead of [`probe`].
+    pub plain: bool,
 }
 
 impl Fake {
     pub fn new() -> Arc<Self> {
+        Self::with_probe(false)
+    }
+
+    /// A fake whose probe declares neither `runeCatalog` nor `runeRecommendations`.
+    pub fn plain() -> Arc<Self> {
+        Self::with_probe(true)
+    }
+
+    fn with_probe(plain: bool) -> Arc<Self> {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
             jukebox: Mutex::new(JukeboxState {
@@ -333,7 +423,12 @@ impl Fake {
                 gain: 1.0,
                 position: None,
             }),
+            plain,
         })
+    }
+
+    fn current_probe(&self) -> SubsonicProbe {
+        if self.plain { plain_probe() } else { probe() }
     }
 
     fn record(&self, call: String) {
@@ -399,11 +494,11 @@ fn owned(ids: &[&str]) -> Vec<String> {
 
 impl System for Fake {
     fn probe<'a>(&'a self) -> ApiFuture<'a, SubsonicProbe> {
-        ready(Ok(probe()))
+        ready(Ok(self.current_probe()))
     }
 
     fn extensions<'a>(&'a self) -> ApiFuture<'a, Vec<(String, Vec<u32>)>> {
-        ready(Ok(probe().extensions))
+        ready(Ok(self.current_probe().extensions))
     }
 }
 
@@ -471,6 +566,62 @@ impl Searching for Fake {
                 .take(limits.songs as usize)
                 .collect(),
         }))
+    }
+}
+
+fn take<T>(items: Vec<T>, count: u32) -> Vec<T> {
+    items.into_iter().take(count as usize).collect()
+}
+
+impl RuneCatalog for Fake {
+    fn search_in_scope<'a>(
+        &'a self,
+        query: &'a str,
+        limits: SearchLimits,
+        song_offset: u32,
+        scope: RuneScope,
+    ) -> ApiFuture<'a, SubsonicSearchResult> {
+        self.record(format!("search {}:{query}:{song_offset}", scope.as_str()));
+        let library = SubsonicSearchResult {
+            artists: artists(),
+            albums: albums(),
+            songs: songs(),
+        };
+        let found = match scope {
+            RuneScope::Library => library,
+            RuneScope::Catalog => catalog_result(),
+            RuneScope::All => {
+                let mut all = library;
+                let catalog = catalog_result();
+                all.artists.extend(catalog.artists);
+                all.albums.extend(catalog.albums);
+                all.songs.extend(catalog.songs);
+                all
+            }
+        };
+        ready(Ok(SubsonicSearchResult {
+            artists: take(found.artists, limits.artists),
+            albums: take(found.albums, limits.albums),
+            songs: take(
+                found.songs.into_iter().skip(song_offset as usize).collect(),
+                limits.songs,
+            ),
+        }))
+    }
+
+    fn add_to_library<'a>(&'a self, ids: &'a [&'a str]) -> ApiFuture<'a, ()> {
+        self.record(format!("add:{}", ids.join(",")));
+        ready(match ids.iter().find_map(|id| Fake::failure(id)) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        })
+    }
+}
+
+impl RuneRecommendations for Fake {
+    fn recommendations<'a>(&'a self, count: u32) -> ApiFuture<'a, Vec<RuneRecommendationGroup>> {
+        self.record(format!("recommendations:{count}"));
+        ready(Ok(take(recommendation_groups(), count)))
     }
 }
 

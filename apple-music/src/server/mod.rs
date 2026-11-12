@@ -1,8 +1,13 @@
 //! A Subsonic-shaped server over the Apple Music API, so Rune can open Apple Music like
 //! any Subsonic server. Apple Music audio is DRM protected: songs carry a hosted
 //! `runePlayback` that the platform's MusicKit host plays, and `stream` is unsupported.
+//!
+//! Ids: library items keep Apple's library ids (`i.` song, `l.` album, `r.` artist, `p.`
+//! playlist); catalog items are `catalog:song:<id>`, `catalog:album:<id>`,
+//! `catalog:artist:<id>` and `catalog:playlist:<id>`; covers are `art:<hash>`.
 
 mod cache;
+mod catalog;
 mod facets;
 mod map;
 
@@ -24,13 +29,13 @@ use subsonic::{
 use crate::client::{AppleMusicClient, ClientBuilder};
 use crate::error::Error;
 use crate::models::{
-    LibraryEntry, LibraryPlaylist, LibrarySearchResults, LibrarySearchType, LibrarySong, Page,
-    RatingValue,
+    LibraryAlbum, LibraryArtist, LibraryEntry, LibraryPlaylist, LibrarySearchResults,
+    LibrarySearchType, LibrarySong, Page, RatingValue,
 };
 use crate::tokens::TokenSource;
 use crate::{ID_BATCH, LIBRARY_SEARCH_LIMIT};
-use cache::{Caches, SongUnion, TTL};
-use map::SongRef;
+use cache::{AlbumList, Caches, SongUnion, TTL};
+use map::{CatalogKind, SongRef};
 
 /// Relationships read with library songs, for their album and artist ids.
 const SONG_INCLUDE: &[&str] = &["albums", "artists"];
@@ -463,6 +468,9 @@ impl AppleMusicServer {
     }
 
     async fn artist(&self, id: &str) -> Outcome<SubsonicArtistDetail> {
+        if let Some(catalog_id) = map::catalog_part(id, CatalogKind::Artist) {
+            return self.catalog_artist(catalog_id).await;
+        }
         let id = map::library_id(id, "artist")?;
         let (artist, albums) = try_join(
             self.client.library_artist(id),
@@ -486,11 +494,15 @@ impl AppleMusicServer {
             id: artist.id,
             name: artist.name,
             cover_art: albums.iter().find_map(|album| album.cover_art.clone()),
+            rune_in_library: artist.rune_in_library,
             albums,
         })
     }
 
     async fn album(&self, id: &str) -> Outcome<SubsonicAlbumDetail> {
+        if let Some(catalog_id) = map::catalog_part(id, CatalogKind::Album) {
+            return self.catalog_album(catalog_id).await;
+        }
         let id = map::library_id(id, "album")?;
         let (album, tracks) = try_join(
             self.client.library_album(id, &["artists"]),
@@ -523,6 +535,7 @@ impl AppleMusicServer {
             year: album.year,
             genre: album.genre,
             cover_art: album.cover_art,
+            rune_in_library: album.rune_in_library,
             songs,
         })
     }
@@ -545,7 +558,13 @@ impl AppleMusicServer {
                 .client
                 .catalog_songs(&[catalog_id.to_owned()])
                 .await
-                .map(|songs| songs.first().map(|song| map::catalog_song(song, artworks))),
+                .map(|songs| {
+                    songs.first().map(|song| {
+                        let mut mapped = map::catalog_song(song, artworks);
+                        mapped.rune_in_library = Some(self.library_marks(None).song(&song.id));
+                        mapped
+                    })
+                }),
             SongRef::Library(library_id) => match self
                 .client
                 .library_songs_by_ids(&[library_id.to_owned()], SONG_INCLUDE)
@@ -577,6 +596,7 @@ impl AppleMusicServer {
             .get(Instant::now(), TTL, || self.build_album_list())
             .await?;
         Ok(albums
+            .albums
             .iter()
             .skip(usize::try_from(offset).unwrap_or(usize::MAX))
             .take(usize::try_from(size).unwrap_or(usize::MAX))
@@ -586,8 +606,9 @@ impl AppleMusicServer {
 
     /// Recently added albums first, in Apple's order, then every other library album:
     /// Rune reads its whole album list through here.
-    async fn build_album_list(&self) -> Outcome<Vec<SubsonicAlbum>> {
+    async fn build_album_list(&self) -> Outcome<AlbumList> {
         let artworks = &self.caches.artworks;
+        let mut library_catalog_ids = HashSet::new();
         let library = async {
             let mut library = Vec::new();
             let mut pages = self
@@ -595,6 +616,11 @@ impl AppleMusicServer {
                 .library_album_pages(&["artists"], PARALLEL_READS);
             while let Some(page) = pages.try_next().await? {
                 library.extend(page.iter().map(|album| map::album(album, artworks)));
+                library_catalog_ids.extend(
+                    page.iter()
+                        .filter_map(LibraryAlbum::catalog_id)
+                        .map(str::to_owned),
+                );
             }
             Ok::<_, Error>(library)
         };
@@ -629,7 +655,10 @@ impl AppleMusicServer {
                 .filter(|album| seen.insert(album.id.clone()))
                 .cloned(),
         );
-        Ok(albums)
+        Ok(AlbumList {
+            albums,
+            library_catalog_ids,
+        })
     }
 
     // Search ---------------------------------------------------------------
@@ -640,8 +669,7 @@ impl AppleMusicServer {
         limits: SearchLimits,
         song_offset: u32,
     ) -> Outcome<SubsonicSearchResult> {
-        let query = query.trim();
-        if query.is_empty() || query == "\"\"" {
+        if lists_everything(query) {
             // Rune lists every song through an empty search.
             if limits.songs == 0 {
                 return Ok(SubsonicSearchResult::default());
@@ -660,24 +688,40 @@ impl AppleMusicServer {
                 ..SubsonicSearchResult::default()
             });
         }
-        let artworks = &self.caches.artworks;
+        let term = search_term(query);
+        if term.is_empty() {
+            return Ok(SubsonicSearchResult::default());
+        }
+        let found = self.library_search(term, limits, song_offset).await?;
+        let mut result = self.map_library_found(&found);
+        result.songs = self.with_likes(result.songs).await;
+        Ok(result)
+    }
+
+    /// The library's matches of each type, up to its limit, the songs from `song_offset`.
+    async fn library_search(
+        &self,
+        term: &str,
+        limits: SearchLimits,
+        song_offset: u32,
+    ) -> Outcome<LibraryFound> {
         let (songs, albums, artists) = try_join3(
             self.search_library(
-                query,
+                term,
                 LibrarySearchType::Songs,
                 limits.songs,
                 song_offset,
                 |results| results.songs,
             ),
             self.search_library(
-                query,
+                term,
                 LibrarySearchType::Albums,
                 limits.albums,
                 0,
                 |results| results.albums,
             ),
             self.search_library(
-                query,
+                term,
                 LibrarySearchType::Artists,
                 limits.artists,
                 0,
@@ -685,18 +729,29 @@ impl AppleMusicServer {
             ),
         )
         .await?;
-        let songs = songs
-            .iter()
-            .filter_map(|song| map::library_song(song, artworks))
-            .collect();
-        Ok(SubsonicSearchResult {
-            artists: artists.iter().map(map::artist).collect(),
-            albums: albums
+        Ok(LibraryFound {
+            songs,
+            albums,
+            artists,
+        })
+    }
+
+    /// Library search results as Subsonic ones, without their likes.
+    fn map_library_found(&self, found: &LibraryFound) -> SubsonicSearchResult {
+        let artworks = &self.caches.artworks;
+        SubsonicSearchResult {
+            artists: found.artists.iter().map(map::artist).collect(),
+            albums: found
+                .albums
                 .iter()
                 .map(|album| map::album(album, artworks))
                 .collect(),
-            songs: self.with_likes(songs).await,
-        })
+            songs: found
+                .songs
+                .iter()
+                .filter_map(|song| map::library_song(song, artworks))
+                .collect(),
+        }
     }
 
     /// Up to `count` results of one type, in pages of Apple's largest search limit.
@@ -749,6 +804,9 @@ impl AppleMusicServer {
     }
 
     async fn playlist(&self, id: &str) -> Outcome<SubsonicPlaylistDetail> {
+        if let Some(catalog_id) = map::catalog_part(id, CatalogKind::Playlist) {
+            return self.catalog_playlist(catalog_id).await;
+        }
         let id = map::library_id(id, "playlist")?;
         let (playlist, tracks) = try_join(
             async { Ok(self.client.library_playlist(id).await?) },
@@ -770,6 +828,7 @@ impl AppleMusicServer {
             public: playlist.public,
             cover_art: playlist.cover_art,
             rune_edit: playlist.rune_edit,
+            rune_in_library: playlist.rune_in_library,
             songs,
         })
     }
@@ -860,6 +919,26 @@ impl AppleMusicServer {
         }
         Ok(bytes)
     }
+}
+
+/// What a library search found, before mapping.
+struct LibraryFound {
+    songs: Vec<LibrarySong>,
+    albums: Vec<LibraryAlbum>,
+    artists: Vec<LibraryArtist>,
+}
+
+/// Whether a search asks for every song: Rune lists them through an empty search, which some
+/// callers send as `""`.
+fn lists_everything(query: &str) -> bool {
+    let query = query.trim();
+    query.is_empty() || query == "\"\""
+}
+
+/// The term Apple is asked to search for. Apple's search has no wildcards, so a trailing
+/// `*`, which Rune appends to what is typed, is left out.
+fn search_term(query: &str) -> &str {
+    query.trim().trim_end_matches('*').trim_end()
 }
 
 fn song_refs<'a>(song_ids: &[&'a str]) -> Result<Vec<SongRef<'a>>, SubsonicError> {

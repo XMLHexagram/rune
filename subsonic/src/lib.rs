@@ -13,7 +13,8 @@ mod rune;
 pub use api::{ApiFuture, StreamBody, SubsonicApi};
 pub use rune::{
     RuneAttribution, RuneEdit, RuneLoginCompletion, RuneLoginMethod, RuneLoginMethods,
-    RuneLoginStart, RuneReason, RuneServiceDescriptor, RuneUnsupported,
+    RuneLoginStart, RuneReason, RuneRecommendationGroup, RuneRecommendationKind, RuneScope,
+    RuneServiceDescriptor, RuneUnsupported,
 };
 
 const CLIENT_VERSION: &str = "1.16.1";
@@ -163,13 +164,29 @@ pub struct SubsonicProbe {
 }
 
 impl SubsonicProbe {
-    /// Whether this OpenSubsonic server declares Rune's visualizer feed version 1.
-    pub fn supports_rune_visualizer_feed(&self) -> bool {
+    /// Whether this OpenSubsonic server declares `version` of the extension `name`.
+    fn declares(&self, name: &str, version: u32) -> bool {
         self.open_subsonic
             && self
                 .extensions
                 .iter()
-                .any(|(name, versions)| name == "runeVisualizerFeed" && versions.contains(&1))
+                .any(|(declared, versions)| declared == name && versions.contains(&version))
+    }
+
+    /// Whether this OpenSubsonic server declares Rune's visualizer feed version 1.
+    pub fn supports_rune_visualizer_feed(&self) -> bool {
+        self.declares("runeVisualizerFeed", 1)
+    }
+
+    /// Whether this OpenSubsonic server declares Rune's catalogue extension version 1: scoped
+    /// `search3`, `addToRuneLibrary` and [`SubsonicSong::rune_in_library`].
+    pub fn supports_rune_catalog(&self) -> bool {
+        self.declares("runeCatalog", 1)
+    }
+
+    /// Whether this OpenSubsonic server declares Rune's recommendations extension version 1.
+    pub fn supports_rune_recommendations(&self) -> bool {
+        self.declares("runeRecommendations", 1)
     }
 }
 
@@ -487,23 +504,65 @@ impl SubsonicClient {
         limits: SearchLimits,
         song_offset: u32,
     ) -> Result<SubsonicSearchResult, SubsonicError> {
+        self.search3(query, limits, song_offset, None).await
+    }
+
+    /// Search with Rune's `runeCatalog` scope, starting the song results at `song_offset`.
+    /// Servers without the extension ignore the scope and search the library.
+    pub async fn search_in_scope(
+        &self,
+        query: &str,
+        limits: SearchLimits,
+        song_offset: u32,
+        scope: RuneScope,
+    ) -> Result<SubsonicSearchResult, SubsonicError> {
+        self.search3(query, limits, song_offset, Some(scope)).await
+    }
+
+    async fn search3(
+        &self,
+        query: &str,
+        limits: SearchLimits,
+        song_offset: u32,
+        scope: Option<RuneScope>,
+    ) -> Result<SubsonicSearchResult, SubsonicError> {
         let artist_count = limits.artists.to_string();
         let album_count = limits.albums.to_string();
         let song_count = limits.songs.to_string();
         let song_offset = song_offset.to_string();
-        let response: SearchResponse = self
-            .call(
-                "search3",
-                &[
-                    ("query", query),
-                    ("artistCount", &artist_count),
-                    ("albumCount", &album_count),
-                    ("songCount", &song_count),
-                    ("songOffset", &song_offset),
-                ],
-            )
-            .await?;
+        let mut params = vec![
+            ("query", query),
+            ("artistCount", artist_count.as_str()),
+            ("albumCount", album_count.as_str()),
+            ("songCount", song_count.as_str()),
+            ("songOffset", song_offset.as_str()),
+        ];
+        if let Some(scope) = scope {
+            params.push(("runeScope", scope.as_str()));
+        }
+        let response: SearchResponse = self.call("search3", &params).await?;
         Ok(response.search_result.unwrap_or_default())
+    }
+
+    /// Add catalogue songs, albums or playlists to the user's library (`runeCatalog`).
+    pub async fn add_to_library(&self, ids: &[&str]) -> Result<(), SubsonicError> {
+        self.song_ids_action("addToRuneLibrary", ids).await
+    }
+
+    /// Read up to `count` groups of recommendations (`runeRecommendations`).
+    pub async fn recommendations(
+        &self,
+        count: u32,
+    ) -> Result<Vec<RuneRecommendationGroup>, SubsonicError> {
+        let count = count.to_string();
+        let response: RecommendationsResponse = self
+            .call("getRuneRecommendations", &[("count", &count)])
+            .await?;
+        Ok(response
+            .recommendations
+            .and_then(|recommendations| recommendations.group)
+            .map(OneOrMany::into_vec)
+            .unwrap_or_default())
     }
 
     /// Read the server's current scan status and reported song count.
@@ -1002,6 +1061,8 @@ pub struct SubsonicArtist {
     pub name: String,
     pub album_count: Option<u32>,
     pub cover_art: Option<String>,
+    /// Rune's `runeCatalog` extension. Servers without it never send it.
+    pub rune_in_library: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1010,6 +1071,7 @@ pub struct SubsonicArtistDetail {
     pub name: String,
     pub album_count: Option<u32>,
     pub cover_art: Option<String>,
+    pub rune_in_library: Option<bool>,
     pub albums: Vec<SubsonicAlbum>,
 }
 
@@ -1025,6 +1087,8 @@ pub struct SubsonicAlbum {
     pub year: Option<u32>,
     pub genre: Option<String>,
     pub cover_art: Option<String>,
+    /// Rune's `runeCatalog` extension. Servers without it never send it.
+    pub rune_in_library: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1038,6 +1102,7 @@ pub struct SubsonicAlbumDetail {
     pub year: Option<u32>,
     pub genre: Option<String>,
     pub cover_art: Option<String>,
+    pub rune_in_library: Option<bool>,
     pub songs: Vec<SubsonicSong>,
 }
 
@@ -1064,6 +1129,9 @@ pub struct SubsonicSong {
     pub starred: Option<String>,
     /// Rune's `runeService` extension. Servers without it never send it.
     pub rune_playback: Option<RunePlayback>,
+    /// Rune's `runeCatalog` extension: whether the song is in the user's library. Servers
+    /// without it never send it.
+    pub rune_in_library: Option<bool>,
 }
 
 /// How a song of a `runeService` server plays.
@@ -1103,11 +1171,7 @@ impl SubsonicProbe {
     /// Whether this OpenSubsonic server declares Rune's service extension version 1, so its songs
     /// may carry [`SubsonicSong::rune_playback`].
     pub fn supports_rune_service(&self) -> bool {
-        self.open_subsonic
-            && self
-                .extensions
-                .iter()
-                .any(|(name, versions)| name == "runeService" && versions.contains(&1))
+        self.declares("runeService", 1)
     }
 }
 
@@ -1187,6 +1251,8 @@ pub struct SubsonicPlaylist {
     pub cover_art: Option<String>,
     /// Rune's `runeService` extension. Servers without it never send it.
     pub rune_edit: Option<RuneEdit>,
+    /// Rune's `runeCatalog` extension. Servers without it never send it.
+    pub rune_in_library: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1199,6 +1265,7 @@ pub struct SubsonicPlaylistDetail {
     pub public: Option<bool>,
     pub cover_art: Option<String>,
     pub rune_edit: Option<RuneEdit>,
+    pub rune_in_library: Option<bool>,
     pub songs: Vec<SubsonicSong>,
 }
 
@@ -1353,6 +1420,16 @@ struct SearchResponse {
     search_result: Option<SubsonicSearchResult>,
 }
 #[derive(Deserialize)]
+struct RecommendationsResponse {
+    #[serde(default, rename = "runeRecommendations")]
+    recommendations: Option<RawRecommendations>,
+}
+#[derive(Deserialize)]
+struct RawRecommendations {
+    #[serde(default)]
+    group: Option<OneOrMany<RuneRecommendationGroup>>,
+}
+#[derive(Deserialize)]
 struct ScanStatusResponse {
     #[serde(default, rename = "scanStatus")]
     scan_status: Option<SubsonicScanStatus>,
@@ -1427,6 +1504,7 @@ impl<'de> Deserialize<'de> for SubsonicArtistDetail {
             name: String,
             album_count: Option<u32>,
             cover_art: Option<String>,
+            rune_in_library: Option<bool>,
             #[serde(rename = "album")]
             albums: Option<OneOrMany<SubsonicAlbum>>,
         }
@@ -1436,6 +1514,7 @@ impl<'de> Deserialize<'de> for SubsonicArtistDetail {
             name: raw.name,
             album_count: raw.album_count,
             cover_art: raw.cover_art,
+            rune_in_library: raw.rune_in_library,
             albums: raw.albums.map(OneOrMany::into_vec).unwrap_or_default(),
         })
     }
@@ -1458,6 +1537,7 @@ impl<'de> Deserialize<'de> for SubsonicAlbumDetail {
             year: Option<u32>,
             genre: Option<String>,
             cover_art: Option<String>,
+            rune_in_library: Option<bool>,
             song: Option<OneOrMany<SubsonicSong>>,
         }
         let raw = RawAlbum::deserialize(deserializer)?;
@@ -1471,6 +1551,7 @@ impl<'de> Deserialize<'de> for SubsonicAlbumDetail {
             year: raw.year,
             genre: raw.genre,
             cover_art: raw.cover_art,
+            rune_in_library: raw.rune_in_library,
             songs: raw.song.map(OneOrMany::into_vec).unwrap_or_default(),
         })
     }
@@ -1492,6 +1573,7 @@ impl<'de> Deserialize<'de> for SubsonicPlaylistDetail {
             public: Option<bool>,
             cover_art: Option<String>,
             rune_edit: Option<RuneEdit>,
+            rune_in_library: Option<bool>,
             entry: Option<OneOrMany<SubsonicSong>>,
         }
         let raw = RawPlaylist::deserialize(deserializer)?;
@@ -1504,6 +1586,7 @@ impl<'de> Deserialize<'de> for SubsonicPlaylistDetail {
             public: raw.public,
             cover_art: raw.cover_art,
             rune_edit: raw.rune_edit,
+            rune_in_library: raw.rune_in_library,
             songs: raw.entry.map(OneOrMany::into_vec).unwrap_or_default(),
         })
     }
@@ -1667,6 +1750,155 @@ mod rune_playback_tests {
         probe.extensions = vec![("runeService".into(), vec![1])];
         probe.open_subsonic = false;
         assert!(!probe.supports_rune_service());
+    }
+}
+
+#[cfg(test)]
+mod rune_catalog_tests {
+    use super::*;
+
+    fn probe(extensions: &[(&str, &[u32])]) -> SubsonicProbe {
+        SubsonicProbe {
+            api_version: "1.16.1".into(),
+            open_subsonic: true,
+            server_type: None,
+            server_version: None,
+            extensions: extensions
+                .iter()
+                .map(|(name, versions)| ((*name).into(), versions.to_vec()))
+                .collect(),
+            roles: SubsonicRoles::default(),
+            roles_known: true,
+        }
+    }
+
+    #[test]
+    fn catalog_and_recommendations_need_version_one() {
+        let both = probe(&[("runeCatalog", &[1]), ("runeRecommendations", &[1, 2])]);
+        assert!(both.supports_rune_catalog());
+        assert!(both.supports_rune_recommendations());
+        assert!(!both.supports_rune_service());
+
+        let later = probe(&[("runeCatalog", &[2]), ("runeRecommendations", &[2])]);
+        assert!(!later.supports_rune_catalog());
+        assert!(!later.supports_rune_recommendations());
+
+        let mut plain = probe(&[("runeCatalog", &[1]), ("runeRecommendations", &[1])]);
+        plain.open_subsonic = false;
+        assert!(!plain.supports_rune_catalog());
+        assert!(!plain.supports_rune_recommendations());
+    }
+
+    #[test]
+    fn library_membership_is_absent_unless_sent() {
+        let song: SubsonicSong = serde_json::from_str(r#"{"id":"s","title":"T"}"#).unwrap();
+        assert_eq!(song.rune_in_library, None);
+        let song: SubsonicSong =
+            serde_json::from_str(r#"{"id":"s","title":"T","runeInLibrary":false}"#).unwrap();
+        assert_eq!(song.rune_in_library, Some(false));
+
+        let album: SubsonicAlbum =
+            serde_json::from_str(r#"{"id":"a","name":"A","runeInLibrary":true}"#).unwrap();
+        assert_eq!(album.rune_in_library, Some(true));
+        let artist: SubsonicArtist =
+            serde_json::from_str(r#"{"id":"r","name":"R","runeInLibrary":false}"#).unwrap();
+        assert_eq!(artist.rune_in_library, Some(false));
+        let playlist: SubsonicPlaylist =
+            serde_json::from_str(r#"{"id":"p","name":"P","runeInLibrary":false}"#).unwrap();
+        assert_eq!(playlist.rune_in_library, Some(false));
+
+        let detail: SubsonicAlbumDetail = serde_json::from_str(
+            r#"{"id":"a","name":"A","runeInLibrary":false,"song":{"id":"s","title":"T"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detail.rune_in_library, Some(false));
+        assert_eq!(detail.songs[0].rune_in_library, None);
+        let detail: SubsonicArtistDetail =
+            serde_json::from_str(r#"{"id":"r","name":"R","runeInLibrary":true}"#).unwrap();
+        assert_eq!(detail.rune_in_library, Some(true));
+        let detail: SubsonicPlaylistDetail = serde_json::from_str(
+            r#"{"id":"p","name":"P","runeEdit":"readOnly","runeInLibrary":false}"#,
+        )
+        .unwrap();
+        assert_eq!(detail.rune_in_library, Some(false));
+        assert_eq!(detail.rune_edit, Some(RuneEdit::ReadOnly));
+
+        let result: SearchResponse = serde_json::from_str(
+            r#"{"searchResult3":{"song":[{"id":"s","title":"T","runeInLibrary":true}],
+                "album":{"id":"a","name":"A","runeInLibrary":false}}}"#,
+        )
+        .unwrap();
+        let result = result.search_result.unwrap();
+        assert_eq!(result.songs[0].rune_in_library, Some(true));
+        assert_eq!(result.albums[0].rune_in_library, Some(false));
+    }
+
+    #[test]
+    fn recommendation_groups_parse_with_their_items() {
+        // The example of the extension draft, with items filled in.
+        let response: RecommendationsResponse = serde_json::from_str(
+            r#"{"runeRecommendations": {"group": [
+              {"id": "g1", "title": "Made for You", "kind": "personal",
+               "album": [{"id": "catalog:album:1", "name": "One", "artist": "A",
+                          "coverArt": "art:1", "runeInLibrary": false}],
+               "playlist": [{"id": "catalog:playlist:2", "name": "Two",
+                             "runeEdit": "readOnly", "runeInLibrary": false}]},
+              {"id": "g2", "title": "Recently Played", "kind": "recent",
+               "album": {"id": "l.3", "name": "Three", "runeInLibrary": true}},
+              {"id": "g3", "title": "Jazz", "kind": "genre"},
+              {"id": "g4", "title": "Later", "kind": "somethingNew"},
+              {}
+            ]}}"#,
+        )
+        .unwrap();
+        let groups = response
+            .recommendations
+            .unwrap()
+            .group
+            .map(OneOrMany::into_vec)
+            .unwrap();
+        assert_eq!(groups.len(), 5);
+        let first = &groups[0];
+        assert_eq!(first.id, "g1");
+        assert_eq!(first.title, "Made for You");
+        assert_eq!(first.kind, RuneRecommendationKind::Personal);
+        assert_eq!(first.albums[0].id, "catalog:album:1");
+        assert_eq!(first.albums[0].cover_art.as_deref(), Some("art:1"));
+        assert_eq!(first.albums[0].rune_in_library, Some(false));
+        assert_eq!(first.playlists[0].rune_edit, Some(RuneEdit::ReadOnly));
+        // A single item may come as an object, as everywhere in Subsonic JSON.
+        assert_eq!(groups[1].kind, RuneRecommendationKind::Recent);
+        assert_eq!(groups[1].albums[0].id, "l.3");
+        assert!(groups[1].playlists.is_empty());
+        assert_eq!(groups[2].kind, RuneRecommendationKind::Genre);
+        assert!(groups[2].albums.is_empty() && groups[2].playlists.is_empty());
+        assert_eq!(groups[3].kind, RuneRecommendationKind::Other);
+        assert_eq!(groups[4], RuneRecommendationGroup::default());
+
+        let empty: RecommendationsResponse = serde_json::from_str("{}").unwrap();
+        assert!(empty.recommendations.is_none());
+        let none: RecommendationsResponse =
+            serde_json::from_str(r#"{"runeRecommendations": {}}"#).unwrap();
+        assert!(none.recommendations.unwrap().group.is_none());
+    }
+
+    #[test]
+    fn scopes_and_kinds_keep_their_wire_names() {
+        for scope in [RuneScope::Library, RuneScope::Catalog, RuneScope::All] {
+            assert_eq!(RuneScope::parse(scope.as_str()), Some(scope));
+        }
+        assert_eq!(RuneScope::parse("everything"), None);
+        assert_eq!(RuneScope::default(), RuneScope::Library);
+        for kind in [
+            RuneRecommendationKind::Personal,
+            RuneRecommendationKind::Recent,
+            RuneRecommendationKind::Genre,
+            RuneRecommendationKind::Other,
+        ] {
+            let parsed: RuneRecommendationKind =
+                serde_json::from_str(&format!("\"{}\"", kind.as_str())).unwrap();
+            assert_eq!(parsed, kind);
+        }
     }
 }
 

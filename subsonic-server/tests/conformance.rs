@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use common::*;
 use subsonic::{
-    RuneLoginCompletion, RuneLoginMethod, RuneLoginStart, RuneReason, SearchLimits, StreamError,
-    SubsonicApi, SubsonicCredentials, SubsonicError, SubsonicJukebox, SubsonicJukeboxPlaylist,
-    SubsonicJukeboxStatus, SubsonicLyrics, SubsonicServerError,
+    RuneLoginCompletion, RuneLoginMethod, RuneLoginStart, RuneReason, RuneScope, SearchLimits,
+    StreamError, SubsonicApi, SubsonicCredentials, SubsonicError, SubsonicJukebox,
+    SubsonicJukeboxPlaylist, SubsonicJukeboxStatus, SubsonicLyrics, SubsonicServerError,
 };
 
 async fn fixture() -> (Arc<Fake>, Served) {
@@ -564,6 +564,8 @@ impl subsonic::api::Jukebox for Nothing {}
 impl subsonic::api::Scanning for Nothing {}
 impl subsonic::api::RuneVisualizerFeed for Nothing {}
 impl subsonic::api::RuneService for Nothing {}
+impl subsonic::api::RuneCatalog for Nothing {}
+impl subsonic::api::RuneRecommendations for Nothing {}
 
 #[tokio::test]
 async fn unsupported_endpoints_answer_501_on_every_path() {
@@ -605,6 +607,20 @@ async fn unsupported_endpoints_answer_501_on_every_path() {
     );
     let error = client.cover_art("c1", None).await.unwrap_err();
     assert!(matches!(&error, SubsonicError::Transport(message) if message.contains("501")));
+
+    // So do the Rune extensions' endpoints.
+    for error in [
+        client
+            .add_to_library(&["catalog:song:9"])
+            .await
+            .unwrap_err(),
+        client.recommendations(5).await.map(drop).unwrap_err(),
+    ] {
+        assert_eq!(
+            error,
+            SubsonicError::HttpStatus(reqwest::StatusCode::NOT_IMPLEMENTED)
+        );
+    }
 }
 
 #[tokio::test]
@@ -812,4 +828,205 @@ async fn repeated_parameters_keep_their_order() {
             "star:s3,s1,s2",
         ]
     );
+}
+
+#[tokio::test]
+async fn scoped_search_and_library_additions_reach_the_catalog_facet() {
+    let (fake, served) = fixture().await;
+    let client = served.client();
+    let limits = SearchLimits {
+        artists: 10,
+        albums: 10,
+        songs: 10,
+    };
+
+    let all = client
+        .search_in_scope("far", limits, 0, RuneScope::All)
+        .await
+        .unwrap();
+    assert_eq!(all.songs.len(), songs().len() + 1);
+    assert_eq!(all.songs.last().unwrap(), &catalog_result().songs[0]);
+    assert_eq!(all.albums.last().unwrap(), &catalog_result().albums[0]);
+    assert_eq!(all.artists.last().unwrap(), &catalog_result().artists[0]);
+    // Membership survives the round trip, absent where the server sent none.
+    let membership: Vec<Option<bool>> = all.songs.iter().map(|song| song.rune_in_library).collect();
+    assert_eq!(
+        membership,
+        [Some(true), None, Some(false), None, Some(false)]
+    );
+
+    let catalog = client
+        .search_in_scope("far", limits, 0, RuneScope::Catalog)
+        .await
+        .unwrap();
+    assert_eq!(catalog, catalog_result());
+    let library = client
+        .search_in_scope("near", limits, 2, RuneScope::Library)
+        .await
+        .unwrap();
+    assert_eq!(library.songs, songs()[2..].to_vec());
+
+    client
+        .add_to_library(&["catalog:song:9", "catalog:album:9", "catalog:playlist:9"])
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls(),
+        [
+            "search all:far:0",
+            "search catalog:far:0",
+            "search library:near:2",
+            "add:catalog:song:9,catalog:album:9,catalog:playlist:9",
+        ]
+    );
+
+    let error = client.add_to_library(&["code:70"]).await.unwrap_err();
+    assert!(matches!(
+        error,
+        SubsonicError::Server {
+            kind: SubsonicServerError::NotFound,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn without_the_extension_the_scope_is_ignored() {
+    let fake = Fake::plain();
+    let served = serve(fake.clone()).await;
+    let client = served.client();
+    let extensions = client.extensions().await.unwrap();
+    assert!(
+        extensions
+            .iter()
+            .all(|(name, _)| name != "runeCatalog" && name != "runeRecommendations"),
+        "{extensions:?}"
+    );
+    assert!(!client.probe().await.unwrap().supports_rune_catalog());
+
+    let limits = SearchLimits {
+        artists: 1,
+        albums: 1,
+        songs: 1,
+    };
+    let found = client
+        .search_in_scope("far", limits, 0, RuneScope::Catalog)
+        .await
+        .unwrap();
+    assert_eq!(found.songs, songs()[..1].to_vec());
+    assert_eq!(fake.calls(), ["search:far"]);
+}
+
+async fn raw(served: &Served, endpoint: &str) -> serde_json::Value {
+    reqwest::get(format!("{}rest/{endpoint}", served.base))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_unknown_scope_is_a_generic_error() {
+    let (fake, served) = fixture().await;
+    let body = raw(&served, "search3?query=x&runeScope=everywhere").await;
+    let envelope = &body["subsonic-response"];
+    assert_eq!(envelope["status"], "failed");
+    assert_eq!(envelope["error"]["code"], 0);
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(message.contains("everywhere") && message.contains("library, catalog or all"));
+    assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn extension_parameters_are_checked() {
+    let (fake, served) = fixture().await;
+    // No id to add is a missing parameter.
+    let body = raw(&served, "addToRuneLibrary").await;
+    assert_eq!(body["subsonic-response"]["error"]["code"], 10);
+    // A count that is not a number too; a number is passed on.
+    let body = raw(&served, "getRuneRecommendations?count=many").await;
+    assert_eq!(body["subsonic-response"]["error"]["code"], 10);
+    let body = raw(&served, "getRuneRecommendations?count=1").await;
+    let groups = body["subsonic-response"]["runeRecommendations"]["group"]
+        .as_array()
+        .unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(fake.calls(), ["recommendations:1"]);
+}
+
+#[tokio::test]
+async fn recommendations_round_trip_and_default_their_count() {
+    let (fake, served) = fixture().await;
+    let client = served.client();
+    assert_eq!(
+        client.recommendations(2).await.unwrap(),
+        recommendation_groups()[..2].to_vec()
+    );
+    assert_eq!(
+        client.recommendations(10).await.unwrap(),
+        recommendation_groups()
+    );
+
+    let body: serde_json::Value =
+        reqwest::get(format!("{}rest/getRuneRecommendations", served.base))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let groups = &body["subsonic-response"]["runeRecommendations"]["group"];
+    assert_eq!(groups[0]["kind"], "personal");
+    assert_eq!(groups[0]["title"], "Made for You");
+    assert_eq!(groups[0]["album"][1]["id"], "catalog:album:9");
+    assert_eq!(groups[0]["album"][1]["runeInLibrary"], false);
+    assert_eq!(groups[0]["playlist"][0]["runeEdit"], "readOnly");
+    assert_eq!(groups[1]["kind"], "recent");
+    assert_eq!(groups[2]["album"], serde_json::json!([]));
+    assert_eq!(
+        fake.calls(),
+        [
+            "recommendations:2",
+            "recommendations:10",
+            "recommendations:10"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn library_membership_uses_its_documented_key() {
+    let (_, served) = fixture().await;
+    let get = |endpoint: &str| {
+        let url = format!("{}rest/{endpoint}", served.base);
+        async move {
+            reqwest::get(url)
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let body = get("search3?query=x&runeScope=all").await;
+    let result = &body["subsonic-response"]["searchResult3"];
+    assert_eq!(result["song"][0]["runeInLibrary"], true);
+    assert!(result["song"][1].get("runeInLibrary").is_none());
+    assert_eq!(result["song"][4]["runeInLibrary"], false);
+    assert_eq!(result["artist"][3]["runeInLibrary"], false);
+
+    let body = get("getAlbum?id=al1").await;
+    assert_eq!(body["subsonic-response"]["album"]["runeInLibrary"], true);
+    let body = get("getArtist?id=ar1").await;
+    assert_eq!(body["subsonic-response"]["artist"]["runeInLibrary"], true);
+    let body = get("getPlaylist?id=p1").await;
+    assert_eq!(body["subsonic-response"]["playlist"]["runeInLibrary"], true);
+
+    let body = get("getOpenSubsonicExtensions").await;
+    let names: Vec<&str> = body["subsonic-response"]["openSubsonicExtensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|extension| extension["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"runeCatalog") && names.contains(&"runeRecommendations"));
 }

@@ -11,8 +11,8 @@ use common::{fast_retry, FixtureServer, Reply, Seen};
 use serde_json::{json, Value};
 use subsonic::{
     RuneEdit, RuneLoginCompletion, RuneLoginMethod, RuneLoginStart, RunePlayback, RunePlaybackMode,
-    RuneReason, SearchLimits, StreamError, SubsonicApi, SubsonicError, SubsonicServerError,
-    SubsonicSong,
+    RuneReason, RuneRecommendationKind, RuneScope, SearchLimits, StreamError, SubsonicApi,
+    SubsonicError, SubsonicServerError, SubsonicSong,
 };
 
 const USER_TOKEN: &str = "music-user-token";
@@ -234,15 +234,19 @@ async fn probe_extensions_and_descriptor_answer_without_tokens() {
     assert_eq!(probe.api_version, "1.16.1");
     assert!(probe.open_subsonic);
     assert_eq!(probe.server_type.as_deref(), Some("rune-apple-music"));
-    assert_eq!(probe.extensions, vec![("runeService".to_owned(), vec![1])]);
+    let declared = vec![
+        ("runeService".to_owned(), vec![1]),
+        ("runeCatalog".to_owned(), vec![1]),
+        ("runeRecommendations".to_owned(), vec![1]),
+    ];
+    assert_eq!(probe.extensions, declared);
     assert!(probe.supports_rune_service());
+    assert!(probe.supports_rune_catalog());
+    assert!(probe.supports_rune_recommendations());
     assert!(probe.roles_known);
     assert!(probe.roles.stream_role);
     assert!(!probe.roles.jukebox_role);
-    assert_eq!(
-        server.extensions().await.unwrap(),
-        vec![("runeService".to_owned(), vec![1])]
-    );
+    assert_eq!(server.extensions().await.unwrap(), declared);
 
     let descriptor = server.rune_service().await.unwrap();
     assert_eq!(descriptor.id, "appleMusic");
@@ -366,6 +370,40 @@ async fn every_call_needing_apple_asks_for_sign_in_first() {
         ("star", server.star(&["i.lib1"]).await.err()),
         ("star nothing", server.star(none).await.err()),
         ("unstar", server.unstar(&["catalog:song:1"]).await.err()),
+        (
+            "search3 all",
+            server
+                .search_in_scope("dawn", songs_only(10), 0, RuneScope::All)
+                .await
+                .err(),
+        ),
+        (
+            "search3 catalog",
+            server
+                .search_in_scope("dawn", songs_only(10), 0, RuneScope::Catalog)
+                .await
+                .err(),
+        ),
+        (
+            "getAlbum catalog",
+            server.album("catalog:album:1").await.err(),
+        ),
+        (
+            "getPlaylist catalog",
+            server.playlist("catalog:playlist:pl.1").await.err(),
+        ),
+        (
+            "addToRuneLibrary",
+            server.add_to_library(&["catalog:song:1"]).await.err(),
+        ),
+        (
+            "addToRuneLibrary nothing",
+            server.add_to_library(none).await.err(),
+        ),
+        (
+            "getRuneRecommendations",
+            server.recommendations(10).await.err(),
+        ),
     ];
     for (call, error) in errors {
         let error = error.unwrap_or_else(|| panic!("{call} answered without a sign-in"));
@@ -586,7 +624,9 @@ async fn library_and_catalog_songs_map_with_hosted_playback() {
     assert_eq!(catalog.track, Some(8));
     assert_eq!(catalog.year, Some(2013));
     assert_eq!(catalog.duration, Some(370));
-    assert_eq!(catalog.album_id, None);
+    // From the song's relationships in Apple's recorded answer.
+    assert_eq!(catalog.album_id.as_deref(), Some("catalog:album:617154241"));
+    assert_eq!(catalog.artist_id.as_deref(), Some("catalog:artist:5468295"));
     let playback = catalog.rune_playback.unwrap();
     assert_eq!(playback.mode, RunePlaybackMode::Hosted);
     assert_eq!(playback.host.as_deref(), Some("appleMusic"));
@@ -1284,7 +1324,7 @@ async fn artists_artist_and_album_browse_the_library() {
     );
 
     assert_not_found(server.album("l.missing").await);
-    assert_not_found(server.artist("catalog:artist:1").await);
+    assert_not_found(server.artist("catalog:artist:").await);
 }
 
 #[tokio::test]
@@ -1568,4 +1608,769 @@ async fn streaming_lyrics_and_scrobbles_stay_with_apple() {
     ));
     server.scrobble("i.lib1", Some(1), true).await.unwrap();
     assert!(fixtures.seen().is_empty());
+}
+
+// Catalog -----------------------------------------------------------------
+
+/// `catalog_search.json` and the other `catalog_*` fixtures of `server/` are hand-written in
+/// the shape of Apple's documented responses (Search for Catalog Resources, Get a Catalog
+/// Album, Artist or Playlist), not recorded from Apple.
+fn serve_search(fixtures: &FixtureServer) {
+    fixtures
+        .on(
+            "GET",
+            "/v1/me/library/search",
+            fixture("library_search.json"),
+        )
+        .on(
+            "GET",
+            "/v1/catalog/it/search",
+            fixture("catalog_search.json"),
+        );
+}
+
+fn limits(count: u32) -> SearchLimits {
+    SearchLimits {
+        artists: count,
+        albums: count,
+        songs: count,
+    }
+}
+
+fn membership<'a>(
+    items: impl IntoIterator<Item = (&'a str, Option<bool>)>,
+) -> Vec<(&'a str, bool)> {
+    items
+        .into_iter()
+        .map(|(id, in_library)| (id, in_library.unwrap()))
+        .collect()
+}
+
+#[tokio::test]
+async fn searching_everything_lists_the_library_first_then_new_catalog_items() {
+    let fixtures = FixtureServer::start().await;
+    serve_search(&fixtures);
+    let server = signed_in(&fixtures).await;
+
+    // Rune appends `*` to what is typed; Apple's search has no wildcards.
+    let found = server
+        .search_in_scope("dawn*", limits(5), 0, RuneScope::All)
+        .await
+        .unwrap();
+
+    // 1001 is i.lib1's catalog id; the album and the artist match by name.
+    assert_eq!(
+        membership(
+            found
+                .songs
+                .iter()
+                .map(|song| (song.id.as_str(), song.rune_in_library))
+        ),
+        [("i.lib1", true), ("catalog:song:6001", false)]
+    );
+    assert_eq!(
+        membership(
+            found
+                .albums
+                .iter()
+                .map(|album| (album.id.as_str(), album.rune_in_library))
+        ),
+        [("l.alb1", true), ("catalog:album:7002", false)]
+    );
+    assert_eq!(
+        membership(
+            found
+                .artists
+                .iter()
+                .map(|artist| (artist.id.as_str(), artist.rune_in_library))
+        ),
+        [("r.art1", true), ("catalog:artist:8002", false)]
+    );
+    let new_song = &found.songs[1];
+    assert_eq!(new_song.title, "Dawn Chorus");
+    // Taken from the song's relationships, as Apple sent them.
+    assert_eq!(new_song.album_id.as_deref(), Some("catalog:album:7002"));
+    assert_eq!(new_song.artist_id.as_deref(), Some("catalog:artist:8002"));
+    assert_eq!(
+        new_song.rune_playback.as_ref().unwrap().key.as_deref(),
+        Some("catalog:6001")
+    );
+    assert_eq!(found.albums[1].artist.as_deref(), Some("Artist Nine"));
+    assert!(found.artists[1].cover_art.is_some());
+
+    let searches = fixtures.seen_for("GET", "/v1/catalog/it/search");
+    assert_eq!(searches.len(), 1);
+    assert_eq!(
+        searches[0].target,
+        "/v1/catalog/it/search?term=dawn&types=songs,albums,artists&limit=5&offset=0"
+    );
+    // The catalog needs only the developer token.
+    assert_eq!(searches[0].user_token, None);
+    assert!(fixtures
+        .seen_for("GET", "/v1/me/library/search")
+        .iter()
+        .all(|request| request.target.contains("term=dawn&")));
+
+    // The merged list is truncated to each limit, library first.
+    let one = server
+        .search_in_scope("dawn", limits(1), 0, RuneScope::All)
+        .await
+        .unwrap();
+    assert_eq!(ids(&one.songs), ["i.lib1"]);
+    assert_eq!(one.albums.len(), 1);
+    // A song offset pages the merged songs.
+    let second = server
+        .search_in_scope("dawn", songs_only(1), 1, RuneScope::All)
+        .await
+        .unwrap();
+    assert_eq!(ids(&second.songs), ["catalog:song:6001"]);
+}
+
+#[tokio::test]
+async fn searching_the_catalog_marks_what_the_library_holds() {
+    let fixtures = FixtureServer::start().await;
+    serve_search(&fixtures);
+    let server = signed_in(&fixtures).await;
+
+    let found = server
+        .search_in_scope("dawn", limits(5), 0, RuneScope::Catalog)
+        .await
+        .unwrap();
+    assert_eq!(
+        membership(
+            found
+                .songs
+                .iter()
+                .map(|song| (song.id.as_str(), song.rune_in_library))
+        ),
+        [("catalog:song:1001", true), ("catalog:song:6001", false)]
+    );
+    assert_eq!(
+        membership(
+            found
+                .albums
+                .iter()
+                .map(|album| (album.id.as_str(), album.rune_in_library))
+        ),
+        [("catalog:album:7001", true), ("catalog:album:7002", false)]
+    );
+    assert_eq!(
+        membership(
+            found
+                .artists
+                .iter()
+                .map(|artist| (artist.id.as_str(), artist.rune_in_library))
+        ),
+        [
+            ("catalog:artist:8001", true),
+            ("catalog:artist:8002", false)
+        ]
+    );
+
+    // A library search is unchanged, and the catalog has no listing of everything.
+    let library = server
+        .search_in_scope("dawn", limits(5), 0, RuneScope::Library)
+        .await
+        .unwrap();
+    assert_eq!(ids(&library.songs), ["i.lib1"]);
+    assert_eq!(library.songs[0].rune_in_library, Some(true));
+    assert_eq!(
+        server
+            .search_in_scope("", limits(5), 0, RuneScope::Catalog)
+            .await
+            .unwrap(),
+        subsonic::SubsonicSearchResult::default()
+    );
+    assert_eq!(fixtures.seen_for("GET", "/v1/catalog/it/search").len(), 1);
+}
+
+#[tokio::test]
+async fn catalog_search_pages_past_25_results() {
+    let fixtures = FixtureServer::start().await;
+    let page = |range: std::ops::Range<u32>, next: Option<&str>| {
+        let songs: Vec<Value> = range
+            .map(|n| {
+                json!({"id": format!("{}", 5000 + n), "type": "songs",
+                       "attributes": {"name": format!("Many {n}"), "playParams": {"id": "x", "kind": "song"}}})
+            })
+            .collect();
+        Reply::json(json!({"results": {"songs": {"data": songs, "next": next}}}))
+    };
+    fixtures
+        .on(
+            "GET",
+            "/v1/me/library/search",
+            Reply::json(json!({"results": {}})),
+        )
+        .on_target(
+            "GET",
+            "/v1/catalog/it/search?term=many&types=songs&limit=25&offset=0",
+            page(
+                0..25,
+                Some("/v1/catalog/it/search?offset=25&term=many&types=songs"),
+            ),
+        )
+        .on_target(
+            "GET",
+            "/v1/catalog/it/search?term=many&types=songs&limit=5&offset=25",
+            page(
+                25..30,
+                Some("/v1/catalog/it/search?offset=30&term=many&types=songs"),
+            ),
+        );
+    let server = signed_in(&fixtures).await;
+
+    let found = server
+        .search_in_scope("many", songs_only(30), 0, RuneScope::Catalog)
+        .await
+        .unwrap();
+    assert_eq!(found.songs.len(), 30);
+    assert_eq!(found.songs[29].id, "catalog:song:5029");
+    assert_eq!(fixtures.seen_for("GET", "/v1/catalog/it/search").len(), 2);
+}
+
+fn serve_catalog_items(fixtures: &FixtureServer) {
+    fixtures
+        .on(
+            "GET",
+            "/v1/catalog/it/albums/7002",
+            fixture("catalog_album.json"),
+        )
+        .on(
+            "GET",
+            "/v1/catalog/it/albums/7002/tracks",
+            fixture("catalog_album_tracks.json"),
+        )
+        .on(
+            "GET",
+            "/v1/catalog/it/artists/8002",
+            fixture("catalog_artist.json"),
+        )
+        .on(
+            "GET",
+            "/v1/catalog/it/artists/8002/albums",
+            fixture("catalog_artist_albums.json"),
+        )
+        .on(
+            "GET",
+            "/v1/catalog/it/artists/8002/albums",
+            fixture("catalog_artist_albums_page2.json"),
+        )
+        .on(
+            "GET",
+            "/v1/catalog/it/playlists/pl.morning",
+            fixture("catalog_playlist.json"),
+        )
+        .on(
+            "GET",
+            "/v1/catalog/it/playlists/pl.morning/tracks",
+            Reply::fixture("catalog_collection_tracks_page2.json"),
+        )
+        .on(
+            "GET",
+            "/v1/catalog/it/albums/404",
+            Reply::fixture_status(404, "error_not_found.json"),
+        )
+        .on(
+            "GET",
+            "/v1/catalog/it/albums/404/tracks",
+            Reply::fixture_status(404, "error_not_found.json"),
+        )
+        .on(
+            "GET",
+            "/v1/me/ratings/songs",
+            Reply::json(json!({"data": [
+                {"id": "6002", "type": "ratings", "attributes": {"value": 1}}
+            ]})),
+        );
+}
+
+#[tokio::test]
+async fn catalog_albums_artists_and_playlists_open_by_their_ids() {
+    let fixtures = FixtureServer::start().await;
+    serve_catalog_items(&fixtures);
+    let server = signed_in(&fixtures).await;
+
+    let album = server.album("catalog:album:7002").await.unwrap();
+    assert_eq!(album.id, "catalog:album:7002");
+    assert_eq!(album.name, "Sunrise EP");
+    assert_eq!(album.artist_id.as_deref(), Some("catalog:artist:8002"));
+    assert_eq!(album.year, Some(2021));
+    assert_eq!(album.rune_in_library, Some(false));
+    // The music video is left out.
+    assert_eq!(
+        ids(&album.songs),
+        ["catalog:song:6001", "catalog:song:6002"]
+    );
+    assert_eq!(album.song_count, Some(2));
+    assert_eq!(album.duration, Some(300));
+    assert!(album.songs.iter().all(
+        |song| song.album_id.as_deref() == Some("catalog:album:7002")
+            && song.rune_in_library == Some(false)
+            && song.cover_art == album.cover_art
+    ));
+    assert_eq!(
+        album.songs[0].artist_id.as_deref(),
+        Some("catalog:artist:8002")
+    );
+    assert_eq!(album.songs[1].artist_id, None);
+    assert_eq!(
+        album.songs[0].rune_playback,
+        Some(RunePlayback {
+            mode: RunePlaybackMode::Hosted,
+            host: Some("appleMusic".into()),
+            key: Some("catalog:6001".into()),
+            reason: None,
+        })
+    );
+    // Likes, as for library albums.
+    assert!(album.songs[1].starred.is_some());
+    assert_eq!(
+        fixtures.seen_for("GET", "/v1/catalog/it/albums/7002")[0].target,
+        "/v1/catalog/it/albums/7002?include=artists"
+    );
+
+    let artist = server.artist("catalog:artist:8002").await.unwrap();
+    assert_eq!(artist.name, "Artist Nine");
+    assert_eq!(artist.rune_in_library, Some(false));
+    assert!(artist.cover_art.is_some());
+    let albums: Vec<&str> = artist
+        .albums
+        .iter()
+        .map(|album| album.id.as_str())
+        .collect();
+    assert_eq!(albums, ["catalog:album:7002", "catalog:album:7003"]);
+    assert_eq!(artist.album_count, Some(2));
+    assert!(artist
+        .albums
+        .iter()
+        .all(|album| album.artist_id.as_deref() == Some("catalog:artist:8002")));
+
+    let playlist = server
+        .playlist("catalog:playlist:pl.morning")
+        .await
+        .unwrap();
+    assert_eq!(playlist.name, "Morning Mix");
+    assert_eq!(playlist.owner.as_deref(), Some("Apple Music"));
+    assert_eq!(playlist.rune_edit, Some(RuneEdit::ReadOnly));
+    assert_eq!(playlist.rune_in_library, Some(false));
+    assert_eq!(ids(&playlist.songs), ["catalog:song:t2"]);
+    assert_eq!(
+        playlist.songs[0]
+            .rune_playback
+            .as_ref()
+            .unwrap()
+            .key
+            .as_deref(),
+        Some("catalog:t2")
+    );
+    // Catalog resources need only the developer token.
+    assert!(fixtures
+        .seen_for("GET", "/v1/catalog/it/playlists/pl.morning")
+        .iter()
+        .all(|request| request.user_token.is_none()));
+    assert!(fixtures
+        .seen_for("GET", "/v1/catalog/it/albums/7002")
+        .iter()
+        .all(|request| request.user_token.is_none()));
+
+    assert_not_found(server.album("catalog:album:404").await);
+    assert_not_found(server.album("catalog:album:").await);
+}
+
+#[tokio::test]
+async fn additions_post_one_request_and_show_at_once() {
+    let fixtures = FixtureServer::start().await;
+    serve_library(&fixtures);
+    serve_search(&fixtures);
+    serve_catalog_items(&fixtures);
+    fixtures
+        .on("POST", "/v1/me/library", Reply::status(202))
+        .on(
+            "GET",
+            "/v1/me/library/recently-added",
+            fixture("recently_added.json"),
+        )
+        .on(
+            "GET",
+            "/v1/me/library/albums",
+            fixture("library_albums.json"),
+        )
+        .on_target(
+            "GET",
+            "/v1/catalog/it/songs?ids=6001",
+            Reply::json(json!({"data": [{
+                "id": "6001", "type": "songs",
+                "attributes": {"name": "Dawn Chorus", "artistName": "Artist Nine",
+                    "durationInMillis": 200000, "playParams": {"id": "6001", "kind": "song"}}
+            }]})),
+        );
+    let server = signed_in(&fixtures).await;
+    assert_eq!(server.scan_status().await.unwrap().count, Some(6));
+    server.album_list(10, 0).await.unwrap();
+
+    server
+        .add_to_library(&[
+            "catalog:song:6001",
+            "catalog:album:7002",
+            "catalog:playlist:pl.morning",
+            "i.lib1",
+        ])
+        .await
+        .unwrap();
+    let posts = fixtures.seen_for("POST", "/v1/me/library");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(
+        posts[0].target,
+        "/v1/me/library?ids[songs]=6001&ids[albums]=7002&ids[playlists]=pl.morning"
+    );
+    assert_eq!(posts[0].user_token.as_deref(), Some(USER_TOKEN));
+
+    // The catalog now shows them as in the library, before Apple lists them.
+    let found = server
+        .search_in_scope("dawn", limits(5), 0, RuneScope::Catalog)
+        .await
+        .unwrap();
+    assert_eq!(found.songs[1].rune_in_library, Some(true));
+    assert_eq!(found.albums[1].rune_in_library, Some(true));
+    let playlist = server
+        .playlist("catalog:playlist:pl.morning")
+        .await
+        .unwrap();
+    assert_eq!(playlist.rune_in_library, Some(true));
+    let album = server.album("catalog:album:7002").await.unwrap();
+    assert!(album
+        .songs
+        .iter()
+        .all(|song| song.rune_in_library == Some(true)));
+    // Until Apple's library search lists their library copies, searching everything lists
+    // them under their catalog ids, in the library; what duplicates a library copy is left out.
+    let all = server
+        .search_in_scope("dawn", limits(5), 0, RuneScope::All)
+        .await
+        .unwrap();
+    assert_eq!(
+        membership(
+            all.songs
+                .iter()
+                .map(|song| (song.id.as_str(), song.rune_in_library))
+        ),
+        [("i.lib1", true), ("catalog:song:6001", true)]
+    );
+    assert_eq!(
+        membership(
+            all.albums
+                .iter()
+                .map(|album| (album.id.as_str(), album.rune_in_library))
+        ),
+        [("l.alb1", true), ("catalog:album:7002", true)]
+    );
+
+    // The kept song list and album list take them in without a rebuild.
+    let songs = all_songs(server.as_ref(), 10).await;
+    assert_eq!(&ids(&songs)[..6], UNION);
+    assert_eq!(
+        &ids(&songs)[6..],
+        ["catalog:song:6001", "catalog:song:6002"]
+    );
+    assert!(songs[6..]
+        .iter()
+        .all(|song| song.rune_in_library == Some(true)));
+    assert_eq!(library_page_reads(&fixtures), 2);
+    let albums = server.album_list(10, 0).await.unwrap();
+    assert_eq!(albums[0].id, "catalog:album:7002");
+    assert_eq!(albums.len(), 4);
+    assert_eq!(fixtures.seen_for("GET", "/v1/me/library/albums").len(), 1);
+
+    // Library items need no request, and artists cannot be added.
+    server.add_to_library(&["i.lib1", "l.alb1"]).await.unwrap();
+    assert_not_found(server.add_to_library(&["catalog:artist:8002"]).await);
+    assert_eq!(fixtures.seen_for("POST", "/v1/me/library").len(), 1);
+}
+
+#[tokio::test]
+async fn recommendations_group_albums_and_playlists_and_are_kept() {
+    let fixtures = FixtureServer::start().await;
+    fixtures
+        .on(
+            "GET",
+            "/v1/me/recommendations",
+            Reply::fixture("recommendations_page1.json"),
+        )
+        .on(
+            "GET",
+            "/v1/me/recommendations",
+            Reply::fixture("recommendations_page2.json"),
+        )
+        .on("POST", "/v1/me/library", Reply::status(202));
+    let server = signed_in(&fixtures).await;
+
+    let groups = server.recommendations(10).await.unwrap();
+    // The group of stations only is left out, and so are stations in the others.
+    let titles: Vec<&str> = groups.iter().map(|group| group.title.as_str()).collect();
+    assert_eq!(titles, ["Made for Someone", "Recently Played"]);
+    let made = &groups[0];
+    assert_eq!(made.id, "rec-1");
+    assert_eq!(made.kind, RuneRecommendationKind::Personal);
+    assert!(made.albums.is_empty());
+    assert_eq!(made.playlists.len(), 1);
+    let mix = &made.playlists[0];
+    assert_eq!(mix.id, "catalog:playlist:pl.pm-mix1");
+    assert_eq!(mix.name, "Mix One");
+    assert_eq!(mix.owner.as_deref(), Some("Curator"));
+    assert_eq!(mix.rune_edit, Some(RuneEdit::ReadOnly));
+    assert_eq!(mix.rune_in_library, Some(false));
+    assert!(mix.cover_art.as_deref().unwrap().starts_with("art:"));
+    let recent = &groups[1];
+    assert_eq!(recent.kind, RuneRecommendationKind::Recent);
+    assert_eq!(recent.albums[0].id, "catalog:album:alb1");
+    assert_eq!(recent.albums[0].artist.as_deref(), Some("Artist"));
+    assert_eq!(recent.albums[0].rune_in_library, Some(false));
+
+    assert_eq!(server.recommendations(1).await.unwrap().len(), 1);
+    server
+        .add_to_library(&["catalog:album:alb1"])
+        .await
+        .unwrap();
+    let again = server.recommendations(10).await.unwrap();
+    assert_eq!(again[1].albums[0].rune_in_library, Some(true));
+    // Read from Apple once: the first page and the one it names.
+    assert_eq!(fixtures.seen_for("GET", "/v1/me/recommendations").len(), 2);
+}
+
+#[tokio::test]
+async fn a_personal_mix_is_read_with_the_user_token() {
+    let fixtures = FixtureServer::start().await;
+    fixtures
+        .on(
+            "GET",
+            "/v1/catalog/it/playlists/pl.pm-mix1",
+            Reply::json(json!({"data": [{"id": "pl.pm-mix1", "type": "playlists",
+                "attributes": {"name": "Mix One", "playlistType": "personal-mix"}}]})),
+        )
+        .on(
+            "GET",
+            "/v1/catalog/it/playlists/pl.pm-mix1/tracks",
+            Reply::fixture("catalog_collection_tracks_page2.json"),
+        );
+    let server = signed_in(&fixtures).await;
+    let mix = server
+        .playlist("catalog:playlist:pl.pm-mix1")
+        .await
+        .unwrap();
+    assert_eq!(mix.name, "Mix One");
+    let reads = fixtures.seen_for("GET", "/v1/catalog/it/playlists/pl.pm-mix1");
+    assert_eq!(reads[0].user_token.as_deref(), Some(USER_TOKEN));
+}
+
+#[tokio::test]
+async fn a_failing_catalog_leaves_everything_search_with_the_library() {
+    for (status, body) in [(500, "error_server.json"), (401, "error_unauthorized.json")] {
+        let fixtures = FixtureServer::start().await;
+        fixtures
+            .on(
+                "GET",
+                "/v1/me/library/search",
+                fixture("library_search.json"),
+            )
+            .on(
+                "GET",
+                "/v1/catalog/it/search",
+                Reply::fixture_status(status, body),
+            )
+            .on(
+                "GET",
+                "/v1/me/storefront",
+                Reply::fixture_status(401, "error_unauthorized.json"),
+            );
+        let server = signed_in(&fixtures).await;
+
+        let found = server
+            .search_in_scope("dawn", limits(5), 0, RuneScope::All)
+            .await
+            .unwrap();
+        assert_eq!(ids(&found.songs), ["i.lib1"], "{status}");
+        assert_eq!(found.albums.len(), 1, "{status}");
+        assert_eq!(found.artists.len(), 1, "{status}");
+
+        // The catalog alone fails as Apple did.
+        let error = server
+            .search_in_scope("dawn", limits(5), 0, RuneScope::Catalog)
+            .await
+            .unwrap_err();
+        if status == 500 {
+            assert!(!error.is_rune_credentials_expired(), "{error:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_catalog_that_finds_nothing_is_empty() {
+    let fixtures = FixtureServer::start().await;
+    fixtures
+        .on(
+            "GET",
+            "/v1/me/library/search",
+            fixture("library_search.json"),
+        )
+        .on(
+            "GET",
+            "/v1/catalog/it/search",
+            Reply::fixture_status(404, "error_not_found.json"),
+        );
+    let server = signed_in(&fixtures).await;
+    let catalog = server
+        .search_in_scope("dawn", limits(5), 0, RuneScope::Catalog)
+        .await
+        .unwrap();
+    assert_eq!(catalog, subsonic::SubsonicSearchResult::default());
+    let all = server
+        .search_in_scope("dawn", limits(5), 0, RuneScope::All)
+        .await
+        .unwrap();
+    assert_eq!(ids(&all.songs), ["i.lib1"]);
+}
+
+#[tokio::test]
+async fn listing_everything_is_the_same_in_every_scope_but_the_catalog() {
+    let fixtures = FixtureServer::start().await;
+    serve_library(&fixtures);
+    let server = signed_in(&fixtures).await;
+    for query in ["", "\"\"", "  "] {
+        let plain = server
+            .search_with_song_offset(query, songs_only(3), 1)
+            .await
+            .unwrap();
+        assert_eq!(plain.songs.len(), 3, "{query:?}");
+        for scope in [RuneScope::All, RuneScope::Library] {
+            let scoped = server
+                .search_in_scope(query, songs_only(3), 1, scope)
+                .await
+                .unwrap();
+            assert_eq!(ids(&scoped.songs), ids(&plain.songs), "{query:?} {scope:?}");
+        }
+        let catalog = server
+            .search_in_scope(query, songs_only(3), 1, RuneScope::Catalog)
+            .await
+            .unwrap();
+        assert!(catalog.songs.is_empty(), "{query:?}");
+    }
+    assert!(fixtures.seen_for("GET", "/v1/catalog/it/search").is_empty());
+    assert!(fixtures.seen_for("GET", "/v1/me/library/search").is_empty());
+}
+
+#[tokio::test]
+async fn catalog_songs_read_by_id_are_marked_against_the_library() {
+    let fixtures = FixtureServer::start().await;
+    serve_library(&fixtures);
+    fixtures.on_target(
+        "GET",
+        "/v1/catalog/it/songs?ids=1001",
+        Reply::json(json!({"data": [{"id": "1001", "type": "songs",
+            "attributes": {"name": "First Light", "playParams": {"id": "1001", "kind": "song"}}}]})),
+    );
+    fixtures.on(
+        "GET",
+        "/v1/catalog/it/songs",
+        Reply::fixture("catalog_songs.json"),
+    );
+    let server = signed_in(&fixtures).await;
+    server.scan_status().await.unwrap();
+
+    // 1001 is the catalog id of library song i.lib1.
+    let held = server.song("catalog:song:1001").await.unwrap();
+    assert_eq!(held.rune_in_library, Some(true));
+    let other = server.song("catalog:song:617154366").await.unwrap();
+    assert_eq!(other.rune_in_library, Some(false));
+}
+
+#[tokio::test]
+async fn an_added_album_counts_its_known_songs_in() {
+    let fixtures = FixtureServer::start().await;
+    serve_search(&fixtures);
+    serve_catalog_items(&fixtures);
+    fixtures.on("POST", "/v1/me/library", Reply::status(202));
+    let server = signed_in(&fixtures).await;
+
+    // Reading the album makes its songs known; nothing is kept that a patch would read.
+    server.album("catalog:album:7002").await.unwrap();
+    server
+        .add_to_library(&["catalog:album:7002"])
+        .await
+        .unwrap();
+
+    let found = server
+        .search_in_scope("dawn", limits(5), 0, RuneScope::Catalog)
+        .await
+        .unwrap();
+    // 6001 is a song of album 7002.
+    assert_eq!(found.songs[1].id, "catalog:song:6001");
+    assert_eq!(found.songs[1].rune_in_library, Some(true));
+    assert_eq!(found.albums[1].rune_in_library, Some(true));
+}
+
+#[tokio::test]
+async fn a_refused_addition_changes_nothing() {
+    let fixtures = FixtureServer::start().await;
+    serve_library(&fixtures);
+    serve_search(&fixtures);
+    fixtures
+        .on(
+            "POST",
+            "/v1/me/library",
+            Reply::fixture_status(403, "error_forbidden.json"),
+        )
+        .on(
+            "GET",
+            "/v1/me/storefront",
+            Reply::fixture("storefront.json"),
+        );
+    let server = signed_in(&fixtures).await;
+    server.scan_status().await.unwrap();
+
+    let error = server
+        .add_to_library(&["catalog:song:6001", "catalog:album:7002"])
+        .await
+        .unwrap_err();
+    assert!(!error.is_rune_credentials_expired(), "{error:?}");
+    let found = server
+        .search_in_scope("dawn", limits(5), 0, RuneScope::Catalog)
+        .await
+        .unwrap();
+    assert_eq!(found.songs[1].rune_in_library, Some(false));
+    assert_eq!(found.albums[1].rune_in_library, Some(false));
+    assert_eq!(ids(&all_songs(server.as_ref(), 10).await), UNION);
+}
+
+#[tokio::test]
+async fn a_new_sign_in_forgets_additions_and_recommendations() {
+    let fixtures = FixtureServer::start().await;
+    serve_search(&fixtures);
+    fixtures
+        .on("POST", "/v1/me/library", Reply::status(202))
+        .on(
+            "GET",
+            "/v1/me/recommendations",
+            Reply::fixture("recommendations_page2.json"),
+        );
+    let server = signed_in(&fixtures).await;
+    server.add_to_library(&["catalog:song:6001"]).await.unwrap();
+    server.recommendations(5).await.unwrap();
+    let marked = |server: Arc<dyn SubsonicApi>| async move {
+        server
+            .search_in_scope("dawn", limits(5), 0, RuneScope::Catalog)
+            .await
+            .unwrap()
+            .songs[1]
+            .rune_in_library
+    };
+    assert_eq!(marked(server.clone()).await, Some(true));
+
+    server
+        .complete_rune_login(&platform(Some("another-user-token"), Some(DEVELOPER_TOKEN)))
+        .await
+        .unwrap();
+    assert_eq!(marked(server.clone()).await, Some(false));
+    server.recommendations(5).await.unwrap();
+    assert_eq!(fixtures.seen_for("GET", "/v1/me/recommendations").len(), 2);
 }

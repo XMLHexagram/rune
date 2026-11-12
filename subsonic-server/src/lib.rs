@@ -12,6 +12,12 @@
 //! where the API itself is not meant to be open. Authentication must be added before any
 //! gateway use. The response format is always JSON, whatever `f` says.
 //!
+//! # Rune extensions
+//!
+//! The extensions come from the api: `getOpenSubsonicExtensions` lists what its `extensions`
+//! returns, and `search3` honours `runeScope` only when its probe declares `runeCatalog`, as a
+//! server without the extension ignores the parameter.
+//!
 //! # Errors
 //!
 //! Errors become Subsonic error objects with `runeReason` when set, in an HTTP 200 envelope as
@@ -32,12 +38,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use serde_json::{Map, Value, json};
 use subsonic::{
-    RuneLoginCompletion, SearchLimits, StreamError, SubsonicApi, SubsonicError, SubsonicServerError,
+    RuneLoginCompletion, RuneScope, SearchLimits, StreamError, SubsonicApi, SubsonicError,
+    SubsonicServerError,
 };
 
 const API_VERSION: &str = "1.16.1";
 /// Subsonic's own default for list sizes.
 const DEFAULT_COUNT: u32 = 20;
+/// Recommendation groups returned when `getRuneRecommendations` names no count.
+const DEFAULT_RECOMMENDATION_COUNT: u32 = 10;
 
 type Api = Arc<dyn SubsonicApi>;
 
@@ -281,9 +290,17 @@ async fn data(
                 songs: params.number("songCount")?.unwrap_or(DEFAULT_COUNT),
             };
             let song_offset = params.number("songOffset")?.unwrap_or(0);
-            let result = api
-                .search_with_song_offset(params.get("query").unwrap_or(""), limits, song_offset)
-                .await?;
+            let query = params.get("query").unwrap_or("");
+            let result = match rune_scope(api, params).await? {
+                Some(scope) => {
+                    api.search_in_scope(query, limits, song_offset, scope)
+                        .await?
+                }
+                None => {
+                    api.search_with_song_offset(query, limits, song_offset)
+                        .await?
+                }
+            };
             data.insert(
                 "searchResult3".into(),
                 json!({
@@ -388,9 +405,43 @@ async fn data(
             let start = api.start_rune_login(method).await?;
             data.insert("runeLogin".into(), wire::rune_login(&start));
         }
+        "addToRuneLibrary" => api.add_to_library(&required_ids(params)?).await?,
+        "getRuneRecommendations" => {
+            let count = params
+                .number("count")?
+                .unwrap_or(DEFAULT_RECOMMENDATION_COUNT);
+            let groups: Vec<Value> = api
+                .recommendations(count)
+                .await?
+                .iter()
+                .map(wire::rune_recommendation_group)
+                .collect();
+            data.insert("runeRecommendations".into(), json!({"group": groups}));
+        }
         _ => return Ok(None),
     }
     Ok(Some(data))
+}
+
+/// The `runeScope` of a `search3`, or `None` when the api does not declare `runeCatalog`.
+async fn rune_scope(api: &Api, params: &Params) -> Result<Option<RuneScope>, SubsonicError> {
+    let Some(value) = params.get("runeScope") else {
+        return Ok(None);
+    };
+    if !api
+        .probe()
+        .await
+        .is_ok_and(|probe| probe.supports_rune_catalog())
+    {
+        return Ok(None);
+    }
+    // Not a missing parameter, so the generic code rather than 10.
+    RuneScope::parse(value).map(Some).ok_or_else(|| {
+        server_error(
+            SubsonicServerError::Generic,
+            &format!("unknown runeScope {value:?}: use library, catalog or all"),
+        )
+    })
 }
 
 fn required_ids(params: &Params) -> Result<Vec<&str>, SubsonicError> {

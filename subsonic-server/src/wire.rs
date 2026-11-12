@@ -3,9 +3,9 @@
 use serde_json::{Map, Value, json};
 use subsonic::{
     RuneEdit, RuneLoginMethod, RuneLoginStart, RunePlayback, RunePlaybackMode, RunePlaybackReason,
-    RuneReason, RuneServiceDescriptor, SubsonicAlbum, SubsonicAlbumDetail, SubsonicArtist,
-    SubsonicArtistDetail, SubsonicJukeboxStatus, SubsonicPlaylist, SubsonicPlaylistDetail,
-    SubsonicSong, SubsonicSyncedLyrics,
+    RuneReason, RuneRecommendationGroup, RuneServiceDescriptor, SubsonicAlbum, SubsonicAlbumDetail,
+    SubsonicArtist, SubsonicArtistDetail, SubsonicJukeboxStatus, SubsonicPlaylist,
+    SubsonicPlaylistDetail, SubsonicSong, SubsonicSyncedLyrics,
 };
 
 fn put<T: Into<Value> + Clone>(map: &mut Map<String, Value>, key: &str, value: &Option<T>) {
@@ -20,6 +20,7 @@ pub(crate) fn artist(artist: &SubsonicArtist) -> Value {
     map.insert("name".into(), artist.name.clone().into());
     put(&mut map, "albumCount", &artist.album_count);
     put(&mut map, "coverArt", &artist.cover_art);
+    put(&mut map, "runeInLibrary", &artist.rune_in_library);
     map.into()
 }
 
@@ -29,6 +30,7 @@ pub(crate) fn artist_detail(detail: &SubsonicArtistDetail) -> Value {
         name: detail.name.clone(),
         album_count: detail.album_count,
         cover_art: detail.cover_art.clone(),
+        rune_in_library: detail.rune_in_library,
     });
     value["album"] = detail.albums.iter().map(album).collect();
     value
@@ -45,6 +47,7 @@ pub(crate) fn album(album: &SubsonicAlbum) -> Value {
     put(&mut map, "year", &album.year);
     put(&mut map, "genre", &album.genre);
     put(&mut map, "coverArt", &album.cover_art);
+    put(&mut map, "runeInLibrary", &album.rune_in_library);
     map.into()
 }
 
@@ -59,6 +62,7 @@ pub(crate) fn album_detail(detail: &SubsonicAlbumDetail) -> Value {
         year: detail.year,
         genre: detail.genre.clone(),
         cover_art: detail.cover_art.clone(),
+        rune_in_library: detail.rune_in_library,
     });
     value["song"] = detail.songs.iter().map(song).collect();
     value
@@ -87,6 +91,7 @@ pub(crate) fn song(song: &SubsonicSong) -> Value {
     if let Some(playback) = &song.rune_playback {
         map.insert("runePlayback".into(), rune_playback(playback));
     }
+    put(&mut map, "runeInLibrary", &song.rune_in_library);
     map.into()
 }
 
@@ -125,6 +130,7 @@ pub(crate) fn playlist(playlist: &SubsonicPlaylist) -> Value {
     if let Some(edit) = playlist.rune_edit {
         map.insert("runeEdit".into(), rune_edit(edit).into());
     }
+    put(&mut map, "runeInLibrary", &playlist.rune_in_library);
     map.into()
 }
 
@@ -138,6 +144,7 @@ pub(crate) fn playlist_detail(detail: &SubsonicPlaylistDetail) -> Value {
         public: detail.public,
         cover_art: detail.cover_art.clone(),
         rune_edit: detail.rune_edit,
+        rune_in_library: detail.rune_in_library,
     });
     value["entry"] = detail.songs.iter().map(song).collect();
     value
@@ -255,4 +262,14 @@ pub(crate) fn login_method(name: &str) -> RuneLoginMethod {
         "deviceCode" => RuneLoginMethod::DeviceCode,
         _ => RuneLoginMethod::Other,
     }
+}
+
+pub(crate) fn rune_recommendation_group(group: &RuneRecommendationGroup) -> Value {
+    json!({
+        "id": group.id,
+        "title": group.title,
+        "kind": group.kind.as_str(),
+        "album": group.albums.iter().map(album).collect::<Vec<_>>(),
+        "playlist": group.playlists.iter().map(playlist).collect::<Vec<_>>(),
+    })
 }
