@@ -9041,7 +9041,7 @@ async fn rr_mix_calls_use_the_queue_the_caller_sent() -> Result<()> {
 async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -> Result<()> {
     use crate::backends::remote::update_visualizer_feed;
     use crate::messages::{
-        LibraryTaskOutcome, LibraryTaskState, LibraryTaskStateChanged, LibraryTaskKind,
+        AnalysisOutcome, LibraryTaskState, LibraryTaskStateChanged,
         PlaylistItem, PlayingItemRef, ScanTaskPhase,
         RealtimeFFT, VisualizerFeedChart, VisualizerFeedCovers,
     };
@@ -9147,24 +9147,20 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
             path: "declared-library".into(),
         });
     b.global_params.broadcaster.broadcast(&LibraryTaskStateChanged {
-        state: LibraryTaskState::Running {
+        state: LibraryTaskState::AnalysisRunning {
             record_id: "declared-library".into(),
-            task: LibraryTaskKind::Analyze,
             run_id: "declared-run".into(),
             progress: 1,
             total: 2,
-            scan_phase: None,
         },
     });
     b.global_params.broadcaster.broadcast(&LibraryTaskStateChanged {
-        state: LibraryTaskState::Ended {
+        state: LibraryTaskState::AnalysisEnded {
             record_id: "declared-library".into(),
-            task: LibraryTaskKind::Analyze,
             run_id: "declared-run".into(),
             progress: 2,
             total: 2,
-            scan_phase: None,
-            outcome: LibraryTaskOutcome::Finished,
+            outcome: AnalysisOutcome::Finished,
         },
     });
     b.global_params
@@ -9203,8 +9199,8 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
     .context("declared events were not decoded and re-broadcast")?;
     let task_states = signals.decoded::<LibraryTaskStateChanged>("LibraryTaskStateChanged");
     assert!(matches!(task_states.as_slice(), [
-        LibraryTaskStateChanged { state: LibraryTaskState::Running { run_id, progress: 1, .. } },
-        LibraryTaskStateChanged { state: LibraryTaskState::Ended { run_id: ended_run, outcome: LibraryTaskOutcome::Finished, .. } },
+        LibraryTaskStateChanged { state: LibraryTaskState::AnalysisRunning { run_id, progress: 1, .. } },
+        LibraryTaskStateChanged { state: LibraryTaskState::AnalysisEnded { run_id: ended_run, outcome: AnalysisOutcome::Finished, .. } },
     ] if run_id == "declared-run" && ended_run == run_id));
     assert!(
         signals
@@ -9481,13 +9477,12 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
         local_queue
     );
     b.global_params.broadcaster.broadcast(&LibraryTaskStateChanged {
-        state: LibraryTaskState::Running {
+        state: LibraryTaskState::ScanRunning {
             record_id: "B".into(),
-            task: LibraryTaskKind::Scan,
             run_id: "rr-scan".into(),
             progress: 3,
             total: 10,
-            scan_phase: Some(ScanTaskPhase::IndexFiles),
+            phase: ScanTaskPhase::IndexFiles,
         },
     });
     wait_until("RR status, content and scan events", || async {
@@ -9506,7 +9501,7 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
             let scan = events.iter().any(|(name, body)| {
                 name == "LibraryTaskStateChanged"
                     && rinf::deserialize::<LibraryTaskStateChanged>(body).is_ok_and(|event| {
-                        matches!(event.state, LibraryTaskState::Running { task: LibraryTaskKind::Scan, ref run_id, .. } if run_id == "rr-scan")
+                        matches!(event.state, LibraryTaskState::ScanRunning { ref run_id, .. } if run_id == "rr-scan")
                     })
             });
             status && content && scan
