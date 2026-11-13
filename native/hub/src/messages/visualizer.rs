@@ -420,6 +420,14 @@ pub struct ListVisualizerPresetsResponse {
     pub call_id: Option<u64>,
 }
 
+/// Sent whenever the list of scenes is ready or changes: when the scene folder has been read,
+/// and after a scene is imported or removed. Carries the same list as
+/// [`ListVisualizerPresetsResponse`].
+#[derive(Serialize, Deserialize, RustSignal)]
+pub struct VisualizerScenesChanged {
+    pub presets: Vec<VisualizerPresetEntry>,
+}
+
 /// Whether the visualizer copies what it sees in each frame for the in-app lab
 /// ([`VisualizerLabResponse`]) and plans the song for it. Off by default: the lab sends it on while
 /// its setting is on (the progress bars show the plan even with the panel closed) and off when

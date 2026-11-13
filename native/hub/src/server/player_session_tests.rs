@@ -13011,7 +13011,7 @@ async fn failed_settings_and_scene_requests_answer_typed_failures() -> Result<()
         call_id: None,
     };
     let error = import
-        .handle((), None, &import)
+        .handle(import.extract_params(params), None, &import)
         .await
         .err()
         .expect("a file that is not there");
@@ -13022,7 +13022,7 @@ async fn failed_settings_and_scene_requests_answer_typed_failures() -> Result<()
         call_id: None,
     };
     remove
-        .handle((), None, &remove)
+        .handle(remove.extract_params(params), None, &remove)
         .await
         .err()
         .expect("a scene that is not there");

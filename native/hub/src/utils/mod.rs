@@ -554,8 +554,10 @@ impl NodeRequestHandlers for ProductionNodeRequestHandlers {
         request: &SetVisualizerPresetDirsRequest,
     ) -> impl Future<Output = Result<Option<()>>> + Send {
         async move {
-            node.current().await?;
-            request.handle((), None, request).await
+            let node = node.current().await?;
+            request
+                .handle(Arc::clone(&node.gui_broadcaster), None, request)
+                .await
         }
     }
 
