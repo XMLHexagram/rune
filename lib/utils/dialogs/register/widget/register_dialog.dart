@@ -43,69 +43,71 @@ class _RegisterDialogState extends State<RegisterDialog> {
             Text(S.of(context).evaluationMode),
           ],
         ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text(
-              S.of(context).evaluationModeContent1,
-              style: TextStyle(height: 1.4),
-            ),
-            SizedBox(height: 4),
-            Text(
-              S.of(context).evaluationModeContent2,
-              style: TextStyle(height: 1.4),
-            ),
-            SizedBox(height: 4),
-            Text(
-              S.of(context).evaluationModeContent4,
-              style: TextStyle(height: 1.4),
-            ),
-            SizedBox(height: 16),
-            Button(
-              onPressed: _loading
-                  ? null
-                  : _loading
-                  ? null
-                  : () => launchUrl(
-                      Uri.parse('https://nodewave.bandcamp.com/album/rune'),
-                    ),
-              child: Row(
-                children: [
-                  SvgPicture.asset(
-                    width: 16,
-                    'assets/bandcamp.svg',
-                    colorFilter: ColorFilter.mode(
-                      theme.inactiveColor,
-                      BlendMode.srcIn,
-                    ),
-                  ),
-                  SizedBox(width: 8),
-                  Text("Bandcamp"),
-                ],
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                S.of(context).evaluationModeContent1,
+                style: TextStyle(height: 1.4),
               ),
-            ),
-            SizedBox(height: 4),
-            Button(
-              onPressed: _loading
-                  ? null
-                  : () => launchUrl(Uri.parse('https://not-ci.itch.io/rune')),
-              child: Row(
-                children: [
-                  SvgPicture.asset(
-                    width: 16,
-                    'assets/itch.svg',
-                    colorFilter: ColorFilter.mode(
-                      theme.inactiveColor,
-                      BlendMode.srcIn,
-                    ),
-                  ),
-                  SizedBox(width: 8),
-                  Text("itch.io"),
-                ],
+              SizedBox(height: 4),
+              Text(
+                S.of(context).evaluationModeContent2,
+                style: TextStyle(height: 1.4),
               ),
-            ),
-          ],
+              SizedBox(height: 4),
+              Text(
+                S.of(context).evaluationModeContent4,
+                style: TextStyle(height: 1.4),
+              ),
+              SizedBox(height: 16),
+              Button(
+                onPressed: _loading
+                    ? null
+                    : _loading
+                    ? null
+                    : () => launchUrl(
+                        Uri.parse('https://nodewave.bandcamp.com/album/rune'),
+                      ),
+                child: Row(
+                  children: [
+                    SvgPicture.asset(
+                      width: 16,
+                      'assets/bandcamp.svg',
+                      colorFilter: ColorFilter.mode(
+                        theme.inactiveColor,
+                        BlendMode.srcIn,
+                      ),
+                    ),
+                    SizedBox(width: 8),
+                    Text("Bandcamp"),
+                  ],
+                ),
+              ),
+              SizedBox(height: 4),
+              Button(
+                onPressed: _loading
+                    ? null
+                    : () => launchUrl(Uri.parse('https://not-ci.itch.io/rune')),
+                child: Row(
+                  children: [
+                    SvgPicture.asset(
+                      width: 16,
+                      'assets/itch.svg',
+                      colorFilter: ColorFilter.mode(
+                        theme.inactiveColor,
+                        BlendMode.srcIn,
+                      ),
+                    ),
+                    SizedBox(width: 8),
+                    Text("itch.io"),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
         actions: [
           ResponsiveDialogActions(

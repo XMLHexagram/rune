@@ -139,25 +139,27 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
     return NoShortcuts(
       ContentDialog(
         title: Column(children: [SizedBox(height: 8), Text(s.addLibrary)]),
-        content: switch (_step) {
-          1 => _sourceContent(s),
-          2 =>
-            _selected == AddLibrarySource.subsonic
-                ? _subsonicContent(s)
-                : _selected == AddLibrarySource.webDav
-                ? _webDavContent(s)
-                : _selected == AddLibrarySource.s3
-                ? _s3Content(s)
-                : _deviceContent(s),
-          3 => _libraryContent(s),
-          4 =>
-            _selected == AddLibrarySource.subsonic
-                ? _subsonicModesContent(s)
-                : _deviceUsageContent(s),
-          5 => _localModeContent(s),
-          6 => _shareModeContent(s),
-          _ => const SizedBox.shrink(),
-        },
+        content: SingleChildScrollView(
+          child: switch (_step) {
+            1 => _sourceContent(s),
+            2 =>
+              _selected == AddLibrarySource.subsonic
+                  ? _subsonicContent(s)
+                  : _selected == AddLibrarySource.webDav
+                  ? _webDavContent(s)
+                  : _selected == AddLibrarySource.s3
+                  ? _s3Content(s)
+                  : _deviceContent(s),
+            3 => _libraryContent(s),
+            4 =>
+              _selected == AddLibrarySource.subsonic
+                  ? _subsonicModesContent(s)
+                  : _deviceUsageContent(s),
+            5 => _localModeContent(s),
+            6 => _shareModeContent(s),
+            _ => const SizedBox.shrink(),
+          },
+        ),
         actions: [
           if (_step > 1)
             Button(
