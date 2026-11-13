@@ -202,8 +202,7 @@ impl Broadcaster for NodeBroadcaster {
             .current_player
             .lock()
             .is_ok_and(|player| player.suppresses_local_session_events())
-            && remote_event == Some(RemoteEventScope::Session)
-            && message.name() != "RequestCapabilities";
+            && remote_event == Some(RemoteEventScope::Session);
         if !suppress_local_status {
             self.local.broadcast(message);
         }

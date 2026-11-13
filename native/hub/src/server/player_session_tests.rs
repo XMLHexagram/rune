@@ -11408,6 +11408,151 @@ async fn attached_renderer_selects_rune_slots_and_suppresses_equal_capabilities(
     Ok(())
 }
 
+/// A controller with a renderer attached, and the renderer.
+async fn attached_controller_and_renderer(
+    controller_dir: &Path,
+    renderer_dir: &Path,
+    signals: Arc<RecordedSignals>,
+) -> Result<(Fixture, Fixture)> {
+    let controller = fixture_with_broadcaster(
+        controller_dir,
+        Uuid::new_v4(),
+        Duration::from_secs(300),
+        signals,
+    )
+    .await?;
+    let renderer = super::fixture(renderer_dir).await?;
+    let renderer_address = super::paired_full(&renderer, &controller).await?;
+    let renderer_info = super::info(&renderer).await?;
+    controller
+        .global_params
+        .cert_validator
+        .read()
+        .await
+        .replace_hosts_for_fingerprint(
+            &renderer_info.fingerprint,
+            vec![format!("127.0.0.1:{}", renderer_address.port())],
+        )
+        .await?;
+    controller
+        .global_params
+        .node
+        .attach_renderer(&renderer_info.fingerprint)
+        .await?;
+    Ok((controller, renderer))
+}
+
+/// This device's own screen keeps its capability snapshot while a Rune player
+/// is the current player, even though that player owns the session events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_ui_receives_capabilities_while_a_rune_player_is_current() -> Result<()> {
+    let controller_dir = tempfile::tempdir()?;
+    let renderer_dir = tempfile::tempdir()?;
+    let signals = Arc::new(RecordedSignals::default());
+    let (controller, renderer) =
+        attached_controller_and_renderer(controller_dir.path(), renderer_dir.path(), signals.clone())
+            .await?;
+    let node = &controller.global_params.node;
+    assert!(matches!(
+        node.current_player()?,
+        CurrentPlayer::RunePeer { .. }
+    ));
+
+    let library_id = Uuid::new_v4();
+    signals.clear();
+    node.set_open_local_catalog(None, library_id).await?;
+    wait_until("this device's snapshot for the opened library", || async {
+        Ok(signals
+            .decoded::<RequestCapabilities>("RequestCapabilities")
+            .iter()
+            .any(|snapshot| snapshot.library_id.as_deref() == Some(&library_id.to_string()))
+            .then_some(()))
+    })
+    .await?;
+    node.shutdown().await?;
+    renderer.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+/// A controller's screen shows the snapshot its remote player publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_receives_the_remote_player_capabilities() -> Result<()> {
+    let controller_dir = tempfile::tempdir()?;
+    let renderer_dir = tempfile::tempdir()?;
+    let signals = Arc::new(RecordedSignals::default());
+    let (controller, renderer) =
+        attached_controller_and_renderer(controller_dir.path(), renderer_dir.path(), signals.clone())
+            .await?;
+
+    let library_id = Uuid::new_v4();
+    signals.clear();
+    renderer
+        .global_params
+        .node
+        .set_open_local_catalog(None, library_id)
+        .await?;
+    wait_until("the remote player's snapshot on the controller", || async {
+        Ok(signals
+            .decoded::<RequestCapabilities>("RequestCapabilities")
+            .iter()
+            .any(|snapshot| snapshot.library_id.as_deref() == Some(&library_id.to_string()))
+            .then_some(()))
+    })
+    .await?;
+    controller.global_params.node.shutdown().await?;
+    renderer.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+/// This device's own screen keeps its capability snapshot while a Subsonic
+/// jukebox is the current player.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_ui_receives_capabilities_while_a_subsonic_jukebox_is_current() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let signals = Arc::new(RecordedSignals::default());
+    let fixture = fixture_with_broadcaster(
+        dir.path(),
+        Uuid::new_v4(),
+        Duration::from_secs(300),
+        signals.clone(),
+    )
+    .await?;
+    let node = fixture.global_params.node.clone();
+    let server = fake_subsonic_server(FakeSubsonicRoles {
+        stream: true,
+        jukebox: true,
+        wrong_password: false,
+    })
+    .await?;
+    let registration = register_subsonic_library_on_node(
+        &subsonic_registration_request(
+            server.endpoint.clone(),
+            "password",
+            Some(SubsonicOpenModeMessage::RemoteControl),
+        ),
+        &node,
+    )
+    .await;
+    let summary = registration.record.context("registered Subsonic record")?;
+    signals.clear();
+    let _ui = open_registered_library_record(node.clone(), summary.record_id.clone()).await?;
+    assert!(matches!(
+        node.current_player()?,
+        CurrentPlayer::SubsonicJukebox(_)
+    ));
+    wait_until("this device's snapshot for the Subsonic library", || async {
+        Ok(signals
+            .decoded::<RequestCapabilities>("RequestCapabilities")
+            .iter()
+            .any(|snapshot| snapshot.record_id.as_deref() == Some(summary.record_id.as_str()))
+            .then_some(()))
+    })
+    .await?;
+    server.task.abort();
+    node.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_binding_prefers_remote_peer_over_attached_renderer() -> Result<()> {
     let controller_dir = tempfile::tempdir()?;
