@@ -80,6 +80,8 @@ struct State_ {
     routes: HashMap<String, VecDeque<Reply>>,
     /// Scripted replies per "METHOD /path?query", tried before `routes`.
     targets: HashMap<String, Reply>,
+    /// How long to hold the answer to "METHOD /path".
+    delays: HashMap<String, Duration>,
     seen: Vec<Seen>,
 }
 
@@ -102,32 +104,43 @@ async fn handle(
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned)
     };
-    let mut state = state.lock().unwrap();
-    state.seen.push(Seen {
-        method: method.to_string(),
-        target: uri
-            .path_and_query()
-            .map(|p| p.as_str().to_owned())
-            .unwrap_or_default(),
-        path: uri.path().to_owned(),
-        authorization: header("authorization"),
-        user_token: header("music-user-token"),
-        body: String::from_utf8_lossy(&body).into_owned(),
-    });
-    let key = format!("{method} {}", uri.path());
-    let target = format!(
-        "{method} {}",
-        uri.path_and_query().map(|p| p.as_str()).unwrap_or_default()
-    );
-    let exact = state.targets.get(&target).cloned();
-    let reply = exact.or_else(|| match state.routes.get_mut(&key) {
-        Some(queue) if queue.len() > 1 => queue.pop_front(),
-        Some(queue) => queue.front().cloned(),
-        None => None,
-    });
-    let Some(reply) = reply else {
-        return (StatusCode::IM_A_TEAPOT, format!("no route for {key}")).into_response();
+    let (reply, delay) = {
+        let mut state = state.lock().unwrap();
+        state.seen.push(Seen {
+            method: method.to_string(),
+            target: uri
+                .path_and_query()
+                .map(|p| p.as_str().to_owned())
+                .unwrap_or_default(),
+            path: uri.path().to_owned(),
+            authorization: header("authorization"),
+            user_token: header("music-user-token"),
+            body: String::from_utf8_lossy(&body).into_owned(),
+        });
+        let key = format!("{method} {}", uri.path());
+        let target = format!(
+            "{method} {}",
+            uri.path_and_query().map(|p| p.as_str()).unwrap_or_default()
+        );
+        let exact = state.targets.get(&target).cloned();
+        let reply = exact.or_else(|| match state.routes.get_mut(&key) {
+            Some(queue) if queue.len() > 1 => queue.pop_front(),
+            Some(queue) => queue.front().cloned(),
+            None => None,
+        });
+        let delay = state.delays.get(&key).copied();
+        (reply, delay)
     };
+    let Some(reply) = reply else {
+        return (
+            StatusCode::IM_A_TEAPOT,
+            format!("no route for {method} {}", uri.path()),
+        )
+            .into_response();
+    };
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
     let mut response = (
         StatusCode::from_u16(reply.status).unwrap(),
         reply.body.clone(),
@@ -176,6 +189,16 @@ impl FixtureServer {
             .unwrap()
             .targets
             .insert(format!("{method} {target}"), reply);
+        self
+    }
+
+    /// Holds every answer to `METHOD path` for `delay`, after recording the request.
+    pub fn delay(&self, method: &str, path: &str, delay: Duration) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .delays
+            .insert(format!("{method} {path}"), delay);
         self
     }
 

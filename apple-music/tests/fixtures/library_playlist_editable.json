@@ -1,0 +1,26 @@
+{
+  "data": [
+    {
+      "id": "p.mine1",
+      "type": "library-playlists",
+      "href": "/v1/me/library/playlists/p.mine1",
+      "attributes": {
+        "name": "Road Trip",
+        "canEdit": true,
+        "hasCatalog": false,
+        "isPublic": false,
+        "playParams": {
+          "id": "p.mine1",
+          "kind": "playlist",
+          "isLibrary": true
+        },
+        "dateAdded": "2024-01-02T03:04:05Z",
+        "artwork": {
+          "width": 1000,
+          "height": 1000,
+          "url": "http://artwork.invalid/roadtrip/{w}x{h}bb.jpg"
+        }
+      }
+    }
+  ]
+}
