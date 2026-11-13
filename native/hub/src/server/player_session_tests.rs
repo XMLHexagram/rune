@@ -2168,6 +2168,52 @@ async fn attach_pair_with_signals(
     Ok(b_info.fingerprint)
 }
 
+/// The reply to a detach request is sent only once the controller has left the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detach_controller_replies_after_the_controller_is_gone() -> Result<()> {
+    use crate::messages::DetachControllerRequest;
+
+    let a_dir = tempfile::tempdir()?;
+    let b_dir = tempfile::tempdir()?;
+    let signals = Arc::new(RecordedSignals::default());
+    let a = fixture_with_broadcaster(
+        a_dir.path(),
+        Uuid::new_v4(),
+        Duration::from_secs(300),
+        signals.clone(),
+    )
+    .await?;
+    let b = fixture(b_dir.path()).await?;
+    attach_pair_with_signals(&a, &b, &signals).await?;
+    let renderer = b.global_params.node.session()?;
+    wait_until("the controller to attach", || async {
+        Ok((!renderer.attached_controllers().is_empty()).then_some(()))
+    })
+    .await?;
+    let controller = renderer
+        .attached_controllers()
+        .into_iter()
+        .next()
+        .context("renderer did not register its controller")?;
+
+    let reply = dispatch_gui_request(
+        &b.global_params,
+        &DetachControllerRequest {
+            call_id: None,
+            id: controller.id,
+        },
+    )
+    .await?;
+    assert!(
+        renderer.attached_controllers().is_empty(),
+        "the reply came before the controller was detached"
+    );
+    assert!(reply.is_some(), "the detach was not answered");
+    a.global_params.node.shutdown().await?;
+    b.global_params.node.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn detached_renderer_restores_local_session_signals() -> Result<()> {
     use crate::messages::{RendererAttachmentChanged, RendererLinkLost};
@@ -2200,7 +2246,8 @@ async fn detached_renderer_restores_local_session_signals() -> Result<()> {
     b.global_params
         .node
         .session()?
-        .detach_controller(Uuid::parse_str(&controller.id)?)?;
+        .detach_controller(Uuid::parse_str(&controller.id)?)
+        .await?;
 
     wait_until("detached renderer signal sequence", || async {
         let (loss, attachment, local_queue) = {

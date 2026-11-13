@@ -96,6 +96,8 @@ pub struct PlayerSession {
 struct ControllerEntry {
     controller: AttachedController,
     cancel: CancellationToken,
+    /// Cancelled once the entry has left the list.
+    removed: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -145,6 +147,7 @@ impl PlayerSession {
         self.controllers().push(ControllerEntry {
             controller,
             cancel: cancel.clone(),
+            removed: CancellationToken::new(),
         });
         self.broadcast_controllers_updated();
         AttachedControllerGuard {
@@ -174,12 +177,17 @@ impl PlayerSession {
             .collect()
     }
 
-    pub(crate) fn detach_controller(&self, id: Uuid) -> Result<()> {
-        let controllers = self.controllers();
-        let Some(entry) = controllers.iter().find(|entry| entry.controller.id == id) else {
-            return Err(ExpectedError::NotFound { what: "controller" }.into());
+    /// Closes the controller's connection and returns once it is no longer listed.
+    pub(crate) async fn detach_controller(&self, id: Uuid) -> Result<()> {
+        let removed = {
+            let controllers = self.controllers();
+            let Some(entry) = controllers.iter().find(|entry| entry.controller.id == id) else {
+                return Err(ExpectedError::NotFound { what: "controller" }.into());
+            };
+            entry.cancel.cancel();
+            entry.removed.clone()
         };
-        entry.cancel.cancel();
+        removed.cancelled().await;
         Ok(())
     }
 
@@ -187,7 +195,13 @@ impl PlayerSession {
         let removed = {
             let mut controllers = self.controllers();
             let before = controllers.len();
-            controllers.retain(|entry| entry.controller.id != id);
+            controllers.retain(|entry| {
+                let keep = entry.controller.id != id;
+                if !keep {
+                    entry.removed.cancel();
+                }
+                keep
+            });
             controllers.len() != before
         };
         if removed {

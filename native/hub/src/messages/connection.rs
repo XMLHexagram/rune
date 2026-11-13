@@ -561,6 +561,13 @@ pub struct DetachControllerRequest {
     pub call_id: Option<u64>,
 }
 
+/// Sent once the controller is no longer attached.
+#[derive(Debug, Serialize, Deserialize, RustSignal)]
+pub struct DetachControllerResponse {
+    #[serde(default)]
+    pub call_id: Option<u64>,
+}
+
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct RemoteRequestFailed {
     pub kind: RequestErrorKind,

@@ -106,7 +106,7 @@ pub fn define_request_types(_input: TokenStream) -> TokenStream {
         },
         RequestResponse {
             request: "DetachControllerRequest".to_string(),
-            response: None,
+            response: Some("DetachControllerResponse".to_string()),
             scope: RequestScope::Node,
             access: RequestAccess::NodeLocal,
             introduced_minor: None,
