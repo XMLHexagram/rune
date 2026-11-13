@@ -18,15 +18,20 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`library::AppleLibrary`] builds on the client for hosts that want the user's library
+//! through plain types, with sign-in, caching and like handling done for them.
 
 mod api;
 mod client;
 mod error;
+pub mod library;
 pub mod models;
 mod tokens;
 
 pub use client::{AppleMusicClient, ClientBuilder, RetryPolicy, DEFAULT_BASE_URL};
 pub use error::{ApiError, Error, Result};
+pub use library::AppleLibrary;
 pub use tokens::{StaticTokens, TokenSource};
 
 /// Largest number of catalog song ids per request.
