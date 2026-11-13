@@ -390,7 +390,15 @@ async fn register_worker_library(
     let path = directory.path().to_string_lossy().into_owned();
     write_quick_identity(directory.path())?;
     let broadcaster = Arc::new(QuietBroadcaster::default());
-    let node = NodeContext::new(&path, &path, broadcaster.clone(), false, RunMode::App).await?;
+    let node = NodeContext::new(
+        &path,
+        &path,
+        broadcaster.clone(),
+        false,
+        RunMode::App,
+        Arc::new(::visualizer::Visualizer::new()),
+    )
+    .await?;
     let record = test_record(namespace);
     std::fs::write(
         directory.path().join("libraries.json"),
@@ -931,7 +939,15 @@ async fn share_worker_skips_redirected_catalog_before_opening_a_store() -> Resul
     let directory = tempfile::tempdir()?;
     let path = directory.path().to_string_lossy().into_owned();
     let broadcaster = Arc::new(QuietBroadcaster::default());
-    let node = NodeContext::new(&path, &path, broadcaster, false, RunMode::App).await?;
+    let node = NodeContext::new(
+        &path,
+        &path,
+        broadcaster,
+        false,
+        RunMode::App,
+        Arc::new(::visualizer::Visualizer::new()),
+    )
+    .await?;
     std::fs::write(
         directory.path().join("libraries.json"),
         serde_json::to_vec(&json!({
@@ -2209,6 +2225,7 @@ mod revocation_tests {
             Arc::new(QuietBroadcaster::default()),
             false,
             RunMode::App,
+            Arc::new(::visualizer::Visualizer::new()),
         )
         .await?;
         {

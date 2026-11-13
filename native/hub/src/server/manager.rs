@@ -1173,6 +1173,7 @@ mod lifecycle_tests {
             run_mode,
             reconnect_config,
             wrap_player,
+            Arc::new(::visualizer::Visualizer::new()),
         )
         .await?;
         fixture_from_library(node_context, library).await
@@ -1210,7 +1211,15 @@ mod lifecycle_tests {
     async fn reopen_fixture(original: &Fixture) -> Result<Fixture> {
         original.global_params.node.shutdown().await?;
         let config = &original.global_params.config_path;
-        let node = NodeContext::new(config, config, Arc::new(Quiet), false, RunMode::App).await?;
+        let node = NodeContext::new(
+            config,
+            config,
+            Arc::new(Quiet),
+            false,
+            RunMode::App,
+            Arc::new(::visualizer::Visualizer::new()),
+        )
+        .await?;
         let library = node
             .library_pool
             .acquire_ui(original.global_params.library_id.context("library")?)
@@ -4028,6 +4037,7 @@ mod lifecycle_tests {
             Arc::new(WebSocketService::new()),
             false,
             RunMode::App,
+            Arc::new(::visualizer::Visualizer::new()),
         )
         .await?;
         let library = node

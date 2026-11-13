@@ -50,7 +50,7 @@ use crate::rpc::{Slot, TargetRequest};
 use crate::server::sync_worker::SyncTokenStore;
 use crate::session::PlayerWrap;
 use crate::subsonic_binding::SubsonicBinding;
-use crate::visualizer::VISUALIZER;
+use crate::visualizer::NodeVisualizer;
 use crate::{Session, session::PlayerSession};
 use crate::{
     library_pool::{LibraryHandle, LibraryPool},
@@ -71,6 +71,7 @@ use crate::{
         RinfRustSignal, nid::get_or_create_node_id, sync_settings::SyncSettings,
     },
 };
+use ::visualizer::Visualizer;
 use database::library_registry::LibraryRecordId;
 use discovery::DiscoveryParams;
 use discovery::access_policy::{AccessPolicy, PeerIdentity};
@@ -152,6 +153,7 @@ pub struct NodeContext {
     current_player: Arc<StdMutex<CurrentPlayer>>,
     open_generation: AtomicU64,
     reconnect_config: ReconnectConfig,
+    visualizer: NodeVisualizer,
     #[cfg(test)]
     reconnect_attempts: AtomicUsize,
     pub token: Arc<CancellationToken>,
@@ -273,12 +275,16 @@ impl NodeContext {
     /// `os_media_controls` registers the local session with the OS (MPRIS, SMTC).
     /// Only the app and the headless server enable it; tests must not touch the
     /// desktop session.
+    ///
+    /// `visualizer` is the one every writer of this node's visualizer state uses: the app passes
+    /// its own, and every other node gets an instance of its own.
     pub(crate) async fn new(
         config_path: &str,
         db_path: &str,
         broadcaster: Arc<dyn Broadcaster>,
         os_media_controls: bool,
         run_mode: RunMode,
+        visualizer: Arc<Visualizer>,
     ) -> Result<Arc<Self>> {
         Self::with_reconnect_config(
             config_path,
@@ -288,10 +294,12 @@ impl NodeContext {
             run_mode,
             ReconnectConfig::default(),
             PlayerSession::real_player(),
+            visualizer,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn with_reconnect_config(
         config_path: &str,
         db_path: &str,
@@ -300,6 +308,7 @@ impl NodeContext {
         run_mode: RunMode,
         reconnect_config: ReconnectConfig,
         wrap_player: PlayerWrap,
+        visualizer: Arc<Visualizer>,
     ) -> Result<Arc<Self>> {
         #[cfg(unix)]
         raise_nofile_soft_limit();
@@ -347,6 +356,7 @@ impl NodeContext {
             current_player,
             open_generation: AtomicU64::new(0),
             reconnect_config,
+            visualizer: NodeVisualizer::new(visualizer),
             #[cfg(test)]
             reconnect_attempts: AtomicUsize::new(0),
             token: Arc::new(CancellationToken::new()),
@@ -891,13 +901,22 @@ impl NodeContext {
             .map_err(|_| anyhow::anyhow!("Current player lock poisoned"))
     }
 
+    /// The visualizer this node's session, feeds and current player write.
+    pub(crate) fn visualizer(&self) -> &Arc<Visualizer> {
+        self.visualizer.visualizer()
+    }
+
+    pub(crate) fn node_visualizer(&self) -> &NodeVisualizer {
+        &self.visualizer
+    }
+
     fn refresh_current_player(&self, player: CurrentPlayer) -> Result<()> {
         let mut current = self
             .current_player
             .lock()
             .map_err(|_| anyhow::anyhow!("Current player lock poisoned"))?;
         *current = player;
-        VISUALIZER.set_inputs(current.visualizer_inputs());
+        self.visualizer().set_inputs(current.visualizer_inputs());
         Ok(())
     }
 
@@ -908,7 +927,7 @@ impl NodeContext {
             .current_player
             .lock()
             .map_err(|_| anyhow::anyhow!("Current player lock poisoned"))?;
-        VISUALIZER.set_inputs(current.visualizer_inputs());
+        self.visualizer().set_inputs(current.visualizer_inputs());
         Ok(())
     }
 
@@ -1483,7 +1502,15 @@ impl NodeSlot {
             );
             return Ok(node.clone());
         }
-        let node = NodeContext::new(config_path, db_path, broadcaster, true, run_mode).await?;
+        let node = NodeContext::new(
+            config_path,
+            db_path,
+            broadcaster,
+            true,
+            run_mode,
+            Arc::clone(&crate::visualizer::VISUALIZER),
+        )
+        .await?;
         *slot = Some(node.clone());
         Ok(node)
     }
@@ -1569,8 +1596,15 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().to_string_lossy();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let node =
-            NodeContext::new(&path, &path, Arc::new(Quiet(Some(tx))), false, RunMode::App).await?;
+        let node = NodeContext::new(
+            &path,
+            &path,
+            Arc::new(Quiet(Some(tx))),
+            false,
+            RunMode::App,
+            Arc::new(::visualizer::Visualizer::new()),
+        )
+        .await?;
         let manager = node.permission_manager.read().await;
         manager
             .add_user(

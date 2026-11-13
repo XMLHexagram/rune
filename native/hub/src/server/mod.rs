@@ -207,6 +207,7 @@ mod tests {
             Arc::new(WebSocketService::new()),
             false,
             RunMode::App,
+            Arc::new(::visualizer::Visualizer::new()),
         )
         .await
         .unwrap();

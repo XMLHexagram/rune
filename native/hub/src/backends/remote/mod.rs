@@ -48,7 +48,7 @@ use crate::{
         Broadcaster, GlobalParams, RemoteEventScope, RinfRustSignal,
         broadcastable::REMOTE_EVENT_DECLARATIONS,
     },
-    visualizer::{ChartItem, VISUALIZER},
+    visualizer::ChartItem,
 };
 #[cfg(test)]
 use ::discovery::protocol_version::PROTOCOL_VERSION;
@@ -59,6 +59,7 @@ use ::discovery::{
     client::{CertValidator, select_best_host},
     endpoint::{DEFAULT_DEVICE_PORT, DeviceAddress, DeviceScheme, device_url},
 };
+use ::visualizer::Visualizer;
 
 pub fn encode_message(type_name: &str, payload: &[u8], uuid: Option<Uuid>) -> Vec<u8> {
     let type_len = type_name.len() as u8;
@@ -656,7 +657,7 @@ async fn register_session_handlers(
                                 report: HandoffPlaybackReport::Playlist(playlist.items.clone()),
                             });
                         }
-                        update_visualizer_feed(message.as_ref());
+                        update_visualizer_feed(node.visualizer(), message.as_ref());
                         node.gui_broadcaster.broadcast(message.as_ref());
                     }
                     Err(error) => error!("Failed to decode renderer event: {error}"),
@@ -666,24 +667,25 @@ async fn register_session_handlers(
     }
 }
 
-pub(crate) fn update_visualizer_feed(message: &dyn RinfRustSignal) {
+/// Give a feed event to `visualizer`, the visualizer of the node the feed reaches.
+pub(crate) fn update_visualizer_feed(visualizer: &Visualizer, message: &dyn RinfRustSignal) {
     if let Some(spectrum) = message.as_any().downcast_ref::<RealtimeFFT>() {
-        VISUALIZER.set_feed_spectrum(&spectrum.value);
+        visualizer.set_feed_spectrum(&spectrum.value);
         return;
     }
     if let Some(status) = message.as_any().downcast_ref::<PlaybackStatus>() {
         let (item, position, playing) = feed_playback_args(status);
-        VISUALIZER.set_feed_playback(item, position, playing);
+        visualizer.set_feed_playback(item, position, playing);
         return;
     }
     if let Some(chart) = message.as_any().downcast_ref::<VisualizerFeedChart>() {
-        if let Err(error) = VISUALIZER.set_feed_chart(chart_item(&chart.item), &chart.chart) {
+        if let Err(error) = visualizer.set_feed_chart(chart_item(&chart.item), &chart.chart) {
             log::warn!("Could not use the renderer's visualizer chart: {error:#}");
         }
         return;
     }
     if let Some(covers) = message.as_any().downcast_ref::<VisualizerFeedCovers>()
-        && let Err(error) = VISUALIZER.set_feed_covers(
+        && let Err(error) = visualizer.set_feed_covers(
             &chart_item(&covers.item),
             covers.playing.clone(),
             covers.random.clone(),
@@ -703,6 +705,7 @@ fn feed_playback_args(status: &PlaybackStatus) -> (Option<ChartItem>, Duration, 
 
 /// Deliver one Rune wire frame from either a Rune renderer or a declared Subsonic feed.
 pub(crate) fn deliver_visualizer_feed_frame(
+    visualizer: &Visualizer,
     payload: &[u8],
     broadcaster: &dyn Broadcaster,
     mut on_playback_status: impl FnMut(&PlaybackStatus),
@@ -720,7 +723,7 @@ pub(crate) fn deliver_visualizer_feed_frame(
         .find(|declaration| declaration.name == name)
         .ok_or_else(|| anyhow::anyhow!("Undeclared visualizer feed message"))?;
     let message = (declaration.decode)(&body)?;
-    update_visualizer_feed(message.as_ref());
+    update_visualizer_feed(visualizer, message.as_ref());
     if let Some(status) = message.as_any().downcast_ref::<PlaybackStatus>() {
         on_playback_status(status);
     } else if message.as_any().is::<RealtimeFFT>() {

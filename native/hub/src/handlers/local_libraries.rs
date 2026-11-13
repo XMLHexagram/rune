@@ -366,6 +366,7 @@ mod tests {
             Arc::new(LocalGuiBroadcaster),
             false,
             RunMode::App,
+            Arc::new(::visualizer::Visualizer::new()),
         )
         .await?;
         assert!(list(&config).await?.is_empty());

@@ -2177,6 +2177,7 @@ mod tests {
             Uuid::new_v4(),
             mode == SubsonicOpenMode::PlayOnThisDevice,
             Arc::new(CountingBroadcaster(Arc::clone(&broadcasts))),
+            Arc::new(::visualizer::Visualizer::new()),
         );
         (
             binding,

@@ -1153,7 +1153,15 @@ async fn assert_node_threads_stop(case: &str) -> Result<()> {
         node
     } else {
         let path = dir.path().to_str().context("node path")?;
-        NodeContext::new(path, path, Arc::new(Quiet), false, RunMode::App).await?
+        NodeContext::new(
+            path,
+            path,
+            Arc::new(Quiet),
+            false,
+            RunMode::App,
+            Arc::new(::visualizer::Visualizer::new()),
+        )
+        .await?
     };
     let session = node.session()?;
     let weak = Arc::downgrade(&node);
@@ -6115,6 +6123,7 @@ async fn session_c2a_revision_conflicts_and_identity_persist() -> Result<()> {
         Arc::new(Quiet),
         false,
         RunMode::App,
+        Arc::new(::visualizer::Visualizer::new()),
     )
     .await?;
     assert_eq!(reopened.session()?.session_id().await, session_id);
@@ -9263,7 +9272,6 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
         RealtimeFFT, VisualizerFeedChart, VisualizerFeedCovers,
     };
     use crate::utils::broadcastable::REMOTE_EVENT_DECLARATIONS;
-    use crate::visualizer::{ChartItem, VISUALIZER};
 
     let first = tempfile::tempdir()?;
     let second = tempfile::tempdir()?;
@@ -9579,7 +9587,6 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
         );
     wait_player(&b, |status| status.playlist.len() == 2).await?;
     let feed_item: PlayingItemRef = library_track_for_id(&b, b_track).await?.into();
-    let identity: ChartItem = feed_item.clone().into();
     wait_until("renderer chart and cover bytes", || async {
         let chart = signals
             .decoded::<VisualizerFeedChart>("VisualizerFeedChart")
@@ -9621,18 +9628,15 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
         .rev()
         .find(|status| status.item_request.as_ref() == Some(&feed_item))
         .context("renderer playback identity was not forwarded")?;
-    update_visualizer_feed(&first_status);
-    update_visualizer_feed(&first_chart);
-    update_visualizer_feed(&first_covers);
-    assert!(VISUALIZER.has_feed_chart(&identity));
-    assert!(VISUALIZER.feed_covers_match(
-        &identity,
-        first_covers.playing.as_deref(),
-        &first_covers.random,
-    ));
+    // A's own visualizer follows the renderer's feed; which charts and covers it keeps is the
+    // visualizer crate's to test.
+    let a_visualizer = a.global_params.node.visualizer();
+    update_visualizer_feed(a_visualizer, &first_status);
+    update_visualizer_feed(a_visualizer, &first_chart);
+    update_visualizer_feed(a_visualizer, &first_covers);
+    assert!(a_visualizer.is_feed_playback());
     b.global_params.player.lock().await.load(1);
     let next_item: PlayingItemRef = library_track_for_id(&b, next_track).await?.into();
-    let next_identity: ChartItem = next_item.clone().into();
     wait_until("track chart and covers", || async {
         let chart_arrived = signals
             .decoded::<VisualizerFeedChart>("VisualizerFeedChart")
@@ -9667,13 +9671,10 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
         .into_iter()
         .find(|covers| covers.item == next_item)
         .context("next track covers were not forwarded")?;
-    update_visualizer_feed(&next_status);
-    update_visualizer_feed(&next_chart);
-    update_visualizer_feed(&next_covers);
-    assert!(!VISUALIZER.has_feed_chart(&identity));
-    VISUALIZER.set_feed_chart(identity.clone(), &first_chart.chart)?;
-    assert!(!VISUALIZER.has_feed_chart(&identity));
-    assert!(VISUALIZER.has_feed_chart(&next_identity));
+    update_visualizer_feed(a_visualizer, &next_status);
+    update_visualizer_feed(a_visualizer, &next_chart);
+    update_visualizer_feed(a_visualizer, &next_covers);
+    assert!(a_visualizer.is_feed_playback());
     assert!(
         REMOTE_EVENT_DECLARATIONS
             .iter()
@@ -9728,7 +9729,8 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
     .await
     .context("RR pushed status/content/scan events missing")?;
     a.global_params.node.detach_renderer().await?;
-    assert!(!VISUALIZER.is_feed_playback());
+    // Back on its own player, A's visualizer follows the local session again.
+    assert!(!a_visualizer.is_feed_playback());
 
     let mut close = start::<CloseLibraryRequest>(&remote);
     close.send(CloseLibraryRequest { call_id: None });
@@ -10909,7 +10911,6 @@ async fn rr_library_pauses_and_restores_local_session_position() -> Result<()> {
         "restored position {restored_position:?} differs from paused position {paused_position:?}"
     );
 
-    crate::visualizer::VISUALIZER.set_feed_playback(None, Duration::ZERO, false);
     a.global_params.node.shutdown().await?;
     b.global_params.node.shutdown().await?;
     Ok(())

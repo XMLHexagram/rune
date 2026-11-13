@@ -2048,6 +2048,7 @@ async fn open_subsonic_record(
         library_id,
         play_on_this_device,
         Arc::clone(&node.gui_broadcaster),
+        Arc::clone(node.visualizer()),
     ));
     node.set_open_subsonic_catalog(Some(record_id), binding)
         .await
@@ -2117,6 +2118,7 @@ pub(crate) async fn subsonic_binding_for_playback(
         library_id,
         *mode == SubsonicOpenMode::PlayOnThisDevice,
         Arc::clone(&node.gui_broadcaster),
+        Arc::clone(node.visualizer()),
     )))
 }
 

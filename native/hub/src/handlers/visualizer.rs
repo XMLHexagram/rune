@@ -104,10 +104,10 @@ impl Signal for StartVisualizerRequest {
         let _turn = STARTING_OR_STOPPING.lock().await;
         crate::visualizer_log::write_to(Arc::clone(&library.main_db));
         provide_covers(
+            &node,
             Arc::clone(&library.fsio),
             Arc::clone(&library.main_db),
             Arc::clone(&library.recommend_db),
-            node,
             library.library_id,
             player.lock().await.get_status().item,
         );

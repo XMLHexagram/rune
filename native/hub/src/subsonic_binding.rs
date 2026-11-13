@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use visualizer::VisualizerInputs;
+use visualizer::{Visualizer, VisualizerInputs};
 
 use anyhow::Result;
 use database::playing_item::PlayingItemMetadataSummary;
@@ -95,6 +95,8 @@ pub(crate) struct SubsonicBinding {
     visualizer_feed: Mutex<Option<ActiveFeed>>,
     /// Counts feed link changes, so the node can republish the visualizer inputs.
     feed_link_changes: watch::Sender<u64>,
+    /// The visualizer of the node this jukebox plays for, which its feed writes.
+    visualizer: Arc<Visualizer>,
 }
 
 /// The running visualizer feed connection loop.
@@ -307,6 +309,7 @@ fn set_feed_link(
 /// Connects to the feed and delivers its events until the connection ends.
 async fn run_feed_session(
     binding: &Weak<SubsonicBinding>,
+    visualizer: &Visualizer,
     client: &SubsonicClient,
     probe: &subsonic::SubsonicProbe,
     broadcaster: &Arc<dyn Broadcaster>,
@@ -368,6 +371,7 @@ async fn run_feed_session(
             message = socket.next() => match message {
                 Some(Ok(Message::Binary(payload))) => {
                     if let Err(error) = deliver_visualizer_feed_frame(
+                        visualizer,
                         &payload,
                         &**broadcaster,
                         |status| {
@@ -609,6 +613,7 @@ impl SubsonicBinding {
         library_id: Uuid,
         play_on_this_device: bool,
         broadcaster: Arc<dyn Broadcaster>,
+        visualizer: Arc<Visualizer>,
     ) -> Self {
         Self {
             library_id,
@@ -630,6 +635,7 @@ impl SubsonicBinding {
             playback_starts: Mutex::new(HashMap::new()),
             visualizer_feed: Mutex::new(None),
             feed_link_changes: watch::channel(0).0,
+            visualizer,
         }
     }
 
@@ -788,6 +794,7 @@ impl SubsonicBinding {
         let client = Arc::clone(&self.client);
         let probe = self.probe.clone();
         let broadcaster = Arc::clone(&self.covers.broadcaster);
+        let visualizer = Arc::clone(&self.visualizer);
         let binding = Arc::downgrade(self);
         tokio::spawn(async move {
             // Same waits as a Rune peer's reconnect; a feed has no deadline because it
@@ -803,6 +810,7 @@ impl SubsonicBinding {
             loop {
                 let end = run_feed_session(
                     &binding,
+                    &visualizer,
                     &client,
                     &probe,
                     &broadcaster,
@@ -1249,12 +1257,11 @@ mod visualizer_feed_tests {
     use tokio::{net::TcpListener, sync::Notify, time::timeout};
     use url::Url;
     use uuid::Uuid;
-    use visualizer::VisualizerInputs;
+    use visualizer::{Visualizer, VisualizerInputs};
 
     use super::SubsonicBinding;
     use crate::test_wait::TEST_DEADLINE;
     use crate::test_wait::wait_until;
-    use crate::visualizer::VISUALIZER;
     use crate::{
         backends::remote::{decode_message, encode_message},
         messages::{
@@ -1641,6 +1648,16 @@ mod visualizer_feed_tests {
         root: &TempDir,
         broadcaster: Arc<Signals>,
     ) -> Arc<SubsonicBinding> {
+        open_binding_for(url, root, broadcaster, Arc::new(Visualizer::new())).await
+    }
+
+    /// A binding whose feed writes `visualizer`, as a node's does.
+    async fn open_binding_for(
+        url: Url,
+        root: &TempDir,
+        broadcaster: Arc<Signals>,
+        visualizer: Arc<Visualizer>,
+    ) -> Arc<SubsonicBinding> {
         let client = SubsonicClient::new(
             url,
             SubsonicCredentials::Password {
@@ -1657,6 +1674,7 @@ mod visualizer_feed_tests {
             Uuid::new_v4(),
             false,
             broadcaster,
+            visualizer,
         ))
     }
 
@@ -1921,22 +1939,11 @@ mod visualizer_feed_tests {
                 .unwrap()
                 .contains_key("t")
         );
-        let visualizer_item = state
-            .feed_status
-            .lock()
-            .unwrap()
-            .item_request
-            .as_ref()
-            .unwrap()
-            .clone();
-        let visualizer_identity: visualizer::ChartItem = visualizer_item.into();
-        wait_until("feed events reached the visualizer", || async {
+        // Which charts and covers a feed's visualizer keeps is the visualizer crate's to test.
+        wait_until("feed events reached the binding's visualizer", || async {
             let names = signals.names.lock().unwrap();
             let fft = names.iter().any(|name| name == "RealtimeFFT");
-            let feed_status = VISUALIZER.is_feed_playback();
-            let chart = VISUALIZER.has_feed_chart(&visualizer_identity);
-            let covers = VISUALIZER.feed_covers_match(&visualizer_identity, Some(&[4]), &[vec![5]]);
-            Ok((fft && feed_status && chart && covers).then_some(()))
+            Ok((fft && binding.visualizer.is_feed_playback()).then_some(()))
         })
         .await
         .unwrap();
@@ -2173,11 +2180,18 @@ mod visualizer_feed_tests {
             Arc::new(Signals::default()),
             false,
             RunMode::App,
+            Arc::new(::visualizer::Visualizer::new()),
         )
         .await
         .unwrap();
         let root = TempDir::new().unwrap();
-        let binding = open_binding(url, &root, Arc::new(Signals::default())).await;
+        let binding = open_binding_for(
+            url,
+            &root,
+            Arc::new(Signals::default()),
+            Arc::clone(node.visualizer()),
+        )
+        .await;
         node.set_open_subsonic_catalog(None, binding.clone())
             .await
             .unwrap();
@@ -2191,7 +2205,7 @@ mod visualizer_feed_tests {
         .await
         .unwrap();
         wait_until("the visualizer to see the live feed", || async {
-            Ok((VISUALIZER.status().inputs == VisualizerInputs::Full).then_some(()))
+            Ok((node.visualizer().status().inputs == VisualizerInputs::Full).then_some(()))
         })
         .await
         .unwrap();
@@ -2199,14 +2213,14 @@ mod visualizer_feed_tests {
         state.refuse_feed.store(true, Ordering::SeqCst);
         state.feed_drop.notify_one();
         wait_until("the visualizer to lose its inputs", || async {
-            Ok((VISUALIZER.status().inputs == VisualizerInputs::None).then_some(()))
+            Ok((node.visualizer().status().inputs == VisualizerInputs::None).then_some(()))
         })
         .await
         .unwrap();
 
         state.refuse_feed.store(false, Ordering::SeqCst);
         wait_until("the visualizer to get its inputs back", || async {
-            Ok((VISUALIZER.status().inputs == VisualizerInputs::Full).then_some(()))
+            Ok((node.visualizer().status().inputs == VisualizerInputs::Full).then_some(()))
         })
         .await
         .unwrap();

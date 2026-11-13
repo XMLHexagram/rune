@@ -65,7 +65,7 @@ use crate::{
         },
         record_library_item_played, report_item_played_through,
     },
-    visualizer::{VISUALIZER, feed_cover_bytes, playing_cover_changed},
+    visualizer::{feed_cover_bytes, playing_cover_changed},
 };
 use store::SessionState;
 
@@ -777,7 +777,7 @@ async fn handle_status_event(
                 }
             }
         }
-        playing_cover_changed(value.item.as_ref(), item_state.cover.as_deref());
+        playing_cover_changed(node, value.item.as_ref(), item_state.cover.as_deref());
         item_state.last_item = value.item.clone();
     }
     if value.state == PlaybackState::Playing && !item_state.track_started {
@@ -800,8 +800,8 @@ async fn handle_status_event(
     let playing = value.state == PlaybackState::Playing;
     // This device is the source: its player gives the spectrum and the chart is analysed here,
     // whether or not an item is loaded.
-    VISUALIZER.set_playing(playing);
-    VISUALIZER.set_playback(
+    node.visualizer().set_playing(playing);
+    node.visualizer().set_playback(
         value.path.as_deref(),
         value.position,
         playing,
@@ -853,7 +853,7 @@ async fn handle_status_event(
         && let Some(library) = &item_state.library
     {
         item_state.feed_item = Some(item.clone());
-        let chart = VISUALIZER.cached_chart(path).ok().flatten();
+        let chart = node.visualizer().cached_chart(path).ok().flatten();
         if let Some(chart) = chart {
             broadcaster.broadcast(&VisualizerFeedChart { item, chart });
         } else {
