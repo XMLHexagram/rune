@@ -17,39 +17,10 @@ use crate::switching::FOLLOWED;
 
 // The numbers below are the defaults of `director.*` in `runtime.toml`, which the director reads
 // (a test pins that they agree); a scene lab can replace them live.
-/// A section whose energy is below this is quiet.
-#[cfg(test)]
-pub const QUIET_BELOW: f32 = 0.35;
-/// A section whose energy is above this is high.
-#[cfg(test)]
-pub const HIGH_ABOVE: f32 = 0.71;
 // The cadence is in seconds, whatever the tempo: counted in bars, a fast song cut every few
 // seconds, far too often.
-/// Seconds between two cuts in a quiet section.
-#[cfg(test)]
-pub const QUIET_SECONDS: f32 = 24.0;
-/// Seconds between two cuts in a section that is neither quiet nor high.
-#[cfg(test)]
-pub const NORMAL_SECONDS: f32 = 16.0;
-/// Seconds between two cuts in a high section.
-#[cfg(test)]
-pub const HIGH_SECONDS: f32 = 10.0;
-/// The shortest time between any two cuts that are not inside one burst.
-#[cfg(test)]
-pub const GAP_SECONDS: f32 = 6.0;
-/// With a known next section start, how close to it a cadence cut waits for it.
-#[cfg(test)]
-pub const LEAD_SECONDS: f32 = 4.0;
 /// How much a calm pace stretches the seconds between cuts, and a busy one shortens them.
 pub const PACE_FACTOR: f32 = 1.5;
-/// Without a followed beat: how long past the time a cut is due it waits for a hit, then cuts at
-/// once.
-#[cfg(test)]
-pub const HIT_GRACE_SECONDS: f32 = 2.0;
-/// How much more energy the next section needs for the burst before it (the cue's own rule for a
-/// lift is the same, `scene::signals::CUE_LIFT`).
-#[cfg(test)]
-pub const FILL_LIFT: f32 = 0.1;
 /// Without a followed beat, how long a burst a scene lab started waits between its cuts.
 pub const FORCED_BURST_SECONDS: f32 = 0.25;
 /// The length of a phrase in a high section, in bars from the section's start.
@@ -1149,6 +1120,26 @@ impl Director {
 
 #[cfg(test)]
 mod tests {
+    /// A section whose energy is below this is quiet.
+    pub const QUIET_BELOW: f32 = 0.35;
+    /// A section whose energy is above this is high.
+    pub const HIGH_ABOVE: f32 = 0.71;
+    /// Seconds between two cuts in a quiet section.
+    pub const QUIET_SECONDS: f32 = 24.0;
+    /// Seconds between two cuts in a section that is neither quiet nor high.
+    pub const NORMAL_SECONDS: f32 = 16.0;
+    /// Seconds between two cuts in a high section.
+    pub const HIGH_SECONDS: f32 = 10.0;
+    /// The shortest time between any two cuts that are not inside one burst.
+    pub const GAP_SECONDS: f32 = 6.0;
+    /// With a known next section start, how close to it a cadence cut waits for it.
+    pub const LEAD_SECONDS: f32 = 4.0;
+    /// Without a followed beat: how long past the time a cut is due it waits for a hit, then cuts at
+    /// once.
+    pub const HIT_GRACE_SECONDS: f32 = 2.0;
+    /// How much more energy the next section needs for the burst before it (the cue's own rule for a
+    /// lift is the same, `scene::signals::CUE_LIFT`).
+    pub const FILL_LIFT: f32 = 0.1;
 
     use super::*;
     use crate::bind::RuntimeBindings;
