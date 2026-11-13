@@ -142,6 +142,9 @@ class PlaybackStatusProvider with ChangeNotifier {
         notifyListeners();
         _hasPendingNotification = false;
       });
+      // A post-frame callback runs only when a frame happens, and an idle
+      // window may not draw one.
+      SchedulerBinding.instance.scheduleFrame();
     }
   }
 

@@ -96,11 +96,80 @@ pub(crate) struct SubsonicBinding {
 #[derive(Clone, Debug, PartialEq)]
 struct JukeboxPollState {
     jukebox: SubsonicJukebox,
+    /// The cached cover of the current song when this state was published.
+    cover_art_path: Option<String>,
     // The server exposes no queue revision, so this local revision is best effort.
     revision: u64,
 }
 
+/// What differs from the jukebox state published before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JukeboxChange {
+    /// The queue or the playback status changed.
+    Queue,
+    /// Only the cover of the current song became available.
+    CoverOnly,
+}
+
+fn current_song(jukebox: &SubsonicJukebox) -> Option<&SubsonicSong> {
+    jukebox
+        .status
+        .current_index
+        .and_then(|index| jukebox.playlist.songs.get(index as usize))
+}
+
+fn current_cover_id(jukebox: &SubsonicJukebox) -> Option<&str> {
+    current_song(jukebox)?.cover_art.as_deref()
+}
+
+/// Remembers what was published. `None` means the state lock is poisoned;
+/// `Some((revision, None))` means nothing changed.
+fn record_jukebox(
+    state: &Mutex<Option<JukeboxPollState>>,
+    jukebox: &SubsonicJukebox,
+    cover_art_path: Option<String>,
+) -> Option<(u64, Option<JukeboxChange>)> {
+    let mut state = state.lock().ok()?;
+    let (revision, change) = match state.as_ref() {
+        Some(current)
+            if current.jukebox == *jukebox && current.cover_art_path == cover_art_path =>
+        {
+            return Some((current.revision, None));
+        }
+        Some(current) if current.jukebox == *jukebox => {
+            (current.revision, JukeboxChange::CoverOnly)
+        }
+        Some(current) => (current.revision.saturating_add(1), JukeboxChange::Queue),
+        None => (1, JukeboxChange::Queue),
+    };
+    *state = Some(JukeboxPollState {
+        jukebox: jukebox.clone(),
+        cover_art_path,
+        revision,
+    });
+    Some((revision, Some(change)))
+}
+
 fn broadcast_jukebox(
+    broadcaster: &dyn Broadcaster,
+    library_id: Uuid,
+    jukebox: &SubsonicJukebox,
+    revision: u64,
+    cover_art_path: Option<String>,
+    change: JukeboxChange,
+) {
+    if change == JukeboxChange::Queue {
+        broadcast_jukebox_queue(broadcaster, library_id, jukebox, revision);
+    }
+    broadcaster.broadcast(&jukebox_playback_status(
+        library_id,
+        jukebox,
+        None,
+        cover_art_path,
+    ));
+}
+
+fn broadcast_jukebox_queue(
     broadcaster: &dyn Broadcaster,
     library_id: Uuid,
     jukebox: &SubsonicJukebox,
@@ -128,19 +197,15 @@ fn broadcast_jukebox(
         session_id: session_id.clone(),
         revision,
     });
-
-    broadcaster.broadcast(&jukebox_playback_status(library_id, jukebox, None));
 }
 
 fn jukebox_playback_status(
     library_id: Uuid,
     jukebox: &SubsonicJukebox,
     feed_position: Option<(PlaybackState, f32)>,
+    cover_art_path: Option<String>,
 ) -> PlaybackStatus {
-    let current = jukebox
-        .status
-        .current_index
-        .and_then(|index| jukebox.playlist.songs.get(index as usize));
+    let current = current_song(jukebox);
     let polled_position = jukebox.status.position_secs.unwrap_or_default() as f32;
     let position = feed_position.map_or(polled_position, |(_, position)| position);
     let duration = current
@@ -181,7 +246,7 @@ fn jukebox_playback_status(
         }),
         playback_mode: 0,
         ready: current.is_some(),
-        cover_art_path: None,
+        cover_art_path,
         lib_path: String::new(),
     }
 }
@@ -447,6 +512,7 @@ impl SubsonicBinding {
         let client = Arc::clone(&self.client);
         let library_id = self.library_id;
         let broadcaster = Arc::clone(&self.covers.broadcaster);
+        let covers = Arc::clone(&self.covers);
         let binding_state = Arc::clone(&self.jukebox_state);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
@@ -465,20 +531,30 @@ impl SubsonicBinding {
                         };
                         match result {
                             Ok(jukebox) => {
-                                let changed = {
-                                    let Ok(mut previous) = binding_state.lock() else { continue; };
-                                    let revision = match previous.as_ref() {
-                                        Some(current) if current.jukebox == jukebox => continue,
-                                        Some(current) => current.revision.saturating_add(1),
-                                        None => 1,
-                                    };
-                                    *previous = Some(JukeboxPollState {
-                                        jukebox: jukebox.clone(),
-                                        revision,
-                                    });
-                                    revision
+                                let cover_id = current_cover_id(&jukebox);
+                                let cover = match cover_id {
+                                    Some(id) => covers.cached_path(id).await.ok().flatten(),
+                                    None => None,
                                 };
-                                broadcast_jukebox(&*broadcaster, library_id, &jukebox, changed);
+                                let Some((revision, Some(change))) =
+                                    record_jukebox(&binding_state, &jukebox, cover.clone())
+                                else {
+                                    continue;
+                                };
+                                if change == JukeboxChange::Queue
+                                    && cover.is_none()
+                                    && let Some(id) = cover_id
+                                {
+                                    covers.schedule(Arc::clone(&client), id.to_owned());
+                                }
+                                broadcast_jukebox(
+                                    &*broadcaster,
+                                    library_id,
+                                    &jukebox,
+                                    revision,
+                                    cover,
+                                    change,
+                                );
                             }
                             Err(error) => log::debug!("Subsonic jukebox status poll failed: {error}"),
                         }
@@ -510,12 +586,7 @@ impl SubsonicBinding {
         let Some(polled) = polled else {
             return;
         };
-        let current = polled
-            .jukebox
-            .status
-            .current_index
-            .and_then(|index| polled.jukebox.playlist.songs.get(index as usize));
-        let Some(current) = current else {
+        let Some(current) = current_song(&polled.jukebox) else {
             return;
         };
         let matches_current_track = matches!(
@@ -529,6 +600,7 @@ impl SubsonicBinding {
             self.library_id,
             &polled.jukebox,
             Some((status.state, status.progress_seconds)),
+            polled.cover_art_path.clone(),
         ));
     }
 
@@ -749,30 +821,28 @@ impl SubsonicBinding {
             .jukebox_get()
             .await
             .map_err(jukebox_error_for_refresh)?;
-        let (revision, changed) = {
-            let mut state = self
-                .jukebox_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Subsonic jukebox state lock poisoned"))?;
-            let (revision, changed) = match state.as_ref() {
-                Some(current) if current.jukebox == jukebox => (current.revision, false),
-                Some(current) => (current.revision.saturating_add(1), true),
-                None => (1, true),
-            };
-            if changed {
-                *state = Some(JukeboxPollState {
-                    jukebox: jukebox.clone(),
-                    revision,
-                });
-            }
-            (revision, changed)
+        let cover_id = current_cover_id(&jukebox);
+        let cover = match cover_id {
+            Some(id) => self.covers.cached_path(id).await.ok().flatten(),
+            None => None,
         };
-        if changed {
+        let (revision, change) = record_jukebox(&self.jukebox_state, &jukebox, cover.clone())
+            .ok_or_else(|| anyhow::anyhow!("Subsonic jukebox state lock poisoned"))?;
+        if let Some(change) = change {
+            if change == JukeboxChange::Queue
+                && cover.is_none()
+                && let Some(id) = cover_id
+            {
+                self.covers
+                    .schedule(Arc::clone(&self.client), id.to_owned());
+            }
             broadcast_jukebox(
                 &*self.covers.broadcaster,
                 self.library_id,
                 &jukebox,
                 revision,
+                cover,
+                change,
             );
         }
         Ok((jukebox, revision))
@@ -1075,6 +1145,8 @@ mod visualizer_feed_tests {
         release_cover: Arc<Notify>,
         delay_cover: Arc<AtomicBool>,
         fail_cover_once: Arc<AtomicBool>,
+        /// The cover id the jukebox's song carries, if any.
+        song_cover: Arc<Mutex<Option<String>>>,
     }
 
     #[derive(Clone)]
@@ -1278,6 +1350,7 @@ mod visualizer_feed_tests {
             release_cover: Arc::new(Notify::new()),
             delay_cover: Arc::new(AtomicBool::new(false)),
             fail_cover_once: Arc::new(AtomicBool::new(false)),
+            song_cover: Arc::new(Mutex::new(None)),
         };
         let app = Router::new()
             .route("/rest/{*endpoint}", get(http))
@@ -1331,7 +1404,8 @@ mod visualizer_feed_tests {
             "jukeboxControl" => {
                 let jukebox = state.jukebox.lock().unwrap().clone();
                 let current_index = jukebox.current_index.map(|index| format!(r#", "currentIndex": {index}"#)).unwrap_or_default();
-                let entry = if jukebox.has_song { format!(r#", "entry": {{"id":"{}","title":"{}","duration":{}}}"#, jukebox.song_id, jukebox.title, jukebox.duration) } else { String::new() };
+                let cover = state.song_cover.lock().unwrap().as_ref().map(|id| format!(r#","coverArt":"{id}""#)).unwrap_or_default();
+                let entry = if jukebox.has_song { format!(r#", "entry": {{"id":"{}","title":"{}","duration":{}{cover}}}"#, jukebox.song_id, jukebox.title, jukebox.duration) } else { String::new() };
                 format!(r#"{{"subsonic-response":{{"status":"ok","jukeboxPlaylist":{{"playing":{},"position":0{current_index}{entry}}}}}}}"#, jukebox.playing)
             }
             _ => r#"{"subsonic-response":{"status":"ok","jukeboxStatus":{"playing":false}}}"#.into(),
@@ -1521,6 +1595,58 @@ mod visualizer_feed_tests {
             .unwrap();
         assert!(result.is_some());
         assert_eq!(state.cover_calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn jukebox_status_carries_the_cover_once_it_is_cached() {
+        let (url, state, server) = server(true, false).await;
+        *state.song_cover.lock().unwrap() = Some("cover-1".into());
+        state.delay_cover.store(true, Ordering::SeqCst);
+        let root = TempDir::new().unwrap();
+        let signals = Arc::new(Signals::default());
+        let binding = open_binding(url, &root, signals.clone()).await;
+        binding.start_jukebox_polling();
+
+        // The status goes out while the cover fetch is still held back.
+        wait_until("a jukebox status for the song", || async {
+            Ok(signals
+                .playback_statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|status| status.title.as_deref() == Some("song"))
+                .then_some(()))
+        })
+        .await
+        .unwrap();
+        assert!(
+            signals
+                .playback_statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|status| status.cover_art_path.is_none())
+        );
+
+        state.release_cover.notify_one();
+        let expected = binding.covers.path_for("cover-1");
+        let path = wait_until("a jukebox status with the cover", || async {
+            Ok(signals
+                .playback_statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|status| status.cover_art_path.clone()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::path::Path::new(&path), expected);
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        assert_eq!(state.cover_calls.load(Ordering::SeqCst), 1);
+
+        binding.stop_jukebox_polling();
+        binding.covers.cancellation.cancel();
         server.abort();
     }
 
