@@ -1657,6 +1657,146 @@ async fn server_start_and_stop_failures_are_typed() -> Result<()> {
     Ok(())
 }
 
+/// The kind of a request failure, or an error naming the request that did not fail.
+fn refused_kind<T>(name: &str, result: Result<Option<T>>) -> Result<RequestErrorKind> {
+    match result {
+        Ok(_) => anyhow::bail!("{name} must fail"),
+        Err(error) => Ok(crate::request_error::classify(&error)),
+    }
+}
+
+#[tokio::test]
+async fn approving_or_blocking_an_unknown_device_is_not_found() -> Result<()> {
+    use crate::messages::{ClientStatus, DevicePreset, UpdateClientStatusRequest};
+
+    let node_dir = tempfile::tempdir()?;
+    let fixture = fixture(node_dir.path()).await?;
+    for (status, preset) in [
+        (ClientStatus::Blocked, None),
+        (ClientStatus::Approved, Some(DevicePreset::Guest)),
+    ] {
+        let request = UpdateClientStatusRequest {
+            call_id: None,
+            fingerprint: "unknown-device".into(),
+            status,
+            preset,
+        };
+        let result = request
+            .handle(request.extract_params(&fixture.global_params), None, &request)
+            .await;
+        assert_eq!(
+            refused_kind("UpdateClientStatusRequest", result)?,
+            RequestErrorKind::NotFound
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn connecting_without_a_reachable_host_is_typed() -> Result<()> {
+    use crate::messages::{ConnectRequest, FetchServerCertificateRequest};
+
+    let node_dir = tempfile::tempdir()?;
+    let fixture = fixture(node_dir.path()).await?;
+    let params = &fixture.global_params;
+    // Nothing listens on port 1 of this device.
+    for (hosts, kind) in [
+        (Vec::new(), RequestErrorKind::InvalidInput),
+        (vec!["127.0.0.1:1".to_owned()], RequestErrorKind::Unavailable),
+    ] {
+        let request = ConnectRequest {
+            call_id: None,
+            hosts,
+        };
+        let result = request
+            .handle(request.extract_params(params), None, &request)
+            .await;
+        assert_eq!(refused_kind("ConnectRequest", result)?, kind);
+    }
+    let request = FetchServerCertificateRequest {
+        call_id: None,
+        url: "https://127.0.0.1:1/ping".into(),
+    };
+    let result = request.handle((), None, &request).await;
+    assert_eq!(
+        refused_kind("FetchServerCertificateRequest", result)?,
+        RequestErrorKind::Unavailable
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_file_requests_that_cannot_be_served_are_typed() -> Result<()> {
+    use crate::messages::FetchRemoteFileRequest;
+
+    let node_dir = tempfile::tempdir()?;
+    let fixture = fixture(node_dir.path()).await?;
+    let digest = blake3::hash(b"cover").to_hex().to_string();
+    let library_id = Uuid::new_v4();
+    for (url, kind) in [
+        ("not a url".to_owned(), RequestErrorKind::InvalidInput),
+        (
+            format!("https://127.0.0.1:7863/files/library/{digest}"),
+            RequestErrorKind::InvalidInput,
+        ),
+        (
+            format!("https://127.0.0.1:7863/?library_id={library_id}"),
+            RequestErrorKind::InvalidInput,
+        ),
+        (
+            format!("https://127.0.0.1:7863/files/library/cover.jpg?library_id={library_id}"),
+            RequestErrorKind::InvalidInput,
+        ),
+        (
+            format!("https://untrusted.invalid/files/library/{digest}?library_id={library_id}"),
+            RequestErrorKind::PermissionDenied,
+        ),
+    ] {
+        let request = FetchRemoteFileRequest {
+            call_id: None,
+            url: url.clone(),
+        };
+        let result = request
+            .handle(request.extract_params(&fixture.global_params), None, &request)
+            .await;
+        assert_eq!(refused_kind(&url, result)?, kind, "{url}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn removing_trust_with_an_unreadable_trust_store_fails() -> Result<()> {
+    use crate::messages::{RemoveTrustedClientRequest, RemoveTrustedServerRequest};
+
+    let node_dir = tempfile::tempdir()?;
+    let fixture = fixture(node_dir.path()).await?;
+    let params = &fixture.global_params;
+    std::fs::write(node_dir.path().join(".known-servers"), "not [ a trust store")?;
+    let request = RemoveTrustedClientRequest {
+        call_id: None,
+        fingerprint: "some-device".into(),
+    };
+    let result = request
+        .handle(request.extract_params(params), None, &request)
+        .await;
+    assert_eq!(
+        refused_kind("RemoveTrustedClientRequest", result)?,
+        RequestErrorKind::Internal
+    );
+    let request = RemoveTrustedServerRequest {
+        call_id: None,
+        fingerprint: "some-device".into(),
+    };
+    let result = request
+        .handle(request.extract_params(params), None, &request)
+        .await;
+    assert_eq!(
+        refused_kind("RemoveTrustedServerRequest", result)?,
+        RequestErrorKind::Internal
+    );
+    Ok(())
+}
+
 async fn attach_test_cover(f: &Fixture, media_file_id: i32, bytes: &[u8]) -> Result<()> {
     let library = f.global_params.test_library();
     let hash = blake3::hash(bytes).to_hex().to_string();

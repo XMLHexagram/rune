@@ -902,7 +902,7 @@ mod access_policy_tests {
             call_id: None,
             fingerprint: fingerprint_b.clone(),
         };
-        let response = request
+        request
             .handle(
                 request.extract_params(&pair.a.global_params),
                 None,
@@ -910,7 +910,6 @@ mod access_policy_tests {
             )
             .await?
             .context("remove device response")?;
-        assert!(response.success, "{}", response.error);
 
         assert!(
             pair.a
@@ -1699,13 +1698,10 @@ mod access_policy_tests {
             status: ClientStatus::Approved,
             preset: Some(DevicePreset::Guest),
         };
-        assert!(
-            request
-                .handle(request.extract_params(&a.global_params), None, &request)
-                .await?
-                .context("approval")?
-                .success
-        );
+        request
+            .handle(request.extract_params(&a.global_params), None, &request)
+            .await?
+            .context("approval")?;
         assert_eq!(
             a.global_params.node.access_policy.grants(&fingerprint)?,
             DeviceGrants::guest()

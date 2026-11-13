@@ -1,3 +1,4 @@
+use crate::access_policy::Denial;
 use crate::node::NodeContext;
 use crate::request_error::ExpectedRequestError;
 use crate::server::api::remove_trusted_device;
@@ -28,6 +29,7 @@ use url::Url;
 use uuid::Uuid;
 
 use ::database::actions::cover_art::COVER_TEMP_DIR;
+use ::database::error::ExpectedError;
 use ::discovery::{
     DiscoveryParams,
     client::{
@@ -35,7 +37,7 @@ use ::discovery::{
     },
     endpoint::{DEFAULT_DEVICE_PORT, DeviceAddress, DeviceScheme},
     protocol::DiscoveryService,
-    server::{PermissionManager, UserStatus},
+    server::{PermissionError, PermissionManager, UserStatus},
 };
 
 use crate::utils::{GlobalParams, ParamsExtractor};
@@ -499,22 +501,10 @@ impl Signal for RemoveTrustedClientRequest {
         let result = remove_trusted_device(&permissions, &validator, &req.fingerprint).await;
         drop(validator);
         drop(permissions);
-        if result.is_ok() {
-            node.sync_tokens.remove_peer(&req.fingerprint);
-            node.revoke_outgoing_for(&req.fingerprint).await;
-        }
-        match result {
-            Ok(_) => Ok(Some(RemoveTrustedClientResponse {
-                call_id: None,
-                success: true,
-                error: String::new(),
-            })),
-            Err(e) => Ok(Some(RemoveTrustedClientResponse {
-                call_id: None,
-                success: false,
-                error: format!("{e:#?}"),
-            })),
-        }
+        result?;
+        node.sync_tokens.remove_peer(&req.fingerprint);
+        node.revoke_outgoing_for(&req.fingerprint).await;
+        Ok(Some(RemoveTrustedClientResponse { call_id: None }))
     }
 }
 
@@ -654,45 +644,36 @@ impl Signal for UpdateClientStatusRequest {
         _session: Option<Session>,
         message: &Self,
     ) -> Result<Option<Self::Response>> {
-        let result = async {
-            let permissions = permission_manager.permission_manager.write().await;
-            // Install a chosen preset before approval becomes visible to transports.
-            if matches!(message.status, ClientStatus::Approved)
-                && let Some(preset) = message.preset
-            {
-                permissions
-                    .verify_by_fingerprint(&message.fingerprint)
-                    .await
-                    .context("Device not found")?;
-                permission_manager
-                    .access_policy
-                    .set(&message.fingerprint, preset.grants())?;
-            }
+        let permissions = permission_manager.permission_manager.write().await;
+        // Install a chosen preset before approval becomes visible to transports.
+        if matches!(message.status, ClientStatus::Approved)
+            && let Some(preset) = message.preset
+        {
             permissions
-                .change_user_status(
-                    &message.fingerprint,
-                    match message.status {
-                        ClientStatus::Approved => UserStatus::Approved,
-                        ClientStatus::Pending => UserStatus::Pending,
-                        ClientStatus::Blocked => UserStatus::Blocked,
-                    },
-                )
-                .await?;
-            Ok::<(), anyhow::Error>(())
+                .verify_by_fingerprint(&message.fingerprint)
+                .await
+                .ok_or(ExpectedError::NotFound { what: "device" })?;
+            permission_manager
+                .access_policy
+                .set(&message.fingerprint, preset.grants())?;
         }
-        .await;
-        match result {
-            Ok(_) => Ok(Some(UpdateClientStatusResponse {
-                call_id: None,
-                success: true,
-                error: String::new(),
-            })),
-            Err(e) => Ok(Some(UpdateClientStatusResponse {
-                call_id: None,
-                success: false,
-                error: format!("{e:#?}"),
-            })),
-        }
+        permissions
+            .change_user_status(
+                &message.fingerprint,
+                match message.status {
+                    ClientStatus::Approved => UserStatus::Approved,
+                    ClientStatus::Pending => UserStatus::Pending,
+                    ClientStatus::Blocked => UserStatus::Blocked,
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                PermissionError::UserNotFound => {
+                    anyhow::Error::new(ExpectedError::NotFound { what: "device" })
+                }
+                error => anyhow::Error::new(error),
+            })?;
+        Ok(Some(UpdateClientStatusResponse { call_id: None }))
     }
 }
 
@@ -751,11 +732,7 @@ impl Signal for AddTrustedServerRequest {
             );
         }
 
-        Ok(Some(AddTrustedServerResponse {
-            call_id: None,
-            success: true,
-            error: String::new(),
-        }))
+        Ok(Some(AddTrustedServerResponse { call_id: None }))
     }
 }
 
@@ -782,22 +759,10 @@ impl Signal for RemoveTrustedServerRequest {
         let result = remove_trusted_device(&permissions, &validator, &req.fingerprint).await;
         drop(validator);
         drop(permissions);
-        if result.is_ok() {
-            node.sync_tokens.remove_peer(&req.fingerprint);
-            node.revoke_outgoing_for(&req.fingerprint).await;
-        }
-        match result {
-            Ok(_) => Ok(Some(RemoveTrustedServerResponse {
-                call_id: None,
-                success: true,
-                error: String::new(),
-            })),
-            Err(e) => Ok(Some(RemoveTrustedServerResponse {
-                call_id: None,
-                success: false,
-                error: format!("{e:#?}"),
-            })),
-        }
+        result?;
+        node.sync_tokens.remove_peer(&req.fingerprint);
+        node.revoke_outgoing_for(&req.fingerprint).await;
+        Ok(Some(RemoveTrustedServerResponse { call_id: None }))
     }
 }
 
@@ -844,11 +809,7 @@ impl Signal for RegisterDeviceOnServerRequest {
             run_mode.device_type(),
         )
         .await?;
-        Ok(Some(RegisterDeviceOnServerResponse {
-            call_id: None,
-            success: true,
-            error: String::new(),
-        }))
+        Ok(Some(RegisterDeviceOnServerResponse { call_id: None }))
     }
 }
 
@@ -892,9 +853,7 @@ impl Signal for CheckDeviceOnServerRequest {
 
                 Ok(Some(CheckDeviceOnServerResponse {
                     call_id: None,
-                    success: true,
-                    error: String::new(),
-                    status: Some(status),
+                    status,
                 }))
             }
             Err(_) => Err(ExpectedRequestError::CertificateMismatch.into()),
@@ -938,9 +897,7 @@ impl Signal for ConnectRequest {
                 Ok(Ok(host)) => {
                     return Ok(Some(ConnectResponse {
                         call_id: None,
-                        success: true,
                         connected_host: host,
-                        error: String::new(),
                     }));
                 }
                 Ok(Err(e)) => last_err = Some(e),
@@ -948,12 +905,13 @@ impl Signal for ConnectRequest {
             }
         }
 
-        Ok(Some(ConnectResponse {
-            call_id: None,
-            success: false,
-            connected_host: String::new(),
-            error: last_err.map(|e| e.to_string()).unwrap_or_default(),
-        }))
+        let unreachable = anyhow::Error::new(ExpectedRequestError::Unavailable {
+            what: "remote device",
+        });
+        Err(match last_err {
+            Some(error) => unreachable.context(error),
+            None => ExpectedRequestError::invalid_input("No host to connect to").into(),
+        })
     }
 }
 
@@ -973,20 +931,16 @@ impl Signal for FetchServerCertificateRequest {
         _session: Option<Session>,
         req: &Self,
     ) -> Result<Option<Self::Response>> {
-        match fetch_server_certificate(&req.url).await {
-            Ok(cert) => Ok(Some(FetchServerCertificateResponse {
-                call_id: None,
-                success: true,
-                fingerprint: cert.fingerprint,
-                error: String::new(),
-            })),
-            Err(e) => Ok(Some(FetchServerCertificateResponse {
-                call_id: None,
-                success: false,
-                fingerprint: String::new(),
-                error: format!("{e:#?}"),
-            })),
-        }
+        let certificate = fetch_server_certificate(&req.url).await.map_err(|error| {
+            anyhow::Error::new(ExpectedRequestError::Unavailable {
+                what: "remote device certificate",
+            })
+            .context(error)
+        })?;
+        Ok(Some(FetchServerCertificateResponse {
+            call_id: None,
+            fingerprint: certificate.fingerprint,
+        }))
     }
 }
 
@@ -1094,128 +1048,71 @@ impl Signal for FetchRemoteFileRequest {
         req: &Self,
     ) -> Result<Option<Self::Response>> {
         let validator = params.validator.read().await.clone();
-
-        // Parse the URL to extract host, port, and path
-        let url = match Url::parse(&req.url) {
-            Ok(url) => url,
-            Err(e) => {
-                return Ok(Some(FetchRemoteFileResponse {
-                    call_id: None,
-                    success: false,
-                    local_path: String::new(),
-                    error: format!("Invalid URL: {e}"),
-                }));
-            }
+        let invalid =
+            |detail: &str| anyhow::Error::new(ExpectedRequestError::invalid_input(detail));
+        let unavailable = |error: anyhow::Error| {
+            anyhow::Error::new(ExpectedRequestError::Unavailable {
+                what: "remote file",
+            })
+            .context(error)
         };
 
-        // Extract hostname and port
-        let host = match url.host_str() {
-            Some(host) => host.to_string(),
-            None => {
-                return Ok(Some(FetchRemoteFileResponse {
-                    call_id: None,
-                    success: false,
-                    local_path: String::new(),
-                    error: "Missing host in URL".to_string(),
-                }));
-            }
-        };
-
+        let url =
+            Url::parse(&req.url).map_err(|error| invalid(&format!("Invalid URL: {error}")))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| invalid("Missing host in URL"))?
+            .to_string();
         let address = (url.scheme() == "https")
             .then(|| {
                 url.host_str().and_then(|host| {
                     DeviceAddress::new(host, url.port().unwrap_or(DEFAULT_DEVICE_PORT)).ok()
                 })
             })
-            .flatten();
-        let Some(address) = address else {
-            return Ok(Some(FetchRemoteFileResponse {
-                call_id: None,
-                success: false,
-                local_path: String::new(),
-                error: "Remote file URL must be an HTTPS URL with a valid port".to_string(),
-            }));
-        };
+            .flatten()
+            .ok_or_else(|| invalid("Remote file URL must be an HTTPS URL with a valid port"))?;
         let port = address.port();
-
         let library_id = url
             .query_pairs()
             .find(|(name, _)| name == "library_id")
-            .and_then(|(_, value)| Uuid::parse_str(&value).ok());
-        let Some(library_id) = library_id else {
-            return Ok(Some(FetchRemoteFileResponse {
-                call_id: None,
-                success: false,
-                local_path: String::new(),
-                error: "Remote file URL must include a valid library_id".to_string(),
-            }));
-        };
+            .and_then(|(_, value)| Uuid::parse_str(&value).ok())
+            .ok_or_else(|| invalid("Remote file URL must include a valid library_id"))?;
 
         // Extract the file name from the URL path
-        let path = url.path();
-        let file_name = Path::new(path)
+        let file_name = Path::new(url.path())
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_owned();
-
         if file_name.is_empty() {
-            return Ok(Some(FetchRemoteFileResponse {
-                call_id: None,
-                success: false,
-                local_path: String::new(),
-                error: "Invalid file path in URL".to_string(),
-            }));
+            return Err(invalid("Invalid file path in URL"));
         }
-
         if file_name.len() != 64 || !file_name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Ok(Some(FetchRemoteFileResponse {
-                call_id: None,
-                success: false,
-                local_path: String::new(),
-                error: "Remote cover file name must be a BLAKE3 digest".to_string(),
-            }));
+            return Err(invalid("Remote cover file name must be a BLAKE3 digest"));
         }
 
         // Authenticate the peer before a cached response can be returned.
-        let server_fingerprint = match trusted_fingerprint(&validator, &host, port).await {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                return Ok(Some(FetchRemoteFileResponse {
-                    call_id: None,
-                    success: false,
-                    local_path: String::new(),
-                    error: format!("Failed to authorize remote host: {error:#}"),
-                }));
-            }
-        };
+        let server_fingerprint = trusted_fingerprint(&validator, &host, port)
+            .await
+            .map_err(|error| anyhow::Error::new(Denial::Untrusted).context(error))?;
 
         let local_path =
             remote_file_cache_path(&COVER_TEMP_DIR, &server_fingerprint, library_id, &file_name);
         let cache_dir = local_path
             .parent()
             .context("remote file cache path has no parent")?;
-        if let Err(e) = fs::create_dir_all(cache_dir) {
-            return Ok(Some(FetchRemoteFileResponse {
-                call_id: None,
-                success: false,
-                local_path: String::new(),
-                error: format!("Failed to create temp directory: {e}"),
-            }));
-        }
+        fs::create_dir_all(cache_dir).context("Failed to create the remote file cache")?;
 
         // The host is a trusted peer (checked above) and the name is content-addressed
         // within that peer and library, so a cached copy needs no new download.
         if local_path.exists() {
             return Ok(Some(FetchRemoteFileResponse {
                 call_id: None,
-                success: true,
                 local_path: local_path.to_string_lossy().into_owned(),
-                error: String::new(),
             }));
         }
 
-        let res = match authorized_get(
+        let res = authorized_get(
             &params.config_path,
             validator,
             &params.sync_tokens,
@@ -1224,60 +1121,37 @@ impl Signal for FetchRemoteFileRequest {
             url,
         )
         .await
-        {
-            Ok(res) => res,
-            Err(e) => {
-                return Ok(Some(FetchRemoteFileResponse {
-                    call_id: None,
-                    success: false,
-                    local_path: String::new(),
-                    error: format!("Failed to fetch remote file: {e:#}"),
-                }));
-            }
-        };
+        .map_err(unavailable)?;
+        remote_file_status(res.status())?;
+        let body = res
+            .bytes()
+            .await
+            .map_err(|error| unavailable(error.into()))?;
+        let published_path =
+            publish_verified_remote_file(cache_dir, &file_name, &body).map_err(unavailable)?;
 
-        if !res.status().is_success() {
-            return Ok(Some(FetchRemoteFileResponse {
-                call_id: None,
-                success: false,
-                local_path: String::new(),
-                error: format!("HTTP request failed with status: {}", res.status()),
-            }));
-        }
-
-        // Read the response body
-        let body = match res.bytes().await {
-            Ok(body) => body,
-            Err(e) => {
-                return Ok(Some(FetchRemoteFileResponse {
-                    call_id: None,
-                    success: false,
-                    local_path: String::new(),
-                    error: format!("Failed to read response body: {e}"),
-                }));
-            }
-        };
-
-        let published_path = match publish_verified_remote_file(cache_dir, &file_name, &body) {
-            Ok(path) => path,
-            Err(error) => {
-                return Ok(Some(FetchRemoteFileResponse {
-                    call_id: None,
-                    success: false,
-                    local_path: String::new(),
-                    error: format!("Failed to verify or publish remote file: {error:#}"),
-                }));
-            }
-        };
-
-        // Return the successful response with the local file path
         Ok(Some(FetchRemoteFileResponse {
             call_id: None,
-            success: true,
             local_path: published_path.to_string_lossy().into_owned(),
-            error: String::new(),
         }))
     }
+}
+
+/// The typed failure for a peer's answer to a remote file download.
+fn remote_file_status(status: reqwest::StatusCode) -> Result<()> {
+    let error = match status {
+        status if status.is_success() => return Ok(()),
+        reqwest::StatusCode::NOT_FOUND => anyhow::Error::new(ExpectedError::NotFound {
+            what: "remote file",
+        }),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            anyhow::Error::new(Denial::Untrusted)
+        }
+        _ => anyhow::Error::new(ExpectedRequestError::Unavailable {
+            what: "remote file",
+        }),
+    };
+    Err(error.context(format!("HTTP request failed with status: {status}")))
 }
 
 #[cfg(test)]
@@ -1320,6 +1194,25 @@ mod remote_file_cache_tests {
         assert!(peer_x.ends_with(format!("peer-x/{library_id}/{file_name}")));
         assert!(peer_y.ends_with(format!("peer-y/{library_id}/{file_name}")));
         Ok(())
+    }
+
+    #[test]
+    fn a_refused_download_is_typed_by_its_status() {
+        use super::remote_file_status;
+        use crate::messages::RequestErrorKind;
+        use crate::request_error::classify;
+        use reqwest::StatusCode;
+
+        assert!(remote_file_status(StatusCode::OK).is_ok());
+        for (status, kind) in [
+            (StatusCode::NOT_FOUND, RequestErrorKind::NotFound),
+            (StatusCode::UNAUTHORIZED, RequestErrorKind::PermissionDenied),
+            (StatusCode::FORBIDDEN, RequestErrorKind::PermissionDenied),
+            (StatusCode::BAD_GATEWAY, RequestErrorKind::Unavailable),
+        ] {
+            let error = remote_file_status(status).expect_err("a refused download fails");
+            assert_eq!(classify(&error), kind, "{status}");
+        }
     }
 
     #[test]

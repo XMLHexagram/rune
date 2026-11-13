@@ -3165,6 +3165,7 @@ mod lifecycle_tests {
     async fn remote_control_and_file_fetch_end_to_end() -> Result<()> {
         use crate::backends::remote::{connect_remote, encode_message, encode_request};
         use crate::handlers::neighbors::authorized_get;
+        use crate::request_error::classify;
         use futures::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
         use url::Url;
@@ -3262,16 +3263,25 @@ mod lifecycle_tests {
         .await?;
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.bytes().await?.as_ref(), bytes);
-        for url in [
-            format!("http://127.0.0.1:{}/files/library/{name}", addr.port()),
-            format!("https://untrusted.invalid/files/library/{name}"),
+        for (url, kind) in [
+            (
+                format!("http://127.0.0.1:{}/files/library/{name}", addr.port()),
+                RequestErrorKind::InvalidInput,
+            ),
+            (
+                format!("https://untrusted.invalid/files/library/{name}"),
+                RequestErrorKind::InvalidInput,
+            ),
         ] {
             let request = FetchRemoteFileRequest { call_id: None, url };
-            let response = request
+            let error = match request
                 .handle(request.extract_params(&b.global_params), None, &request)
-                .await?
-                .context("missing response")?;
-            assert!(!response.success, "unexpected success for {}", request.url);
+                .await
+            {
+                Ok(_) => anyhow::bail!("unexpected success for {}", request.url),
+                Err(error) => error,
+            };
+            assert_eq!(classify(&error), kind, "{}: {error:#}", request.url);
         }
         a.global_params
             .permission_manager
