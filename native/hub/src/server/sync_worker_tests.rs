@@ -1,6 +1,7 @@
 use super::*;
 use crate::library_pool::{LibraryHandle, LibraryResources};
 use crate::node::NodeContext;
+use crate::server::utils::device::RunMode;
 use crate::test_wait::{TEST_DEADLINE, wait_until};
 use crate::utils::{Broadcaster, RinfRustSignal};
 use database::connection::RecommendationDbConnection;
@@ -375,7 +376,7 @@ async fn register_worker_library(
 ) -> Result<(Arc<NodeContext>, Arc<QuietBroadcaster>, LibraryHandle)> {
     let path = directory.path().to_string_lossy().into_owned();
     let broadcaster = Arc::new(QuietBroadcaster::default());
-    let node = NodeContext::new(&path, &path, broadcaster.clone(), false).await?;
+    let node = NodeContext::new(&path, &path, broadcaster.clone(), false, RunMode::App).await?;
     let record = test_record(namespace);
     std::fs::write(
         directory.path().join("libraries.json"),
@@ -916,7 +917,7 @@ async fn share_worker_skips_redirected_catalog_before_opening_a_store() -> Resul
     let directory = tempfile::tempdir()?;
     let path = directory.path().to_string_lossy().into_owned();
     let broadcaster = Arc::new(QuietBroadcaster::default());
-    let node = NodeContext::new(&path, &path, broadcaster, false).await?;
+    let node = NodeContext::new(&path, &path, broadcaster, false, RunMode::App).await?;
     std::fs::write(
         directory.path().join("libraries.json"),
         serde_json::to_vec(&json!({

@@ -9,6 +9,7 @@ use rustls::ClientConfig;
 use ::discovery::{
     client::{fetch_server_certificate, parse_certificate},
     config::get_config_dir,
+    utils::DeviceType,
 };
 
 use discovery::endpoint::{DeviceAddress, DeviceScheme};
@@ -172,7 +173,7 @@ pub async fn register_current_device(host: &str, config: Arc<ClientConfig>) -> R
         fingerprint,
         certificate_id,
         "RuneAudio".to_owned(),
-        "Headless".to_owned(),
+        DeviceType::Headless,
     )
     .await?;
 

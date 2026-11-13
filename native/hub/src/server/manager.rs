@@ -844,7 +844,7 @@ mod lifecycle_tests {
     use super::super::sync_worker::{
         PeerEndpoint, PeerPass, TestPeerSession, authenticated_client, test_peer_pass,
     };
-    use super::super::utils::device::load_device_info;
+    use super::super::utils::device::RunMode;
     use crate::Signal;
     use crate::macros::{RequestScope, dispatch_remote, request_scope};
     use crate::messages::*;
@@ -1112,6 +1112,25 @@ mod lifecycle_tests {
         broadcaster: Arc<dyn Broadcaster>,
         reconnect_config: ReconnectConfig,
     ) -> Result<Fixture> {
+        fixture_with_run_mode(
+            dir,
+            library_id,
+            idle_timeout,
+            broadcaster,
+            reconnect_config,
+            RunMode::App,
+        )
+        .await
+    }
+
+    async fn fixture_with_run_mode(
+        dir: &Path,
+        library_id: Uuid,
+        idle_timeout: Duration,
+        broadcaster: Arc<dyn Broadcaster>,
+        reconnect_config: ReconnectConfig,
+        run_mode: RunMode,
+    ) -> Result<Fixture> {
         use database::credentials::CredentialStore;
 
         fs::create_dir_all(dir.join(".rune"))?;
@@ -1151,6 +1170,7 @@ mod lifecycle_tests {
             dir.to_str().context("db path")?,
             broadcaster,
             false,
+            run_mode,
             reconnect_config,
         )
         .await?;
@@ -1189,7 +1209,7 @@ mod lifecycle_tests {
     async fn reopen_fixture(original: &Fixture) -> Result<Fixture> {
         original.global_params.node.shutdown().await?;
         let config = &original.global_params.config_path;
-        let node = NodeContext::new(config, config, Arc::new(Quiet), false).await?;
+        let node = NodeContext::new(config, config, Arc::new(Quiet), false, RunMode::App).await?;
         let library = node
             .library_pool
             .acquire_ui(original.global_params.library_id.context("library")?)
@@ -1348,7 +1368,7 @@ mod lifecycle_tests {
     }
 
     async fn info(manager: &Fixture) -> Result<discovery::utils::DeviceInfo> {
-        load_device_info(Path::new(&*manager.global_params.config_path)).await
+        manager.global_params.node.device_info().await
     }
 
     async fn start_test_tls_server(fixture: &Fixture) -> Result<(SocketAddr, String)> {
@@ -1937,7 +1957,12 @@ mod lifecycle_tests {
             config_path: first.path().to_string_lossy().into_owned(),
         };
         let node = slot
-            .initialize(&request.config_path, &request.config_path, Arc::new(Quiet))
+            .initialize(
+                &request.config_path,
+                &request.config_path,
+                Arc::new(Quiet),
+                RunMode::App,
+            )
             .await?;
         let worker = node
             .manager()?
@@ -1952,7 +1977,12 @@ mod lifecycle_tests {
             assert!(response.success);
             assert!(response.error_kind.is_none());
             let same = slot
-                .initialize(&request.config_path, &request.config_path, Arc::new(Quiet))
+                .initialize(
+                    &request.config_path,
+                    &request.config_path,
+                    Arc::new(Quiet),
+                    RunMode::App,
+                )
                 .await?;
             assert!(Arc::ptr_eq(&node, &same));
             assert_eq!(
@@ -2664,6 +2694,63 @@ mod lifecycle_tests {
                 addr.port()
             ))
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_server_announces_itself_as_a_server_with_the_app_version() -> Result<()> {
+        use crate::server::api::fetch_device_info_at_port;
+        use crate::server::utils::device::APP_VERSION;
+        use discovery::protocol::announcement_message;
+        use discovery::utils::DeviceType;
+
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let server = fixture_with_run_mode(
+            first.path(),
+            Uuid::new_v4(),
+            Duration::from_secs(300),
+            Arc::new(Quiet),
+            ReconnectConfig::default(),
+            RunMode::Server,
+        )
+        .await?;
+        let viewer = fixture(second.path()).await?;
+        let addr = paired_full(&server, &viewer).await?;
+
+        // The device information the viewer fetches over its pinned connection.
+        let validator = viewer.global_params.cert_validator.read().await.clone();
+        let fetched = fetch_device_info_at_port(
+            "127.0.0.1",
+            addr.port(),
+            Arc::new(Arc::new(validator).into_client_config()),
+        )
+        .await?;
+        assert_eq!(fetched.device_type, DeviceType::Server);
+        assert_eq!(fetched.version, APP_VERSION);
+
+        // The multicast announcement the viewer lists the device from.
+        let announced = announcement_message(&server.global_params.node.device_info().await?);
+        viewer
+            .global_params
+            .device_scanner
+            .observe_announcement(
+                &serde_json::to_vec(&announced)?,
+                "192.0.2.10:57863".parse()?,
+                None,
+            )
+            .await?;
+        let request = GetDiscoveredDeviceRequest { call_id: None };
+        let response = request
+            .handle(
+                Arc::clone(&viewer.global_params.device_scanner),
+                None,
+                &request,
+            )
+            .await?
+            .context("discovered devices")?;
+        assert_eq!(response.devices.len(), 1);
+        assert_eq!(response.devices[0].device_type, DeviceTypeMessage::Server);
         Ok(())
     }
 
@@ -3923,6 +4010,7 @@ mod lifecycle_tests {
             first.path().to_str().context("db path")?,
             Arc::new(WebSocketService::new()),
             false,
+            RunMode::App,
         )
         .await?;
         let library = node

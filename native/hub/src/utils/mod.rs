@@ -459,7 +459,11 @@ impl NodeRequestHandlers for ProductionNodeRequestHandlers {
                 .cloned()
                 .context("Server manager is not initialized")?;
             request
-                .handle((node.config_path.clone(), manager), None, request)
+                .handle(
+                    (node.config_path.clone(), manager, node.run_mode),
+                    None,
+                    request,
+                )
                 .await
         }
     }
@@ -489,7 +493,11 @@ impl NodeRequestHandlers for ProductionNodeRequestHandlers {
             let node = node.current().await?;
             request
                 .handle(
-                    (Arc::clone(&node.device_scanner), node.config_path.clone()),
+                    (
+                        Arc::clone(&node.device_scanner),
+                        node.config_path.clone(),
+                        node.run_mode,
+                    ),
                     None,
                     request,
                 )
@@ -648,6 +656,7 @@ impl NodeRequestHandlers for ProductionNodeRequestHandlers {
                         Arc::clone(&node.sync_settings),
                         node.config_path.clone(),
                         node.server_manager.get().cloned(),
+                        node.run_mode,
                     ),
                     None,
                     request,
@@ -735,7 +744,11 @@ impl NodeRequestHandlers for ProductionNodeRequestHandlers {
             let node = node.current().await?;
             request
                 .handle(
-                    (node.config_path.clone(), Arc::clone(&node.cert_validator)),
+                    (
+                        node.config_path.clone(),
+                        Arc::clone(&node.cert_validator),
+                        node.run_mode,
+                    ),
                     None,
                     request,
                 )
@@ -2628,6 +2641,7 @@ pub fn init_logging() {
 mod moved_node_request_tests {
     use std::{sync::Arc, time::Duration};
 
+    use crate::server::utils::device::RunMode;
     use anyhow::Result;
     use database::library_registry::{
         CatalogPlacement, FsAdapter, LibraryRecord, LibraryRecordId, LibraryRegistry,
@@ -2655,7 +2669,9 @@ mod moved_node_request_tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().to_string_lossy().into_owned();
         let node_slot = NodeSlot::new();
-        let node = node_slot.initialize(&path, &path, Arc::new(Quiet)).await?;
+        let node = node_slot
+            .initialize(&path, &path, Arc::new(Quiet), RunMode::App)
+            .await?;
         let handlers = ProductionNodeRequestHandlers::new(Arc::new(Mutex::new(
             ScrobblingManager::new(10, Duration::from_secs(5)),
         )));

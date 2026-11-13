@@ -5,8 +5,6 @@ use super::sync::client::fetch_missing;
 use super::sync::downloads::{DownloadAudioContext, download_requested_audio_until};
 use super::sync::{library_base, library_notification};
 use super::sync_auth::{Authorization, Challenge, TOKEN_TTL, Token, message};
-#[cfg(test)]
-use super::utils::device::load_device_info;
 use crate::access_policy::{Action, ConnectionLevel, SyncLevel};
 use crate::messages::{LibrarySyncStatusUpdated, ShareSyncFailure};
 #[cfg(test)]
@@ -1186,9 +1184,7 @@ impl TestPeerSession {
     ) -> Result<PeerPass> {
         let global = params.node.clone();
         let credentials = LocalCredentials {
-            fingerprint: load_device_info(Path::new(&*global.config_path))
-                .await?
-                .fingerprint,
+            fingerprint: global.device_info().await?.fingerprint,
             private_key: private_key.into(),
         };
         let library = global

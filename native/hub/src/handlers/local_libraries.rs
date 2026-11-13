@@ -329,6 +329,7 @@ impl Signal for SetLibraryBackgroundSyncRequest {
 #[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
+    use crate::server::utils::device::RunMode;
     use crate::utils::LocalGuiBroadcaster;
     use database::{
         connection::StorageMode,
@@ -381,7 +382,14 @@ mod tests {
     async fn list_and_set_local_library_options() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let config = Arc::new(dir.path().to_string_lossy().into_owned());
-        let node = NodeContext::new(&config, &config, Arc::new(LocalGuiBroadcaster), false).await?;
+        let node = NodeContext::new(
+            &config,
+            &config,
+            Arc::new(LocalGuiBroadcaster),
+            false,
+            RunMode::App,
+        )
+        .await?;
         assert!(list(&config).await?.is_empty());
         let (owned, replica) = register(dir.path(), Uuid::new_v4()).await?;
         let libraries = list(&config).await?;

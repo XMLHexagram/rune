@@ -7,7 +7,7 @@ use crate::{
         LibraryContentChanged, RemoveDownloadRuleRequest, RemoveDownloadRuleResponse,
         SetDownloadRuleRequest, SetDownloadRuleResponse,
     },
-    server::utils::device::load_device_info,
+    server::utils::device::{RunMode, load_device_info},
     utils::{
         Broadcaster, GlobalParams, ParamsExtractor, require_library, sync_settings::SyncSettings,
     },
@@ -163,12 +163,14 @@ impl ParamsExtractor for crate::messages::SetSyncSettingsRequest {
         Arc<tokio::sync::RwLock<SyncSettings>>,
         Arc<String>,
         Option<Arc<crate::server::ServerManager>>,
+        RunMode,
     );
     fn extract_params(&self, params: &GlobalParams) -> Self::Params {
         (
             params.sync_settings.clone(),
             params.config_path.clone(),
             params.server_manager.get().cloned(),
+            params.node.run_mode,
         )
     }
 }
@@ -177,11 +179,12 @@ impl Signal for crate::messages::SetSyncSettingsRequest {
         Arc<tokio::sync::RwLock<SyncSettings>>,
         Arc<String>,
         Option<Arc<crate::server::ServerManager>>,
+        RunMode,
     );
     type Response = crate::messages::SetSyncSettingsResponse;
     async fn handle(
         &self,
-        (settings, config, manager): Self::Params,
+        (settings, config, manager, run_mode): Self::Params,
         _: Option<Session>,
         request: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -201,7 +204,7 @@ impl Signal for crate::messages::SetSyncSettingsRequest {
                 })?;
                 if request.listen {
                     if !manager.is_running() {
-                        let info = load_device_info(Path::new(&**config)).await?;
+                        let info = load_device_info(Path::new(&**config), run_mode).await?;
                         manager
                             .start_sync(
                                 ([0, 0, 0, 0], DEFAULT_DEVICE_PORT).into(),

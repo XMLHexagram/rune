@@ -1,5 +1,6 @@
 use super::gui_listener_tests::start;
 use anyhow::Context;
+use crate::server::utils::device::RunMode;
 use crate::Session;
 use crate::macros::{
     RequestAccess, RequestScope, RequestSlots, capability_snapshot, request_scope,
@@ -1133,7 +1134,7 @@ async fn assert_node_threads_stop(case: &str) -> Result<()> {
         node
     } else {
         let path = dir.path().to_str().context("node path")?;
-        NodeContext::new(path, path, Arc::new(Quiet), false).await?
+        NodeContext::new(path, path, Arc::new(Quiet), false, RunMode::App).await?
     };
     let session = node.session()?;
     let weak = Arc::downgrade(&node);
@@ -5770,6 +5771,7 @@ async fn session_c2a_revision_conflicts_and_identity_persist() -> Result<()> {
         &fixture.global_params.config_path,
         Arc::new(Quiet),
         false,
+        RunMode::App,
     )
     .await?;
     assert_eq!(reopened.session()?.session_id().await, session_id);

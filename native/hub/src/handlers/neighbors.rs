@@ -8,7 +8,7 @@ use crate::server::{
     sync_worker::{
         SyncTokenStore, obtain_or_reuse_token, peer_base, tls_config, trusted_fingerprint,
     },
-    utils::device::load_device_info,
+    utils::device::{RunMode, local_device_info},
 };
 use std::net::{IpAddr, SocketAddr};
 use std::{
@@ -36,7 +36,6 @@ use ::discovery::{
     endpoint::{DEFAULT_DEVICE_PORT, DeviceAddress, DeviceScheme},
     protocol::DiscoveryService,
     server::{PermissionManager, UserStatus},
-    utils::{DeviceInfo, DeviceType},
 };
 
 use crate::utils::{GlobalParams, ParamsExtractor};
@@ -94,23 +93,24 @@ pub(crate) async fn select_pinned_pair_host(
 }
 
 impl ParamsExtractor for StartBroadcastRequest {
-    type Params = (Arc<DiscoveryService>, Arc<String>);
+    type Params = (Arc<DiscoveryService>, Arc<String>, RunMode);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
         (
             Arc::clone(&all_params.device_scanner),
             Arc::clone(&all_params.config_path),
+            all_params.node.run_mode,
         )
     }
 }
 
 impl Signal for StartBroadcastRequest {
-    type Params = (Arc<DiscoveryService>, Arc<String>);
+    type Params = (Arc<DiscoveryService>, Arc<String>, RunMode);
     type Response = ();
 
     async fn handle(
         &self,
-        (scanner, config_path): Self::Params,
+        (scanner, config_path, run_mode): Self::Params,
         _session: Option<Session>,
         request: &Self,
     ) -> anyhow::Result<Option<Self::Response>> {
@@ -125,17 +125,7 @@ impl Signal for StartBroadcastRequest {
 
         scanner
             .start_announcements(
-                DeviceInfo {
-                    alias: request.alias.clone(),
-                    device_model: Some("RuneAudio".to_string()),
-                    version: "Technical Preview".to_owned(),
-                    device_type: Some(DeviceType::Desktop),
-                    fingerprint: fingerprint.clone(),
-                    api_port: DEFAULT_DEVICE_PORT,
-                    protocol: "http".to_owned(),
-                    protocol_version: Some(discovery::protocol_version::PROTOCOL_VERSION),
-                    capabilities: None,
-                },
+                local_device_info(request.alias.clone(), fingerprint, run_mode),
                 Duration::from_secs(request.duration_seconds.into()),
                 None,
             )
@@ -309,7 +299,7 @@ mod device_type_tests {
 }
 
 impl ParamsExtractor for StartServerRequest {
-    type Params = (Arc<String>, Arc<ServerManager>);
+    type Params = (Arc<String>, Arc<ServerManager>, RunMode);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
         let server_manager = all_params
@@ -321,18 +311,19 @@ impl ParamsExtractor for StartServerRequest {
         (
             Arc::clone(&all_params.config_path),
             Arc::clone(&server_manager),
+            all_params.node.run_mode,
         )
     }
 }
 
 impl Signal for StartServerRequest {
-    type Params = (Arc<String>, Arc<ServerManager>);
+    type Params = (Arc<String>, Arc<ServerManager>, RunMode);
     type Response = StartServerResponse;
 
     #[allow(clippy::manual_async_fn)]
     fn handle(
         &self,
-        (config_path, server_manager): Self::Params,
+        (config_path, server_manager, run_mode): Self::Params,
         _session: Option<Session>,
         request: &Self,
     ) -> impl Future<Output = Result<Option<Self::Response>>> + Send {
@@ -345,22 +336,11 @@ impl Signal for StartServerRequest {
             })?;
             let addr = SocketAddr::new(ip, DEFAULT_DEVICE_PORT);
 
-            let device_info = DeviceInfo {
-                alias: request.alias.clone(),
-                device_model: Some("RuneAudio".to_string()),
-                version: "Technical Preview".to_owned(),
-                device_type: Some(DeviceType::Desktop),
-                fingerprint: generate_or_load_certificates(
-                    Path::new(&*config_path),
-                    &request.alias.clone(),
-                )
-                .await?
-                .0,
-                api_port: DEFAULT_DEVICE_PORT,
-                protocol: "http".to_owned(),
-                protocol_version: Some(discovery::protocol_version::PROTOCOL_VERSION),
-                capabilities: None,
-            };
+            let fingerprint =
+                generate_or_load_certificates(Path::new(&*config_path), &request.alias)
+                    .await?
+                    .0;
+            let device_info = local_device_info(request.alias.clone(), fingerprint, run_mode);
 
             let discovery_params = DiscoveryParams { device_info };
 
@@ -410,8 +390,7 @@ impl Signal for StopServerRequest {
             if server_manager.node()?.sync_settings.read().await.listen
                 && let Some(address) = address
             {
-                let info =
-                    load_device_info(Path::new(&*server_manager.node()?.config_path)).await?;
+                let info = server_manager.node()?.device_info().await?;
                 server_manager
                     .clone()
                     .start_sync(address, DiscoveryParams { device_info: info })
@@ -841,18 +820,19 @@ impl Signal for RemoveTrustedServerRequest {
 }
 
 impl ParamsExtractor for RegisterDeviceOnServerRequest {
-    type Params = (Arc<String>, Arc<RwLock<CertValidator>>);
+    type Params = (Arc<String>, Arc<RwLock<CertValidator>>, RunMode);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
         (
             Arc::clone(&all_params.config_path),
             Arc::clone(&all_params.cert_validator),
+            all_params.node.run_mode,
         )
     }
 }
 
 impl Signal for RegisterDeviceOnServerRequest {
-    type Params = (Arc<String>, Arc<RwLock<CertValidator>>);
+    type Params = (Arc<String>, Arc<RwLock<CertValidator>>, RunMode);
     type Response = RegisterDeviceOnServerResponse;
 
     async fn handle(
@@ -861,7 +841,7 @@ impl Signal for RegisterDeviceOnServerRequest {
         _session: Option<Session>,
         req: &Self,
     ) -> Result<Option<Self::Response>> {
-        let (config_path, validator) = config;
+        let (config_path, validator, run_mode) = config;
         let validator = validator.read().await.clone();
         let config_path = config_path.to_string();
 
@@ -879,7 +859,7 @@ impl Signal for RegisterDeviceOnServerRequest {
             fingerprint,
             req.alias.clone(),
             "RuneAudio".to_string(),
-            "Desktop".to_string(),
+            run_mode.device_type(),
         )
         .await?;
         Ok(Some(RegisterDeviceOnServerResponse {

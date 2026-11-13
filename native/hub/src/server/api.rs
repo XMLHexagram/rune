@@ -15,6 +15,7 @@ use ::discovery::server::PermissionManager;
 use ::discovery::{
     client::{CertValidator, fetch_server_certificate},
     endpoint::{DeviceAddress, DeviceScheme, device_url},
+    utils::DeviceType,
 };
 
 /// Remove a paired device from both trust directions.
@@ -166,7 +167,7 @@ struct RegisterRequest {
     fingerprint: String,
     alias: String,
     device_model: String,
-    device_type: String,
+    device_type: DeviceType,
 }
 
 #[derive(Deserialize)]
@@ -181,7 +182,7 @@ pub async fn register_device(
     fingerprint: String,
     alias: String,
     device_model: String,
-    device_type: String,
+    device_type: DeviceType,
 ) -> Result<()> {
     let address: DeviceAddress = host
         .parse()

@@ -62,7 +62,10 @@ use crate::{
         RequestCapability, TrustListUpdated, TrustedClientsChanged, TrustedServerCertificate,
     },
     request_error::classify,
-    server::{ServerManager, WebSocketService, utils::device::load_device_info},
+    server::{
+        ServerManager, WebSocketService,
+        utils::device::{RunMode, load_device_info},
+    },
     utils::{
         Broadcaster, GlobalParams, LibraryTaskOwner, LocalGuiBroadcaster, RemoteEventScope,
         RinfRustSignal, nid::get_or_create_node_id, sync_settings::SyncSettings,
@@ -73,6 +76,7 @@ use discovery::DiscoveryParams;
 use discovery::access_policy::{AccessPolicy, PeerIdentity};
 use discovery::endpoint::DEFAULT_DEVICE_PORT;
 use discovery::protocol_version::{PROTOCOL_VERSION, ProtocolVersion};
+use discovery::utils::DeviceInfo;
 
 static NODE: NodeSlot = NodeSlot::new();
 
@@ -130,6 +134,7 @@ enum LibraryBinding {
 pub struct NodeContext {
     protocol_version: StdMutex<ProtocolVersion>,
     pub config_path: Arc<String>,
+    pub run_mode: RunMode,
     pub node_id: Arc<String>,
     pub library_pool: Arc<LibraryPool>,
     pub credentials: Arc<CredentialStore>,
@@ -276,12 +281,14 @@ impl NodeContext {
         db_path: &str,
         broadcaster: Arc<dyn Broadcaster>,
         os_media_controls: bool,
+        run_mode: RunMode,
     ) -> Result<Arc<Self>> {
         Self::with_reconnect_config(
             config_path,
             db_path,
             broadcaster,
             os_media_controls,
+            run_mode,
             ReconnectConfig::default(),
         )
         .await
@@ -292,6 +299,7 @@ impl NodeContext {
         db_path: &str,
         broadcaster: Arc<dyn Broadcaster>,
         os_media_controls: bool,
+        run_mode: RunMode,
         reconnect_config: ReconnectConfig,
     ) -> Result<Arc<Self>> {
         #[cfg(unix)]
@@ -313,6 +321,7 @@ impl NodeContext {
         let node = Arc::new(Self {
             protocol_version: StdMutex::new(PROTOCOL_VERSION),
             config_path: Arc::new(config_path.to_owned()),
+            run_mode,
             library_pool: LibraryPool::new_with_credentials(
                 Path::new(config_path),
                 Path::new(db_path),
@@ -397,7 +406,7 @@ impl NodeContext {
         manager.start_worker().await?;
         if node.sync_settings.read().await.listen {
             let result = async {
-                let device_info = load_device_info(Path::new(config_path)).await?;
+                let device_info = node.device_info().await?;
                 manager
                     .start_sync(
                         ([0, 0, 0, 0], DEFAULT_DEVICE_PORT).into(),
@@ -412,6 +421,11 @@ impl NodeContext {
         }
         node.publish_capabilities()?;
         Ok(node)
+    }
+
+    /// What this device tells other devices about itself.
+    pub async fn device_info(&self) -> Result<DeviceInfo> {
+        load_device_info(Path::new(&*self.config_path), self.run_mode).await
     }
 
     async fn start_notifications(&self) {
@@ -1452,7 +1466,7 @@ impl NodeSlot {
         broadcaster: Arc<dyn Broadcaster>,
     ) -> InitializeNodeResponse {
         let path = &request.config_path;
-        let result = self.initialize(path, path, broadcaster).await;
+        let result = self.initialize(path, path, broadcaster, RunMode::App).await;
         let (error_kind, error) = match result {
             Ok(_) => (None, None),
             Err(error) => (Some(classify(&error)), Some(format!("{error:#}"))),
@@ -1469,6 +1483,7 @@ impl NodeSlot {
         config_path: &str,
         db_path: &str,
         broadcaster: Arc<dyn Broadcaster>,
+        run_mode: RunMode,
     ) -> Result<Arc<NodeContext>> {
         let mut slot = self.0.lock().await;
         if let Some(node) = slot.as_ref() {
@@ -1480,7 +1495,7 @@ impl NodeSlot {
             );
             return Ok(node.clone());
         }
-        let node = NodeContext::new(config_path, db_path, broadcaster, true).await?;
+        let node = NodeContext::new(config_path, db_path, broadcaster, true, run_mode).await?;
         *slot = Some(node.clone());
         Ok(node)
     }
@@ -1490,8 +1505,10 @@ pub async fn initialize_node(
     config_path: &str,
     db_path: &str,
     broadcaster: Arc<dyn Broadcaster>,
+    run_mode: RunMode,
 ) -> Result<Arc<NodeContext>> {
-    NODE.initialize(config_path, db_path, broadcaster).await
+    NODE.initialize(config_path, db_path, broadcaster, run_mode)
+        .await
 }
 
 pub async fn receive_initialize_node() {
@@ -1532,6 +1549,7 @@ mod tests {
     };
 
     use super::{NodeBroadcaster, NodeContext};
+    use crate::server::utils::device::RunMode;
     use crate::{
         messages::{LibraryContentChanged, TrustListUpdated},
         request_owner::CurrentPlayer,
@@ -1553,7 +1571,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().to_string_lossy();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let node = NodeContext::new(&path, &path, Arc::new(Quiet(Some(tx))), false).await?;
+        let node =
+            NodeContext::new(&path, &path, Arc::new(Quiet(Some(tx))), false, RunMode::App).await?;
         let manager = node.permission_manager.read().await;
         manager
             .add_user(
