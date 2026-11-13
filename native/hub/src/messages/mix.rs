@@ -13,6 +13,20 @@ pub struct MixQuery {
     pub parameter: String,
 }
 
+/// Tracks a mix result leaves out. They are named only to be skipped: nothing is read from
+/// their libraries. An empty list excludes nothing.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, SignalPiece)]
+pub struct ExcludedItems {
+    pub items: Vec<PlayingItemRef>,
+}
+
+/// The tracks of the caller's own player queue. A mix query reads the queue only to select
+/// them with `lib::queue`; nothing is read from their libraries. An empty list is an empty queue.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, SignalPiece)]
+pub struct CallerQueue {
+    pub items: Vec<PlayingItemRef>,
+}
+
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct ResolveMixQueryRequest {
     pub queries: Vec<MixQuery>,
@@ -20,7 +34,8 @@ pub struct ResolveMixQueryRequest {
     pub initial_playback_item: Option<PlayingItemRef>,
     pub instantly_play: bool,
     pub fallback_playing_items: Vec<PlayingItemRef>,
-    pub exclude_current_queue: bool,
+    /// The caller's own player queue, to leave out of the result.
+    pub excluded: ExcludedItems,
     #[serde(default)]
     pub call_id: Option<u64>,
 }
@@ -39,6 +54,8 @@ pub struct MixQueryRequest {
     pub cursor: i32,
     pub page_size: i32,
     pub bake_cover_arts: bool,
+    /// The caller's own player queue, which `lib::queue` selects.
+    pub queue: CallerQueue,
     #[serde(default)]
     pub call_id: Option<u64>,
 }

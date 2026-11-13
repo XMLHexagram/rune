@@ -7,6 +7,7 @@ use crate::macros::{
 };
 use crate::messages::PlaybackMode as WirePlaybackMode;
 use crate::messages::{
+    ExcludedItems, CallerQueue,
     CapabilityReason, LoadPlay, CloseLibraryRequest, CloseLibraryResponse, CreatePlaylistRequest,
     FetchAllPlaylistsRequest, FetchAllPlaylistsResponse, GetPlaylistByIdRequest,
     LibraryContentChanged, LibraryInitializeMode, ListLocalLibrariesRequest, MixQuery,
@@ -370,6 +371,14 @@ impl MixPlaybackTestRequest {
     ) -> Result<Option<MixPlaybackTestResponse>> {
         let library = params.library.clone();
         let node = Arc::clone(&params.node);
+        let excluded_items = if node.renderer_link()?.is_none() && self.cast_to.is_none() {
+            dispatch_gui_request(&params, &SessionSnapshotRequest { call_id: None })
+                .await?
+                .context("current player snapshot")?
+                .items
+        } else {
+            Vec::new()
+        };
         let resolve_request = ResolveMixQueryRequest {
             call_id: None,
             queries: self.queries.clone(),
@@ -377,10 +386,12 @@ impl MixPlaybackTestRequest {
             initial_playback_item: self.initial_playback_item.clone(),
             instantly_play: self.instantly_play,
             fallback_playing_items: self.fallback_playing_items.clone(),
-            exclude_current_queue: node.renderer_link()?.is_none() && self.cast_to.is_none(),
+            excluded: ExcludedItems {
+                items: excluded_items,
+            },
         };
         let resolved = resolve_request
-            .handle(params, session, &resolve_request)
+            .handle(resolve_request.extract_params(&params), session, &resolve_request)
             .await?
             .context("mix query resolution")?;
         let load = LoadResolvedItemsRequest {
@@ -636,6 +647,7 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
             cursor: 0,
             page_size: 30,
             bake_cover_arts: true,
+            queue: CallerQueue::default(),
         },
     )
     .await?
@@ -654,6 +666,7 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
             cursor: 0,
             page_size: 30,
             bake_cover_arts: true,
+            queue: CallerQueue::default(),
         },
     )
     .await?
@@ -687,6 +700,7 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
             cursor: 0,
             page_size: 30,
             bake_cover_arts: false,
+            queue: CallerQueue::default(),
         },
     )
     .await
@@ -2623,25 +2637,25 @@ async fn attached_mix_query_resolves_for_controller_library_and_loads_resolved_i
             parameter: controller_file_ids[&item.file_uuid].to_string(),
         })
         .collect();
-    let resolve_with_exclusion = |exclude_current_queue| ResolveMixQueryRequest {
+    let resolve_with_exclusion = |items| ResolveMixQueryRequest {
         call_id: None,
         queries: query.clone(),
         hint_position: -1,
         initial_playback_item: None,
         instantly_play: true,
         fallback_playing_items: Vec::new(),
-        exclude_current_queue,
+        excluded: ExcludedItems { items },
     };
     let excluded = dispatch_gui_request(
         &controller_replica.global_params,
-        &resolve_with_exclusion(true),
+        &resolve_with_exclusion(current_player_queue.clone()),
     )
     .await?
     .context("resolved mix with current queue exclusion")?;
     assert_eq!(excluded.playing_items.len(), 1);
     let included = dispatch_gui_request(
         &controller_replica.global_params,
-        &resolve_with_exclusion(false),
+        &resolve_with_exclusion(Vec::new()),
     )
     .await?
     .context("resolved mix without current queue exclusion")?;
@@ -2656,7 +2670,12 @@ async fn attached_mix_query_resolves_for_controller_library_and_loads_resolved_i
             .collect::<Vec<_>>(),
     )
     .await?;
-    let mut local_request = resolve_with_exclusion(true);
+    let host_queue =
+        dispatch_gui_request(&host.global_params, &SessionSnapshotRequest { call_id: None })
+            .await?
+            .context("host player snapshot")?
+            .items;
+    let mut local_request = resolve_with_exclusion(host_queue);
     local_request.queries = host_items
         .iter()
         .map(|item| MixQuery {
@@ -2772,19 +2791,14 @@ async fn attached_mix_query_resolves_for_controller_library_and_loads_resolved_i
         .renderer_link()?
         .context("attached renderer link")?
         .close();
-    let snapshot_failure = match dispatch_gui_request(
+    // The exclusion travels with the request, so a gone player cannot fail the resolution.
+    let after_detach = dispatch_gui_request(
         &controller_replica.global_params,
-        &resolve_with_exclusion(true),
+        &resolve_with_exclusion(current_player_queue.clone()),
     )
-    .await
-    {
-        Err(error) => error,
-        Ok(_) => anyhow::bail!("a failed current-player snapshot should fail the mix request"),
-    };
-    assert!(snapshot_failure.chain().any(|cause| matches!(
-        cause.downcast_ref::<ExpectedRequestError>(),
-        Some(ExpectedRequestError::Unavailable { what: "renderer" })
-    )));
+    .await?
+    .context("resolved mix after the renderer link closed")?;
+    assert_eq!(after_detach.playing_items.len(), 1);
 
     renderer_replica.global_params.player.lock().await.stop();
     wait_player(&renderer_replica, |status| {
@@ -2803,8 +2817,8 @@ async fn attached_mix_query_resolves_for_controller_library_and_loads_resolved_i
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mix_queue_exclusion_reports_unreadable_queue() -> Result<()> {
-    use crate::messages::{MixQuery, MixQueryRequest};
+async fn mix_exclusion_ignores_the_nodes_queue_and_rejects_an_unreadable_excluded_track() -> Result<()> {
+    use crate::messages::{MixQuery, MixQueryRequest, PlayingItemRef};
     use crate::request_error::classify;
 
     let dir = tempfile::tempdir()?;
@@ -2828,7 +2842,7 @@ async fn mix_queue_exclusion_reports_unreadable_queue() -> Result<()> {
         );
     wait_player(&fixture, |status| status.playlist.len() == 1).await?;
 
-    let request = MixQueryRequest {
+    let request = |items| MixQueryRequest {
         call_id: None,
         queries: vec![MixQuery {
             operator: "lib::track".into(),
@@ -2837,12 +2851,28 @@ async fn mix_queue_exclusion_reports_unreadable_queue() -> Result<()> {
         cursor: 0,
         page_size: 30,
         bake_cover_arts: false,
+        queue: CallerQueue { items },
     };
-    let error = match dispatch_gui_request(&fixture.global_params, &request).await {
+    // The node's own queue, readable or not, is not part of a library call.
+    let files = dispatch_gui_request(&fixture.global_params, &request(Vec::new()))
+        .await?
+        .context("mix without exclusions")?
+        .files;
+    assert_eq!(files.len(), 1);
+    // What the caller sends has to be readable.
+    let error = match dispatch_gui_request(
+        &fixture.global_params,
+        &request(vec![PlayingItemRef::LibraryTrack {
+            library_id: library_id.to_string(),
+            track: "not-a-uuid".into(),
+        }]),
+    )
+    .await
+    {
         Err(error) => error,
-        Ok(_) => anyhow::bail!("a mix must fail when its exclusion queue cannot be read"),
+        Ok(_) => anyhow::bail!("a mix must fail when an excluded track cannot be read"),
     };
-    assert_eq!(classify(&error), RequestErrorKind::Internal);
+    assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
     Ok(())
 }
 
@@ -8166,6 +8196,124 @@ async fn rpc_target_blacklisted_request_returns_typed_failure_without_sending() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rr_mix_calls_use_the_queue_the_caller_sent() -> Result<()> {
+    let first = tempfile::tempdir()?;
+    let second = tempfile::tempdir()?;
+    let signals = Arc::new(RecordedSignals::default());
+    let a = super::fixture_with_reconnect_config(
+        first.path(),
+        Uuid::new_v4(),
+        Duration::from_secs(300),
+        signals.clone(),
+        reconnect_config(Duration::from_millis(400)),
+    )
+    .await?;
+    let b = fixture(second.path()).await?;
+    b.global_params
+        .node
+        .set_open_local_catalog(
+            None,
+            b.global_params.library_id.context("library node id")?,
+        )
+        .await?;
+    let address = super::paired_full(&b, &a).await?;
+    let fingerprint = super::info(&b).await?.fingerprint;
+    a.global_params
+        .cert_validator
+        .read()
+        .await
+        .replace_hosts_for_fingerprint(&fingerprint, vec![format!("127.0.0.1:{}", address.port())])
+        .await?;
+    let remote =
+        super::open_remote_control_record(a.global_params.node.clone(), &fingerprint).await?;
+
+    // B owns the library and its own player plays `playing`. The caller, which browses B's
+    // library through the remote handle, controls another player whose queue holds `queued`.
+    let playing = session_audio(&b, "rr-exclusion-playing.ogg").await?;
+    let queued = session_audio(&b, "rr-exclusion-queued.ogg").await?;
+    queue_session(&b, &[playing]).await?;
+    let queued_ref: PlayingItemRef = library_track_for_id(&b, queued).await?.into();
+    let playing_ref: PlayingItemRef = library_track_for_id(&b, playing).await?.into();
+    let query = [playing, queued]
+        .iter()
+        .map(|id| MixQuery {
+            operator: "lib::track".into(),
+            parameter: id.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let resolve = |items| ResolveMixQueryRequest {
+        call_id: None,
+        queries: query.clone(),
+        hint_position: -1,
+        initial_playback_item: None,
+        instantly_play: true,
+        fallback_playing_items: Vec::new(),
+        excluded: ExcludedItems { items },
+    };
+
+    let resolved = dispatch_gui_request(&remote, &resolve(vec![queued_ref.clone()]))
+        .await?
+        .context("resolved mix excluding the caller's queue")?;
+    assert_eq!(resolved.playing_items, vec![playing_ref.clone()]);
+    let nothing_excluded = dispatch_gui_request(&remote, &resolve(Vec::new()))
+        .await?
+        .context("resolved mix excluding nothing")?;
+    assert_eq!(nothing_excluded.playing_items.len(), 2);
+
+    // `lib::queue` selects the caller's queue, which is not B's own player queue.
+    let PlayingItemRef::LibraryTrack { track: playing_track, .. } = &playing_ref else {
+        anyhow::bail!("expected a library track");
+    };
+    let PlayingItemRef::LibraryTrack { track: queued_track, .. } = &queued_ref else {
+        anyhow::bail!("expected a library track");
+    };
+    let paged = |items| MixQueryRequest {
+        call_id: None,
+        queries: vec![
+            MixQuery {
+                operator: "lib::track".into(),
+                parameter: playing.to_string(),
+            },
+            MixQuery {
+                operator: "lib::queue".into(),
+                parameter: "true".into(),
+            },
+        ],
+        cursor: 0,
+        page_size: 30,
+        bake_cover_arts: false,
+        queue: CallerQueue { items },
+    };
+    let with_queue = dispatch_gui_request(&remote, &paged(vec![queued_ref.clone()]))
+        .await?
+        .context("mix page with the caller's queue")?;
+    let mut tracks = with_queue
+        .files
+        .iter()
+        .map(|file| file.track.clone())
+        .collect::<Vec<_>>();
+    tracks.sort();
+    let mut both = vec![playing_track.clone(), queued_track.clone()];
+    both.sort();
+    assert_eq!(tracks, both);
+    let without_queue = dispatch_gui_request(&remote, &paged(Vec::new()))
+        .await?
+        .context("mix page with an empty caller queue")?;
+    assert_eq!(
+        without_queue
+            .files
+            .iter()
+            .map(|file| file.track.clone())
+            .collect::<Vec<_>>(),
+        vec![playing_track.clone()]
+    );
+
+    a.global_params.node.shutdown().await?;
+    b.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -> Result<()> {
     use crate::backends::remote::update_visualizer_feed;
     use crate::messages::{
@@ -8462,7 +8610,7 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
             initial_playback_item: None,
             instantly_play: true,
             fallback_playing_items: Vec::new(),
-            exclude_current_queue: false,
+            excluded: ExcludedItems::default(),
         },
     )
     .await?

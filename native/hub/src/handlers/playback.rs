@@ -37,7 +37,7 @@ use crate::{
     library_pool::{LibraryHandle, LibraryPool},
     messages::*,
     node::NodeContext,
-    rpc::{TargetRequest, dispatch_gui_request},
+    rpc::TargetRequest,
     session::{HandoffLoadParams, PlayerSession},
     utils::{
         GlobalParams, ParamsExtractor, files_to_playback_request, find_nearest_index,
@@ -214,6 +214,32 @@ pub async fn playing_item_requests(
         .collect()
 }
 
+/// The row ids of the tracks, named by the caller, that belong to `library`.
+pub(crate) async fn queue_file_ids(
+    items: &[PlayingItemRef],
+    library: &LibraryHandle,
+) -> Result<Vec<i32>> {
+    let library_id = library.library_id.to_string();
+    let mut track_uuids = Vec::new();
+    for item in items {
+        if let PlayingItemRef::LibraryTrack {
+            library_id: item_library,
+            track,
+        } = item
+            && *item_library == library_id
+        {
+            track_uuids.push(Uuid::parse_str(track).map_err(|error| {
+                ExpectedRequestError::invalid_input(format!("Invalid excluded track: {error}"))
+            })?);
+        }
+    }
+    let ids = file_ids_by_uuid(&library.main_db, &track_uuids).await?;
+    Ok(track_uuids
+        .iter()
+        .filter_map(|uuid| ids.get(uuid).copied())
+        .collect())
+}
+
 struct ResolvedMixQuery {
     playing_items: Vec<PlayingItemRef>,
     start_index: Option<usize>,
@@ -222,7 +248,7 @@ struct ResolvedMixQuery {
 async fn resolve_mix_query(
     request: &ResolveMixQueryRequest,
     library: &LibraryHandle,
-    params: &GlobalParams,
+    pool: &Arc<LibraryPool>,
 ) -> Result<ResolvedMixQuery> {
     let fallback_items =
         playing_items_from_requests(&request.fallback_playing_items, Some(library)).await?;
@@ -232,30 +258,7 @@ async fn resolve_mix_query(
             .get_file_handle(&library.fsio, &library.main_db, &fallback_items)
             .await?
     } else {
-        let queue = if request.exclude_current_queue {
-            let snapshot = dispatch_gui_request(params, &SessionSnapshotRequest { call_id: None })
-                .await?
-                .context("Current player did not return a session snapshot")?;
-            let track_uuids = snapshot
-                .items
-                .into_iter()
-                .filter_map(|item| match item {
-                    PlayingItemRef::LibraryTrack { library_id, track }
-                        if library_id == library.library_id.to_string() =>
-                    {
-                        Uuid::parse_str(&track).ok()
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let ids = file_ids_by_uuid(&library.main_db, &track_uuids).await?;
-            track_uuids
-                .iter()
-                .filter_map(|uuid| ids.get(uuid).copied())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let queue = queue_file_ids(&request.excluded.items, library).await?;
         let excluded_tracks = queue.iter().copied().collect::<HashSet<_>>();
         query_mix_media_files(
             &library.main_db,
@@ -319,7 +322,7 @@ async fn resolve_mix_query(
             nearest_index
         }
     };
-    let playing_items = playing_item_requests(&items, &params.library_pool, None).await;
+    let playing_items = playing_item_requests(&items, pool, None).await;
 
     Ok(ResolvedMixQuery {
         playing_items,
@@ -748,20 +751,20 @@ impl Signal for SetMixWithOthersRequest {
 }
 
 impl ParamsExtractor for ResolveMixQueryRequest {
-    type Params = GlobalParams;
+    type Params = (Option<LibraryHandle>, Arc<LibraryPool>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        all_params.clone()
+        (all_params.library.clone(), all_params.library_pool.clone())
     }
 }
 
 impl Signal for ResolveMixQueryRequest {
-    type Params = GlobalParams;
+    type Params = (Option<LibraryHandle>, Arc<LibraryPool>);
     type Response = ResolveMixQueryResponse;
 
     async fn handle(
         &self,
-        params: Self::Params,
+        (library, pool): Self::Params,
         session: Option<Session>,
         request: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -771,8 +774,8 @@ impl Signal for ResolveMixQueryRequest {
         for item in &request.fallback_playing_items {
             reject_remote_independent_item(session.as_ref(), item)?;
         }
-        let library = require_library(params.library.clone())?;
-        let resolved = resolve_mix_query(request, &library, &params).await?;
+        let library = require_library(library)?;
+        let resolved = resolve_mix_query(request, &library, &pool).await?;
         let start_index = resolved
             .start_index
             .map(u32::try_from)

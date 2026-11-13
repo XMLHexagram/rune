@@ -29,6 +29,16 @@ LoadResolvedItemsRequest loadResolvedItemsRequest({
   );
 }
 
+/// The tracks of the player the UI shows that a mix should leave out: its whole
+/// queue, unless the result is cast to another renderer.
+List<PlayingItemRef> queueItemsToExclude({
+  required CastTarget? castTo,
+  required List<PlaylistItem>? queue,
+}) {
+  if (castTo != null) return const [];
+  return [for (final entry in queue ?? const <PlaylistItem>[]) entry.item];
+}
+
 Future<List<PlayingItem>> operatePlaybackWithMixQuery({
   required QueryList queries,
   required PlaybackMode? playbackMode,
@@ -54,7 +64,12 @@ Future<List<PlayingItem>> operatePlaybackWithMixQuery({
       initialPlaybackItem: requestItems.first,
       instantlyPlay: instantlyPlay,
       fallbackPlayingItems: requestItems.skip(1).toList(),
-      excludeCurrentQueue: castTo == null,
+      excluded: ExcludedItems(
+        items: queueItemsToExclude(
+          castTo: castTo,
+          queue: PlaylistUpdate.latestRustSignal?.message.items,
+        ),
+      ),
       callId: callId,
     ).sendSignalToRust(),
   );

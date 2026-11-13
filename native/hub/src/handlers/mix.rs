@@ -1,4 +1,3 @@
-use crate::node::NodeContext;
 use database::actions::mixes::{add_item_to_mix, create_mix, remove_mix, update_mix};
 use std::{collections::HashMap, sync::Arc};
 
@@ -13,6 +12,7 @@ use ::database::actions::{
     },
 };
 
+use super::playback::queue_file_ids;
 use crate::library_pool::LibraryHandle;
 use crate::utils::{
     GlobalParams, ParamsExtractor, parse_media_files, process_cover_art_map, require_library,
@@ -287,24 +287,20 @@ impl Signal for GetMixByIdRequest {
 }
 
 impl ParamsExtractor for MixQueryRequest {
-    type Params = (Option<LibraryHandle>, Arc<String>, Arc<NodeContext>);
+    type Params = (Option<LibraryHandle>, Arc<String>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (
-            all_params.library.clone(),
-            Arc::clone(&all_params.node_id),
-            all_params.node.clone(),
-        )
+        (all_params.library.clone(), Arc::clone(&all_params.node_id))
     }
 }
 
 impl Signal for MixQueryRequest {
-    type Params = (Option<LibraryHandle>, Arc<String>, Arc<NodeContext>);
+    type Params = (Option<LibraryHandle>, Arc<String>);
     type Response = MixQueryResponse;
 
     async fn handle(
         &self,
-        (library, node_id, node): Self::Params,
+        (library, node_id): Self::Params,
         session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -319,7 +315,7 @@ impl Signal for MixQueryRequest {
             .map(|x| (x.operator, x.parameter))
             .collect();
 
-        let queue = node.session_queue_for_library(library.library_id).await?;
+        let queue = queue_file_ids(&request.queue.items, &library).await?;
         let media_entries = query_mix_media_files(
             &library.main_db,
             &library.recommend_db,

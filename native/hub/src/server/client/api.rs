@@ -138,6 +138,9 @@ pub async fn operate_playback_with_mix_query_request(
             parameter,
         })
         .collect();
+    let snapshot: SessionSnapshotResponse = connection
+        .request(&SessionSnapshotRequest { call_id: None })
+        .await?;
     let resolved: ResolveMixQueryResponse = connection
         .request(&ResolveMixQueryRequest {
             call_id: None,
@@ -146,7 +149,9 @@ pub async fn operate_playback_with_mix_query_request(
             initial_playback_item: None,
             instantly_play: instant_play,
             fallback_playing_items: vec![],
-            exclude_current_queue: true,
+            excluded: ExcludedItems {
+                items: snapshot.items,
+            },
         })
         .await?;
     let _: LoadResolvedItemsResponse = connection
@@ -169,6 +174,9 @@ pub async fn send_mix_query_request(
     queries: Vec<(String, String)>,
     connection: &WSConnection,
 ) -> Result<MixQueryResponse> {
+    let snapshot: SessionSnapshotResponse = connection
+        .request(&SessionSnapshotRequest { call_id: None })
+        .await?;
     let request = MixQueryRequest {
         call_id: None,
         queries: queries
@@ -181,6 +189,9 @@ pub async fn send_mix_query_request(
         cursor: 0,
         page_size: 9999,
         bake_cover_arts: false,
+        queue: CallerQueue {
+            items: snapshot.items,
+        },
     };
 
     connection.request(&request).await
