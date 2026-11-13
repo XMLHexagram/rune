@@ -412,7 +412,6 @@ pub enum OpenDalShareDataDetection {
     ExistingLibrary { library_id: String },
     WritableEmpty,
     ReadOnly,
-    Failed(RegisterLibraryFailureKind),
 }
 
 #[derive(Deserialize, Serialize, RustSignal)]
@@ -429,14 +428,12 @@ pub enum RegisterLibraryOutcome {
     NeedsSubsonicMode {
         allowed: Vec<SubsonicOpenModeMessage>,
     },
-    Failed(RegisterLibraryFailureKind),
 }
 
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct RegisterLibraryResponse {
     pub record: Option<LibraryRecordSummary>,
     pub outcome: RegisterLibraryOutcome,
-    pub detail: Option<String>,
     #[serde(default)]
     pub call_id: Option<u64>,
 }

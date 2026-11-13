@@ -1379,7 +1379,7 @@ async fn liked_requests_address_a_library_other_than_the_ui_library() -> Result<
         },
         &fixture.global_params.node,
     )
-    .await;
+    .await?;
     let record = registered.record.context("second library record")?;
     let library_id = LibraryRegistry::load(node_dir.path())?
         .catalogs()
@@ -1796,6 +1796,20 @@ async fn removing_trust_with_an_unreadable_trust_store_fails() -> Result<()> {
         RequestErrorKind::Internal
     );
     Ok(())
+}
+
+/// The failure kind of a library registration that must fail.
+fn registration_failure_kind(
+    result: Result<crate::messages::RegisterLibraryResponse>,
+) -> Result<RegisterLibraryFailureKind> {
+    let error = match result {
+        Ok(response) => anyhow::bail!("registration must fail, answered {:?}", response.outcome),
+        Err(error) => error,
+    };
+    match crate::request_error::request_failure_cause(&error) {
+        Some(RequestFailureCause::LibraryRegistrationFailed { kind }) => Ok(kind),
+        cause => anyhow::bail!("registration failed without its kind ({cause:?}): {error:#}"),
+    }
 }
 
 async fn attach_test_cover(f: &Fixture, media_file_id: i32, bytes: &[u8]) -> Result<()> {
@@ -3973,7 +3987,7 @@ async fn registered_open_helper_releases_its_ui_lease() -> Result<()> {
             &source.global_params.node,
         ),
     )
-    .await;
+    .await?;
     let record = registered.record.context("registered library")?;
     let opened = super::step(
         "open lease test library",
@@ -9217,7 +9231,7 @@ fn opendal_registration_request(endpoint: String) -> RegisterOpenDalLibraryReque
 
 #[tokio::test]
 async fn opendal_registration_reports_auth_rejection_without_storing_anything() -> Result<()> {
-    use crate::messages::{RegisterLibraryFailureKind, RegisterLibraryOutcome};
+    use crate::messages::RegisterLibraryFailureKind;
     use database::library_registry::FsAdapter;
 
     let listener = TokioTcpListener::bind("127.0.0.1:0").await?;
@@ -9238,10 +9252,7 @@ async fn opendal_registration_reports_auth_rejection_without_storing_anything() 
     )
     .await
     .context("WebDAV authentication probe hung")?;
-    assert_eq!(
-        response.outcome,
-        RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::OpenDalAuthenticationRejected)
-    );
+    assert_eq!(registration_failure_kind(response)?, RegisterLibraryFailureKind::OpenDalAuthenticationRejected);
     let registry = LibraryRegistry::load(PathBuf::from(&*node.config_path).as_path())?;
     assert!(registry.libraries.iter().all(|record| {
         !record
@@ -9261,7 +9272,7 @@ async fn opendal_registration_reports_auth_rejection_without_storing_anything() 
 
 #[tokio::test]
 async fn opendal_registration_reports_unreachable_endpoint() -> Result<()> {
-    use crate::messages::{RegisterLibraryFailureKind, RegisterLibraryOutcome};
+    use crate::messages::RegisterLibraryFailureKind;
     use database::library_registry::FsAdapter;
 
     let (endpoint, unreachable_server) = unreachable_http_endpoint().await?;
@@ -9274,10 +9285,7 @@ async fn opendal_registration_reports_unreachable_endpoint() -> Result<()> {
     )
     .await
     .context("unreachable WebDAV probe hung")?;
-    assert_eq!(
-        response.outcome,
-        RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::OpenDalUnreachable)
-    );
+    assert_eq!(registration_failure_kind(response)?, RegisterLibraryFailureKind::OpenDalUnreachable);
     let registry = LibraryRegistry::load(PathBuf::from(&*node.config_path).as_path())?;
     assert!(registry.libraries.iter().all(|record| {
         !record
@@ -9297,7 +9305,7 @@ async fn opendal_registration_reports_unreachable_endpoint() -> Result<()> {
 
 #[tokio::test]
 async fn opendal_registration_reports_non_folder_root() -> Result<()> {
-    use crate::messages::{RegisterLibraryFailureKind, RegisterLibraryOutcome};
+    use crate::messages::RegisterLibraryFailureKind;
     use database::library_registry::FsAdapter;
     use fsio::test_fixtures::WebDavFixture;
 
@@ -9324,10 +9332,7 @@ async fn opendal_registration_reports_non_folder_root() -> Result<()> {
     )
     .await
     .context("non-folder WebDAV probe hung")?;
-    assert_eq!(
-        response.outcome,
-        RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::OpenDalNotFolder)
-    );
+    assert_eq!(registration_failure_kind(response)?, RegisterLibraryFailureKind::OpenDalNotFolder);
     let registry = LibraryRegistry::load(PathBuf::from(&*node.config_path).as_path())?;
     assert!(registry.libraries.iter().all(|record| {
         !record
@@ -9380,7 +9385,7 @@ async fn opendal_share_registration_uses_choice_and_existing_share_identity() ->
             },
             &node,
         )
-        .await;
+        .await?;
         anyhow::ensure!(response.outcome == RegisterLibraryOutcome::Registered);
         let record_id = response
             .record
@@ -9434,7 +9439,7 @@ async fn opendal_share_registration_uses_choice_and_existing_share_identity() ->
         },
         &node,
     )
-    .await;
+    .await?;
     anyhow::ensure!(response.outcome == RegisterLibraryOutcome::Registered);
     let record_id = response.record.context("existing share record")?.record_id;
     let registry = LibraryRegistry::load(PathBuf::from(&*node.config_path).as_path())?;
@@ -9480,9 +9485,9 @@ async fn opendal_share_registration_uses_choice_and_existing_share_identity() ->
         &node,
     )
     .await;
-    anyhow::ensure!(
-        conflict.outcome
-            == RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::OpenDalShareChanged)
+    assert_eq!(
+        registration_failure_kind(conflict)?,
+        RegisterLibraryFailureKind::OpenDalShareChanged
     );
 
     node.shutdown().await?;
@@ -9496,7 +9501,7 @@ async fn opendal_webdav_registration_open_and_scan_are_read_only_on_current_thre
 
 #[tokio::test]
 async fn keep_in_share_rejects_a_read_only_share_before_registration() -> Result<()> {
-    use crate::messages::{RegisterLibraryFailureKind, RegisterLibraryOutcome};
+    use crate::messages::RegisterLibraryFailureKind;
     use database::library_registry::FsAdapter;
     use fsio::test_fixtures::WebDavFixture;
 
@@ -9520,10 +9525,7 @@ async fn keep_in_share_rejects_a_read_only_share_before_registration() -> Result
     )
     .await;
 
-    assert_eq!(
-        response.outcome,
-        RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::OpenDalReadOnly)
-    );
+    assert_eq!(registration_failure_kind(response)?, RegisterLibraryFailureKind::OpenDalReadOnly);
     let registry = LibraryRegistry::load(PathBuf::from(&*node.config_path).as_path())?;
     assert!(registry.libraries.iter().all(|record| {
         !record
@@ -9605,14 +9607,14 @@ async fn assert_opendal_library_scan(service_kind: OpenDalServiceKind) -> Result
             alias: "WebDAV test".into(),
             share_data_choice: ShareDataChoice::ThisDeviceOnly,
         };
-        let response = register_opendal_library_on_node(&request, &node).await;
+        let response = register_opendal_library_on_node(&request, &node).await?;
         anyhow::ensure!(
             response.outcome == RegisterLibraryOutcome::Registered,
             "OpenDAL registration failed: {:?}",
             response.outcome
         );
         let record_id = response.record.context("WebDAV record")?.record_id;
-        let duplicate = register_opendal_library_on_node(&request, &node).await;
+        let duplicate = register_opendal_library_on_node(&request, &node).await?;
         anyhow::ensure!(
             duplicate.outcome == RegisterLibraryOutcome::Registered,
             "duplicate OpenDAL registration failed: {:?}",
@@ -9777,7 +9779,7 @@ async fn subsonic_registration_resolves_mode_stores_secret_and_deduplicates() ->
     .await?;
     let base =
         subsonic_registration_request(server.endpoint.clone(), "sensitive-test-password", None);
-    let needs_mode = register_subsonic_library_on_node(&base, &node).await;
+    let needs_mode = register_subsonic_library_on_node(&base, &node).await?;
     assert_eq!(
         needs_mode.outcome,
         RegisterLibraryOutcome::NeedsSubsonicMode {
@@ -9795,7 +9797,7 @@ async fn subsonic_registration_resolves_mode_stores_secret_and_deduplicates() ->
         ),
         &node,
     )
-    .await;
+    .await?;
     assert_eq!(registration.outcome, RegisterLibraryOutcome::Registered);
     let summary = registration.record.context("registered Subsonic record")?;
     assert_eq!(summary.alias, "Remote music");
@@ -9852,7 +9854,7 @@ async fn subsonic_registration_resolves_mode_stores_secret_and_deduplicates() ->
         ),
         &node,
     )
-    .await;
+    .await?;
     assert_eq!(duplicate.outcome, RegisterLibraryOutcome::Registered);
     assert_eq!(
         duplicate.record.context("duplicate record")?.record_id,
@@ -9910,7 +9912,7 @@ async fn local_session_signals_are_hidden_during_subsonic_remote_control() -> Re
         ),
         &node,
     )
-    .await;
+    .await?;
     let record = registration.record.context("registered Subsonic record")?;
     open_library_by_record_on_node(
         &OpenLibraryRequest {
@@ -10044,7 +10046,7 @@ async fn opening_local_library_restores_local_session_signals() -> Result<()> {
         ),
         &node,
     )
-    .await;
+    .await?;
     let record = registration.record.context("registered Subsonic record")?;
     open_library_by_record_on_node(
         &OpenLibraryRequest {
@@ -10132,7 +10134,7 @@ async fn subsonic_remote_control_pauses_and_restores_local_session_position() ->
         ),
         &node,
     )
-    .await;
+    .await?;
     let record = registration.record.context("registered Subsonic record")?;
     open_library_by_record_on_node(
         &OpenLibraryRequest {
@@ -10283,7 +10285,7 @@ async fn subsonic_visualizer_covers_use_the_bounded_server_cover_cache() -> Resu
         ),
         &node,
     )
-    .await;
+    .await?;
     let record = registration.record.context("registered Subsonic library")?;
     let opened = open_library_by_record_on_node(
         &OpenLibraryRequest {
@@ -10365,7 +10367,7 @@ async fn subsonic_visualizer_covers_use_the_bounded_server_cover_cache() -> Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subsonic_registration_uses_single_role_and_rejects_no_roles() -> Result<()> {
-    use crate::messages::{RegisterLibraryFailureKind, RegisterLibraryOutcome};
+    use crate::messages::RegisterLibraryFailureKind;
 
     assert_single_role_subsonic_registration(
         true,
@@ -10390,10 +10392,7 @@ async fn subsonic_registration_uses_single_role_and_rejects_no_roles() -> Result
         &node,
     )
     .await;
-    assert_eq!(
-        response.outcome,
-        RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::SubsonicRoleMissing)
-    );
+    assert_eq!(registration_failure_kind(response)?, RegisterLibraryFailureKind::SubsonicRoleMissing);
     assert!(
         !PathBuf::from(&*node.config_path)
             .join("credentials.enc")
@@ -10424,7 +10423,7 @@ async fn assert_single_role_subsonic_registration(
         &subsonic_registration_request(server.endpoint.clone(), "password", None),
         &node,
     )
-    .await;
+    .await?;
     assert_eq!(
         response.outcome,
         RegisterLibraryOutcome::NeedsSubsonicMode {
@@ -10444,7 +10443,7 @@ async fn assert_single_role_subsonic_registration(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subsonic_registration_wrong_password_does_not_store_secret() -> Result<()> {
-    use crate::messages::{RegisterLibraryFailureKind, RegisterLibraryOutcome};
+    use crate::messages::RegisterLibraryFailureKind;
 
     let dir = tempfile::tempdir()?;
     let fixture = super::fixture(dir.path()).await?;
@@ -10461,11 +10460,15 @@ async fn subsonic_registration_wrong_password_does_not_store_secret() -> Result<
         &node,
     )
     .await;
+    let error = match response {
+        Ok(response) => anyhow::bail!("a wrong password registered: {:?}", response.outcome),
+        Err(error) => error,
+    };
+    assert!(!format!("{error:#}").contains(password));
     assert_eq!(
-        response.outcome,
-        RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::SubsonicWrongCredentials)
+        registration_failure_kind(Err(error))?,
+        RegisterLibraryFailureKind::SubsonicWrongCredentials
     );
-    assert!(!response.detail.unwrap_or_default().contains(password));
     assert!(
         !PathBuf::from(&*node.config_path)
             .join("credentials.enc")
@@ -10478,7 +10481,7 @@ async fn subsonic_registration_wrong_password_does_not_store_secret() -> Result<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subsonic_registration_unreachable_is_bounded() -> Result<()> {
-    use crate::messages::{RegisterLibraryFailureKind, RegisterLibraryOutcome};
+    use crate::messages::RegisterLibraryFailureKind;
 
     let (endpoint, unreachable_server) = unreachable_http_endpoint().await?;
     let dir = tempfile::tempdir()?;
@@ -10493,10 +10496,7 @@ async fn subsonic_registration_unreachable_is_bounded() -> Result<()> {
     )
     .await
     .context("unreachable registration hung")?;
-    assert_eq!(
-        response.outcome,
-        RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::SubsonicUnreachable)
-    );
+    assert_eq!(registration_failure_kind(response)?, RegisterLibraryFailureKind::SubsonicUnreachable);
     unreachable_server.abort();
     node.shutdown().await?;
     Ok(())
@@ -10525,7 +10525,7 @@ async fn subsonic_registration_receiver_dispatches_to_node_handler() -> Result<(
         .await
         .context("registration receiver did not receive the request")?
         .context("registration signal channel closed")?;
-    let response = register_subsonic_library_with_node(&signal.message, &node).await;
+    let response = register_subsonic_library_with_node(&signal.message, &node).await?;
     assert_eq!(
         response.outcome,
         RegisterLibraryOutcome::NeedsSubsonicMode {
@@ -10574,7 +10574,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
     };
     assert_eq!(
         register_local_library_on_node(&request, &node)
-            .await
+            .await?
             .outcome,
         RegisterLibraryOutcome::NeedsInitializeMode
     );
@@ -10586,7 +10586,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         },
         &node,
     )
-    .await;
+    .await?;
     assert_eq!(registered.outcome, RegisterLibraryOutcome::Registered);
     let record_id = registered.record.context("registered record")?.record_id;
     assert!(
@@ -10634,7 +10634,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         },
         &node,
     )
-    .await;
+    .await?;
     assert_eq!(
         second_registration.outcome,
         RegisterLibraryOutcome::Registered
@@ -10815,7 +10815,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         },
         &node,
     )
-    .await;
+    .await?;
     assert_eq!(remote.outcome, RegisterLibraryOutcome::Registered);
     let remote_id = remote.record.context("remote record")?.record_id;
     let listed = ListLibraryRecordsRequest { call_id: None }
@@ -10990,10 +10990,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         &node,
     )
     .await;
-    assert_eq!(
-        untrusted.outcome,
-        RegisterLibraryOutcome::Failed(RegisterLibraryFailureKind::Untrusted)
-    );
+    assert_eq!(registration_failure_kind(untrusted)?, RegisterLibraryFailureKind::Untrusted);
     assert_eq!(
         LibraryRegistry::load(PathBuf::from(&*node.config_path).as_path())?
             .libraries
@@ -11037,7 +11034,7 @@ async fn registered_remote_control_opens_and_routes_library_and_session_requests
         },
         &a.global_params.node,
     )
-    .await;
+    .await?;
     assert_eq!(registered.outcome, RegisterLibraryOutcome::Registered);
     let record_id = registered.record.context("remote record")?.record_id;
     let scrobbler = Arc::new(Mutex::new(ScrobblingManager::new(
@@ -11750,7 +11747,7 @@ async fn request_scopes_resolve_to_the_current_implementations() -> Result<()> {
             &subsonic_registration_request(server.endpoint.clone(), "password", Some(mode)),
             &subsonic_node.global_params.node,
         )
-        .await;
+        .await?;
         assert_eq!(registered.outcome, RegisterLibraryOutcome::Registered);
         let record = registered.record.context("Subsonic record")?;
         let opened = open_library_by_record_on_node(
@@ -12003,7 +12000,7 @@ async fn own_ui_receives_capabilities_while_a_subsonic_jukebox_is_current() -> R
         ),
         &node,
     )
-    .await;
+    .await?;
     let summary = registration.record.context("registered Subsonic record")?;
     signals.clear();
     let _ui = open_registered_library_record(node.clone(), summary.record_id.clone()).await?;

@@ -5,7 +5,9 @@ import 'package:fluent_ui/fluent_ui.dart';
 import 'package:rinf/rinf.dart';
 
 import '../bindings/bindings.dart';
+import '../l10n/app_localizations.dart';
 import '../utils/api/request_failure.dart';
+import '../utils/library_registry_messages.dart';
 import '../utils/api/call_id.dart';
 import '../utils/api/library_registry.dart' as library_api;
 import '../utils/rune_log.dart';
@@ -18,6 +20,17 @@ class LibraryRegistryFailure implements Exception {
   final Object kind;
   final String detail;
 }
+
+/// What to tell the user about a failed library action.
+String libraryFailureMessage(AppLocalizations s, Object error) =>
+    switch (error) {
+      LibraryRegistryFailure(:final kind) => libraryRegistryFailureMessage(
+        s,
+        kind,
+      ),
+      RequestFailure() => requestFailureMessage(s, error),
+      _ => s.unknownError,
+    };
 
 Future<LibraryRecordSummary?> registerAndOpenLocalFolder(
   BuildContext context,
@@ -247,11 +260,6 @@ class LibraryRegistryProvider extends ChangeNotifier {
   RegisterLibraryResponse _acceptRegisterResponse(
     RegisterLibraryResponse response,
   ) {
-    if (response.outcome case RegisterLibraryOutcomeFailed(:final value)) {
-      final detail = response.detail ?? value.toString();
-      error$('Could not register library: $detail');
-      throw LibraryRegistryFailure(value, detail);
-    }
     if (response.record != null) {
       _records = [
         ..._records.where((r) => r.recordId != response.record!.recordId),

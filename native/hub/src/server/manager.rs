@@ -980,7 +980,7 @@ mod lifecycle_tests {
             },
             &node,
         )
-        .await;
+        .await?;
         let record = registered.record.context("remote record")?;
         open_registered_library_record(node, record.record_id).await
     }
@@ -1194,7 +1194,7 @@ mod lifecycle_tests {
             },
             &node,
         )
-        .await;
+        .await?;
         let record = response.record.context("registered local record")?;
         fixture_open_record(source, record.record_id).await
     }
@@ -1797,7 +1797,7 @@ mod lifecycle_tests {
             },
             &owner.global_params.node,
         )
-        .await;
+        .await?;
         anyhow::ensure!(registered.outcome == RegisterLibraryOutcome::Registered);
         let summary = registered.record.context("registered owned library")?;
         let library_id = match &summary.kind {
@@ -1886,7 +1886,7 @@ mod lifecycle_tests {
             },
             &owner.global_params.node,
         )
-        .await;
+        .await?;
         let summary = registered.record.context("re-registered record")?;
         anyhow::ensure!(
             matches!(summary.kind, LibraryRecordKindSummary::Local { library_id: ref id, .. } if id == &library_id.to_string()),

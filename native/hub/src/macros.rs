@@ -392,7 +392,6 @@ mod node_request_loop_tests {
             call_id: None,
             record: None,
             outcome: RegisterLibraryOutcome::Registered,
-            detail: None,
         }
     }
 

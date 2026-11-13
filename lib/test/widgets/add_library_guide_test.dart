@@ -805,9 +805,12 @@ void main() {
                   registerOpenDal: (service, alias, choice) async {
                     requests.add((service, alias, choice));
                     if (fail) {
-                      return const RegisterLibraryResponse(
-                        outcome: RegisterLibraryOutcomeFailed(
-                          value: RegisterLibraryFailureKind.openDalUnreachable,
+                      throw const RequestFailure(
+                        'RegisterOpenDalLibraryRequest',
+                        RequestErrorKind.unavailable,
+                        'Could not reach the remote library',
+                        RequestFailureCauseLibraryRegistrationFailed(
+                          kind: RegisterLibraryFailureKind.openDalUnreachable,
                         ),
                       );
                     }
@@ -1186,9 +1189,12 @@ void main() {
             onPressed: () => showAddLibraryGuide(
               context,
               dependencies: AddLibraryGuideDependencies(
-                registerSubsonic: (_) async => const RegisterLibraryResponse(
-                  outcome: RegisterLibraryOutcomeFailed(
-                    value: RegisterLibraryFailureKind.subsonicWrongCredentials,
+                registerSubsonic: (_) async => throw const RequestFailure(
+                  'RegisterSubsonicLibraryRequest',
+                  RequestErrorKind.permissionDenied,
+                  'The Subsonic credentials were rejected',
+                  RequestFailureCauseLibraryRegistrationFailed(
+                    kind: RegisterLibraryFailureKind.subsonicWrongCredentials,
                   ),
                 ),
               ),

@@ -443,9 +443,6 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
       final response =
           await (widget.dependencies.registerLocal ??
               registry.registerLocalFolder)(path, alias, mode);
-      if (response.outcome case RegisterLibraryOutcomeFailed(:final value)) {
-        throw LibraryRegistryFailure(value, response.detail ?? '');
-      }
       final record = response.record;
       if (record == null) throw StateError('Registration returned no record');
       await MacSecureManager().saveBookmark(path);
@@ -472,9 +469,7 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
       if (mounted) {
         await showFailedToInitializeLibrary(
           context,
-          error is LibraryRegistryFailure
-              ? libraryRegistryFailureMessage(S.of(context), error.kind)
-              : S.of(context).unknownError,
+          libraryFailureMessage(S.of(context), error),
         );
         if (widget.navigateIfFailed) $$replace('/');
       }
@@ -511,9 +506,6 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
         });
         return;
       }
-      if (response.outcome case RegisterLibraryOutcomeFailed(:final value)) {
-        throw LibraryRegistryFailure(value, response.detail ?? '');
-      }
       final record = response.record;
       if (record == null) throw StateError('Registration returned no record');
       await _openRecord(record.recordId);
@@ -522,9 +514,7 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
       await showErrorDialog(
         context: context,
         title: S.of(context).addLibrary,
-        errorMessage: error is LibraryRegistryFailure
-            ? libraryRegistryFailureMessage(S.of(context), error.kind)
-            : S.of(context).unknownError,
+        errorMessage: libraryFailureMessage(S.of(context), error),
       );
     }
   }
@@ -594,8 +584,6 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
           case OpenDalShareDataDetectionWritableEmpty():
             if (mounted) setState(() => _step = 6);
             return;
-          case OpenDalShareDataDetectionFailed(:final value):
-            throw LibraryRegistryFailure(value, '');
           case OpenDalShareDataDetectionExistingLibrary():
             // The choice is not used here; registration always joins the library in the share.
             shareDataChoice = ShareDataChoice.thisDeviceOnly;
@@ -611,10 +599,6 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
             alias,
             selectedShareDataChoice,
           );
-      final outcome = response.outcome;
-      if (outcome case RegisterLibraryOutcomeFailed(:final value)) {
-        throw LibraryRegistryFailure(value, response.detail ?? '');
-      }
       final record = response.record;
       if (record == null) throw StateError('Registration returned no record');
       // Like a new local folder, a new WebDAV or S3 library starts empty and
@@ -631,9 +615,7 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
       await showErrorDialog(
         context: context,
         title: S.of(context).addLibrary,
-        errorMessage: error is LibraryRegistryFailure
-            ? libraryRegistryFailureMessage(S.of(context), error.kind)
-            : S.of(context).unknownError,
+        errorMessage: libraryFailureMessage(S.of(context), error),
       );
     } finally {
       if (mounted) setState(() => _registeringOpenDal = false);
@@ -855,9 +837,7 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
         await showErrorDialog(
           context: context,
           title: S.of(context).addLibrary,
-          errorMessage: error is LibraryRegistryFailure
-              ? libraryRegistryFailureMessage(S.of(context), error.kind)
-              : requestErrorText(S.of(context), error),
+          errorMessage: libraryFailureMessage(S.of(context), error),
         );
       }
     } finally {
