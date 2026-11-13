@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CastLibraryState, LibraryOpenErrorKind, LibraryTaskKind, OpenLibraryFailureKind,
-    RegisterLibraryFailureKind, RemoveLibraryRecordFailureKind,
+    RegisterLibraryFailureKind, RemoveLibraryRecordFailureKind, ScrobbleAuthenticationFailure,
 };
 
 #[derive(Serialize, Deserialize, DartSignal)]
@@ -79,6 +79,9 @@ pub enum RequestFailureCause {
     },
     LibraryRecordRemovalFailed {
         kind: RemoveLibraryRecordFailureKind,
+    },
+    ScrobbleAuthentication {
+        failure: ScrobbleAuthenticationFailure,
     },
 }
 

@@ -294,25 +294,17 @@ impl Signal for SetLibraryBackgroundSyncRequest {
         _: Option<Session>,
         request: &Self,
     ) -> Result<Option<Self::Response>> {
-        let result = async {
-            let library_id = Uuid::parse_str(&request.library_id).map_err(|error| {
-                ExpectedRequestError::invalid_input(format!("invalid library UUID: {error}"))
-            })?;
-            LibraryRegistry::set_background_sync(
-                Path::new(&*node.config_path),
-                library_id,
-                request.enabled,
-            )
-            .await
-        }
-        .await;
-        if result.is_ok() {
-            publish_library_records_changed(&node).await?;
-        }
-        Ok(Some(SetLibraryBackgroundSyncResponse {
-            call_id: None,
-            error: result.err().map(|error| format!("{error:#}")),
-        }))
+        let library_id = Uuid::parse_str(&request.library_id).map_err(|error| {
+            ExpectedRequestError::invalid_input(format!("invalid library UUID: {error}"))
+        })?;
+        LibraryRegistry::set_background_sync(
+            Path::new(&*node.config_path),
+            library_id,
+            request.enabled,
+        )
+        .await?;
+        publish_library_records_changed(&node).await?;
+        Ok(Some(SetLibraryBackgroundSyncResponse { call_id: None }))
     }
 }
 
@@ -340,17 +332,13 @@ mod tests {
         node: &Arc<NodeContext>,
         library_id: String,
         enabled: bool,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<anyhow::Error>> {
         let request = SetLibraryBackgroundSyncRequest {
             call_id: None,
             library_id,
             enabled,
         };
-        Ok(request
-            .handle(node.clone(), None, &request)
-            .await?
-            .unwrap()
-            .error)
+        Ok(request.handle(node.clone(), None, &request).await.err())
     }
 
     async fn register(config: &Path, replica_id: Uuid) -> Result<(LibraryRecord, LibraryRecord)> {
@@ -431,9 +419,16 @@ mod tests {
                 .count(),
             1
         );
-        for id in ["invalid".into(), Uuid::new_v4().to_string()] {
-            assert!(set(&node, id, false).await?.is_some());
-        }
+        let invalid = set(&node, "invalid".into(), false).await?;
+        assert_eq!(
+            crate::request_error::classify(&invalid.expect("a library id that is not a UUID")),
+            crate::messages::RequestErrorKind::InvalidInput
+        );
+        assert!(
+            set(&node, Uuid::new_v4().to_string(), false)
+                .await?
+                .is_some()
+        );
         assert_eq!(LibraryRegistry::load(dir.path())?.libraries.len(), 2);
         Ok(())
     }

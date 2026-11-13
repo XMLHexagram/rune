@@ -3869,7 +3869,7 @@ mod lifecycle_tests {
             library_id: id.to_string(),
             enabled,
         };
-        let response = request
+        request
             .handle(
                 request.extract_params(&manager.global_params),
                 None,
@@ -3877,11 +3877,6 @@ mod lifecycle_tests {
             )
             .await?
             .context("option response")?;
-        anyhow::ensure!(
-            response.error.is_none(),
-            "option failed: {:?}",
-            response.error
-        );
         Ok(())
     }
 

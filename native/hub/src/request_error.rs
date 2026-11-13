@@ -6,7 +6,7 @@ use crate::access_policy::Denial;
 use crate::messages::{
     CastLibraryState, LibraryOpenErrorKind, LibraryTaskKind, OpenLibraryFailureKind,
     ProtocolUpdateSide, RegisterLibraryFailureKind, RemoveLibraryRecordFailureKind,
-    RequestErrorKind, RequestFailureCause,
+    RequestErrorKind, RequestFailureCause, ScrobbleAuthenticationFailure,
 };
 use crate::rpc::UnsupportedReason;
 use discovery::protocol_version::ProtocolVersion;
@@ -83,6 +83,10 @@ pub enum ExpectedRequestError {
     #[error("Library record could not be removed: {kind:?}")]
     LibraryRecordRemovalFailed {
         kind: RemoveLibraryRecordFailureKind,
+    },
+    #[error("Scrobble authentication failed: {failure:?}")]
+    ScrobbleAuthentication {
+        failure: ScrobbleAuthenticationFailure,
     },
 }
 
@@ -224,6 +228,19 @@ pub fn classify(error: &Error) -> RequestErrorKind {
                     RemoveLibraryRecordFailureKind::RecordNotFound => RequestErrorKind::NotFound,
                     RemoveLibraryRecordFailureKind::RecordIsOpen => RequestErrorKind::Conflict,
                 },
+                ExpectedRequestError::ScrobbleAuthentication { failure } => match failure {
+                    ScrobbleAuthenticationFailure::CredentialsRejected => {
+                        RequestErrorKind::PermissionDenied
+                    }
+                    ScrobbleAuthenticationFailure::ServiceUnreachable => {
+                        RequestErrorKind::Unavailable
+                    }
+                    ScrobbleAuthenticationFailure::LastFmApiCredentialsMissing { .. }
+                    | ScrobbleAuthenticationFailure::LastFmApiCredentialsInvalid => {
+                        RequestErrorKind::InvalidInput
+                    }
+                    ScrobbleAuthenticationFailure::Other { .. } => RequestErrorKind::Internal,
+                },
             };
         }
     }
@@ -292,6 +309,11 @@ pub fn request_failure_cause(error: &Error) -> Option<RequestFailureCause> {
                 }
                 ExpectedRequestError::LibraryRecordRemovalFailed { kind } => {
                     return Some(RequestFailureCause::LibraryRecordRemovalFailed { kind: *kind });
+                }
+                ExpectedRequestError::ScrobbleAuthentication { failure } => {
+                    return Some(RequestFailureCause::ScrobbleAuthentication {
+                        failure: failure.clone(),
+                    });
                 }
                 _ => {}
             }

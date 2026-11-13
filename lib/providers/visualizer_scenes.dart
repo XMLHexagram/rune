@@ -213,7 +213,7 @@ class VisualizerScenesProvider extends ChangeNotifier {
     final name = p.basenameWithoutExtension(file);
     final directory = await sceneDir();
     try {
-      final message = (await awaitResponse(
+      await awaitResponse(
         'ImportVisualizerSceneRequest',
         ImportVisualizerSceneResponse.rustSignalStream,
         timeout: const Duration(seconds: 30),
@@ -223,10 +223,9 @@ class VisualizerScenesProvider extends ChangeNotifier {
           dir: directory,
           callId: callId,
         ).sendSignalToRust(),
-      )).message;
-      if (message.error != null) {
-        return VisualizerImport(name, error: message.error);
-      }
+      );
+    } on RequestFailure catch (failure) {
+      return VisualizerImport(name, error: failure.detail);
     } on TimeoutException {
       return VisualizerImport(name, error: 'No answer from the visualizer');
     }
@@ -253,7 +252,7 @@ class VisualizerScenesProvider extends ChangeNotifier {
     if (!scene.imported) return null;
     final directory = await sceneDir();
     try {
-      final error = (await awaitResponse(
+      await awaitResponse(
         'RemoveVisualizerSceneRequest',
         RemoveVisualizerSceneResponse.rustSignalStream,
         timeout: const Duration(seconds: 10),
@@ -263,8 +262,9 @@ class VisualizerScenesProvider extends ChangeNotifier {
           dir: directory,
           callId: callId,
         ).sendSignalToRust(),
-      )).message.error;
-      if (error != null) return error;
+      );
+    } on RequestFailure catch (failure) {
+      return failure.detail;
     } on TimeoutException {
       return 'No answer from the visualizer';
     }

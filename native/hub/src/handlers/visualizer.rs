@@ -16,6 +16,7 @@ use crate::{
     Session, Signal, flutter_bridge,
     library_pool::LibraryHandle,
     messages::*,
+    request_error::ExpectedRequestError,
     utils::{GlobalParams, ParamsExtractor, require_library},
     visualizer::{VISUALIZER, provide_covers},
 };
@@ -472,25 +473,24 @@ impl Signal for ImportVisualizerSceneRequest {
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("The import stopped unexpectedly: {e}")))
         };
-        let (path, error) = match imported {
+        let path = match imported {
             Ok(path) => {
                 let imported = format!("Imported {} into {}", file.display(), path.display());
                 log::info!("{imported}");
                 crate::visualizer_log::diagnostic("import_scene", imported);
                 rescan(&dir);
-                (Some(path.to_string_lossy().into_owned()), None)
+                path.to_string_lossy().into_owned()
             }
             Err(e) => {
                 log::error!("Failed to import the scene {}: {e:#}", file.display());
                 crate::visualizer_log::error("import_scene", format!("{}: {e:#}", file.display()));
-                (None, Some(format!("{e:#}")))
+                return Err(ExpectedRequestError::invalid_input(format!("{e:#}")).into());
             }
         };
         Ok(Some(ImportVisualizerSceneResponse {
             call_id: None,
             file: dart_signal.file.clone(),
             path,
-            error,
         }))
     }
 }
@@ -520,22 +520,20 @@ impl Signal for RemoveVisualizerSceneRequest {
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("The removal stopped unexpectedly: {e}")))
         };
-        let error = match removed {
+        match removed {
             Ok(()) => {
                 log::info!("Deleted the scene {}", path.display());
                 rescan(&dir);
-                None
             }
             Err(e) => {
                 log::error!("Failed to delete the scene {}: {e:#}", path.display());
                 crate::visualizer_log::error("remove_scene", format!("{}: {e:#}", path.display()));
-                Some(format!("{e:#}"))
+                return Err(e);
             }
-        };
+        }
         Ok(Some(RemoveVisualizerSceneResponse {
             call_id: None,
             path: dart_signal.path.clone(),
-            error,
         }))
     }
 }

@@ -21,6 +21,7 @@ import '../../providers/library_manager.dart';
 import '../../providers/broadcast.dart';
 import '../../bindings/bindings.dart';
 import '../../utils/api/library_registry.dart';
+import '../../utils/api/request_failure.dart';
 import '../../utils/library_ui/library_ui_state.dart';
 import '../../utils/dialogs/information/error.dart';
 
@@ -83,15 +84,11 @@ class _SettingsLibraryPageState extends State<SettingsLibraryPage> {
           )
           .toList();
     });
-    String? error;
+    Object? error;
     try {
-      final response = await setLibraryBackgroundSync(
-        library.libraryId,
-        enabled,
-      );
-      error = response.error;
+      await setLibraryBackgroundSync(library.libraryId, enabled);
     } catch (exception) {
-      error = exception.toString();
+      error = exception;
     }
     if (!mounted) return;
     setState(() {
@@ -110,7 +107,7 @@ class _SettingsLibraryPageState extends State<SettingsLibraryPage> {
       await showErrorDialog(
         context: context,
         title: S.of(context).unknownError,
-        errorMessage: error,
+        errorMessage: requestErrorText(S.of(context), error),
       );
     }
   }

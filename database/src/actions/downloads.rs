@@ -2,6 +2,7 @@
 use crate::actions::file::{MANAGED_AUDIO_DIRECTORY, blob_path_for_track, is_managed_directory};
 use crate::actions::mixes::query_mix_media_files;
 use crate::connection::RecommendationDbConnection;
+use crate::error::ExpectedError;
 use crate::sync::SeaOrmSyncStore;
 use crate::sync::model::BlobRef;
 use crate::{
@@ -20,11 +21,18 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+fn invalid(detail: &str) -> anyhow::Error {
+    ExpectedError::InvalidInput {
+        detail: detail.to_owned(),
+    }
+    .into()
+}
+
 pub fn validate_queries(queries: &[(String, String)]) -> Result<()> {
     use crate::actions::mixes::QueryOperator;
     let mut selects = false;
     for (operator, parameter) in queries {
-        match QueryOperator::parse(operator, parameter)? {
+        match QueryOperator::parse(operator, parameter).map_err(ExpectedError::from)? {
             QueryOperator::LibAll(value) | QueryOperator::LibQueue(value) => selects |= value,
             QueryOperator::LibArtist(id)
             | QueryOperator::LibAlbum(id)
@@ -33,14 +41,15 @@ pub fn validate_queries(queries: &[(String, String)]) -> Result<()> {
             | QueryOperator::LibTrack(id)
             | QueryOperator::LibRandom(id) => {
                 selects = true;
-                ensure!(id > 0, "invalid offline query operator or parameter");
+                if id <= 0 {
+                    return Err(invalid("invalid offline query operator or parameter"));
+                }
             }
             QueryOperator::LibDirectoryDeep(path) | QueryOperator::LibDirectoryShallow(path) => {
                 selects = true;
-                ensure!(
-                    !path.is_empty(),
-                    "invalid offline query operator or parameter"
-                );
+                if path.is_empty() {
+                    return Err(invalid("invalid offline query operator or parameter"));
+                }
             }
             QueryOperator::FilterLiked(_)
             | QueryOperator::FilterAnalyzed(_)
@@ -54,7 +63,9 @@ pub fn validate_queries(queries: &[(String, String)]) -> Result<()> {
             | QueryOperator::PipeLimit(_) => {}
         }
     }
-    ensure!(selects, "offline query has no selection");
+    if !selects {
+        return Err(invalid("offline query has no selection"));
+    }
     Ok(())
 }
 
@@ -65,19 +76,20 @@ pub async fn set_download_rule(
     mix_id: Option<i32>,
     enabled: bool,
 ) -> Result<String> {
-    ensure!(
-        mix_id.is_some() || !queries.is_empty(),
-        "offline rule must select content"
-    );
-    ensure!(
-        queries.len() <= 128
-            && queries
-                .iter()
-                .all(|(op, value)| !op.is_empty() && op.len() <= 256 && value.len() <= 4096),
-        "invalid offline rule"
-    );
-    if let Some(id) = mix_id {
-        ensure!(id > 0, "invalid mix id");
+    if mix_id.is_none() && queries.is_empty() {
+        return Err(invalid("offline rule must select content"));
+    }
+    if queries.len() > 128
+        || !queries
+            .iter()
+            .all(|(op, value)| !op.is_empty() && op.len() <= 256 && value.len() <= 4096)
+    {
+        return Err(invalid("invalid offline rule"));
+    }
+    if let Some(id) = mix_id
+        && id <= 0
+    {
+        return Err(invalid("invalid mix id"));
     }
     if mix_id.is_none() {
         validate_queries(&queries)?;
@@ -87,7 +99,7 @@ pub async fn set_download_rule(
             mixes::Entity::find_by_id(id)
                 .one(db)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("mix does not exist"))?
+                .ok_or(ExpectedError::NotFound { what: "mix" })?
                 .source_uuid,
         )
     } else {

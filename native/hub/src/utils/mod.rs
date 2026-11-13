@@ -2672,8 +2672,6 @@ mod moved_node_request_tests {
                 MissingHostFilePolicy::KeepAsRemote
             )
         ));
-        assert_eq!(open_response.error, closed_response.error);
-        assert!(open_response.error.is_none());
 
         node.close_ui(&params.main_token).await;
         node.shutdown().await?;

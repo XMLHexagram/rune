@@ -12529,3 +12529,139 @@ async fn a_mix_without_a_stored_mode_keeps_the_players_mode_instead_of_failing_r
     assert_eq!(mix.mode, None);
     Ok(())
 }
+
+/// What a request that did not do its work answers: a typed failure, never a response carrying an
+/// error text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_settings_and_scene_requests_answer_typed_failures() -> Result<()> {
+    use crate::messages::{
+        ImportVisualizerSceneRequest, MissingHostFilePolicy, RemoveVisualizerSceneRequest,
+        SetDownloadRuleRequest, SetSyncSettingsRequest,
+    };
+    use crate::request_error::classify;
+    use crate::utils::sync_settings::SyncSettings;
+
+    let dir = tempfile::tempdir()?;
+    let fixture = fixture(dir.path()).await?;
+    let params = &fixture.global_params;
+
+    let rule = |mix_id, queries: Vec<MixQuery>| SetDownloadRuleRequest {
+        request_id: "rule".into(),
+        queries,
+        mix_id,
+        enabled: true,
+        delete_unselected_files: false,
+        call_id: None,
+    };
+    for (request, kind) in [
+        (rule(None, Vec::new()), RequestErrorKind::InvalidInput),
+        (rule(Some(9999), Vec::new()), RequestErrorKind::NotFound),
+    ] {
+        let error = request
+            .handle(request.extract_params(params), None, &request)
+            .await
+            .err()
+        .expect("an offline rule that selects nothing or a missing mix");
+        assert_eq!(classify(&error), kind, "{error:#}");
+    }
+
+    // Turning sync listening on needs the server manager, which this call does not have.
+    let settings = Arc::new(tokio::sync::RwLock::new(SyncSettings {
+        listen: false,
+        ..SyncSettings::default()
+    }));
+    let request = SetSyncSettingsRequest {
+        request_id: "settings".into(),
+        listen: true,
+        missing_host_file: MissingHostFilePolicy::KeepAsRemote,
+        call_id: None,
+    };
+    let error = request
+        .handle(
+            (
+                settings,
+                params.config_path.clone(),
+                None::<Arc<crate::server::ServerManager>>,
+                RunMode::App,
+            ),
+            None,
+            &request,
+        )
+        .await
+        .err()
+        .expect("listening without a server manager");
+    assert_eq!(classify(&error), RequestErrorKind::Unavailable, "{error:#}");
+
+    let scenes = tempfile::tempdir()?;
+    let import = ImportVisualizerSceneRequest {
+        file: scenes.path().join("missing.rune-scene").to_string_lossy().into(),
+        dir: scenes.path().to_string_lossy().into(),
+        call_id: None,
+    };
+    let error = import
+        .handle((), None, &import)
+        .await
+        .err()
+        .expect("a file that is not there");
+    assert_eq!(classify(&error), RequestErrorKind::InvalidInput, "{error:#}");
+    let remove = RemoveVisualizerSceneRequest {
+        path: scenes.path().join("not-a-scene").to_string_lossy().into(),
+        dir: scenes.path().to_string_lossy().into(),
+        call_id: None,
+    };
+    remove
+        .handle((), None, &remove)
+        .await
+        .err()
+        .expect("a scene that is not there");
+
+    fixture.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_scrobble_login_answers_its_typed_failure() -> Result<()> {
+    use crate::messages::{
+        AuthenticateSingleServiceRequest, LastFmApiCredentialField, LoginRequestItem,
+        ScrobbleApiCredentials, ScrobbleAuthenticationFailure, ScrobbleSecretInput,
+    };
+    use crate::request_error::{classify, request_failure_cause};
+
+    let dir = tempfile::tempdir()?;
+    let fixture = fixture(dir.path()).await?;
+    let request = AuthenticateSingleServiceRequest {
+        request: Some(LoginRequestItem {
+            service_id: "LastFm".into(),
+            username: "listener".into(),
+            secret_input: ScrobbleSecretInput::Password {
+                password: "password".into(),
+                api_credentials: ScrobbleApiCredentials::LastFm {
+                    api_key: String::new(),
+                    api_secret: String::new(),
+                },
+                replaces: None,
+            },
+        }),
+        call_id: None,
+    };
+    let error = request
+        .handle(
+            request.extract_params(&fixture.global_params),
+            None,
+            &request,
+        )
+        .await
+        .err()
+        .expect("a Last.fm login without its API credentials");
+    assert_eq!(classify(&error), RequestErrorKind::InvalidInput, "{error:#}");
+    assert_eq!(
+        request_failure_cause(&error),
+        Some(RequestFailureCause::ScrobbleAuthentication {
+            failure: ScrobbleAuthenticationFailure::LastFmApiCredentialsMissing {
+                field: LastFmApiCredentialField::ApiKey,
+            },
+        })
+    );
+    fixture.global_params.node.shutdown().await?;
+    Ok(())
+}
