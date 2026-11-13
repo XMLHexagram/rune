@@ -7,6 +7,28 @@ use walkdir::WalkDir;
 
 use super::{FileIo, FileIoError, FileStream, FsNode};
 
+/// The canonical form of `path` with its metadata.
+fn canonical_node(path: &Path) -> Result<FsNode, FileIoError> {
+    let path = dunce::canonicalize(path).map_err(FileIoError::Io)?;
+    let metadata = std::fs::metadata(&path)?;
+    Ok(FsNode {
+        filename: path.file_name().unwrap().to_str().unwrap().to_string(),
+        raw_path: path.to_str().unwrap_or_default().to_string(),
+        path,
+        is_dir: metadata.is_dir(),
+        is_file: metadata.is_file(),
+        size: metadata.len(),
+    })
+}
+
+/// [`canonical_node`] on a blocking thread, for async callers.
+async fn canonical_node_async(path: &Path) -> Result<FsNode, FileIoError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || canonical_node(&path))
+        .await
+        .map_err(|error| FileIoError::Io(std::io::Error::other(error)))?
+}
+
 pub(crate) struct StdFsIo;
 
 impl StdFsIo {
@@ -165,16 +187,7 @@ impl FileIo for StdFsIo {
     }
 
     fn canonicalize(&self, path: &Path) -> Result<FsNode, FileIoError> {
-        let path = self.canonicalize_path(path)?;
-        let metadata = std::fs::metadata(&path)?;
-        Ok(FsNode {
-            filename: path.file_name().unwrap().to_str().unwrap().to_string(),
-            raw_path: path.to_str().unwrap_or_default().to_string(),
-            path,
-            is_dir: metadata.is_dir(),
-            is_file: metadata.is_file(),
-            size: metadata.len(),
-        })
+        canonical_node(path)
     }
 
     fn canonicalize_str(&self, path: &str) -> Result<FsNode, FileIoError> {
@@ -199,19 +212,19 @@ impl FileIo for StdFsIo {
     }
 
     async fn ensure_file(&self, path: &Path) -> Result<FsNode, FileIoError> {
-        if !self.exists(path)? {
+        if !fs::try_exists(path).await? {
             if let Some(parent) = path.parent() {
-                self.create_dir_all(parent)?;
+                fs::create_dir_all(parent).await?;
             }
             self.write(path, &[]).await?;
         }
-        self.canonicalize(path)
+        canonical_node_async(path).await
     }
 
     async fn ensure_directory(&self, path: &Path) -> Result<FsNode, FileIoError> {
-        if !self.exists(path)? {
-            self.create_dir_all(path)?;
+        if !fs::try_exists(path).await? {
+            fs::create_dir_all(path).await?;
         }
-        self.canonicalize(path)
+        canonical_node_async(path).await
     }
 }
