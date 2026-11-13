@@ -11184,13 +11184,14 @@ async fn controller_capabilities_follow_catalogue_access_grants() -> Result<()> 
     let mut guest = node.capabilities_for_peer(capability_snapshot(node)?, &peer, Some(library_id));
     let mut guest_connection_edit_count = 0;
     let mut guest_control_count = 0;
+    let mut guest_node_local_count = 0;
     guest.for_each_capability_mut(|access, capability| match access {
         RequestAccess::ConnectionEdit => {
             guest_connection_edit_count += 1;
             assert_eq!(
                 *capability,
                 RequestCapability::Disabled {
-                    reason: CapabilityReason::OwnerOnly,
+                    reason: CapabilityReason::NotAllowed,
                 }
             );
         }
@@ -11198,10 +11199,20 @@ async fn controller_capabilities_follow_catalogue_access_grants() -> Result<()> 
             guest_control_count += 1;
             assert_eq!(*capability, RequestCapability::Available);
         }
+        RequestAccess::NodeLocal => {
+            guest_node_local_count += 1;
+            assert_eq!(
+                *capability,
+                RequestCapability::Disabled {
+                    reason: CapabilityReason::OwnerOnly,
+                }
+            );
+        }
         _ => {}
     });
     assert!(guest_connection_edit_count > 0);
     assert!(guest_control_count > 0);
+    assert!(guest_node_local_count > 0);
 
     node.access_policy
         .set(&peer.fingerprint, DeviceGrants::my_device())?;

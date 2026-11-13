@@ -868,7 +868,13 @@ impl NodeContext {
     ) -> RequestCapabilities {
         capabilities.for_each_capability_mut(|access, capability| {
             let allowed = match access {
-                RequestAccess::NodeLocal => false,
+                // Calls that only this device makes cannot be granted.
+                RequestAccess::NodeLocal => {
+                    *capability = RequestCapability::Disabled {
+                        reason: CapabilityReason::OwnerOnly,
+                    };
+                    return;
+                }
                 RequestAccess::Control => self.access_policy.check(peer, &Action::Control).is_ok(),
                 RequestAccess::ConnectionView => library_id.is_some_and(|library_id| {
                     self.access_policy
@@ -886,7 +892,7 @@ impl NodeContext {
             };
             if !allowed {
                 *capability = RequestCapability::Disabled {
-                    reason: CapabilityReason::OwnerOnly,
+                    reason: CapabilityReason::NotAllowed,
                 };
             }
         });
