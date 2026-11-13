@@ -7436,6 +7436,139 @@ async fn handoff_of_a_paused_session_leaves_the_target_paused_at_its_position() 
     Ok(())
 }
 
+/// A source that hosts one track and a renderer it can hand off to, whose copy of the track
+/// does not decode: a handoff there fails once the target has the block.
+async fn handoff_source_and_undecodable_target(
+    name: &str,
+) -> Result<(Vec<TempDir>, Fixture, Fixture, Fixture, String, i32)> {
+    let source_dir = tempfile::tempdir()?;
+    let target_dir = tempfile::tempdir()?;
+    let source = fixture(source_dir.path()).await?;
+    let target = fixture(target_dir.path()).await?;
+    let file_name = format!("{name}.ogg");
+    let id = session_audio(&source, &file_name).await?;
+    let item = library_track_for_id(&source, id).await?;
+    let (_, target_replica) = replicate_host_library(&source, &target).await?;
+    let target_address = paired_full(&target, &source).await?;
+    let target_fingerprint = info(&target).await?.fingerprint;
+    source
+        .global_params
+        .cert_validator
+        .read()
+        .await
+        .replace_hosts_for_fingerprint(
+            &target_fingerprint,
+            vec![format!("127.0.0.1:{}", target_address.port())],
+        )
+        .await?;
+    let target_track_id = file_ids_by_uuid(
+        &target_replica.global_params.test_library().main_db,
+        &[item.file_uuid],
+    )
+    .await?
+    .get(&item.file_uuid)
+    .copied()
+    .context("target replica track id")?;
+    let corrupt = target_dir.path().join(format!("{name}-corrupt.ogg"));
+    fs::write(&corrupt, b"not an audio file")?;
+    materialize_replica_file(&target_replica, target_track_id, &corrupt, &file_name).await?;
+    queue_session(&source, &[id]).await?;
+    source
+        .global_params
+        .player
+        .lock()
+        .await
+        .set_playback_mode(PlaybackMode::RepeatAll);
+    Ok((
+        vec![source_dir, target_dir],
+        source,
+        target,
+        target_replica,
+        target_fingerprint,
+        id,
+    ))
+}
+
+/// Asks for a handoff right after Play was pressed on the source, and expects the handoff to
+/// fail at the target and the source to play on.
+async fn hand_off_right_after_play_and_expect_resume(
+    source: &Fixture,
+    target_fingerprint: String,
+) -> Result<()> {
+    use crate::messages::HandoffRequest;
+
+    source.global_params.player.lock().await.play();
+    let handoff = HandoffRequest {
+        call_id: None,
+        target: Some(target_fingerprint),
+    };
+    let result = timeout(
+        TEST_DEADLINE,
+        dispatch_gui_request(&source.global_params, &handoff),
+    )
+    .await
+    .context("handoff to an undecodable target did not finish")?;
+    assert!(
+        result.as_ref().is_err_and(|error| error.chain().any(|cause| matches!(
+            cause.downcast_ref::<ExpectedRequestError>(),
+            Some(
+                ExpectedRequestError::Unavailable { .. }
+                    | ExpectedRequestError::Remote {
+                        kind: RequestErrorKind::Unavailable,
+                        ..
+                    }
+            )
+        ))),
+        "a handoff to an undecodable target should fail as unavailable: {result:?}"
+    );
+    wait_player(source, |status| status.state == PlayerPlaybackState::Playing)
+        .await
+        .context("the source should play on after the failed handoff")?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn failed_handoff_resumes_a_paused_source_whose_play_was_just_pressed() -> Result<()> {
+    let (_dirs, source, target, _target_replica, target_fingerprint, _) =
+        handoff_source_and_undecodable_target("handoff-play-pressed").await?;
+    source.global_params.player.lock().await.load(0);
+    source.global_params.player.lock().await.play();
+    wait_player(&source, |status| status.state == PlayerPlaybackState::Playing).await?;
+    source.global_params.player.lock().await.pause();
+    wait_player(&source, |status| status.state == PlayerPlaybackState::Paused).await?;
+
+    hand_off_right_after_play_and_expect_resume(&source, target_fingerprint).await?;
+    source.global_params.node.shutdown().await?;
+    target.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn failed_handoff_resumes_a_source_whose_play_reopens_its_track() -> Result<()> {
+    let (_dirs, source, target, _target_replica, target_fingerprint, id) =
+        handoff_source_and_undecodable_target("handoff-play-reopens").await?;
+    // The track comes up paused without an output, as a restored session does, so Play loads it
+    // again before it plays.
+    source
+        .global_params
+        .player
+        .lock()
+        .await
+        .load_at_position(0, Duration::from_secs(1), false);
+    let item = PlayingItem::from(library_track_for_id(&source, id).await?);
+    wait_player(&source, |status| {
+        status.state == PlayerPlaybackState::Paused
+            && status.ready
+            && status.item == Some(item.clone())
+    })
+    .await?;
+
+    hand_off_right_after_play_and_expect_resume(&source, target_fingerprint).await?;
+    source.global_params.node.shutdown().await?;
+    target.global_params.node.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn handoff_moves_queue_and_position_and_preserves_source_sessions() -> Result<()> {
     use crate::messages::{

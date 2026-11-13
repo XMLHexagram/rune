@@ -22,9 +22,9 @@ use ::database::{
 };
 use ::playback::PlayerCommand;
 use ::playback::player::{
-    HandoffBlockId as PlayerHandoffBlockId, LibraryItem, Playable, PlaybackSource,
-    PlaybackState as PlayerPlaybackState, PlayerStatus, PlayingItem, PlaylistEdit, PlaylistLoad,
-    PlaylistPlacement,
+    HandoffBlockId as PlayerHandoffBlockId, LibraryItem, PausedPlayback, Playable, PlaybackSource,
+    PlaybackState as PlayerPlaybackState, PlayerCommandError, PlayerStatus, PlayingItem,
+    PlaylistEdit, PlaylistLoad, PlaylistPlacement,
 };
 
 use crate::backends::remote::{RendererLink, RendererLinkUse};
@@ -1887,9 +1887,12 @@ async fn pause_handoff_source(
         })
     } else {
         let session = node.session()?;
-        let was_playing =
-            session.player.lock().await.get_status().state == PlayerPlaybackState::Playing;
-        apply_player_command(&session.player, PlayerCommand::Pause).await?;
+        // The player answers after the commands already sent, such as a Play pressed just before
+        // the handoff, and counts a track that is loading to play as playing.
+        let paused = { session.player.lock().await.pause_reporting() };
+        let was_playing = paused.await.map_err(|_| {
+            anyhow::Error::new(player_command_error(PlayerCommandError::ThreadUnavailable))
+        })? == PausedPlayback::Playing;
         let snapshot = match session_snapshot(node, &session).await {
             Ok(snapshot) => snapshot,
             Err(error) => {

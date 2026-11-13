@@ -28,9 +28,10 @@ use crate::output_stream::{RuneOutputStream, RuneOutputStreamHandle};
 use crate::pcm_tap::PcmTap;
 use crate::player::{
     AudioPlaybackNote, AudioSourceMode, ClearHandoffBlocksResult, HandoffBlockId,
-    HandoffLoadResult, InterruptedItem, LibraryTrackKey, PlaybackSource, PlaybackSourceResolver,
-    PlayerCommandError, PlayerStatus, PlayingItem, PlaylistEdit, PlaylistPlacement, QueueEntry,
-    RemoteAudioError, SubsonicItem, TakeBackBlockResult, UnavailableReason,
+    HandoffLoadResult, InterruptedItem, LibraryTrackKey, PausedPlayback, PlaybackSource,
+    PlaybackSourceResolver, PlayerCommandError, PlayerStatus, PlayingItem, PlaylistEdit,
+    PlaylistPlacement, QueueEntry, RemoteAudioError, SubsonicItem, TakeBackBlockResult,
+    UnavailableReason,
 };
 use crate::realtime_fft::RealTimeFFT;
 use crate::shared_source::SharedSource;
@@ -402,6 +403,10 @@ pub enum PlayerCommand {
     },
     Play,
     Pause,
+    /// Pauses, and answers what the pause stopped.
+    PauseReporting {
+        response: oneshot::Sender<PausedPlayback>,
+    },
     Stop,
     Next,
     Previous,
@@ -904,6 +909,16 @@ impl PlayerInternal {
                             self.resume_after_interruption = false;
                             self.pause()?;
                         },
+                        PlayerCommand::PauseReporting { response } => {
+                            let paused = if self.plays_or_starts_playing() {
+                                PausedPlayback::Playing
+                            } else {
+                                PausedPlayback::NotPlaying
+                            };
+                            self.resume_after_interruption = false;
+                            self.pause()?;
+                            let _ = response.send(paused);
+                        },
                         PlayerCommand::Stop => self.stop()?,
                         PlayerCommand::Next => self.next()?,
                         PlayerCommand::Previous => self.previous()?,
@@ -991,8 +1006,7 @@ impl PlayerInternal {
                             }
                             let current_index = self.current_playlist_index();
                             let current_item = self.current_item.clone();
-                            let was_playing = self.state == InternalPlaybackState::Playing
-                                || (self.state == InternalPlaybackState::Loading && self.play_when_loaded);
+                            let was_playing = self.plays_or_starts_playing();
                             let was_inside = self.state != InternalPlaybackState::Stopped
                                 && current_item.is_some()
                                 && current_index
@@ -1114,6 +1128,12 @@ impl PlayerInternal {
 
     fn load(&mut self, index: Option<usize>, play: bool, mapped: bool) -> Result<()> {
         self.load_at(index, play, mapped, None)
+    }
+
+    // Whether playback plays, or starts once the track that is loading is ready.
+    fn plays_or_starts_playing(&self) -> bool {
+        self.state == InternalPlaybackState::Playing
+            || (self.state == InternalPlaybackState::Loading && self.play_when_loaded)
     }
 
     // Loads a track that seeks to `restore_position` once it is ready. The position belongs to
@@ -4654,6 +4674,58 @@ mod playback_state_tests {
                         Duration::from_millis(1500),
                     );
                     assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+                    runner.abort();
+                    let _ = std::fs::remove_file(wav_path);
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+            })
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pause_reporting_counts_a_track_that_reopens_to_play_as_playing() -> Result<()> {
+        let file_uuid = Uuid::new_v4();
+        let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
+        let local = LocalSet::new();
+        local
+            .run_until(async move {
+                let runner = tokio::task::spawn_local(async move { internal.run().await });
+                async {
+                    let library_id = Uuid::new_v4();
+                    let track = library_item(library_id, file_uuid);
+                    let pause_reporting = || {
+                        let (response, paused) = oneshot::channel();
+                        commands_sender.send(PlayerCommand::PauseReporting { response })?;
+                        Ok::<_, anyhow::Error>(paused)
+                    };
+                    commands_sender.send(restore(
+                        library_id,
+                        &[file_uuid],
+                        0,
+                        1.5,
+                        PlaybackMode::Sequential,
+                    ))?;
+                    expect_loaded(&mut events, &track).await?;
+                    assert_eq!(pause_reporting()?.await?, PausedPlayback::NotPlaying);
+
+                    // The track came up paused without an output, so Play loads it again before
+                    // it plays. A pause meanwhile stops playback that was about to start, and the
+                    // track comes up paused where it stood.
+                    commands_sender.send(PlayerCommand::Play)?;
+                    assert_eq!(pause_reporting()?.await?, PausedPlayback::Playing);
+                    assert_about(
+                        expect_loaded(&mut events, &track).await?,
+                        Duration::from_millis(1500),
+                    );
+
+                    commands_sender.send(PlayerCommand::Play)?;
+                    expect_playing(&mut events, &track).await?;
+                    assert_eq!(pause_reporting()?.await?, PausedPlayback::Playing);
+                    expect_paused(&mut events, &track).await?;
+                    assert_eq!(pause_reporting()?.await?, PausedPlayback::NotPlaying);
 
                     runner.abort();
                     let _ = std::fs::remove_file(wav_path);
