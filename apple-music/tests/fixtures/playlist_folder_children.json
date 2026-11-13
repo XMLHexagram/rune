@@ -1,0 +1,6 @@
+{
+  "data": [
+    {"id": "p.WmzVVDOUO9pDBk", "type": "library-playlist-folders", "href": "/v1/me/library/playlist-folders/p.WmzVVDOUO9pDBk", "attributes": {"name": "Chill", "dateAdded": "2022-03-19T06:07:33Z"}},
+    {"id": "p.RB1AAkGsv74Zkl", "type": "library-playlists", "href": "/v1/me/library/playlists/p.RB1AAkGsv74Zkl", "attributes": {"name": "New Playlist", "canEdit": true}}
+  ]
+}

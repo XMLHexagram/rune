@@ -1,0 +1,8 @@
+{
+  "data": [{
+    "id": "p.lib2",
+    "type": "library-playlists",
+    "attributes": {"hasCatalog": false, "name": "Mine", "canEdit": true},
+    "relationships": {"catalog": {"data": []}}
+  }]
+}
