@@ -57,9 +57,9 @@ use crate::{
         AttachedRenderer, CapabilityReason, ClientStatus, ClientSummary,
         IncommingClientPermissionNotification, InitializeNodeRequest, InitializeNodeResponse,
         LibraryTaskKind, LibraryTaskStateChanged, PauseRequest, PlaybackStatus, PlaylistItem,
-        PlaylistUpdate, ProtocolUpdateSide, RefreshSessionRequest, RemoteLibraryReconnecting,
-        RemoteLossKind, RendererAttachmentChanged, RendererLinkLost, RequestCapabilities,
-        RequestCapability, TrustListUpdated, TrustedClientsChanged, TrustedServerCertificate,
+        ProtocolUpdateSide, RefreshSessionRequest, RemoteLibraryReconnecting, RemoteLossKind,
+        RendererAttachmentChanged, RendererLinkLost, RequestCapabilities, RequestCapability,
+        TrustListUpdated, TrustedClientsChanged, TrustedServerCertificate,
     },
     server::{
         ServerManager, WebSocketService,
@@ -181,26 +181,25 @@ struct NodeBroadcaster {
     current_player: Arc<StdMutex<CurrentPlayer>>,
     local: Arc<dyn Broadcaster>,
     remote: Arc<WebSocketService>,
-    handoff_playback_events: broadcast::Sender<HandoffPlaybackEvent>,
+}
+
+/// A report a renderer sent over one link, for a handoff that waits for that renderer to start
+/// the handed-off track. Only renderer links publish them: this device's own session reports the
+/// same track at the same place while it is handed off, and must never stand in for the target.
+#[derive(Clone)]
+pub(crate) struct HandoffPlaybackEvent {
+    pub(crate) link: Uuid,
+    pub(crate) report: HandoffPlaybackReport,
 }
 
 #[derive(Clone)]
-pub(crate) enum HandoffPlaybackEvent {
+pub(crate) enum HandoffPlaybackReport {
     Status(Box<PlaybackStatus>),
     Playlist(Vec<PlaylistItem>),
 }
 
 impl Broadcaster for NodeBroadcaster {
     fn broadcast(&self, message: &dyn RinfRustSignal) {
-        if let Some(status) = message.as_any().downcast_ref::<PlaybackStatus>() {
-            let _ = self
-                .handoff_playback_events
-                .send(HandoffPlaybackEvent::Status(Box::new(status.clone())));
-        } else if let Some(playlist) = message.as_any().downcast_ref::<PlaylistUpdate>() {
-            let _ = self
-                .handoff_playback_events
-                .send(HandoffPlaybackEvent::Playlist(playlist.items.clone()));
-        }
         let remote_event = message.remote_event();
         let suppress_local_status = self
             .current_player
@@ -338,7 +337,6 @@ impl NodeContext {
                 current_player: current_player.clone(),
                 local: broadcaster.clone(),
                 remote: websocket_service.clone(),
-                handoff_playback_events: handoff_playback_events.clone(),
             }),
             gui_broadcaster: broadcaster,
             handoff_playback_events,
@@ -1630,16 +1628,12 @@ mod tests {
 
     #[test]
     fn only_controller_signals_reach_remote_clients() {
-        use tokio::sync::broadcast;
-
         let remote = Arc::new(WebSocketService::new());
         let mut received = remote.broadcast_tx.subscribe();
-        let (handoff_playback_events, _) = broadcast::channel(1);
         let broadcaster = NodeBroadcaster {
             current_player: Arc::new(StdMutex::new(CurrentPlayer::Local)),
             local: Arc::new(Quiet(None)),
             remote,
-            handoff_playback_events,
         };
         broadcaster.broadcast(&TrustListUpdated {
             certificates: Vec::new(),

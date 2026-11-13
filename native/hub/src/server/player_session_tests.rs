@@ -7155,6 +7155,144 @@ async fn handoff_unplayable_and_decode_failures_roll_back_and_resume_source() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn handoff_is_not_confirmed_by_this_devices_own_playing_status() -> Result<()> {
+    use crate::backends::remote::decode_message;
+    use crate::messages::HandoffRequest;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let source_dir = tempfile::tempdir()?;
+    let target_dir = tempfile::tempdir()?;
+    let source = fixture(source_dir.path()).await?;
+    let target = fixture(target_dir.path()).await?;
+    let id = session_audio(&source, "handoff-own-status.ogg").await?;
+    let item = library_track_for_id(&source, id).await?;
+    let (_, target_replica) = replicate_host_library(&source, &target).await?;
+    let target_address = paired_full(&target, &source).await?;
+    let target_fingerprint = info(&target).await?.fingerprint;
+    source
+        .global_params
+        .cert_validator
+        .read()
+        .await
+        .replace_hosts_for_fingerprint(
+            &target_fingerprint,
+            vec![format!("127.0.0.1:{}", target_address.port())],
+        )
+        .await?;
+    // The target has the track, but its copy does not decode, so it never starts it.
+    let target_track_id = file_ids_by_uuid(
+        &target_replica.global_params.test_library().main_db,
+        &[item.file_uuid],
+    )
+    .await?
+    .get(&item.file_uuid)
+    .copied()
+    .context("target replica track id")?;
+    let corrupt = target_dir.path().join("handoff-own-status-corrupt.ogg");
+    fs::write(&corrupt, b"not an audio file")?;
+    materialize_replica_file(
+        &target_replica,
+        target_track_id,
+        &corrupt,
+        "handoff-own-status.ogg",
+    )
+    .await?;
+
+    queue_session(&source, &[id]).await?;
+    source
+        .global_params
+        .player
+        .lock()
+        .await
+        .set_playback_mode(PlaybackMode::RepeatAll);
+    source.global_params.player.lock().await.load(0);
+    source.global_params.player.lock().await.play();
+    wait_player(&source, |status| status.state == PlayerPlaybackState::Playing).await?;
+
+    // The target's session reports nothing while its UI library is held, as when it lags behind.
+    let target_ui = target.global_params.node.current_ui().await?;
+    let target_reports = target_ui.ui_library.lock().await;
+    let source_params = source.global_params.clone();
+    let handoff_request = HandoffRequest {
+        call_id: None,
+        target: Some(target_fingerprint),
+    };
+    let handoff = tokio::spawn(async move {
+        dispatch_gui_request(&source_params, &handoff_request).await
+    });
+    let handed_off = PlayingItem::from(item);
+    wait_player(&target, |status| {
+        status.playlist.iter().any(|entry| entry.item == handed_off)
+    })
+    .await?;
+
+    // Before the target answers, this device reports the handed-off track playing at the
+    // handed-off place, as its own late statuses do under load.
+    let handed_off_ref = PlayingItemRef::LibraryTrack {
+        library_id: item.library_id.to_string(),
+        track: item.file_uuid.to_string(),
+    };
+    let mut source_reports = source
+        .global_params
+        .node
+        .websocket_service
+        .broadcast_tx
+        .subscribe();
+    source.global_params.player.lock().await.play();
+    timeout(TEST_DEADLINE, async {
+        loop {
+            let frame = match source_reports.recv().await {
+                Ok(frame) => frame,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(error) => return Err(anyhow::Error::new(error)),
+            };
+            let Some((name, payload, _)) = decode_message(&frame) else {
+                continue;
+            };
+            if name != "PlaybackStatus" {
+                continue;
+            }
+            let status = rinf::deserialize::<PlaybackStatus>(&payload)?;
+            if status.state == PlaybackState::Playing
+                && status.item_request.as_ref() == Some(&handed_off_ref)
+            {
+                return Ok(());
+            }
+        }
+    })
+    .await
+    .context("this device did not report the handed-off track playing")??;
+    drop(target_reports);
+
+    let result = timeout(TEST_DEADLINE, handoff)
+        .await
+        .context("handoff did not finish")?
+        .context("join handoff")?;
+    assert!(
+        result.as_ref().is_err_and(|error| error.chain().any(|cause| matches!(
+            cause.downcast_ref::<ExpectedRequestError>(),
+            Some(
+                ExpectedRequestError::Unavailable { .. }
+                    | ExpectedRequestError::Remote {
+                        kind: RequestErrorKind::Unavailable,
+                        ..
+                    }
+            )
+        ))),
+        "a handoff the target never started should fail as unavailable: {result:?}"
+    );
+    wait_player(&target, |status| {
+        !status.playlist.iter().any(|entry| entry.item == handed_off)
+    })
+    .await
+    .context("the failed handoff should take its block back from the target")?;
+    wait_player(&source, |status| status.state == PlayerPlaybackState::Playing).await?;
+    source.global_params.node.shutdown().await?;
+    target.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn handoff_moves_queue_and_position_and_preserves_source_sessions() -> Result<()> {
     use crate::messages::{
         HandoffBlockId, HandoffRequest, MovePlaylistItemRequest, RemoveRequest,

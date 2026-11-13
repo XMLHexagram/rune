@@ -28,7 +28,7 @@ use ::playback::player::{
 };
 
 use crate::backends::remote::{RendererLink, RendererLinkUse};
-use crate::node::HandoffPlaybackEvent;
+use crate::node::{HandoffPlaybackEvent, HandoffPlaybackReport};
 use crate::request_error::{ExpectedRequestError, player_command_error};
 use crate::server::libraries::{cast_library_state, cast_library_states, parse_library_ids};
 use crate::subsonic_binding::SubsonicBinding;
@@ -1994,6 +1994,7 @@ async fn hand_off_to_renderer(
         }
     };
     let target_item = response.handoff_item;
+    let target_link = connected_link.id();
     let previous_player = node.current_player_snapshot()?;
     node.install_renderer_link(connected_link, alias)?;
     node.transition_current_player(previous_player, node.current_player()?)
@@ -2008,7 +2009,9 @@ async fn hand_off_to_renderer(
     {
         warn!("Handoff succeeded, but renderer state refresh failed: {error:#}");
     }
-    if let Err(error) = wait_for_handoff_start(&mut events, &target_item, expected_position).await {
+    if let Err(error) =
+        wait_for_handoff_start(&mut events, target_link, &target_item, expected_position).await
+    {
         let rollback = link
             .call(&TakeBackHandoffBlockRequest {
                 block: block.into(),
@@ -2065,8 +2068,11 @@ async fn hand_off_to_this_device(
     Ok(())
 }
 
+/// Waits for the target to report the handed-off track playing at the handed-off place, or
+/// unavailable. Only the reports that came over `target_link` count.
 async fn wait_for_handoff_start(
     events: &mut broadcast::Receiver<HandoffPlaybackEvent>,
+    target_link: Uuid,
     expected_item: &PlayingItemRef,
     expected_position: f64,
 ) -> Result<()> {
@@ -2082,8 +2088,11 @@ async fn wait_for_handoff_start(
                     .into());
                 }
             };
-            match event {
-                HandoffPlaybackEvent::Playlist(items) => {
+            if event.link != target_link {
+                continue;
+            }
+            match event.report {
+                HandoffPlaybackReport::Playlist(items) => {
                     if items.iter().any(|item| {
                         same_handoff_item(&item.item, expected_item) && item.unavailable.is_some()
                     }) {
@@ -2093,7 +2102,7 @@ async fn wait_for_handoff_start(
                         .into());
                     }
                 }
-                HandoffPlaybackEvent::Status(status) => {
+                HandoffPlaybackReport::Status(status) => {
                     if status
                         .item_request
                         .as_ref()
@@ -2133,33 +2142,85 @@ mod handoff_confirmation_tests {
         let expected_item = PlayingItemRef::IndependentFile {
             path: "slow-start.ogg".into(),
         };
+        let target_link = Uuid::new_v4();
         let (sender, mut events) = broadcast::channel(1);
         let delayed_sender = sender.clone();
         let delayed_item = expected_item.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = delayed_sender.send(HandoffPlaybackEvent::Status(Box::new(PlaybackStatus {
-                session_id: "slow-start".into(),
-                state: PlaybackState::Playing,
-                progress_seconds: 42.0,
-                progress_percentage: 0.0,
-                artist: None,
-                album: None,
-                title: None,
-                duration: 0.0,
-                index: Some(0),
-                item: None,
-                item_request: Some(delayed_item),
-                playback_mode: PlaybackMode::Sequential,
-                ready: true,
-                cover_art_path: None,
-                lib_path: String::new(),
-            })));
+            let _ = delayed_sender.send(HandoffPlaybackEvent {
+                link: target_link,
+                report: HandoffPlaybackReport::Status(Box::new(playing_status(delayed_item, 42.0))),
+            });
         });
 
         let started = Instant::now();
-        wait_for_handoff_start(&mut events, &expected_item, 42.0).await?;
+        wait_for_handoff_start(&mut events, target_link, &expected_item, 42.0).await?;
         assert!(started.elapsed() >= Duration::from_millis(100));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_the_target_link_confirms_or_fails_a_handoff() -> Result<()> {
+        let expected_item = PlayingItemRef::IndependentFile {
+            path: "handed-off.ogg".into(),
+        };
+        let target_link = Uuid::new_v4();
+        let (sender, mut events) = broadcast::channel(4);
+        // The track playing at the handed-off place over another link, such as the renderer
+        // handed off from, is not the target starting it.
+        sender
+            .send(HandoffPlaybackEvent {
+                link: Uuid::new_v4(),
+                report: HandoffPlaybackReport::Status(Box::new(playing_status(
+                    expected_item.clone(),
+                    42.0,
+                ))),
+            })
+            .map_err(|_| anyhow::anyhow!("handoff event channel closed"))?;
+        sender
+            .send(HandoffPlaybackEvent {
+                link: target_link,
+                report: HandoffPlaybackReport::Playlist(vec![PlaylistItem {
+                    unavailable: Some(PlaylistUnavailableReason::Unreadable),
+                    item: expected_item.clone(),
+                    artist: String::new(),
+                    album: String::new(),
+                    title: String::new(),
+                    duration: 0.0,
+                }]),
+            })
+            .map_err(|_| anyhow::anyhow!("handoff event channel closed"))?;
+
+        let error = wait_for_handoff_start(&mut events, target_link, &expected_item, 42.0)
+            .await
+            .expect_err("a status from another link confirmed the handoff");
+        assert!(matches!(
+            error.downcast_ref::<ExpectedRequestError>(),
+            Some(ExpectedRequestError::Unavailable {
+                what: "handed-off track"
+            })
+        ));
+        Ok(())
+    }
+
+    fn playing_status(item: PlayingItemRef, progress_seconds: f32) -> PlaybackStatus {
+        PlaybackStatus {
+            session_id: "handoff".into(),
+            state: PlaybackState::Playing,
+            progress_seconds,
+            progress_percentage: 0.0,
+            artist: None,
+            album: None,
+            title: None,
+            duration: 0.0,
+            index: Some(0),
+            item: None,
+            item_request: Some(item),
+            playback_mode: PlaybackMode::Sequential,
+            ready: true,
+            cover_art_path: None,
+            lib_path: String::new(),
+        }
     }
 }
