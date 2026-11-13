@@ -111,14 +111,7 @@ void main(List<String> arguments) async {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         final context = rootNavigatorKey.currentState?.overlay?.context;
         if (context != null && context.mounted) {
-          displayInfoBar(
-            context,
-            builder: (_, close) => InfoBar(
-              title: Text(requestFailureMessage(S.of(context), error)),
-              severity: InfoBarSeverity.error,
-              onClose: close,
-            ),
-          );
+          showRequestFailureInfoBar(context, error);
         }
       });
       WidgetsBinding.instance.ensureVisualUpdate();
@@ -641,22 +634,13 @@ class RuneLifecycleState extends State<RuneLifecycle> {
         }
         final noticeContext = rootNavigatorKey.currentState?.overlay?.context;
         if (noticeContext == null || !mounted || !noticeContext.mounted) return;
-        displayInfoBar(
+        showRequestFailureInfoBar(
           noticeContext,
-          builder: (_, close) => InfoBar(
-            title: Text(
-              requestFailureMessage(
-                S.of(noticeContext),
-                RequestFailure(
-                  failure.request,
-                  failure.kind,
-                  failure.detail,
-                  failure.cause,
-                ),
-              ),
-            ),
-            severity: InfoBarSeverity.error,
-            onClose: close,
+          RequestFailure(
+            failure.request,
+            failure.kind,
+            failure.detail,
+            failure.cause,
           ),
         );
       },

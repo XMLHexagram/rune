@@ -69,7 +69,6 @@ pub struct RemovePlaylistRequest {
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct RemovePlaylistResponse {
     pub playlist_id: i32,
-    pub success: bool,
     #[serde(default)]
     pub call_id: Option<u64>,
 }
@@ -85,7 +84,6 @@ pub struct AddItemToPlaylistRequest {
 
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct AddItemToPlaylistResponse {
-    pub success: bool,
     pub occurrence_id: String,
     #[serde(default)]
     pub call_id: Option<u64>,
@@ -102,7 +100,6 @@ pub struct ReorderPlaylistItemPositionRequest {
 
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct ReorderPlaylistItemPositionResponse {
-    pub success: bool,
     #[serde(default)]
     pub call_id: Option<u64>,
 }

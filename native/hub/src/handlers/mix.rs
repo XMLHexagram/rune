@@ -198,7 +198,6 @@ impl Signal for RemoveMixRequest {
         Ok(Some(RemoveMixResponse {
             call_id: None,
             mix_id: request.mix_id,
-            success: true,
         }))
     }
 }
@@ -241,10 +240,7 @@ impl Signal for AddItemToMixRequest {
             )
         })?;
 
-        Ok(Some(AddItemToMixResponse {
-            call_id: None,
-            success: true,
-        }))
+        Ok(Some(AddItemToMixResponse { call_id: None }))
     }
 }
 

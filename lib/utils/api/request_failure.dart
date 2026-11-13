@@ -1,7 +1,10 @@
 import 'dart:async';
 
+import 'package:fluent_ui/fluent_ui.dart';
+
 import '../../bindings/bindings.dart';
 import '../../l10n/app_localizations.dart';
+import '../l10n.dart';
 import 'call_id.dart';
 
 class RequestFailure implements Exception {
@@ -108,6 +111,18 @@ String requestFailureMessage(AppLocalizations s, RequestFailure failure) =>
         RequestErrorKind.internal => s.unknownError,
       },
     };
+
+/// Show a request failure in the app's error notice.
+void showRequestFailureInfoBar(BuildContext context, RequestFailure failure) {
+  displayInfoBar(
+    context,
+    builder: (_, close) => InfoBar(
+      title: Text(requestFailureMessage(S.of(context), failure)),
+      severity: InfoBarSeverity.error,
+      onClose: close,
+    ),
+  );
+}
 
 String requestErrorText(AppLocalizations s, Object error) =>
     error is RequestFailure ? requestFailureMessage(s, error) : 'Error: $error';

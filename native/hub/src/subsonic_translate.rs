@@ -78,7 +78,6 @@ pub(crate) async fn set_liked_request(
     Ok(request.item.clone().map(|item| SetLikedResponse {
         item,
         liked: request.liked,
-        success: true,
         call_id: request.call_id,
     }))
 }
@@ -350,7 +349,6 @@ pub(crate) async fn remove_playlist_request(
         .map_err(subsonic_request_error)?;
     Ok(Some(RemovePlaylistResponse {
         playlist_id: request.playlist_id,
-        success: true,
         call_id: None,
     }))
 }
@@ -398,7 +396,6 @@ pub(crate) async fn add_item_to_playlist_request(
         .await
         .map_err(subsonic_request_error)?;
     Ok(Some(AddItemToPlaylistResponse {
-        success: true,
         occurrence_id: append_position.to_string(),
         call_id: None,
     }))
@@ -452,10 +449,7 @@ pub(crate) async fn reorder_playlist_item_position_request(
         .replace_playlist_songs(&remote_id, &refs)
         .await
         .map_err(subsonic_request_error)?;
-    Ok(Some(ReorderPlaylistItemPositionResponse {
-        success: true,
-        call_id: None,
-    }))
+    Ok(Some(ReorderPlaylistItemPositionResponse { call_id: None }))
 }
 
 async fn subsonic_cover_map(
@@ -2865,7 +2859,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(response.success && response.liked);
+        assert!(response.liked);
         assert!(
             get_liked_request(
                 &binding,

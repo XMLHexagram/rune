@@ -16,7 +16,6 @@ pub struct SetLikedRequest {
 pub struct SetLikedResponse {
     pub item: PlayingItemRef,
     pub liked: bool,
-    pub success: bool,
     #[serde(default)]
     pub call_id: Option<u64>,
 }

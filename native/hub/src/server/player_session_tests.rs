@@ -1437,7 +1437,7 @@ async fn liked_requests_address_a_library_other_than_the_ui_library() -> Result<
     )
     .await?
     .context("set liked response")?;
-    assert!(updated.success);
+    assert!(updated.liked);
     let final_state = dispatch_gui_request(
         &fixture.global_params,
         &GetLikedRequest {
@@ -1458,7 +1458,7 @@ async fn liked_requests_address_a_library_other_than_the_ui_library() -> Result<
     )
     .await?
     .context("unset liked response")?;
-    assert!(unliked.success);
+    assert!(!unliked.liked);
     let final_state = dispatch_gui_request(
         &fixture.global_params,
         &GetLikedRequest {
@@ -1528,6 +1528,55 @@ async fn setting_liked_on_a_read_only_replica_returns_a_typed_error() -> Result<
             what: "write access to liked state"
         })
     )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn setting_liked_on_an_item_without_liked_state_returns_a_typed_error() -> Result<()> {
+    use crate::request_error::classify;
+
+    let node_dir = tempfile::tempdir()?;
+    let fixture = fixture(node_dir.path()).await?;
+    let library_id = fixture.global_params.test_library().library_id.to_string();
+    for (item, kind) in [
+        (
+            PlayingItemRef::LibraryTrack {
+                library_id: library_id.clone(),
+                track: Uuid::new_v4().to_string(),
+            },
+            RequestErrorKind::NotFound,
+        ),
+        (
+            PlayingItemRef::LibraryTrack {
+                library_id,
+                track: "not-a-track-uuid".into(),
+            },
+            RequestErrorKind::InvalidInput,
+        ),
+        (
+            PlayingItemRef::IndependentFile {
+                path: "/music/independent.flac".into(),
+            },
+            RequestErrorKind::InvalidInput,
+        ),
+        (
+            PlayingItemRef::IndependentFile {
+                path: String::new(),
+            },
+            RequestErrorKind::InvalidInput,
+        ),
+    ] {
+        let request = SetLikedRequest {
+            call_id: None,
+            item: Some(item.clone()),
+            liked: true,
+        };
+        let error = match dispatch_gui_request(&fixture.global_params, &request).await {
+            Ok(_) => anyhow::bail!("{item:?} has no liked state and must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(classify(&error), kind, "{item:?}: {error:#}");
+    }
     Ok(())
 }
 

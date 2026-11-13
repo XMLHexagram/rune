@@ -150,7 +150,6 @@ pub struct RemoveMixRequest {
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct RemoveMixResponse {
     pub mix_id: i32,
-    pub success: bool,
     #[serde(default)]
     pub call_id: Option<u64>,
 }
@@ -166,7 +165,6 @@ pub struct AddItemToMixRequest {
 
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct AddItemToMixResponse {
-    pub success: bool,
     #[serde(default)]
     pub call_id: Option<u64>,
 }
