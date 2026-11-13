@@ -1981,6 +1981,12 @@ async fn hand_off_to_renderer(
         .connect_renderer(target, RendererLinkUse::Control)
         .await?;
     let mut events = node.subscribe_handoff_playback_events();
+    // The target starts the handed-off track as the load asks: playing, or paused at its place.
+    let expected_state = if load.play != LoadPlay::Pause {
+        PlaybackState::Playing
+    } else {
+        PlaybackState::Paused
+    };
     let handoff = HandoffLoadRequest {
         block: block.into(),
         load,
@@ -2009,8 +2015,14 @@ async fn hand_off_to_renderer(
     {
         warn!("Handoff succeeded, but renderer state refresh failed: {error:#}");
     }
-    if let Err(error) =
-        wait_for_handoff_start(&mut events, target_link, &target_item, expected_position).await
+    if let Err(error) = wait_for_handoff_start(
+        &mut events,
+        target_link,
+        &target_item,
+        expected_position,
+        expected_state,
+    )
+    .await
     {
         let rollback = link
             .call(&TakeBackHandoffBlockRequest {
@@ -2068,13 +2080,15 @@ async fn hand_off_to_this_device(
     Ok(())
 }
 
-/// Waits for the target to report the handed-off track playing at the handed-off place, or
-/// unavailable. Only the reports that came over `target_link` count.
+/// Waits for the target to report the handed-off track at the handed-off place in the expected
+/// state, playing or paused, or to report it unavailable. Only the reports that came over
+/// `target_link` count.
 async fn wait_for_handoff_start(
     events: &mut broadcast::Receiver<HandoffPlaybackEvent>,
     target_link: Uuid,
     expected_item: &PlayingItemRef,
     expected_position: f64,
+    expected_state: PlaybackState,
 ) -> Result<()> {
     tokio::time::timeout(HANDOFF_START_TIMEOUT, async {
         loop {
@@ -2107,7 +2121,7 @@ async fn wait_for_handoff_start(
                         .item_request
                         .as_ref()
                         .is_some_and(|item| same_handoff_item(item, expected_item))
-                        && status.state == PlaybackState::Playing
+                        && status.state == expected_state
                         && status.ready
                         && (f64::from(status.progress_seconds) - expected_position).abs() <= 1.5
                     {
@@ -2123,7 +2137,7 @@ async fn wait_for_handoff_start(
             what: "handoff playback start",
         })
         .context(format!(
-            "expected item {expected_item:?} at {expected_position}s"
+            "expected item {expected_item:?} {expected_state:?} at {expected_position}s"
         ))
     })?
 }
@@ -2155,7 +2169,14 @@ mod handoff_confirmation_tests {
         });
 
         let started = Instant::now();
-        wait_for_handoff_start(&mut events, target_link, &expected_item, 42.0).await?;
+        wait_for_handoff_start(
+            &mut events,
+            target_link,
+            &expected_item,
+            42.0,
+            PlaybackState::Playing,
+        )
+        .await?;
         assert!(started.elapsed() >= Duration::from_millis(100));
         Ok(())
     }
@@ -2192,9 +2213,15 @@ mod handoff_confirmation_tests {
             })
             .map_err(|_| anyhow::anyhow!("handoff event channel closed"))?;
 
-        let error = wait_for_handoff_start(&mut events, target_link, &expected_item, 42.0)
-            .await
-            .expect_err("a status from another link confirmed the handoff");
+        let error = wait_for_handoff_start(
+            &mut events,
+            target_link,
+            &expected_item,
+            42.0,
+            PlaybackState::Playing,
+        )
+        .await
+        .expect_err("a status from another link confirmed the handoff");
         assert!(matches!(
             error.downcast_ref::<ExpectedRequestError>(),
             Some(ExpectedRequestError::Unavailable {

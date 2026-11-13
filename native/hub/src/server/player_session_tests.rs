@@ -7293,6 +7293,150 @@ async fn handoff_is_not_confirmed_by_this_devices_own_playing_status() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn handoff_of_a_paused_session_leaves_the_target_paused_at_its_position() -> Result<()> {
+    use crate::messages::HandoffRequest;
+
+    let source_dir = tempfile::tempdir()?;
+    let target_dir = tempfile::tempdir()?;
+    let source = fixture(source_dir.path()).await?;
+    let target = fixture(target_dir.path()).await?;
+    let ids = [
+        session_audio(&source, "handoff-paused-1.ogg").await?,
+        session_audio(&source, "handoff-paused-2.ogg").await?,
+        session_audio(&source, "handoff-paused-3.ogg").await?,
+        session_audio(&source, "handoff-paused-target-1.ogg").await?,
+        session_audio(&source, "handoff-paused-target-2.ogg").await?,
+    ];
+    let items = futures::future::join_all(ids.iter().map(|id| library_track_for_id(&source, *id)))
+        .await
+        .into_iter()
+        .map(|item| item.map(PlayingItem::from))
+        .collect::<Result<Vec<_>>>()?;
+    let (_, target_replica) = replicate_host_library(&source, &target).await?;
+    let target_address = paired_full(&target, &source).await?;
+    let target_fingerprint = info(&target).await?.fingerprint;
+    source
+        .global_params
+        .cert_validator
+        .read()
+        .await
+        .replace_hosts_for_fingerprint(
+            &target_fingerprint,
+            vec![format!("127.0.0.1:{}", target_address.port())],
+        )
+        .await?;
+
+    // The target plays its own queue.
+    let target_queue = items[3..].to_vec();
+    let target_tracks = target_queue.clone();
+    target_replica
+        .global_params
+        .node
+        .session()?
+        .edit_queue(None, move |player| {
+            player.add_to_playlist_with_sources(
+                target_tracks
+                    .into_iter()
+                    .map(|item| (item, PlaybackSource::LibraryStream))
+                    .collect(),
+                AddMode::AppendToEnd,
+            );
+            true
+        })
+        .await?;
+    target
+        .global_params
+        .player
+        .lock()
+        .await
+        .set_playback_mode(PlaybackMode::RepeatAll);
+    target.global_params.player.lock().await.load(0);
+    target.global_params.player.lock().await.play();
+    wait_player(&target, |status| {
+        status.state == PlayerPlaybackState::Playing && status.item == Some(target_queue[0].clone())
+    })
+    .await?;
+
+    // This device has played its second track past the tolerance of the place check and is
+    // paused there.
+    let source_queue = items[..3].to_vec();
+    let source_tracks = source_queue.clone();
+    source
+        .global_params
+        .node
+        .session()?
+        .edit_queue(None, move |player| {
+            player.add_to_playlist_with_sources(
+                source_tracks
+                    .into_iter()
+                    .map(|item| (item, PlaybackSource::LibraryStream))
+                    .collect(),
+                AddMode::AppendToEnd,
+            );
+            true
+        })
+        .await?;
+    wait_player(&source, |status| status.playlist.len() == 3).await?;
+    source
+        .global_params
+        .player
+        .lock()
+        .await
+        .set_playback_mode(PlaybackMode::RepeatAll);
+    source.global_params.player.lock().await.switch(1);
+    source.global_params.player.lock().await.play();
+    wait_player(&source, |status| {
+        status.state == PlayerPlaybackState::Playing
+            && status.index == Some(1)
+            && status.position >= Duration::from_secs(2)
+    })
+    .await?;
+    source.global_params.player.lock().await.pause();
+    let source_paused =
+        wait_player(&source, |status| status.state == PlayerPlaybackState::Paused).await?;
+
+    let handoff = HandoffRequest {
+        call_id: None,
+        target: Some(target_fingerprint),
+    };
+    let result = timeout(
+        TEST_DEADLINE,
+        dispatch_gui_request(&source.global_params, &handoff),
+    )
+    .await
+    .context("paused handoff did not finish")?;
+    assert!(
+        result.is_ok(),
+        "a paused session should hand off to a renderer that loads it: {result:?}"
+    );
+
+    // The handed-off block follows the target's current track, and its track waits paused at
+    // the handed-off place.
+    let expected_queue = vec![
+        target_queue[0].clone(),
+        source_queue[0].clone(),
+        source_queue[1].clone(),
+        source_queue[2].clone(),
+        target_queue[1].clone(),
+    ];
+    let target_after = wait_player(&target, |status| {
+        status.playlist.iter().map(|entry| entry.item.clone()).collect::<Vec<_>>()
+            == expected_queue
+            && status.index == Some(2)
+            && status.item == source_paused.item
+            && status.state == PlayerPlaybackState::Paused
+    })
+    .await?;
+    assert!(target_after.position.abs_diff(source_paused.position) <= Duration::from_millis(1500));
+    let source_after = source.global_params.player.lock().await.get_status();
+    assert_eq!(source_after.state, PlayerPlaybackState::Paused);
+    assert_eq!(source_after.item, source_paused.item);
+    source.global_params.node.shutdown().await?;
+    target.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn handoff_moves_queue_and_position_and_preserves_source_sessions() -> Result<()> {
     use crate::messages::{
         HandoffBlockId, HandoffRequest, MovePlaylistItemRequest, RemoveRequest,
