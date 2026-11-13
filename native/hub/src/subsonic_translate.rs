@@ -1147,12 +1147,26 @@ async fn jukebox_next_request(binding: &SubsonicBinding, _: &NextRequest) -> Res
         .jukebox_get()
         .await
         .map_err(|error| jukebox_error(error, NextRequest::wire_name()))?;
-    let index = queue.status.current_index.unwrap_or(0).saturating_add(1);
-    binding
-        .client
-        .jukebox_skip(index, 0)
-        .await
-        .map_err(|error| jukebox_error(error, NextRequest::wire_name()))?;
+    // The jukebox reports Sequential, so Next follows Rune's sequential rule: the
+    // next song if there is one, otherwise playback stops. With no current song
+    // there is nothing to move on from.
+    let Some(current) = queue.status.current_index else {
+        return Ok(Some(()));
+    };
+    let next = current.saturating_add(1);
+    if (next as usize) < queue.playlist.songs.len() {
+        binding
+            .client
+            .jukebox_skip(next, 0)
+            .await
+            .map_err(|error| jukebox_error(error, NextRequest::wire_name()))?;
+    } else {
+        binding
+            .client
+            .jukebox_stop()
+            .await
+            .map_err(|error| jukebox_error(error, NextRequest::wire_name()))?;
+    }
     Ok(Some(()))
 }
 
@@ -1280,22 +1294,155 @@ fn subsonic_track_ids(
         .collect()
 }
 
+/// Whether a load that jumps to a start index then plays. The same rule as Rune's
+/// own queue edit: an explicit choice wins, a position alone means "do not
+/// assume", and a plain load plays.
+fn load_plays(request: &LoadResolvedItemsRequest) -> bool {
+    if request.position_seconds.is_some() || request.play.is_some() {
+        request.play.unwrap_or(request.playback_mode.is_some())
+    } else {
+        true
+    }
+}
+
+/// The song and offset a load jumps to, checked against the loaded items.
+fn load_start(request: &LoadResolvedItemsRequest) -> Result<Option<(u32, u32)>> {
+    let Some(start) = request.start_index.filter(|_| !request.items.is_empty()) else {
+        return Ok(None);
+    };
+    if start as usize >= request.items.len() {
+        return Err(ExpectedRequestError::invalid_input("Invalid jukebox start index").into());
+    }
+    let offset = match request.position_seconds {
+        None => 0,
+        Some(position)
+            if position.is_finite() && (0.0..=f64::from(u32::MAX)).contains(&position) =>
+        {
+            position as u32
+        }
+        Some(_) => {
+            return Err(
+                ExpectedRequestError::invalid_input("Invalid jukebox start position").into(),
+            );
+        }
+    };
+    Ok(Some((start, offset)))
+}
+
+/// Puts `ids` right after the current song and returns the index of the first one.
+/// The jukebox has no insert, so the queue is rebuilt with `set` and the current
+/// song is jumped back to at its position, and started again if it was playing.
+async fn jukebox_insert_after_current(binding: &SubsonicBinding, ids: &[String]) -> Result<u32> {
+    let request = LoadResolvedItemsRequest::wire_name();
+    let queue = binding
+        .client
+        .jukebox_get()
+        .await
+        .map_err(|error| jukebox_error(error, request))?;
+    let existing = queue.playlist.songs.iter().map(|song| song.id.as_str());
+    let added = ids.iter().map(String::as_str);
+    let Some(current) = queue
+        .status
+        .current_index
+        .filter(|current| (*current as usize) < queue.playlist.songs.len())
+    else {
+        let end = queue.playlist.songs.len() as u32;
+        binding
+            .client
+            .jukebox_add(&added.collect::<Vec<_>>())
+            .await
+            .map_err(|error| jukebox_error(error, request))?;
+        return Ok(end);
+    };
+    let split = current as usize + 1;
+    let rebuilt = existing
+        .clone()
+        .take(split)
+        .chain(added)
+        .chain(existing.skip(split))
+        .collect::<Vec<_>>();
+    binding
+        .client
+        .jukebox_set(&rebuilt)
+        .await
+        .map_err(|error| jukebox_error(error, request))?;
+    binding
+        .client
+        .jukebox_skip(current, queue.status.position_secs.unwrap_or_default())
+        .await
+        .map_err(|error| jukebox_error(error, request))?;
+    if queue.status.playing {
+        binding
+            .client
+            .jukebox_start()
+            .await
+            .map_err(|error| jukebox_error(error, request))?;
+    } else {
+        binding
+            .client
+            .jukebox_stop()
+            .await
+            .map_err(|error| jukebox_error(error, request))?;
+    }
+    Ok(current + 1)
+}
+
 async fn jukebox_load_resolved_items_request(
     binding: &SubsonicBinding,
     request: &LoadResolvedItemsRequest,
 ) -> Result<Option<LoadResolvedItemsResponse>> {
+    let error = |error| jukebox_error(error, LoadResolvedItemsRequest::wire_name());
     let ids = subsonic_track_ids(binding, request)?;
     let references = ids.iter().map(String::as_str).collect::<Vec<_>>();
-    let result = match request.mode {
+    let start = load_start(request)?;
+    let insertion = match request.mode {
         PlaylistOperateMode::Replace if references.is_empty() => {
-            binding.client.jukebox_clear().await
+            binding.client.jukebox_clear().await.map_err(error)?;
+            0
         }
-        PlaylistOperateMode::Replace => binding.client.jukebox_set(&references).await,
-        PlaylistOperateMode::AppendToEnd | PlaylistOperateMode::PlayNext => {
-            binding.client.jukebox_add(&references).await
+        PlaylistOperateMode::Replace => {
+            binding
+                .client
+                .jukebox_set(&references)
+                .await
+                .map_err(error)?;
+            0
         }
+        PlaylistOperateMode::AppendToEnd => {
+            let end = if start.is_some() {
+                binding
+                    .client
+                    .jukebox_get()
+                    .await
+                    .map_err(error)?
+                    .playlist
+                    .songs
+                    .len() as u32
+            } else {
+                0
+            };
+            binding
+                .client
+                .jukebox_add(&references)
+                .await
+                .map_err(error)?;
+            end
+        }
+        PlaylistOperateMode::PlayNext if references.is_empty() => 0,
+        PlaylistOperateMode::PlayNext => jukebox_insert_after_current(binding, &ids).await?,
     };
-    result.map_err(|error| jukebox_error(error, LoadResolvedItemsRequest::wire_name()))?;
+    if let Some((index, offset)) = start {
+        binding
+            .client
+            .jukebox_skip(insertion + index, offset)
+            .await
+            .map_err(error)?;
+        if load_plays(request) {
+            binding.client.jukebox_start().await.map_err(error)?;
+        } else {
+            binding.client.jukebox_stop().await.map_err(error)?;
+        }
+    }
     Ok(Some(LoadResolvedItemsResponse {
         call_id: request.call_id,
         result: Default::default(),
@@ -2089,16 +2236,21 @@ mod tests {
                     }
                 }
                 Some("set") => {
-                    jukebox.entries = vec![mock_song(
-                        query.get("id").map(String::as_str).unwrap_or_default(),
-                    )];
+                    jukebox.entries = params
+                        .iter()
+                        .filter(|(key, _)| key == "id")
+                        .map(|(_, id)| mock_song(id))
+                        .collect();
+                    // A real server starts a replaced queue over, stopped.
                     jukebox.current_index = Some(0);
+                    jukebox.position = 0;
+                    jukebox.playing = false;
                     serde_json::json!({})
                 }
                 Some("add") => {
-                    jukebox.entries.push(mock_song(
-                        query.get("id").map(String::as_str).unwrap_or_default(),
-                    ));
+                    for (_, id) in params.iter().filter(|(key, _)| key == "id") {
+                        jukebox.entries.push(mock_song(id));
+                    }
                     serde_json::json!({})
                 }
                 Some("remove") => {
@@ -3342,6 +3494,178 @@ mod tests {
             play: None,
             call_id: Some(17),
         }
+    }
+
+    fn jukebox_load(
+        library_id: Uuid,
+        tracks: &[&str],
+        mode: PlaylistOperateMode,
+    ) -> LoadResolvedItemsRequest {
+        LoadResolvedItemsRequest {
+            items: tracks
+                .iter()
+                .map(|track| PlayingItemRef::LibraryTrack {
+                    library_id: library_id.to_string(),
+                    track: (*track).to_owned(),
+                })
+                .collect(),
+            start_index: None,
+            mode,
+            expected_revision: None,
+            playback_mode: None,
+            position_seconds: None,
+            play: None,
+            call_id: None,
+        }
+    }
+
+    fn set_mock_jukebox(
+        server: &MockServer,
+        tracks: &[&str],
+        current_index: Option<u32>,
+        playing: bool,
+        position: u32,
+    ) {
+        let mut jukebox = server.state.jukebox.lock().unwrap();
+        jukebox.entries = tracks.iter().map(|id| mock_song(id)).collect();
+        jukebox.current_index = current_index;
+        jukebox.playing = playing;
+        jukebox.position = position;
+        drop(jukebox);
+        server.state.jukebox_calls.lock().unwrap().clear();
+    }
+
+    #[tokio::test]
+    async fn next_at_the_last_song_stops_instead_of_skipping_past_the_end() {
+        let root = TempDir::new().unwrap();
+        let (binding, server) = mock_subsonic(&root, true).await;
+        set_mock_jukebox(&server, &["track-a", "track-b"], Some(1), true, 20);
+
+        RequestTranslator::translate_next_request(&binding, &NextRequest { call_id: None })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let status = binding.client.jukebox_status().await.unwrap();
+        assert!(
+            !status.playing,
+            "sequential playback ends after the last song"
+        );
+        assert_eq!(status.current_index, Some(1));
+        let calls = server.state.jukebox_calls.lock().unwrap();
+        assert!(!calls.iter().any(|call| {
+            call.get("action").is_some_and(|action| action == "skip")
+                && call
+                    .get("index")
+                    .and_then(|index| index.parse::<u32>().ok())
+                    .is_some_and(|index| index >= 2)
+        }));
+    }
+
+    #[tokio::test]
+    async fn play_next_inserts_after_the_current_song_and_keeps_its_place() {
+        for playing in [true, false] {
+            let root = TempDir::new().unwrap();
+            let (binding, server) = mock_subsonic(&root, true).await;
+            set_mock_jukebox(
+                &server,
+                &["track-a", "track-b", "track-c"],
+                Some(1),
+                playing,
+                37,
+            );
+
+            RequestTranslator::translate_load_resolved_items_request(
+                &binding,
+                &jukebox_load(
+                    binding.library_id,
+                    &["track-x"],
+                    PlaylistOperateMode::PlayNext,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            let queue = binding.client.jukebox_get().await.unwrap();
+            let ids = queue
+                .playlist
+                .songs
+                .iter()
+                .map(|song| song.id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, ["track-a", "track-b", "track-x", "track-c"]);
+            assert_eq!(queue.status.current_index, Some(1));
+            assert_eq!(queue.status.position_secs, Some(37));
+            assert_eq!(queue.status.playing, playing);
+        }
+    }
+
+    #[tokio::test]
+    async fn load_starts_the_requested_song_at_the_requested_position() {
+        let tracks = ["t-1", "t-2", "t-3", "t-4", "t-5", "t-6"];
+        for (play, expected_playing) in [(Some(true), true), (Some(false), false)] {
+            let root = TempDir::new().unwrap();
+            let (binding, _server) = mock_subsonic(&root, true).await;
+            let mut request =
+                jukebox_load(binding.library_id, &tracks, PlaylistOperateMode::Replace);
+            request.start_index = Some(4);
+            request.position_seconds = Some(12.0);
+            request.play = play;
+
+            RequestTranslator::translate_load_resolved_items_request(&binding, &request)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let queue = binding.client.jukebox_get().await.unwrap();
+            assert_eq!(queue.playlist.songs.len(), tracks.len());
+            assert_eq!(queue.status.current_index, Some(4));
+            assert_eq!(queue.status.position_secs, Some(12));
+            assert_eq!(queue.status.playing, expected_playing);
+        }
+    }
+
+    #[tokio::test]
+    async fn load_of_an_appended_list_starts_inside_the_new_songs() {
+        let root = TempDir::new().unwrap();
+        let (binding, server) = mock_subsonic(&root, true).await;
+        set_mock_jukebox(&server, &["track-a", "track-b"], Some(0), false, 0);
+        let mut request = jukebox_load(
+            binding.library_id,
+            &["t-1", "t-2"],
+            PlaylistOperateMode::AppendToEnd,
+        );
+        request.start_index = Some(1);
+
+        RequestTranslator::translate_load_resolved_items_request(&binding, &request)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let queue = binding.client.jukebox_get().await.unwrap();
+        assert_eq!(queue.playlist.songs.len(), 4);
+        assert_eq!(queue.status.current_index, Some(3));
+        assert!(queue.status.playing);
+    }
+
+    #[tokio::test]
+    async fn load_refuses_a_start_index_outside_the_loaded_songs() {
+        let root = TempDir::new().unwrap();
+        let (binding, server) = mock_subsonic(&root, true).await;
+        let mut request = jukebox_load(binding.library_id, &["t-1"], PlaylistOperateMode::Replace);
+        request.start_index = Some(1);
+
+        let error = RequestTranslator::translate_load_resolved_items_request(&binding, &request)
+            .await
+            .err()
+            .and_then(|error| error.downcast::<ExpectedRequestError>().ok());
+
+        assert!(matches!(
+            error,
+            Some(ExpectedRequestError::InvalidInput { .. })
+        ));
+        assert!(server.state.jukebox_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
