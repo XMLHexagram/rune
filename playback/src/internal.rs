@@ -9,9 +9,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use anyhow::{Context, Result, anyhow, bail};
 use fsio::{FileIoError, FileStream, FsIo};
 use log::{debug, error, info, warn};
@@ -24,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffered::{RuneBuffered, rune_buffered};
 use crate::decoder::RuneDecoder;
-use crate::output_stream::{RuneOutputStream, RuneOutputStreamHandle};
+use crate::output_stream::{Outputs, RuneOutputStream, RuneOutputStreamHandle};
 use crate::pcm_tap::PcmTap;
 use crate::player::{
     AudioPlaybackNote, AudioSourceMode, ClearHandoffBlocksResult, HandoffBlockId,
@@ -683,23 +680,12 @@ pub(crate) struct PlayerInternal {
     // or a track that starts playing, settles it first.
     resume_after_interruption: bool,
     unavailable: HashMap<PlayingItem, UnavailableReason>,
-    // How many of the next attempts to open an output fail.
-    #[cfg(test)]
-    failing_opens: Arc<AtomicUsize>,
-    // How many times the player tried to open an output.
-    #[cfg(test)]
-    output_opens: Arc<AtomicUsize>,
-    // How many times the player stopped an output while paused, and tried to start one again.
-    #[cfg(test)]
-    output_suspends: Arc<AtomicUsize>,
-    #[cfg(test)]
-    output_resumes: Arc<AtomicUsize>,
-    // How many of the next attempts to start a stopped output fail.
-    #[cfg(test)]
-    failing_resumes: Arc<AtomicUsize>,
+    // Where outputs come from, and how they stop and start again.
+    outputs: Arc<dyn Outputs>,
 }
 
 impl PlayerInternal {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         commands: mpsc::UnboundedReceiver<PlayerCommand>,
         event_sender: mpsc::UnboundedSender<PlayerEvent>,
@@ -708,6 +694,7 @@ impl PlayerInternal {
         fsio: Arc<FsIo>,
         pcm_tap: Arc<PcmTap>,
         source_resolver: Arc<RwLock<Option<Arc<dyn PlaybackSourceResolver>>>>,
+        outputs: Arc<dyn Outputs>,
     ) -> Self {
         let (stream_error_sender, stream_error_receiver) = mpsc::unbounded_channel();
         Self {
@@ -748,16 +735,7 @@ impl PlayerInternal {
             output_stale: false,
             resume_after_interruption: false,
             unavailable: HashMap::new(),
-            #[cfg(test)]
-            failing_opens: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            output_opens: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            output_suspends: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            output_resumes: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            failing_resumes: Arc::new(AtomicUsize::new(0)),
+            outputs,
         }
     }
 
@@ -1419,17 +1397,6 @@ impl PlayerInternal {
     }
 
     fn open_output(&self) -> Result<(RuneOutputStream, RuneOutputStreamHandle)> {
-        #[cfg(test)]
-        {
-            self.output_opens.fetch_add(1, Ordering::SeqCst);
-            if self
-                .failing_opens
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                bail!("the test output refused to open");
-            }
-        }
         // Whatever asked to play, the session is set up and active again before a stream starts:
         // an interruption or a reset of the media services leaves it inactive. A session that
         // cannot be activated, as during a call, fails the open, and the track waits paused for
@@ -1438,13 +1405,12 @@ impl PlayerInternal {
         if !crate::ios_session::activate(self.mix_with_others) {
             bail!("the audio session could not be activated");
         }
-        RuneOutputStream::try_default_with_callback({
-            let error_sender = self.stream_error_sender.clone();
-            move |error| {
+        let error_sender = self.stream_error_sender.clone();
+        self.outputs
+            .open(Arc::new(move |error| {
                 let _ = error_sender.send(error.to_string());
-            }
-        })
-        .context("Failed to create output stream")
+            }))
+            .context("Failed to create output stream")
     }
 
     // Opens an output for a loaded track and plays it from `start`. Only playback opens an
@@ -1802,12 +1768,8 @@ impl PlayerInternal {
         if stream.is_suspended() {
             return;
         }
-        if let Err(e) = stream.suspend() {
+        if let Err(e) = self.outputs.suspend(stream) {
             warn!("Failed to stop the audio output while nothing plays: {e:?}");
-        }
-        #[cfg(test)]
-        if stream.is_suspended() {
-            self.output_suspends.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1833,19 +1795,8 @@ impl PlayerInternal {
         if !crate::ios_session::activate(self.mix_with_others) {
             bail!("The audio session could not be made active");
         }
-        #[cfg(test)]
-        {
-            self.output_resumes.fetch_add(1, Ordering::SeqCst);
-            if self
-                .failing_resumes
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                bail!("the test output refused to start again");
-            }
-        }
-        stream
-            .resume()
+        self.outputs
+            .resume(stream)
             .context("Failed to start the output stream again")
     }
 
@@ -2903,6 +2854,7 @@ mod stream_open_tests {
             Arc::new(FsIo::new_noop()),
             PcmTap::new(),
             Arc::new(RwLock::new(Some(resolver))),
+            Arc::new(crate::output_stream::DeviceOutputs),
         );
         let local = LocalSet::new();
         local
@@ -2974,6 +2926,7 @@ mod stream_open_tests {
             Arc::new(FsIo::new_noop()),
             PcmTap::new(),
             Arc::new(RwLock::new(Some(resolver))),
+            Arc::new(crate::output_stream::DeviceOutputs),
         );
         let local = LocalSet::new();
         local
@@ -3059,6 +3012,7 @@ mod stream_open_tests {
             Arc::new(FsIo::new_noop()),
             PcmTap::new(),
             Arc::new(RwLock::new(Some(resolver))),
+            Arc::new(crate::output_stream::DeviceOutputs),
         );
         let local = LocalSet::new();
         local
@@ -3116,7 +3070,71 @@ mod playback_state_tests {
         DelayedResolver, delayed_resolver_fixture, delayed_resolver_fixture_with_samples,
     };
     use super::*;
+    use crate::output_stream::FakeSuspend;
     use crate::player::PlaylistLoad;
+    use rodio::StreamError;
+
+    /// The outputs of these tests: fake ones that stop when suspended, as on iOS. They count how
+    /// often the player opens, stops and starts an output again, and fail as many of the next
+    /// opens and restarts as they are told to.
+    #[derive(Default)]
+    struct TestOutputs {
+        failing_opens: Arc<AtomicUsize>,
+        opens: Arc<AtomicUsize>,
+        suspends: Arc<AtomicUsize>,
+        resumes: Arc<AtomicUsize>,
+        failing_resumes: Arc<AtomicUsize>,
+    }
+
+    impl Outputs for TestOutputs {
+        fn open(
+            &self,
+            _: Arc<dyn Fn(rodio::cpal::StreamError) + Send + Sync>,
+        ) -> std::result::Result<(RuneOutputStream, RuneOutputStreamHandle), StreamError> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            if self
+                .failing_opens
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(StreamError::NoDevice);
+            }
+            RuneOutputStream::fake(FakeSuspend::Stops)
+        }
+
+        fn suspend(
+            &self,
+            stream: &RuneOutputStream,
+        ) -> std::result::Result<(), rodio::cpal::PauseStreamError> {
+            let stopped = stream.suspend();
+            if stream.is_suspended() {
+                self.suspends.fetch_add(1, Ordering::SeqCst);
+            }
+            stopped
+        }
+
+        fn resume(&self, stream: &RuneOutputStream) -> Result<()> {
+            self.resumes.fetch_add(1, Ordering::SeqCst);
+            if self
+                .failing_resumes
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                bail!("the test output refused to start again");
+            }
+            Ok(stream.resume()?)
+        }
+    }
+
+    impl PlayerInternal {
+        /// The outputs this player was made with.
+        fn test_outputs(&self) -> &TestOutputs {
+            (&*self.outputs as &dyn std::any::Any)
+                .downcast_ref()
+                .expect("the player of these tests has test outputs")
+        }
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::channel;
     use tokio::runtime::Builder;
@@ -3143,6 +3161,7 @@ mod playback_state_tests {
             Arc::new(FsIo::new_noop()),
             PcmTap::new(),
             Arc::new(RwLock::new(Some(resolver))),
+            Arc::new(TestOutputs::default()),
         );
         (internal, commands_sender, events)
     }
@@ -3199,6 +3218,7 @@ mod playback_state_tests {
             Arc::new(FsIo::new_noop()),
             PcmTap::new(),
             Arc::new(RwLock::new(None)),
+            Arc::new(TestOutputs::default()),
         );
         let library_id = Uuid::new_v4();
         let block = HandoffBlockId(Uuid::new_v4());
@@ -4003,8 +4023,8 @@ mod playback_state_tests {
     async fn interruption_that_ends_with_resume_plays_on_from_the_same_place() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
-        let resumes = internal.output_resumes.clone();
+        let opens = internal.test_outputs().opens.clone();
+        let resumes = internal.test_outputs().resumes.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4037,7 +4057,7 @@ mod playback_state_tests {
     async fn interruption_that_ends_without_resume_stays_paused_until_play() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4070,8 +4090,8 @@ mod playback_state_tests {
     async fn paused_track_starts_its_output_again_on_play_after_an_interruption() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
-        let resumes = internal.output_resumes.clone();
+        let opens = internal.test_outputs().opens.clone();
+        let resumes = internal.test_outputs().resumes.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4106,7 +4126,7 @@ mod playback_state_tests {
     async fn device_lost_pauses_and_cancels_the_resume_after_an_interruption() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4151,7 +4171,7 @@ mod playback_state_tests {
             LONG_TRACK_SAMPLES,
         );
         let (mut internal, commands_sender, mut events) = library_engine(resolver);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4194,7 +4214,7 @@ mod playback_state_tests {
     async fn device_added_while_playing_moves_playback_in_place() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4220,7 +4240,7 @@ mod playback_state_tests {
     async fn device_added_while_paused_waits_for_play() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4251,8 +4271,8 @@ mod playback_state_tests {
     async fn failed_open_keeps_the_track_paused_in_place() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
-        let failing_opens = internal.failing_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
+        let failing_opens = internal.test_outputs().failing_opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4300,7 +4320,7 @@ mod playback_state_tests {
     async fn stream_error_while_playing_pauses_in_place() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let stream_errors = internal.stream_error_sender.clone();
         let local = LocalSet::new();
         local
@@ -4344,7 +4364,7 @@ mod playback_state_tests {
     async fn seek_while_the_output_is_stale_resumes_there() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4380,7 +4400,7 @@ mod playback_state_tests {
     async fn seek_during_an_interruption_resumes_there() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4418,9 +4438,9 @@ mod playback_state_tests {
     async fn failed_resume_after_an_interruption_opens_a_new_output_in_place() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
-        let resumes = internal.output_resumes.clone();
-        let failing_resumes = internal.failing_resumes.clone();
+        let opens = internal.test_outputs().opens.clone();
+        let resumes = internal.test_outputs().resumes.clone();
+        let failing_resumes = internal.test_outputs().failing_resumes.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4503,7 +4523,7 @@ mod playback_state_tests {
     async fn load_during_an_interruption_opens_no_output_until_play() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4543,7 +4563,7 @@ mod playback_state_tests {
     async fn play_during_an_interruption_cancels_its_resume() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4646,7 +4666,7 @@ mod playback_state_tests {
     async fn paused_load_opens_no_output_until_play() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4741,7 +4761,7 @@ mod playback_state_tests {
     async fn seek_before_the_first_play_is_where_playback_starts() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4819,7 +4839,7 @@ mod playback_state_tests {
     async fn another_paused_load_opens_nothing_and_next_opens_one_output() -> Result<()> {
         let file_uuids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&file_uuids);
-        let opens = internal.output_opens.clone();
+        let opens = internal.test_outputs().opens.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4928,9 +4948,9 @@ mod playback_state_tests {
     async fn changing_mixing_while_playing_restarts_the_output_where_it_plays() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
-        let suspends = internal.output_suspends.clone();
-        let resumes = internal.output_resumes.clone();
+        let opens = internal.test_outputs().opens.clone();
+        let suspends = internal.test_outputs().suspends.clone();
+        let resumes = internal.test_outputs().resumes.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -4989,9 +5009,9 @@ mod playback_state_tests {
     async fn pause_stops_the_output_and_play_starts_it_again() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
-        let suspends = internal.output_suspends.clone();
-        let resumes = internal.output_resumes.clone();
+        let opens = internal.test_outputs().opens.clone();
+        let suspends = internal.test_outputs().suspends.clone();
+        let resumes = internal.test_outputs().resumes.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -5035,9 +5055,9 @@ mod playback_state_tests {
             let (mut internal, commands_sender, events, wav_path) = long_track_engine(&[file_uuid]);
             let hooks = (
                 internal.cancellation_token.clone(),
-                internal.output_opens.clone(),
-                internal.output_suspends.clone(),
-                internal.output_resumes.clone(),
+                internal.test_outputs().opens.clone(),
+                internal.test_outputs().suspends.clone(),
+                internal.test_outputs().resumes.clone(),
             );
             setup_sender
                 .send((commands_sender, events, wav_path, hooks))
@@ -5080,9 +5100,9 @@ mod playback_state_tests {
     async fn failed_resume_opens_a_new_output_where_the_track_was_paused() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
-        let resumes = internal.output_resumes.clone();
-        let failing_resumes = internal.failing_resumes.clone();
+        let opens = internal.test_outputs().opens.clone();
+        let resumes = internal.test_outputs().resumes.clone();
+        let failing_resumes = internal.test_outputs().failing_resumes.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -5122,9 +5142,9 @@ mod playback_state_tests {
             LONG_TRACK_SAMPLES,
         );
         let (mut internal, commands_sender, mut events) = library_engine(resolver);
-        let opens = internal.output_opens.clone();
-        let suspends = internal.output_suspends.clone();
-        let resumes = internal.output_resumes.clone();
+        let opens = internal.test_outputs().opens.clone();
+        let suspends = internal.test_outputs().suspends.clone();
+        let resumes = internal.test_outputs().resumes.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -5175,8 +5195,8 @@ mod playback_state_tests {
             LONG_TRACK_SAMPLES,
         );
         let (mut internal, commands_sender, mut events) = library_engine(resolver);
-        let opens = internal.output_opens.clone();
-        let failing_resumes = internal.failing_resumes.clone();
+        let opens = internal.test_outputs().opens.clone();
+        let failing_resumes = internal.test_outputs().failing_resumes.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -5215,7 +5235,7 @@ mod playback_state_tests {
     async fn stop_stops_the_output() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let suspends = internal.output_suspends.clone();
+        let suspends = internal.test_outputs().suspends.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -5279,7 +5299,10 @@ mod playback_state_tests {
     async fn play_output_open_failure_is_typed_and_pause_completes() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, _events, wav_path) = long_track_engine(&[file_uuid]);
-        internal.failing_opens.store(1, Ordering::SeqCst);
+        internal
+            .test_outputs()
+            .failing_opens
+            .store(1, Ordering::SeqCst);
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -5305,7 +5328,10 @@ mod playback_state_tests {
     async fn play_next_edit_to_idle_queue_reports_output_failure() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, _events, wav_path) = long_track_engine(&[file_uuid]);
-        internal.failing_opens.store(1, Ordering::SeqCst);
+        internal
+            .test_outputs()
+            .failing_opens
+            .store(1, Ordering::SeqCst);
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -5600,8 +5626,11 @@ mod playback_state_tests {
     async fn track_whose_first_output_fails_to_open_is_ready_to_play() -> Result<()> {
         let file_uuid = Uuid::new_v4();
         let (mut internal, commands_sender, mut events, wav_path) = long_track_engine(&[file_uuid]);
-        let opens = internal.output_opens.clone();
-        internal.failing_opens.store(1, Ordering::SeqCst);
+        let opens = internal.test_outputs().opens.clone();
+        internal
+            .test_outputs()
+            .failing_opens
+            .store(1, Ordering::SeqCst);
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -5693,8 +5722,8 @@ mod playback_state_tests {
             LONG_TRACK_SAMPLES,
         );
         let (mut internal, commands_sender, mut events) = library_engine(resolver);
-        let suspends = internal.output_suspends.clone();
-        let resumes = internal.output_resumes.clone();
+        let suspends = internal.test_outputs().suspends.clone();
+        let resumes = internal.test_outputs().resumes.clone();
         let local = LocalSet::new();
         local
             .run_until(async move {

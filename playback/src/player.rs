@@ -655,6 +655,7 @@ impl Player {
                 fsio,
                 pcm_tap,
                 source_resolver,
+                Arc::new(crate::output_stream::DeviceOutputs),
             );
             // Create a new Tokio runtime for asynchronous tasks
             let runtime = Runtime::new().expect("Failed to create Tokio runtime");
