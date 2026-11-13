@@ -56,6 +56,7 @@ use std::{
 use sync::SyncPeer;
 use sync::protocol::SyncError;
 use sync::share::{ObjectStore, StoreError};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::time as tokio_time;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio::{sync::Mutex, task::JoinSet};
@@ -1114,28 +1115,42 @@ async fn peer_may_sync(
     is_authority || peer.is_some_and(|peer| global.access_policy.check(&peer, &action).is_ok())
 }
 
+/// Returns once the peer `fingerprint` is no longer approved here, or `host` is no longer one of
+/// its trusted hosts. It follows the permission and trusted-host changes (as the websocket does
+/// with the grants) instead of asking on a timer, so it ends the moment the change is made, and
+/// when the node is gone.
 pub(super) async fn wait_for_revocation(global: Weak<NodeContext>, fingerprint: &str, host: &str) {
+    let Some(node) = global.upgrade() else {
+        return;
+    };
+    // Subscribe before the first check, so that no change between them is missed.
+    let mut permissions = node.permission_manager.read().await.changes();
+    let mut hosts = node.cert_validator.read().await.subscribe_changes();
+    drop(node);
     loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let Some(global) = global.upgrade() else {
+        let Some(node) = global.upgrade() else {
             return;
         };
-        let status = global
+        let status = node
             .permission_manager
             .read()
             .await
             .verify_by_fingerprint(fingerprint)
             .await
-            .map(|u| u.status);
-        let approved = outbound_eligible(status);
-        let trusted = global
+            .map(|user| user.status);
+        let trusted = node
             .cert_validator
             .read()
             .await
             .get_hosts_for_fingerprint(fingerprint)
             .await;
-        if !approved || !trusted.iter().any(|candidate| candidate == host) {
+        drop(node);
+        if !outbound_eligible(status) || !trusted.iter().any(|candidate| candidate == host) {
             return;
+        }
+        tokio::select! {
+            result = permissions.changed() => if result.is_err() { return; },
+            result = hosts.recv() => if matches!(result, Err(RecvError::Closed)) { return; },
         }
     }
 }

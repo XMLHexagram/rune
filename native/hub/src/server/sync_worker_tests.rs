@@ -2190,3 +2190,131 @@ fn repeated_share_failures_back_off_to_the_cap() {
         ]
     );
 }
+
+mod revocation_tests {
+    use super::*;
+    use discovery::server::UserStatus;
+    use discovery::utils::DeviceType;
+
+    /// A node with `fingerprint` approved and `host` its trusted host.
+    async fn node_with_trusted_peer(
+        directory: &tempfile::TempDir,
+        fingerprint: &str,
+        host: &str,
+    ) -> Result<Arc<NodeContext>> {
+        let path = directory.path().to_string_lossy().into_owned();
+        let node = NodeContext::new(
+            &path,
+            &path,
+            Arc::new(QuietBroadcaster::default()),
+            false,
+            RunMode::App,
+        )
+        .await?;
+        {
+            let permissions = node.permission_manager.read().await;
+            permissions
+                .add_user(
+                    "key".into(),
+                    fingerprint.into(),
+                    "peer".into(),
+                    "test".into(),
+                    DeviceType::Desktop,
+                    "127.0.0.1".into(),
+                )
+                .await?;
+            permissions
+                .change_user_status(fingerprint, UserStatus::Approved)
+                .await?;
+        }
+        node.cert_validator
+            .read()
+            .await
+            .replace_hosts_for_fingerprint(fingerprint, vec![host.into()])
+            .await?;
+        Ok(node)
+    }
+
+    /// Starts the watcher, and checks it keeps waiting while nothing changes.
+    async fn watch(
+        node: &Arc<NodeContext>,
+        fingerprint: &str,
+        host: &str,
+    ) -> tokio::task::JoinHandle<()> {
+        let weak = Arc::downgrade(node);
+        let (fingerprint, host) = (fingerprint.to_owned(), host.to_owned());
+        let watcher =
+            tokio::spawn(async move { wait_for_revocation(weak, &fingerprint, &host).await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!watcher.is_finished(), "an approved peer is not revoked");
+        watcher
+    }
+
+    /// With the clock stopped from here on, only a change can end the watcher before a second of
+    /// the clock has passed: a timer would need it to move.
+    async fn ends_within_a_tick(watcher: &tokio::task::JoinHandle<()>) -> Result<()> {
+        let started = tokio::time::Instant::now();
+        wait_until("the watcher to end", || async {
+            Ok(watcher.is_finished().then_some(()))
+        })
+        .await?;
+        let waited = started.elapsed();
+        anyhow::ensure!(
+            waited < Duration::from_millis(500),
+            "the watcher ended only after {waited:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoking_a_peer_ends_the_watcher_at_once() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let node = node_with_trusted_peer(&directory, "peer-a", "127.0.0.1:1").await?;
+        let watcher = watch(&node, "peer-a", "127.0.0.1:1").await;
+        tokio::time::pause();
+
+        node.permission_manager
+            .read()
+            .await
+            .change_user_status("peer-a", UserStatus::Blocked)
+            .await?;
+
+        ends_within_a_tick(&watcher).await?;
+        node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removing_the_trusted_host_ends_the_watcher_at_once() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let node = node_with_trusted_peer(&directory, "peer-b", "127.0.0.1:2").await?;
+        let watcher = watch(&node, "peer-b", "127.0.0.1:2").await;
+        tokio::time::pause();
+
+        node.cert_validator
+            .read()
+            .await
+            .replace_hosts_for_fingerprint("peer-b", vec!["127.0.0.1:3".into()])
+            .await?;
+
+        ends_within_a_tick(&watcher).await?;
+        node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_watcher_ends_with_its_node() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let node = node_with_trusted_peer(&directory, "peer-c", "127.0.0.1:4").await?;
+        let watcher = watch(&node, "peer-c", "127.0.0.1:4").await;
+        tokio::time::pause();
+
+        node.shutdown().await?;
+        drop(node);
+
+        ends_within_a_tick(&watcher).await?;
+        Ok(())
+    }
+}
