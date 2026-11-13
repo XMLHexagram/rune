@@ -96,6 +96,28 @@ async fn webdav_read_and_seek_contract() {
 }
 
 #[tokio::test]
+async fn s3_change_token_is_absent_only_when_the_server_reports_nothing() {
+    tokio::time::timeout(DEADLINE, async {
+        let files = vec![("audio.mp3".to_owned(), AUDIO.to_vec())];
+        let with_metadata = S3Fixture::start(files.clone()).await.unwrap();
+        let without_metadata = S3Fixture::start_without_object_metadata(files)
+            .await
+            .unwrap();
+        let token = |server: S3Fixture| async move {
+            let fs = FsIo::new_opendal(s3_config(&server), Handle::current()).unwrap();
+            spawn_blocking(move || fs.change_token(Path::new("audio.mp3")))
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        assert!(token(with_metadata).await.is_some());
+        assert_eq!(token(without_metadata).await, None);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn s3_read_and_seek_contract() {
     tokio::time::timeout(DEADLINE, async {
         let server = S3Fixture::start(vec![("nested/audio.mp3".into(), AUDIO.to_vec())])

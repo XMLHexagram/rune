@@ -137,7 +137,6 @@ pub fn describe_file(
     // tree-relative path does not exist on the local filesystem.
     let last_modified = fsio.modified_time(&file_path)?.to_string();
     let change_token = fsio.change_token(&file_path)?;
-    let change_token = (!change_token.is_empty()).then_some(change_token);
 
     Ok(FileDescription {
         lib_path: lib_path.clone(),

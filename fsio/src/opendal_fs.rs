@@ -557,15 +557,14 @@ impl FileIo for OpenDalFsIo {
                 .unwrap_or_default()
         })
     }
-    fn change_token(&self, path: &Path) -> Result<String, FileIoError> {
+    fn change_token(&self, path: &Path) -> Result<Option<String>, FileIoError> {
         let key = self.key(path)?;
         self.run("stat", |op| op.stat(&key)).map(|meta| {
-            meta.etag().map(str::to_owned).unwrap_or_else(|| {
+            meta.etag().map(str::to_owned).or_else(|| {
                 meta.last_modified()
                     .map(SystemTime::from)
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                     .map(|duration| duration.as_secs().to_string())
-                    .unwrap_or_default()
             })
         })
     }
