@@ -1617,6 +1617,46 @@ async fn liked_requests_without_an_item_are_refused() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn server_start_and_stop_failures_are_typed() -> Result<()> {
+    use crate::messages::{StartServerRequest, StopServerRequest};
+    use crate::request_error::classify;
+
+    let node_dir = tempfile::tempdir()?;
+    let fixture = fixture(node_dir.path()).await?;
+    let node = &fixture.global_params.node;
+    let manager = node.server_manager.get().cloned().context("server manager")?;
+
+    // 192.0.2.1 is reserved for documentation (RFC 5737), so no interface of
+    // this device has it and the server cannot listen there.
+    let start = StartServerRequest {
+        interface: "192.0.2.1".into(),
+        alias: "unreachable interface".into(),
+        call_id: None,
+    };
+    let error = match start
+        .handle(
+            (node.config_path.clone(), Arc::clone(&manager), node.run_mode),
+            None,
+            &start,
+        )
+        .await
+    {
+        Ok(_) => anyhow::bail!("a server cannot start on an address this device lacks"),
+        Err(error) => error,
+    };
+    assert_eq!(classify(&error), RequestErrorKind::Unavailable, "{error:#}");
+
+    // The fixture never started its server, so there is nothing to stop.
+    let stop = StopServerRequest { call_id: None };
+    let error = match stop.handle(manager, None, &stop).await {
+        Ok(_) => anyhow::bail!("stopping a server that is not running must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(classify(&error), RequestErrorKind::Unavailable, "{error:#}");
+    Ok(())
+}
+
 async fn attach_test_cover(f: &Fixture, media_file_id: i32, bytes: &[u8]) -> Result<()> {
     let library = f.global_params.test_library();
     let hash = blake3::hash(bytes).to_hex().to_string();

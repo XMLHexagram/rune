@@ -344,18 +344,14 @@ impl Signal for StartServerRequest {
 
             let discovery_params = DiscoveryParams { device_info };
 
-            match server_manager.start(addr, discovery_params).await {
-                Ok(_) => Ok(Some(StartServerResponse {
-                    call_id: None,
-                    success: true,
-                    error: String::new(),
-                })),
-                Err(e) => Ok(Some(StartServerResponse {
-                    call_id: None,
-                    success: false,
-                    error: format!("{e:#?}"),
-                })),
-            }
+            server_manager
+                .start(addr, discovery_params)
+                .await
+                .map_err(|error| {
+                    anyhow::Error::new(ExpectedRequestError::Unavailable { what: "server" })
+                        .context(error)
+                })?;
+            Ok(Some(StartServerResponse { call_id: None }))
         }
     }
 }
@@ -385,7 +381,7 @@ impl Signal for StopServerRequest {
         _: &Self,
     ) -> Result<Option<Self::Response>> {
         let address = server_manager.get_address().await;
-        let result = async {
+        async {
             server_manager.stop().await?;
             if server_manager.node()?.sync_settings.read().await.listen
                 && let Some(address) = address
@@ -398,19 +394,11 @@ impl Signal for StopServerRequest {
             }
             anyhow::Ok(())
         }
-        .await;
-        match result {
-            Ok(_) => Ok(Some(StopServerResponse {
-                call_id: None,
-                success: true,
-                error: "".into(),
-            })),
-            Err(e) => Ok(Some(StopServerResponse {
-                call_id: None,
-                success: false,
-                error: format!("{e:#?}"),
-            })),
-        }
+        .await
+        .map_err(|error| {
+            anyhow::Error::new(ExpectedRequestError::Unavailable { what: "server" }).context(error)
+        })?;
+        Ok(Some(StopServerResponse { call_id: None }))
     }
 }
 
@@ -450,9 +438,7 @@ impl Signal for ListClientsRequest {
 
         Ok(Some(ListClientsResponse {
             call_id: None,
-            success: true,
             users: converted_users,
-            error: String::new(),
         }))
     }
 }
@@ -734,11 +720,7 @@ impl Signal for EditHostsRequest {
             req.hosts.clone(),
         )
         .await?;
-        Ok(Some(EditHostsResponse {
-            call_id: None,
-            success: true,
-            error: String::new(),
-        }))
+        Ok(Some(EditHostsResponse { call_id: None }))
     }
 }
 

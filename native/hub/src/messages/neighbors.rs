@@ -106,8 +106,6 @@ pub struct StartServerRequest {
 
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct StartServerResponse {
-    pub success: bool,
-    pub error: String,
     #[serde(default)]
     pub call_id: Option<u64>,
 }
@@ -120,8 +118,6 @@ pub struct StopServerRequest {
 
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct StopServerResponse {
-    pub success: bool,
-    pub error: String,
     #[serde(default)]
     pub call_id: Option<u64>,
 }
@@ -134,9 +130,7 @@ pub struct ListClientsRequest {
 
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct ListClientsResponse {
-    pub success: bool,
     pub users: Vec<ClientSummary>,
-    pub error: String,
     #[serde(default)]
     pub call_id: Option<u64>,
 }
@@ -204,8 +198,6 @@ pub struct EditHostsRequest {
 
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct EditHostsResponse {
-    pub success: bool,
-    pub error: String,
     #[serde(default)]
     pub call_id: Option<u64>,
 }
