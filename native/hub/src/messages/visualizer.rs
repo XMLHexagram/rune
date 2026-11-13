@@ -1,5 +1,120 @@
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
+use visualizer::{ColumnGroup, ColumnKind, ColumnPlan, ShotSize, Strength, Tier};
+
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualizerShotSize {
+    Wide,
+    Medium,
+    Close,
+    Detail,
+    Top,
+}
+
+impl From<ShotSize> for VisualizerShotSize {
+    fn from(value: ShotSize) -> Self {
+        match value {
+            ShotSize::Wide => Self::Wide,
+            ShotSize::Medium => Self::Medium,
+            ShotSize::Close => Self::Close,
+            ShotSize::Detail => Self::Detail,
+            ShotSize::Top => Self::Top,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualizerMomentStrength {
+    Medium,
+    Strong,
+}
+
+impl From<Strength> for VisualizerMomentStrength {
+    fn from(value: Strength) -> Self {
+        match value {
+            Strength::Medium => Self::Medium,
+            Strength::Strong => Self::Strong,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualizerLabColumnGroup {
+    Director,
+    Looks,
+    Signals,
+    Inputs,
+}
+
+impl From<ColumnGroup> for VisualizerLabColumnGroup {
+    fn from(value: ColumnGroup) -> Self {
+        match value {
+            ColumnGroup::Director => Self::Director,
+            ColumnGroup::Looks => Self::Looks,
+            ColumnGroup::Signals => Self::Signals,
+            ColumnGroup::Inputs => Self::Inputs,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualizerLabColumnKind {
+    Number,
+    Event,
+    Bool,
+    Category,
+    Phase,
+}
+
+impl From<ColumnKind> for VisualizerLabColumnKind {
+    fn from(value: ColumnKind) -> Self {
+        match value {
+            ColumnKind::Number => Self::Number,
+            ColumnKind::Event => Self::Event,
+            ColumnKind::Bool => Self::Bool,
+            ColumnKind::Category => Self::Category,
+            ColumnKind::Phase => Self::Phase,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualizerLabColumnPlan {
+    Yes,
+    No,
+}
+
+impl From<ColumnPlan> for VisualizerLabColumnPlan {
+    fn from(value: ColumnPlan) -> Self {
+        match value {
+            ColumnPlan::Yes => Self::Yes,
+            ColumnPlan::No => Self::No,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualizerSectionTier {
+    Quiet,
+    Normal,
+    High,
+}
+
+impl From<Tier> for VisualizerSectionTier {
+    fn from(value: Tier) -> Self {
+        match value {
+            Tier::Quiet => Self::Quiet,
+            Tier::Normal => Self::Normal,
+            Tier::High => Self::High,
+        }
+    }
+}
 
 /// Inputs available from the current source to installed scenes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
@@ -171,12 +286,16 @@ pub struct VisualizerSupportRequest {
 /// cover wall can be shown.
 #[derive(Serialize, Deserialize, RustSignal)]
 pub struct VisualizerSupportResponse {
-    pub supported: bool,
-    pub adapter: String,
-    pub problem: Option<String>,
+    pub support: VisualizerSupport,
     pub inputs: VisualizerInputs,
     #[serde(default)]
     pub call_id: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Debug, PartialEq, Eq)]
+pub enum VisualizerSupport {
+    Supported { adapter: String },
+    Unsupported { problem: String },
 }
 
 #[derive(Serialize, Deserialize, DartSignal)]
@@ -187,7 +306,7 @@ pub struct VisualizerStatusRequest {
 
 #[derive(Serialize, Deserialize, RustSignal)]
 pub struct VisualizerStatusResponse {
-    pub running: bool,
+    pub runtime: VisualizerRuntimeStatus,
     pub width: u32,
     pub height: u32,
     pub target_fps: u32,
@@ -198,14 +317,43 @@ pub struct VisualizerStatusResponse {
     pub preset_path: String,
     pub preset_count: u32,
     pub inputs: VisualizerInputs,
-    pub adapter: String,
-    /// How frames reach the screen: "iosurface" (no copies, macOS), "dxgi-shared" (no copies,
-    /// Windows), "vulkan-shared" (no copies, Linux), "surface" (no copies, Android: presented
-    /// into the texture's window), "readback", or empty before the render thread runs.
-    pub transport: String,
     pub last_error: Option<String>,
     #[serde(default)]
     pub call_id: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Debug, PartialEq, Eq)]
+pub enum VisualizerRuntimeStatus {
+    NotRunningYet,
+    Stopped {
+        adapter: String,
+        transport: VisualizerTransport,
+    },
+    Running {
+        adapter: String,
+        transport: VisualizerTransport,
+    },
+}
+
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisualizerTransport {
+    Readback,
+    IoSurface,
+    DxgiShared,
+    VulkanShared,
+    Surface,
+}
+
+impl From<visualizer::Transport> for VisualizerTransport {
+    fn from(value: visualizer::Transport) -> Self {
+        match value {
+            visualizer::Transport::Readback => Self::Readback,
+            visualizer::Transport::IoSurface => Self::IoSurface,
+            visualizer::Transport::DxgiShared => Self::DxgiShared,
+            visualizer::Transport::VulkanShared => Self::VulkanShared,
+            visualizer::Transport::Surface => Self::Surface,
+        }
+    }
 }
 
 /// The texture that shows the visualizer (macOS), sent once it started and whenever another one
@@ -349,8 +497,7 @@ pub enum VisualizerLabEventKind {
     /// The camera cut to a shot.
     Cut {
         shot: String,
-        /// "wide", "medium", "close", "detail" or "top".
-        size: String,
+        size: VisualizerShotSize,
         /// 0 for a normal cut, else the position in a burst.
         fill: u32,
         /// The cut lands on a strong transition.
@@ -366,7 +513,7 @@ pub enum VisualizerLabEventKind {
     /// A moment of the music played an effect. `strength` is "medium" or "strong"; `effect` is
     /// what it did by name, none when the scene lists nothing that suits it.
     Moment {
-        strength: String,
+        strength: VisualizerMomentStrength,
         effect: Option<String>,
     },
 }
@@ -383,8 +530,7 @@ pub struct VisualizerLabEvent {
 pub struct VisualizerLabShot {
     /// The shot's name, empty if it has none.
     pub name: String,
-    /// "wide", "medium", "close", "detail" or "top".
-    pub size: String,
+    pub size: VisualizerShotSize,
 }
 
 /// The camera director of the scene on screen.
@@ -478,10 +624,8 @@ pub struct VisualizerLabColumns {
 pub struct VisualizerLabColumn {
     pub id: String,
     pub name: String,
-    /// "Director", "Looks & Level", "Signals" or "Inputs".
-    pub group: String,
-    /// "number", "event", "bool", "category" or "phase".
-    pub kind: String,
+    pub group: VisualizerLabColumnGroup,
+    pub kind: VisualizerLabColumnKind,
     pub lo: f32,
     pub hi: f32,
     /// Empty when it has none.
@@ -489,7 +633,7 @@ pub struct VisualizerLabColumn {
     /// What the places of a category stand for.
     pub categories: Vec<String>,
     /// Whether the plan has the column: "yes" or "no".
-    pub plan: String,
+    pub plan: VisualizerLabColumnPlan,
     /// For a scene input, the ids of the columns its bindings read.
     pub binds: Vec<String>,
     /// For a scene input, the value it sits at when nothing drives it.
@@ -520,8 +664,7 @@ pub struct VisualizerPlanSection {
     pub start: f64,
     pub end: f64,
     pub label: String,
-    /// How lively the director takes it to be: "quiet", "normal" or "high".
-    pub tier: String,
+    pub tier: VisualizerSectionTier,
 }
 
 /// A planned cut of the camera.
@@ -530,8 +673,7 @@ pub struct VisualizerPlanCut {
     /// Song seconds.
     pub time: f64,
     pub shot: String,
-    /// "wide", "medium", "close", "detail" or "top".
-    pub size: String,
+    pub size: VisualizerShotSize,
     /// 0 for a normal cut, else the position in a burst (1 to 4).
     pub fill: u32,
     pub strong: bool,
@@ -555,7 +697,7 @@ pub struct VisualizerPlanMoment {
     /// Song seconds.
     pub time: f64,
     /// "medium" or "strong".
-    pub strength: String,
+    pub strength: VisualizerMomentStrength,
     /// What it plays, by name; none if the scene lists nothing that suits the moment.
     pub effect: Option<String>,
 }

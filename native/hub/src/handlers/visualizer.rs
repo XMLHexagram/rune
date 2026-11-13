@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use ::playback::player::Playable;
 use ::visualizer::{
     Inspect, LabCommand, LabEvent, LabEventKind, LabTransition, Level, Location, PcmInput,
-    SceneInputs, Transport, VisualizerInputs as EngineInputs,
+    SceneInputs, VisualizerInputs as EngineInputs,
 };
 
 use crate::{
@@ -25,6 +25,31 @@ fn message_inputs(inputs: EngineInputs) -> VisualizerInputs {
         EngineInputs::None => VisualizerInputs::None,
         EngineInputs::SpectrumOnly => VisualizerInputs::SpectrumOnly,
         EngineInputs::Full => VisualizerInputs::Full,
+    }
+}
+
+fn message_runtime_status(status: &::visualizer::Status) -> VisualizerRuntimeStatus {
+    match status.transport {
+        Some(transport) if status.running => VisualizerRuntimeStatus::Running {
+            adapter: status.adapter.clone(),
+            transport: transport.into(),
+        },
+        Some(transport) => VisualizerRuntimeStatus::Stopped {
+            adapter: status.adapter.clone(),
+            transport: transport.into(),
+        },
+        None => VisualizerRuntimeStatus::NotRunningYet,
+    }
+}
+
+fn message_support(result: &Result<String, String>) -> VisualizerSupport {
+    match result {
+        Ok(adapter) => VisualizerSupport::Supported {
+            adapter: adapter.clone(),
+        },
+        Err(problem) => VisualizerSupport::Unsupported {
+            problem: problem.clone(),
+        },
     }
 }
 
@@ -332,7 +357,7 @@ impl Signal for VisualizerStatusRequest {
         let status = VISUALIZER.status();
         Ok(Some(VisualizerStatusResponse {
             call_id: None,
-            running: status.running,
+            runtime: message_runtime_status(&status),
             width: status.width,
             height: status.height,
             target_fps: status.target_fps,
@@ -341,16 +366,6 @@ impl Signal for VisualizerStatusRequest {
             preset_path: status.preset_path,
             preset_count: u32::try_from(status.preset_count).unwrap_or(u32::MAX),
             inputs: message_inputs(status.inputs),
-            adapter: status.adapter,
-            transport: match status.transport {
-                Some(Transport::IoSurface) => "iosurface",
-                Some(Transport::Readback) => "readback",
-                Some(Transport::DxgiShared) => "dxgi-shared",
-                Some(Transport::VulkanShared) => "vulkan-shared",
-                Some(Transport::Surface) => "surface",
-                None => "",
-            }
-            .to_string(),
             last_error: status.last_error,
         }))
     }
@@ -600,21 +615,10 @@ impl Signal for VisualizerSupportRequest {
                 gpu
             })
             .await;
-        Ok(Some(match gpu {
-            Ok(adapter) => VisualizerSupportResponse {
-                call_id: None,
-                supported: true,
-                adapter: adapter.clone(),
-                problem: None,
-                inputs: message_inputs(VISUALIZER.status().inputs),
-            },
-            Err(problem) => VisualizerSupportResponse {
-                call_id: None,
-                supported: false,
-                adapter: String::new(),
-                problem: Some(problem.clone()),
-                inputs: message_inputs(VISUALIZER.status().inputs),
-            },
+        Ok(Some(VisualizerSupportResponse {
+            call_id: None,
+            support: message_support(gpu),
+            inputs: message_inputs(VISUALIZER.status().inputs),
         }))
     }
 }
@@ -763,16 +767,17 @@ fn lab_event(event: LabEvent) -> Option<VisualizerLabEvent> {
             ..
         } => VisualizerLabEventKind::Cut {
             shot,
-            size,
+            size: size.into(),
             fill,
             strong,
             dress,
             first,
         },
         LabEventKind::Look { look } => VisualizerLabEventKind::Look { look },
-        LabEventKind::Moment { strength, effect } => {
-            VisualizerLabEventKind::Moment { strength, effect }
-        }
+        LabEventKind::Moment { strength, effect } => VisualizerLabEventKind::Moment {
+            strength: strength.into(),
+            effect,
+        },
         _ => return None,
     };
     Some(VisualizerLabEvent {
@@ -793,7 +798,7 @@ fn lab_now(inspect: Inspect) -> VisualizerLabNow {
                 .into_iter()
                 .map(|shot| VisualizerLabShot {
                     name: shot.name,
-                    size: shot.size,
+                    size: shot.size.into(),
                 })
                 .collect(),
         }),
@@ -807,6 +812,58 @@ fn lab_now(inspect: Inspect) -> VisualizerLabNow {
             lens: inspect.effects.lens,
         },
         forced_level: overrides.level.map(Into::into),
+    }
+}
+
+fn message_plan(plan: &::visualizer::SongPlan) -> VisualizerPlan {
+    VisualizerPlan {
+        length: plan.length,
+        sections: plan
+            .sections
+            .iter()
+            .map(|section| VisualizerPlanSection {
+                start: section.start,
+                end: section.end,
+                label: section.label.clone(),
+                tier: section.tier.into(),
+            })
+            .collect(),
+        cuts: plan
+            .cuts
+            .iter()
+            .map(|cut| VisualizerPlanCut {
+                time: cut.time,
+                shot: cut.shot.clone(),
+                size: cut.size.into(),
+                fill: cut.fill,
+                strong: cut.strong,
+                dress: cut.dress.clone(),
+                first: cut.first,
+            })
+            .collect(),
+        looks: plan
+            .looks
+            .iter()
+            .map(|look| VisualizerPlanLook {
+                time: look.time,
+                look: look.look.clone(),
+            })
+            .collect(),
+        moments: plan
+            .moments
+            .iter()
+            .map(|moment| VisualizerPlanMoment {
+                time: moment.time,
+                strength: moment.strength.into(),
+                effect: moment.effect.clone(),
+            })
+            .collect(),
+        series: plan.series.as_ref().map(|series| VisualizerPlanSeries {
+            columns_version: series.columns_version,
+            rate: ::visualizer::LAB_RATE,
+            buckets: series.buckets,
+            values: series.values.clone(),
+        }),
     }
 }
 
@@ -842,13 +899,13 @@ impl Signal for VisualizerLabRequest {
                     .map(|column| VisualizerLabColumn {
                         id: column.id.clone(),
                         name: column.name.clone(),
-                        group: column.group.as_str().to_string(),
-                        kind: column.kind.as_str().to_string(),
+                        group: column.group.into(),
+                        kind: column.kind.into(),
                         lo: column.lo,
                         hi: column.hi,
                         unit: column.unit.clone(),
                         categories: column.categories.clone(),
-                        plan: column.plan.as_str().to_string(),
+                        plan: column.plan.into(),
                         binds: column.binds.clone(),
                         rest: column.rest,
                     })
@@ -898,59 +955,137 @@ impl Signal for VisualizerPlanRequest {
     ) -> Result<Option<Self::Response>> {
         // The version first: a plan made in between is then fetched again for its own version.
         let version = VISUALIZER.plan_version();
-        let plan = VISUALIZER.plan().map(|plan| VisualizerPlan {
-            length: plan.length,
-            sections: plan
-                .sections
-                .iter()
-                .map(|section| VisualizerPlanSection {
-                    start: section.start,
-                    end: section.end,
-                    label: section.label.clone(),
-                    tier: section.tier.clone(),
-                })
-                .collect(),
-            cuts: plan
-                .cuts
-                .iter()
-                .map(|cut| VisualizerPlanCut {
-                    time: cut.time,
-                    shot: cut.shot.clone(),
-                    size: cut.size.clone(),
-                    fill: cut.fill,
-                    strong: cut.strong,
-                    dress: cut.dress.clone(),
-                    first: cut.first,
-                })
-                .collect(),
-            looks: plan
-                .looks
-                .iter()
-                .map(|look| VisualizerPlanLook {
-                    time: look.time,
-                    look: look.look.clone(),
-                })
-                .collect(),
-            moments: plan
-                .moments
-                .iter()
-                .map(|moment| VisualizerPlanMoment {
-                    time: moment.time,
-                    strength: moment.strength.clone(),
-                    effect: moment.effect.clone(),
-                })
-                .collect(),
-            series: plan.series.as_ref().map(|series| VisualizerPlanSeries {
-                columns_version: series.columns_version,
-                rate: ::visualizer::LAB_RATE,
-                buckets: series.buckets,
-                values: series.values.clone(),
-            }),
-        });
+        let plan = VISUALIZER.plan().map(|plan| message_plan(&plan));
         Ok(Some(VisualizerPlanResponse {
             call_id: None,
             version,
             plan,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use visualizer::Transport;
+    use visualizer::{ColumnGroup, ColumnKind, ColumnPlan, ShotSize, Strength, Tier};
+
+    use crate::Signal;
+    use crate::messages::{
+        VisualizerLabColumnGroup, VisualizerLabColumnKind, VisualizerLabColumnPlan,
+        VisualizerMomentStrength, VisualizerRuntimeStatus, VisualizerSectionTier,
+        VisualizerShotSize, VisualizerSupport, VisualizerTransport,
+    };
+
+    use super::{VISUALIZER, VisualizerStatusRequest, message_runtime_status, message_support};
+
+    #[test]
+    fn visualizer_support_handler_encodes_each_case() {
+        assert_eq!(
+            message_support(&Ok("Adapter".into())),
+            VisualizerSupport::Supported {
+                adapter: "Adapter".into()
+            }
+        );
+        assert_eq!(
+            message_support(&Err("No GPU".into())),
+            VisualizerSupport::Unsupported {
+                problem: "No GPU".into()
+            }
+        );
+    }
+
+    #[test]
+    fn hub_choice_messages_follow_visualizer_enums() {
+        for (source, message) in [
+            (ShotSize::Wide, VisualizerShotSize::Wide),
+            (ShotSize::Medium, VisualizerShotSize::Medium),
+            (ShotSize::Close, VisualizerShotSize::Close),
+            (ShotSize::Detail, VisualizerShotSize::Detail),
+            (ShotSize::Top, VisualizerShotSize::Top),
+        ] {
+            assert_eq!(VisualizerShotSize::from(source), message);
+        }
+        for (source, message) in [
+            (Strength::Medium, VisualizerMomentStrength::Medium),
+            (Strength::Strong, VisualizerMomentStrength::Strong),
+        ] {
+            assert_eq!(VisualizerMomentStrength::from(source), message);
+        }
+        for (source, message) in [
+            (ColumnGroup::Director, VisualizerLabColumnGroup::Director),
+            (ColumnGroup::Looks, VisualizerLabColumnGroup::Looks),
+            (ColumnGroup::Signals, VisualizerLabColumnGroup::Signals),
+            (ColumnGroup::Inputs, VisualizerLabColumnGroup::Inputs),
+        ] {
+            assert_eq!(VisualizerLabColumnGroup::from(source), message);
+        }
+        for (source, message) in [
+            (ColumnKind::Number, VisualizerLabColumnKind::Number),
+            (ColumnKind::Event, VisualizerLabColumnKind::Event),
+            (ColumnKind::Bool, VisualizerLabColumnKind::Bool),
+            (ColumnKind::Category, VisualizerLabColumnKind::Category),
+            (ColumnKind::Phase, VisualizerLabColumnKind::Phase),
+        ] {
+            assert_eq!(VisualizerLabColumnKind::from(source), message);
+        }
+        for (source, message) in [
+            (ColumnPlan::Yes, VisualizerLabColumnPlan::Yes),
+            (ColumnPlan::No, VisualizerLabColumnPlan::No),
+        ] {
+            assert_eq!(VisualizerLabColumnPlan::from(source), message);
+        }
+        for (source, message) in [
+            (Tier::Quiet, VisualizerSectionTier::Quiet),
+            (Tier::Normal, VisualizerSectionTier::Normal),
+            (Tier::High, VisualizerSectionTier::High),
+        ] {
+            assert_eq!(VisualizerSectionTier::from(source), message);
+        }
+    }
+
+    #[test]
+    fn visualizer_status_handler_encodes_started_runtime_states() {
+        let status = |running, transport| visualizer::Status {
+            running,
+            adapter: "Adapter".into(),
+            transport: Some(transport),
+            ..Default::default()
+        };
+        for (engine_transport, wire_transport) in [
+            (Transport::Readback, VisualizerTransport::Readback),
+            (Transport::IoSurface, VisualizerTransport::IoSurface),
+            (Transport::DxgiShared, VisualizerTransport::DxgiShared),
+            (Transport::VulkanShared, VisualizerTransport::VulkanShared),
+            (Transport::Surface, VisualizerTransport::Surface),
+        ] {
+            assert_eq!(
+                message_runtime_status(&status(true, engine_transport)),
+                VisualizerRuntimeStatus::Running {
+                    adapter: "Adapter".into(),
+                    transport: wire_transport,
+                }
+            );
+            assert_eq!(
+                message_runtime_status(&status(false, engine_transport)),
+                VisualizerRuntimeStatus::Stopped {
+                    adapter: "Adapter".into(),
+                    transport: wire_transport,
+                }
+            );
+        }
+        assert_eq!(
+            message_runtime_status(&visualizer::Status::default()),
+            VisualizerRuntimeStatus::NotRunningYet
+        );
+    }
+
+    #[tokio::test]
+    async fn visualizer_status_handler_returns_the_render_thread_state() {
+        let request = VisualizerStatusRequest { call_id: None };
+        let response = request.handle((), None, &request).await.unwrap().unwrap();
+        assert_eq!(
+            response.runtime,
+            message_runtime_status(&VISUALIZER.status())
+        );
     }
 }

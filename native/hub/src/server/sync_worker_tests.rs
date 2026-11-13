@@ -1,6 +1,7 @@
 use super::*;
 use crate::library_pool::{LibraryHandle, LibraryResources};
 use crate::node::NodeContext;
+use crate::test_wait::{TEST_DEADLINE, wait_until};
 use crate::utils::{Broadcaster, RinfRustSignal};
 use database::connection::RecommendationDbConnection;
 use database::credentials::{Credential, CredentialRef, CredentialStore, Secret};
@@ -11,11 +12,12 @@ use database::sync::share::{BaseCutRequest, ShareWriter, cut_base};
 use database::sync::share::{load_or_create_state, save_state};
 use fsio::test_fixtures::{S3Fixture, WebDavFixture};
 use fsio::{OpenDalConfig, OpenDalObjectStore};
+use futures::future::try_join_all;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use sync::SyncModel;
@@ -26,10 +28,14 @@ use sync::share::{
     RETIREMENT_MS, StoreError, StoreOperation, base_key, decode_head, encode_library, library_key,
 };
 use tokio::sync::{Barrier, Notify};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 #[path = "share_worker_tests/support.rs"]
 mod support;
+
+#[path = "share_worker_tests/pre_head_write.rs"]
+mod pre_head_write;
 
 struct MemoryShareFactory {
     store: Arc<MemoryObjectStore>,
@@ -56,6 +62,11 @@ struct FixedShareFactory {
     session: ShareStoreSession,
 }
 
+struct RoutedShareFactory {
+    stores: HashMap<Uuid, Arc<MemoryObjectStore>>,
+    opened: Arc<Mutex<HashMap<Uuid, usize>>>,
+}
+
 impl ShareStoreFactory for FixedShareFactory {
     fn open<'a>(
         &'a self,
@@ -65,6 +76,35 @@ impl ShareStoreFactory for FixedShareFactory {
     ) -> BoxFuture<'a, Result<ShareStoreSession, ShareSyncFailure>> {
         let session = self.session.clone();
         Box::pin(async move { Ok(session) })
+    }
+}
+
+impl ShareStoreFactory for RoutedShareFactory {
+    fn open<'a>(
+        &'a self,
+        record: &'a LibraryRecord,
+        _prefix: &'a str,
+        _credentials: &'a CredentialStore,
+    ) -> BoxFuture<'a, Result<ShareStoreSession, ShareSyncFailure>> {
+        let Some(library_id) = record.library_id else {
+            return Box::pin(async { Err(ShareSyncFailure::ProbeFailed) });
+        };
+        let Some(store) = self.stores.get(&library_id).cloned() else {
+            return Box::pin(async { Err(ShareSyncFailure::ProbeFailed) });
+        };
+        *self
+            .opened
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(library_id)
+            .or_default() += 1;
+        let store: Arc<dyn ObjectStore> = store;
+        Box::pin(async move {
+            Ok(ShareStoreSession {
+                store,
+                capabilities: ShareCapabilities::default(),
+            })
+        })
     }
 }
 
@@ -142,7 +182,7 @@ async fn detailed_sync_pass(
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShareBackend {
     WebDav,
     S3,
@@ -227,10 +267,20 @@ async fn hubs_on_share(namespace: Uuid, count: usize) -> Vec<support::SqlLibrary
 #[derive(Default)]
 struct QuietBroadcaster {
     messages: std::sync::Mutex<Vec<String>>,
+    successful_share_passes: AtomicUsize,
+    successful_share_pass: Notify,
 }
 
 impl Broadcaster for QuietBroadcaster {
     fn broadcast(&self, message: &dyn RinfRustSignal) {
+        if message
+            .as_any()
+            .downcast_ref::<LibrarySyncStatusUpdated>()
+            .is_some_and(|status| status.share_failure.is_none())
+        {
+            self.successful_share_passes.fetch_add(1, Ordering::SeqCst);
+            self.successful_share_pass.notify_waiters();
+        }
         let status = if message.name() == "LibrarySyncStatusUpdated" {
             format!(
                 " status_tail={:?}",
@@ -264,6 +314,19 @@ struct WorkerHub {
 }
 
 impl WorkerHub {
+    fn start_worker(&mut self) {
+        let worker_cancel = self.cancel.clone();
+        let worker_node = Arc::downgrade(&self.node);
+        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        self.task = Some(tokio::spawn(run_share_worker(
+            worker_node,
+            notify,
+            worker_cancel,
+            self.factory.clone(),
+            self.timers,
+        )));
+    }
+
     async fn stop_worker(&mut self) -> Result<()> {
         self.cancel.cancel();
         if let Some(task) = self.task.take() {
@@ -305,14 +368,6 @@ impl WorkerHub {
     }
 }
 
-async fn worker_hubs_on_share(
-    namespace: Uuid,
-    count: usize,
-    session: ShareStoreSession,
-) -> Result<Vec<WorkerHub>> {
-    worker_hubs_on_share_sessions(namespace, vec![session; count]).await
-}
-
 async fn register_worker_library(
     directory: &tempfile::TempDir,
     namespace: Uuid,
@@ -352,6 +407,29 @@ async fn worker_hubs_on_share_sessions(
     namespace: Uuid,
     sessions: Vec<ShareStoreSession>,
 ) -> Result<Vec<WorkerHub>> {
+    let mut hubs = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let library = support::SqlLibrary::new_persistent(namespace, Uuid::new_v4()).await?;
+        hubs.push(worker_hub_on_share(namespace, session, library).await?);
+    }
+    Ok(hubs)
+}
+
+async fn worker_hub_on_share(
+    namespace: Uuid,
+    session: ShareStoreSession,
+    library: support::SqlLibrary,
+) -> Result<WorkerHub> {
+    let mut hub = worker_hub_on_share_prepared(namespace, session, library).await?;
+    hub.start_worker();
+    Ok(hub)
+}
+
+async fn worker_hub_on_share_prepared(
+    namespace: Uuid,
+    session: ShareStoreSession,
+    library: support::SqlLibrary,
+) -> Result<WorkerHub> {
     let timers = ShareWorkerTimers {
         tick: Duration::from_millis(25),
         foreground_pull: Duration::from_millis(50),
@@ -360,89 +438,93 @@ async fn worker_hubs_on_share_sessions(
         statistics_push: Duration::from_millis(50),
         idle_push: Duration::from_millis(100),
     };
-    let mut hubs = Vec::with_capacity(sessions.len());
-    for session in sessions {
-        let factory: Arc<dyn ShareStoreFactory> = Arc::new(FixedShareFactory { session });
-        let library = support::SqlLibrary::new_persistent(namespace, Uuid::new_v4()).await?;
-        let directory = tempfile::tempdir()?;
-        let (node, broadcaster, handle) =
-            register_worker_library(&directory, namespace, &library).await?;
-        let cancel = CancellationToken::new();
-        let worker_cancel = cancel.clone();
-        let worker_node = Arc::downgrade(&node);
-        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-        let task = tokio::spawn(run_share_worker(
-            worker_node,
-            notify,
-            worker_cancel,
-            factory.clone(),
-            timers,
-        ));
-        hubs.push(WorkerHub {
-            _directory: directory,
-            node,
-            namespace,
-            library,
-            broadcaster,
-            handle: Some(handle),
-            cancel,
-            task: Some(task),
-            factory,
-            timers,
-        });
-    }
-    Ok(hubs)
+    let factory: Arc<dyn ShareStoreFactory> = Arc::new(FixedShareFactory { session });
+    let directory = tempfile::tempdir()?;
+    let (node, broadcaster, handle) =
+        register_worker_library(&directory, namespace, &library).await?;
+    let cancel = CancellationToken::new();
+    Ok(WorkerHub {
+        _directory: directory,
+        node,
+        namespace,
+        library,
+        broadcaster,
+        handle: Some(handle),
+        cancel,
+        task: None,
+        factory,
+        timers,
+    })
 }
 
 async fn wait_for_key_on_hubs(hubs: &[WorkerHub], key: &ObjectKey) -> Result<()> {
-    wait_for_key_on_hubs_with_timeout(hubs, key, Duration::from_secs(180)).await
+    wait_until("share key to reach every hub", || async {
+        let records = try_join_all(hubs.iter().map(|hub| hub.library.library.get(key))).await?;
+        let present = records.iter().all(Option::is_some);
+        Ok(present.then_some(()))
+    })
+    .await
 }
 
-async fn wait_for_key_on_hubs_with_timeout(
-    hubs: &[WorkerHub],
-    key: &ObjectKey,
-    timeout: Duration,
-) -> Result<()> {
-    tokio::time::timeout(timeout, async {
-        loop {
-            let mut present = true;
-            for hub in hubs {
-                present &= hub.library.library.get(key).await?.is_some();
-            }
-            if present {
-                return Ok::<_, anyhow::Error>(());
-            }
-            tokio::task::yield_now().await;
-        }
+async fn wait_for_keys_on_hubs(hubs: &[WorkerHub], keys: &[ObjectKey]) -> Result<()> {
+    wait_until("share keys to reach every hub", || async {
+        let records = try_join_all(
+            hubs.iter()
+                .flat_map(|hub| keys.iter().map(|key| hub.library.library.get(key))),
+        )
+        .await?;
+        let present = records.iter().all(Option::is_some);
+        Ok(present.then_some(()))
     })
-    .await??;
-    Ok(())
+    .await
+}
+
+async fn key_presence_on_hubs(hubs: &[WorkerHub], key: &ObjectKey) -> Result<String> {
+    let mut states = Vec::with_capacity(hubs.len());
+    for (index, hub) in hubs.iter().enumerate() {
+        let replica = hub.library.peer.identity().await?.replica;
+        let present = hub.library.library.get(key).await?.is_some();
+        states.push(format!("hub#{index} replica={replica} present={present}"));
+    }
+    Ok(states.join(", "))
+}
+
+async fn key_presence_matrix(hubs: &[WorkerHub], keys: &[ObjectKey]) -> Result<String> {
+    let mut states = Vec::with_capacity(hubs.len() * keys.len());
+    for (writer, key) in keys.iter().enumerate() {
+        for (index, hub) in hubs.iter().enumerate() {
+            let replica = hub.library.peer.identity().await?.replica;
+            let present = hub.library.library.get(key).await?.is_some();
+            states.push(format!(
+                "writer#{writer} key={} hub#{index} replica={replica} present={present}",
+                key.id
+            ));
+        }
+    }
+    Ok(states.join(", "))
 }
 
 async fn wait_for_replica_head(store: &dyn ObjectStore, replica: Uuid) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            for key in store
-                .list_prefix("devices/")
-                .await
-                .map_err(|error| anyhow::anyhow!("list replica heads: {error:?}"))?
-            {
-                if !key.contains("/head.") {
-                    continue;
-                }
-                let value = store
-                    .get(&key)
-                    .await
-                    .map_err(|error| anyhow::anyhow!("get replica head: {error:?}"))?;
-                if decode_head(&value.bytes)?.local_replica == replica {
-                    return Ok::<_, anyhow::Error>(());
-                }
+    wait_until("share replica head to appear", || async {
+        for key in store
+            .list_prefix("devices/")
+            .await
+            .map_err(|error| anyhow::anyhow!("list replica heads: {error:?}"))?
+        {
+            if !key.contains("/head.") {
+                continue;
             }
-            tokio::task::yield_now().await;
+            let value = store
+                .get(&key)
+                .await
+                .map_err(|error| anyhow::anyhow!("get replica head: {error:?}"))?;
+            if decode_head(&value.bytes)?.local_replica == replica {
+                return Ok(Some(()));
+            }
         }
+        Ok(None)
     })
-    .await??;
-    Ok(())
+    .await
 }
 
 struct CrashBetweenSegmentAndHead {
@@ -822,6 +904,109 @@ async fn read_only_share_reports_typed_failure_without_objects() -> Result<()> {
 }
 
 #[tokio::test]
+async fn share_worker_skips_redirected_catalog_before_opening_a_store() -> Result<()> {
+    let redirected_id = Uuid::new_v4();
+    let share_id = Uuid::new_v4();
+    let mut redirected_record = test_record(redirected_id);
+    redirected_record.catalog = CatalogPlacement::Redirected(Uuid::new_v4());
+    let share_record = test_record(share_id);
+    let redirected_library =
+        support::SqlLibrary::new_persistent(redirected_id, Uuid::new_v4()).await?;
+    let share_library = support::SqlLibrary::new_persistent(share_id, Uuid::new_v4()).await?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().to_string_lossy().into_owned();
+    let broadcaster = Arc::new(QuietBroadcaster::default());
+    let node = NodeContext::new(&path, &path, broadcaster, false).await?;
+    std::fs::write(
+        directory.path().join("libraries.json"),
+        serde_json::to_vec(&json!({
+            "version": 3,
+            "libraries": [redirected_record.clone(), share_record.clone()],
+            "last_open_record": null,
+        }))?,
+    )?;
+    let make_resources =
+        |library_id: Uuid, library: &support::SqlLibrary, record: LibraryRecord| LibraryResources {
+            library_id,
+            display_name: record.alias.clone(),
+            main_db: Arc::new(library.db.clone()),
+            library_sync: library.library.clone(),
+            recommend_db: Arc::new(RecommendationDbConnection::new()),
+            fsio: Arc::new(fsio::FsIo::new()),
+            media_root: library.root.path().to_string_lossy().into_owned(),
+            descriptor: record,
+        };
+    let redirected_handle = node
+        .library_pool
+        .register_ui(make_resources(
+            redirected_id,
+            &redirected_library,
+            redirected_record,
+        ))
+        .await?;
+    let share_handle = node
+        .library_pool
+        .register_ui(make_resources(share_id, &share_library, share_record))
+        .await?;
+    anyhow::ensure!(
+        node.library_pool.served_library_ids().await? == [redirected_id, share_id],
+        "redirected catalog must precede the share status barrier"
+    );
+
+    let redirected_store = Arc::new(MemoryObjectStore::default());
+    let share_store = Arc::new(MemoryObjectStore::default());
+    let opened = Arc::new(Mutex::new(HashMap::new()));
+    let factory: Arc<dyn ShareStoreFactory> = Arc::new(RoutedShareFactory {
+        stores: HashMap::from([
+            (redirected_id, redirected_store.clone()),
+            (share_id, share_store.clone()),
+        ]),
+        opened: opened.clone(),
+    });
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(run_share_worker(
+        Arc::downgrade(&node),
+        Arc::new(|| {}),
+        cancel.clone(),
+        factory,
+        ShareWorkerTimers {
+            tick: Duration::from_millis(25),
+            foreground_pull: Duration::from_millis(50),
+            background_pull: Duration::from_millis(50),
+            push_debounce: Duration::from_millis(10),
+            statistics_push: Duration::from_millis(50),
+            idle_push: Duration::from_millis(100),
+        },
+    ));
+    wait_until("the later in-share catalog store request", || async {
+        Ok((opened
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&share_id)
+            .copied()
+            .unwrap_or_default()
+            > 0
+            && !share_store.calls().is_empty())
+        .then_some(()))
+    })
+    .await?;
+    assert!(redirected_store.calls().is_empty());
+    assert_eq!(
+        opened
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&redirected_id),
+        None
+    );
+
+    cancel.cancel();
+    task.await?;
+    drop((redirected_handle, share_handle));
+    node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn read_only_webdav_in_share_probe_reports_typed_state_without_persisting_writes()
 -> Result<()> {
     let server = WebDavFixture::start_read_only(Vec::new()).await?;
@@ -869,21 +1054,50 @@ async fn read_only_webdav_in_share_probe_reports_typed_state_without_persisting_
 #[tokio::test]
 async fn sh15_three_hub_concurrent_push_obeys_backend_capabilities() -> Result<()> {
     for backend in [ShareBackend::WebDav, ShareBackend::S3] {
+        let started = Instant::now();
         let namespace = Uuid::new_v4();
         let (_fixture, session) = real_share(backend).await;
-        let seed = support::SqlLibrary::new(namespace, Uuid::new_v4()).await?;
+        let seed_library = support::SqlLibrary::new(namespace, Uuid::new_v4()).await?;
+        let seed_hub = worker_hub_on_share(namespace, session.clone(), seed_library).await?;
+        let seed_replica = seed_hub.library.peer.identity().await?.replica;
+        if let Err(error) = wait_for_replica_head(&*session.store, seed_replica).await {
+            anyhow::bail!(
+                "{backend:?} waiting for initial seed writer hub#0 replica {seed_replica}: {error:#}"
+            );
+        }
         let seed_key = ObjectKey {
             collection: Collection::Playlists,
             id: Uuid::new_v4(),
         };
-        seed.library
+        seed_hub
+            .library
+            .library
             .write_local(seed_key.clone(), support::playlist("three hub shared seed"))
             .await?;
-        detailed_sync_pass(&seed.library, namespace, &session).await?;
-        let hubs = worker_hubs_on_share(namespace, 3, session.clone()).await?;
-        wait_for_key_on_hubs_with_timeout(&hubs, &seed_key, Duration::from_secs(300))
-            .await
-            .map_err(|error| anyhow::anyhow!("waiting for seed catch-up: {error:#}"))?;
+        let mut hubs = vec![seed_hub];
+        for _ in 1..3 {
+            let library = support::SqlLibrary::new(namespace, Uuid::new_v4()).await?;
+            hubs.push(worker_hub_on_share(namespace, session.clone(), library).await?);
+        }
+        let seed_wait_started = Instant::now();
+        if let Err(error) = wait_for_key_on_hubs(&hubs, &seed_key).await {
+            anyhow::bail!(
+                "{backend:?} waiting for seed catch-up: {error:#}; {}",
+                key_presence_on_hubs(&hubs, &seed_key).await?
+            );
+        }
+        let seed_wait = seed_wait_started.elapsed();
+        let mut initial_head_waits = Vec::with_capacity(hubs.len());
+        for (index, hub) in hubs.iter().enumerate().skip(1) {
+            let replica = hub.library.peer.identity().await?.replica;
+            let wait_started = Instant::now();
+            if let Err(error) = wait_for_replica_head(&*session.store, replica).await {
+                anyhow::bail!(
+                    "{backend:?} waiting for initial head from hub#{index} replica {replica}: {error:#}"
+                );
+            }
+            initial_head_waits.push((index, replica, wait_started.elapsed()));
+        }
 
         let first_key = ObjectKey {
             collection: Collection::Playlists,
@@ -893,7 +1107,11 @@ async fn sh15_three_hub_concurrent_push_obeys_backend_capabilities() -> Result<(
             collection: Collection::Playlists,
             id: Uuid::new_v4(),
         };
-        let (first_write, second_write) = tokio::join!(
+        let third_key = ObjectKey {
+            collection: Collection::Playlists,
+            id: Uuid::new_v4(),
+        };
+        let (first_write, second_write, third_write) = tokio::join!(
             hubs[0]
                 .library
                 .library
@@ -902,15 +1120,17 @@ async fn sh15_three_hub_concurrent_push_obeys_backend_capabilities() -> Result<(
                 .library
                 .library
                 .write_local(second_key.clone(), support::playlist("writer two")),
+            hubs[2]
+                .library
+                .library
+                .write_local(third_key.clone(), support::playlist("writer three")),
         );
         first_write?;
         second_write?;
+        third_write?;
+        let keys = [first_key, second_key, third_key];
         if backend == ShareBackend::WebDav {
             assert!(!session.capabilities.conditional_head_write);
-            for hub in hubs.iter().take(2) {
-                wait_for_replica_head(&*session.store, hub.library.peer.identity().await?.replica)
-                    .await?;
-            }
             let keys = session
                 .store
                 .list_prefix("devices/")
@@ -932,17 +1152,19 @@ async fn sh15_three_hub_concurrent_push_obeys_backend_capabilities() -> Result<(
             );
         } else {
             assert!(session.capabilities.conditional_head_write);
-            wait_for_key_on_hubs_with_timeout(&hubs, &first_key, Duration::from_secs(300))
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!("waiting for first S3 writer to converge: {error:#}")
-                })?;
-            wait_for_key_on_hubs_with_timeout(&hubs, &second_key, Duration::from_secs(300))
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!("waiting for second S3 writer to converge: {error:#}")
-                })?;
         }
+        let key_wait_started = Instant::now();
+        if let Err(error) = wait_for_keys_on_hubs(&hubs, &keys).await {
+            anyhow::bail!(
+                "{backend:?} waiting for all three writer keys to converge: {error:#}; {}",
+                key_presence_matrix(&hubs, &keys).await?
+            );
+        }
+        let key_wait = key_wait_started.elapsed();
+        eprintln!(
+            "SH15 concurrent {backend:?}: seed_wait={seed_wait:?}, initial_head_waits={initial_head_waits:?}, key_wait={key_wait:?}, total={:?}",
+            started.elapsed()
+        );
         for hub in hubs {
             hub.stop().await?;
         }
@@ -974,8 +1196,10 @@ async fn sh15_read_only_real_share_reports_typed_status_and_writes_nothing() -> 
 #[tokio::test]
 async fn sh15_crash_after_segment_put_recovers_without_a_gap_or_duplicate() -> Result<()> {
     for backend in [ShareBackend::WebDav, ShareBackend::S3] {
+        let backend_started = Instant::now();
         let namespace = Uuid::new_v4();
         let (_fixture, session) = real_share(backend).await;
+        let fixture_started = backend_started.elapsed();
         let crash_store = Arc::new(CrashBetweenSegmentAndHead {
             inner: session.store.clone(),
             armed: AtomicBool::new(false),
@@ -996,20 +1220,26 @@ async fn sh15_crash_after_segment_put_recovers_without_a_gap_or_duplicate() -> R
         seed.library
             .write_local(seed_key.clone(), support::playlist("crash recovery seed"))
             .await?;
+        let push_started = Instant::now();
         detailed_sync_pass(&seed.library, namespace, &session).await?;
-        let mut sessions = vec![session.clone(); 3];
-        sessions[0] = crash_session;
-        let mut hubs = worker_hubs_on_share_sessions(namespace, sessions).await?;
+        let seed_push = push_started.elapsed();
+        let hub_start_started = Instant::now();
+        let mut hubs = worker_hubs_on_share_sessions(namespace, vec![crash_session]).await?;
+        let hub_started = hub_start_started.elapsed();
+        let push_started = Instant::now();
         wait_for_key_on_hubs(&hubs, &seed_key).await?;
         for hub in &hubs {
             wait_for_replica_head(&*session.store, hub.library.peer.identity().await?.replica)
                 .await?;
         }
+        let writer_seed_push = push_started.elapsed();
+        let receiver = support::SqlLibrary::new(namespace, Uuid::new_v4()).await?;
         let key = ObjectKey {
             collection: Collection::Playlists,
             id: Uuid::new_v4(),
         };
         crash_store.arm();
+        let crash_started = Instant::now();
         hubs[0]
             .library
             .library
@@ -1027,7 +1257,9 @@ async fn sh15_crash_after_segment_put_recovers_without_a_gap_or_duplicate() -> R
             pending.is_some(),
             "local edit was not visible to share worker"
         );
-        if tokio::time::timeout(Duration::from_secs(20), crash_store.wait_for_head_failure())
+        let local_push = crash_started.elapsed();
+        let crash_wait_started = Instant::now();
+        if tokio::time::timeout(TEST_DEADLINE, crash_store.wait_for_head_failure())
             .await
             .is_err()
         {
@@ -1046,6 +1278,7 @@ async fn sh15_crash_after_segment_put_recovers_without_a_gap_or_duplicate() -> R
                 "worker did not reach the head after segment write; objects: {objects:?}; messages: {messages:?}"
             );
         }
+        let crash = crash_wait_started.elapsed();
         assert!(
             session
                 .store
@@ -1057,27 +1290,21 @@ async fn sh15_crash_after_segment_put_recovers_without_a_gap_or_duplicate() -> R
         );
         hubs[0].stop_worker().await?;
         crash_store.resume_after_crash();
+        let recovery_started = Instant::now();
         hubs[0].restart_node().await?;
-        if let Err(error) = wait_for_key_on_hubs(&hubs, &key).await {
-            let objects = session
-                .store
-                .list_prefix("devices/")
-                .await
-                .unwrap_or_default();
-            let messages = hubs
-                .iter()
-                .map(|hub| {
-                    hub.broadcaster
-                        .messages
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            anyhow::bail!(
-                "recovery did not reach every hub: {error:#}; objects: {objects:?}; messages: {messages:?}"
-            );
-        }
+        let recovery_restart = recovery_started.elapsed();
+        let recovery_push_started = Instant::now();
+        detailed_sync_pass(&receiver.library, namespace, &session).await?;
+        anyhow::ensure!(
+            receiver.library.get(&seed_key).await?.is_some(),
+            "recovery left a gap before the changed playlist"
+        );
+        anyhow::ensure!(
+            receiver.library.get(&key).await?.is_some(),
+            "recovery did not reach the independent replica"
+        );
+        let recovery_push = recovery_push_started.elapsed();
+        let assertion_started = Instant::now();
         let objects = session
             .store
             .list_prefix("devices/")
@@ -1088,6 +1315,11 @@ async fn sh15_crash_after_segment_put_recovers_without_a_gap_or_duplicate() -> R
             .filter(|object| object.contains("/seg/"))
             .count();
         assert_eq!(segments, 1, "recovered local event was duplicated");
+        let assertions = assertion_started.elapsed();
+        eprintln!(
+            "SH15 {backend:?}: fixture={fixture_started:?}, seed_push={seed_push:?}, hub_started={hub_started:?}, writer_seed_push={writer_seed_push:?}, local_push={local_push:?}, crash={crash:?}, recovery_restart={recovery_restart:?}, recovery_push={recovery_push:?}, assertions={assertions:?}, total={:?}",
+            backend_started.elapsed()
+        );
         for hub in hubs {
             hub.stop().await?;
         }
@@ -1911,10 +2143,8 @@ async fn cancellation_drops_an_in_flight_share_pass() -> Result<()> {
         )
         .await
     });
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !store.calls().contains(&StoreOperation::Put) {
-            tokio::task::yield_now().await;
-        }
+    wait_until("share pass to begin its put", || async {
+        Ok(store.calls().contains(&StoreOperation::Put).then_some(()))
     })
     .await?;
     cancel.cancel();

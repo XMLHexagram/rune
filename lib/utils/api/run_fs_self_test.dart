@@ -7,15 +7,13 @@ import '../settings_manager.dart';
 
 class FsSelfTestLayerResult {
   final String layer;
-  final bool ok;
-  final bool skipped;
+  final FsSelfTestLayerOutcome outcome;
   final int elapsedMs;
   final String detail;
 
   const FsSelfTestLayerResult({
     required this.layer,
-    required this.ok,
-    required this.skipped,
+    required this.outcome,
     required this.elapsedMs,
     required this.detail,
   });
@@ -23,8 +21,11 @@ class FsSelfTestLayerResult {
   factory FsSelfTestLayerResult.fromJson(Map<String, dynamic> json) {
     return FsSelfTestLayerResult(
       layer: json['layer'] as String? ?? '',
-      ok: json['ok'] as bool? ?? false,
-      skipped: json['skipped'] as bool? ?? false,
+      outcome: switch ((json['ok'] as bool? ?? false, json['skipped'] as bool? ?? false)) {
+        (true, false) => FsSelfTestLayerOutcome.passed,
+        (false, false) => FsSelfTestLayerOutcome.failed,
+        (_, true) => FsSelfTestLayerOutcome.skipped,
+      },
       elapsedMs: (json['elapsed_ms'] as num?)?.toInt() ?? 0,
       detail: json['detail'] as String? ?? '',
     );
@@ -55,8 +56,9 @@ Future<FsSelfTestResult> runFsSelfTest(
   void Function(FsSelfTestProgress progress)? onProgress,
 }) async {
   final dbPath = await getSettingsPath();
-  final progressSubscription =
-      FsSelfTestProgress.rustSignalStream.listen((rustSignal) {
+  final progressSubscription = FsSelfTestProgress.rustSignalStream.listen((
+    rustSignal,
+  ) {
     onProgress?.call(rustSignal.message);
   });
 
@@ -64,7 +66,12 @@ Future<FsSelfTestResult> runFsSelfTest(
     final rustSignal = await awaitResponse(
       'RunFsSelfTestRequest',
       RunFsSelfTestResponse.rustSignalStream,
-      send: () => RunFsSelfTestRequest(path: path, dbPath: dbPath).sendSignalToRust(),
+      responseCallId: (response) => response.message.callId?.toInt(),
+      send: (callId) => RunFsSelfTestRequest(
+        path: path,
+        dbPath: dbPath,
+        callId: callId,
+      ).sendSignalToRust(),
       timeout: const Duration(seconds: 120),
     );
     final response = rustSignal.message;

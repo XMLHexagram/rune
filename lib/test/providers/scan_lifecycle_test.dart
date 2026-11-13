@@ -1,4 +1,4 @@
-import 'dart:typed_data';
+import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fluent_ui/fluent_ui.dart';
@@ -9,12 +9,16 @@ import 'package:rune/screens/welcome/scanning.dart';
 import 'package:rune/bindings/bindings.dart';
 import 'package:rune/providers/library_manager.dart';
 
-class FakeLibraryPath extends ChangeNotifier implements LibraryOpenStateProvider {
+class FakeLibraryPath extends ChangeNotifier
+    implements LibraryOpenStateProvider {
   @override
   LibraryRecordSummary? get openRecord => const LibraryRecordSummary(
     recordId: 'test-record',
     alias: 'Test',
-    kind: LibraryRecordKindSummaryLocal(libraryId: 'test-library', path: '/test/library'),
+    kind: LibraryRecordKindSummaryLocal(
+      libraryId: 'test-library',
+      path: '/test/library',
+    ),
   );
   @override
   String? get openLocalFolderPath => '/test/library';
@@ -28,118 +32,136 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   test(
-    'scan terminal events settle waiters and ignore replaced tasks',
+    'scan progress and ending follow the reported library task state',
     () async {
+      final states = StreamController<LibraryTaskStateChanged>.broadcast(
+        sync: true,
+      );
       final requests = <ScanAudioLibraryRequest>[];
-      final manager = LibraryManagerProvider(sendScanRequest: requests.add);
+      final manager = LibraryManagerProvider(
+        sendScanRequest: requests.add,
+        libraryTaskStates: states.stream,
+      );
+      addTearDown(states.close);
       addTearDown(manager.dispose);
       const recordId = 'test-record';
-      await manager.scanLibrary(recordId);
-      final old = requests.last.scanId;
-      final firstWait = manager.waitForScanToComplete(recordId);
-      await manager.scanLibrary(recordId);
-      expect(await firstWait, TaskStatus.cancelled);
-      final active = requests.last.scanId;
+
+      await manager.scanLibrary(recordId, force: true);
+      expect(requests, hasLength(1));
+      expect(requests.single.force, true);
+      expect(requests.single.callId, isNotNull);
       final wait = manager.waitForScanToComplete(recordId);
-
-      void terminal(String id, String status) {
-        final response = ScanAudioLibraryResponse(
-          scanId: id,
-          status: status,
-          error: status == 'failed' ? 'injected failure' : '',
-          recordId: recordId,
-          progress: 0,
-        );
-        assignRustSignal['ScanAudioLibraryResponse']!(
-          response.bincodeSerialize(),
-          Uint8List(0),
-        );
-      }
-
-      terminal(old, 'success');
-      await Future<void>.delayed(Duration.zero);
-      expect(manager.getScanTaskProgress(recordId)?.status, TaskStatus.working);
-      terminal(active, 'failed');
-      expect(await wait, TaskStatus.failed);
-      expect(await manager.waitForScanToComplete(recordId), TaskStatus.failed);
-      expect(manager.getScanTaskProgress(recordId)?.error, 'injected failure');
-
-      await manager.scanLibrary(recordId);
-      final cancelled = manager.waitForScanToComplete(recordId);
-      terminal(requests.last.scanId, 'cancelled');
-      expect(await cancelled, TaskStatus.cancelled);
-      expect(await manager.waitForScanToComplete(recordId), TaskStatus.cancelled);
-
-      await manager.scanLibrary(recordId);
-      final cleared = manager.waitForScanToComplete(recordId);
-      final stale = requests.last.scanId;
-      manager.clearAll(recordId);
-      expect(await cleared, TaskStatus.cancelled);
-      terminal(stale, 'success');
-      await Future<void>.delayed(Duration.zero);
-      expect(manager.getScanTaskProgress(recordId), isNull);
+      states.add(
+        const LibraryTaskStateChanged(
+          state: LibraryTaskStateRunning(
+            recordId: recordId,
+            task: LibraryTaskKind.scan,
+            runId: 'node-run',
+            progress: 3,
+            total: 8,
+            scanPhase: ScanTaskPhase.scanCoverArts,
+          ),
+        ),
+      );
+      expect(manager.getScanTaskProgress(recordId)?.progress, 3);
+      expect(manager.getScanTaskProgress(recordId)?.total, 8);
+      expect(
+        manager.getScanTaskProgress(recordId)?.phase,
+        ScanTaskPhase.scanCoverArts,
+      );
+      states.add(
+        const LibraryTaskStateChanged(
+          state: LibraryTaskStateEnded(
+            recordId: recordId,
+            task: LibraryTaskKind.scan,
+            runId: 'node-run',
+            progress: 8,
+            total: 8,
+            outcome: LibraryTaskOutcomeFinished(),
+          ),
+        ),
+      );
+      expect(
+        manager.getScanTaskProgress(recordId)?.status,
+        TaskStatus.finished,
+      );
+      expect(await wait, TaskStatus.finished);
+      expect(
+        await manager.waitForScanToComplete(recordId),
+        TaskStatus.finished,
+      );
     },
   );
-  test('successful initialization navigates only for success', () async {
-    final requests = <ScanAudioLibraryRequest>[];
-    final routes = <String>[];
-    final manager = LibraryManagerProvider(
-      sendScanRequest: requests.add,
-      navigate: routes.add,
-    );
-    addTearDown(manager.dispose);
-    await manager.scanLibrary('test-record', isInitializeTask: true);
-    final response = ScanAudioLibraryResponse(
-      scanId: requests.last.scanId,
-      status: 'success',
-      error: '',
-      recordId: 'test-record',
-      progress: 1,
-    );
-    assignRustSignal['ScanAudioLibraryResponse']!(
-      response.bincodeSerialize(),
-      Uint8List(0),
-    );
-    await Future<void>.delayed(Duration.zero);
-    expect(routes, ['/scanning', '/library']);
-    for (final status in ['failed', 'cancelled']) {
+
+  test(
+    'successful initialization navigates after the reported scan end',
+    () async {
+      final states = StreamController<LibraryTaskStateChanged>.broadcast(
+        sync: true,
+      );
+      final requests = <ScanAudioLibraryRequest>[];
+      final routes = <String>[];
+      final manager = LibraryManagerProvider(
+        sendScanRequest: requests.add,
+        navigate: routes.add,
+        libraryTaskStates: states.stream,
+      );
+      addTearDown(states.close);
+      addTearDown(manager.dispose);
       await manager.scanLibrary('test-record', isInitializeTask: true);
-      final response = ScanAudioLibraryResponse(
-        scanId: requests.last.scanId,
-        status: status,
-        error: '',
-        recordId: 'test-record',
-        progress: 0,
+      states.add(
+        const LibraryTaskStateChanged(
+          state: LibraryTaskStateRunning(
+            recordId: 'test-record',
+            task: LibraryTaskKind.scan,
+            runId: 'node-run',
+            progress: 0,
+            total: 0,
+          ),
+        ),
       );
-      assignRustSignal['ScanAudioLibraryResponse']!(
-        response.bincodeSerialize(),
-        Uint8List(0),
+      const ended = LibraryTaskStateChanged(
+        state: LibraryTaskStateEnded(
+          recordId: 'test-record',
+          task: LibraryTaskKind.scan,
+          runId: 'node-run',
+          progress: 1,
+          total: 1,
+          outcome: LibraryTaskOutcomeFinished(),
+        ),
       );
-      await Future<void>.delayed(Duration.zero);
-    }
-    expect(routes, ['/scanning', '/library', '/scanning', '/scanning']);
-  });
+      states
+        ..add(ended)
+        ..add(ended);
+      expect(routes, ['/scanning', '/library']);
+    },
+  );
 
   testWidgets('failed initialization screen offers recovery', (tester) async {
+    final states = StreamController<LibraryTaskStateChanged>.broadcast(
+      sync: true,
+    );
     final requests = <ScanAudioLibraryRequest>[];
     final manager = LibraryManagerProvider(
       sendScanRequest: requests.add,
       navigate: (_) {},
+      libraryTaskStates: states.stream,
     );
+    addTearDown(states.close);
     addTearDown(manager.dispose);
     await manager.scanLibrary('test-record', isInitializeTask: true);
-    final response = ScanAudioLibraryResponse(
-      scanId: requests.last.scanId,
-      status: 'failed',
-      error: 'injected failure',
-      recordId: 'test-record',
-      progress: 0,
+    states.add(
+      const LibraryTaskStateChanged(
+        state: LibraryTaskStateEnded(
+          recordId: 'test-record',
+          task: LibraryTaskKind.scan,
+          runId: 'node-run',
+          progress: 0,
+          total: 0,
+          outcome: LibraryTaskOutcomeFailed(value: LibraryTaskError.scanFailed),
+        ),
+      ),
     );
-    assignRustSignal['ScanAudioLibraryResponse']!(
-      response.bincodeSerialize(),
-      Uint8List(0),
-    );
-    await tester.pump();
     await tester.pumpWidget(
       MultiProvider(
         providers: [
@@ -156,25 +178,111 @@ void main() {
       ),
     );
     await tester.pump();
-    expect(find.textContaining('injected failure'), findsOneWidget);
-    expect(find.byType(FilledButton), findsOneWidget);
-    expect(find.byType(Button), findsOneWidget);
-    await manager.scanLibrary('test-record', isInitializeTask: true);
-    final cancelled = ScanAudioLibraryResponse(
-      scanId: requests.last.scanId,
-      status: 'cancelled',
-      error: '',
-      recordId: 'test-record',
-      progress: 0,
-    );
-    assignRustSignal['ScanAudioLibraryResponse']!(
-      cancelled.bincodeSerialize(),
-      Uint8List(0),
-    );
-    await tester.pump();
+    expect(find.textContaining('Scan failed'), findsOneWidget);
     expect(find.byType(FilledButton), findsOneWidget);
     expect(find.byType(Button), findsOneWidget);
     await tester.pump(const Duration(milliseconds: 100));
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump(const Duration(milliseconds: 100));
+  });
+
+  testWidgets('refused welcome scan start is shown in the scanning page', (
+    tester,
+  ) async {
+    final failures = StreamController<RequestFailedResponse>.broadcast(
+      sync: true,
+    );
+    final requests = <ScanAudioLibraryRequest>[];
+    final manager = LibraryManagerProvider(
+      sendScanRequest: requests.add,
+      navigate: (_) {},
+      requestFailures: failures.stream,
+    );
+    addTearDown(failures.close);
+    addTearDown(manager.dispose);
+    addTearDown(() async {
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump(const Duration(milliseconds: 100));
+    });
+    await manager.scanLibrary('test-record', isInitializeTask: true);
+    failures.add(
+      RequestFailedResponse(
+        request: 'diagnostic only',
+        callId: requests.single.callId,
+        kind: RequestErrorKind.conflict,
+        detail: 'A scan is already running',
+        cause: const RequestFailureCauseLibraryTaskAlreadyRunning(
+          task: LibraryTaskKind.scan,
+        ),
+      ),
+    );
+
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<LibraryOpenStateProvider>(
+            create: (_) => FakeLibraryPath(),
+          ),
+          ChangeNotifierProvider<LibraryManagerProvider>.value(value: manager),
+        ],
+        child: const FluentApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: ScanningPage(),
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(
+      find.text('Scanning: This is not available right now.'),
+      findsOneWidget,
+    );
+    expect(find.byType(FilledButton), findsOneWidget);
+    expect(find.byType(Button), findsOneWidget);
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump(const Duration(milliseconds: 100));
+  });
+
+  testWidgets('scanning screen shows the reported cover-art phase', (
+    tester,
+  ) async {
+    final states = StreamController<LibraryTaskStateChanged>.broadcast(
+      sync: true,
+    );
+    final manager = LibraryManagerProvider(libraryTaskStates: states.stream);
+    addTearDown(states.close);
+    addTearDown(manager.dispose);
+    states.add(
+      const LibraryTaskStateChanged(
+        state: LibraryTaskStateRunning(
+          recordId: 'test-record',
+          task: LibraryTaskKind.scan,
+          runId: 'node-run',
+          progress: 3,
+          total: 8,
+          scanPhase: ScanTaskPhase.scanCoverArts,
+        ),
+      ),
+    );
+
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<LibraryOpenStateProvider>(
+            create: (_) => FakeLibraryPath(),
+          ),
+          ChangeNotifierProvider<LibraryManagerProvider>.value(value: manager),
+        ],
+        child: const FluentApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: ScanningPage(),
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.textContaining('album covers collected'), findsOneWidget);
     await tester.pumpWidget(const SizedBox());
     await tester.pump(const Duration(milliseconds: 100));
   });

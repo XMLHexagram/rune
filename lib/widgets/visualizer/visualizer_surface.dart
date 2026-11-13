@@ -7,6 +7,7 @@ import '../../bindings/bindings.dart';
 import '../../providers/visualizer_scenes.dart';
 import '../../utils/color_brightness.dart';
 import '../../utils/rune_log.dart';
+import '../../utils/api/request_failure.dart';
 
 import 'visualizer_controller.dart';
 import 'visualizer_render_size.dart';
@@ -194,10 +195,15 @@ class _VisualizerSurfaceState extends State<VisualizerSurface>
   Future<void> _pollStatus() async {
     if (_renderedSize == null || _disposed) return;
 
-    VisualizerStatusRequest().sendSignalToRust();
     try {
-      final signal = await VisualizerStatusResponse.rustSignalStream.first
-          .timeout(const Duration(seconds: 1));
+      final signal = await awaitResponse(
+        'VisualizerStatusRequest',
+        VisualizerStatusResponse.rustSignalStream,
+        timeout: const Duration(seconds: 1),
+        responseCallId: (response) => response.message.callId?.toInt(),
+        send: (callId) =>
+            VisualizerStatusRequest(callId: callId).sendSignalToRust(),
+      );
       if (_disposed || !mounted) return;
       final status = signal.message;
 
@@ -205,7 +211,7 @@ class _VisualizerSurfaceState extends State<VisualizerSurface>
       _updateLabel(status);
       // No path yet: the scene the visualizer begins with is still being
       // built, and the page stays as it is until it shows.
-      final path = status.running ? status.presetPath : '';
+      final path = visualizerScenePath(status);
       _controller.scenePath.value = path.isEmpty ? null : path;
       _controller.sceneName.value = path.isEmpty ? null : status.presetName;
       if (path.isNotEmpty) {
@@ -220,6 +226,8 @@ class _VisualizerSurfaceState extends State<VisualizerSurface>
           : path != kCoverWallScenePath;
     } on TimeoutException {
       // The next tick asks again.
+    } on RequestFailure catch (failure) {
+      error$('Could not read visualizer status: ${failure.detail}');
     }
   }
 
@@ -267,4 +275,16 @@ class _VisualizerSurfaceState extends State<VisualizerSurface>
       ),
     );
   }
+}
+
+@visibleForTesting
+String visualizerScenePath(VisualizerStatusResponse status) {
+  switch (status.runtime) {
+    case VisualizerRuntimeStatusRunning():
+      return status.presetPath;
+    case VisualizerRuntimeStatusStopped():
+    case VisualizerRuntimeStatusNotRunningYet():
+      return '';
+  }
+  throw StateError('Unknown visualizer runtime status');
 }

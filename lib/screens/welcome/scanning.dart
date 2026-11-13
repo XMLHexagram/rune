@@ -4,10 +4,11 @@ import 'package:mesh_gradient/mesh_gradient.dart';
 import 'package:animated_flip_counter/animated_flip_counter.dart';
 
 import '../../utils/color_brightness.dart';
-import '../../bindings/bindings.dart';
 import '../../providers/library_open_state.dart';
 import '../../providers/library_manager.dart';
+import '../../bindings/bindings.dart';
 import '../../utils/l10n.dart';
+import '../../utils/api/request_failure.dart';
 import '../../utils/router/navigation.dart';
 import '../../widgets/status_bar_style.dart';
 
@@ -46,7 +47,6 @@ class _ScanningPageState extends State<ScanningPage>
     final recordId = libraryPath.openRecord?.recordId;
     final progress = libraryManager.getScanTaskProgress(recordId);
 
-    final task = progress?.type ?? ScanTaskType.indexFiles;
     final count = progress?.progress ?? 0;
 
     return AnimatedMeshGradient(
@@ -70,7 +70,14 @@ class _ScanningPageState extends State<ScanningPage>
               children: [
                 if (progress?.status == TaskStatus.failed ||
                     progress?.status == TaskStatus.cancelled) ...[
-                  Text(S.of(context).error(progress?.error ?? '')),
+                  Text(
+                    progress?.failure != null
+                        ? requestFailureMessage(
+                            S.of(context),
+                            progress!.failure!,
+                          )
+                        : S.of(context).error(progress?.error ?? ''),
+                  ),
                   const SizedBox(height: 12),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.center,
@@ -84,7 +91,9 @@ class _ScanningPageState extends State<ScanningPage>
                       ),
                       const SizedBox(width: 12),
                       Button(
-                        onPressed: () => $$replace('/'),
+                        onPressed: () => $hasLibraryNavigator
+                            ? $replace('/library')
+                            : $$replace('/'),
                         child: Text(S.of(context).cancel),
                       ),
                     ],
@@ -103,7 +112,7 @@ class _ScanningPageState extends State<ScanningPage>
                     value: count,
                     duration: const Duration(milliseconds: 400),
                     curve: Curves.easeInOut,
-                    suffix: task == ScanTaskType.indexFiles
+                    suffix: progress?.phase == ScanTaskPhase.indexFiles
                         ? S.of(context).tracksFound
                         : S.of(context).albumCoversCollected,
                     textStyle: typography.bodyLarge?.apply(

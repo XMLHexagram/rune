@@ -10,6 +10,8 @@ import 'package:system_theme/system_theme.dart';
 import 'package:local_notifier/local_notifier.dart';
 import 'package:flutter_acrylic/flutter_acrylic.dart';
 import 'package:bitsdojo_window/bitsdojo_window.dart';
+import 'package:macos_window_utils/macos_window_utils.dart'
+    show WindowManipulator;
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter_fullscreen/flutter_fullscreen.dart';
 
@@ -144,17 +146,24 @@ void main(List<String> arguments) async {
   await initializeRust(assignRustSignal);
   // Start device-level sharing and sync before any library is open. A
   // failure here is not fatal: opening a library retries and reports it.
-  final nodeInitialized = InitializeNodeResponse.rustSignalStream.first;
-  InitializeNodeRequest(configPath: await getSettingsPath()).sendSignalToRust();
   try {
-    final nodeResponse = (await nodeInitialized.timeout(
-      const Duration(seconds: 30),
+    final configPath = await getSettingsPath();
+    final nodeResponse = (await awaitResponse(
+      'InitializeNodeRequest',
+      InitializeNodeResponse.rustSignalStream,
+      responseCallId: (response) => response.message.callId?.toInt(),
+      send: (callId) => InitializeNodeRequest(
+        configPath: configPath,
+        callId: callId,
+      ).sendSignalToRust(),
     )).message;
     if (!nodeResponse.success) {
       error$('Could not initialize this device: ${nodeResponse.error}');
     }
   } on TimeoutException {
     error$('Device initialization did not answer within 30 seconds');
+  } on RequestFailure catch (failure) {
+    error$('Could not initialize this device: ${failure.detail}');
   }
   // Scene files the app was opened with, or is asked to open later.
   SceneFiles.start(arguments);
@@ -242,6 +251,13 @@ void main(List<String> arguments) async {
   if (isDesktop && !Platform.isLinux) {
     try {
       await Window.initialize();
+      if (Platform.isMacOS) {
+        // Window.initialize() turns the full-size content view off, and bitsdojo_window turns it
+        // back on when it shows the window. Turning it on before the first frame keeps the
+        // content one size while the window first shows: a change there can make Flutter's macOS
+        // compositor hand Impeller a surface of the old size, which crashes the raster thread.
+        await WindowManipulator.enableFullSizeContentView();
+      }
       await appTheme.setEffect();
     } catch (error) {
       warn$('Window effect initialization failed: $error');
@@ -600,22 +616,49 @@ class RuneLifecycleState extends State<RuneLifecycle> {
     final registry = context.read<LibraryRegistryProvider>();
     _requestFailureSubscription = RequestFailedResponse.rustSignalStream.listen(
       (signal) {
-        if (signal.message.cause
-                is! RequestFailureCauseSubsonicNotAuthorized ||
-            _subsonicReloginOpen) {
+        final failure = signal.message;
+        if (failure.cause is RequestFailureCauseSubsonicNotAuthorized) {
+          if (_subsonicReloginOpen) return;
+          final recordId = registry.openRecordId;
+          final dialogContext = rootNavigatorKey.currentState?.overlay?.context;
+          if (recordId == null ||
+              dialogContext == null ||
+              !mounted ||
+              !dialogContext.mounted) {
+            return;
+          }
+          _subsonicReloginOpen = true;
+          showSubsonicReloginDialog(
+            dialogContext,
+            registry,
+            recordId,
+          ).whenComplete(() => _subsonicReloginOpen = false);
           return;
         }
-        final recordId = registry.openRecordId;
-        final dialogContext = rootNavigatorKey.currentState?.overlay?.context;
-        if (recordId == null ||
-            dialogContext == null ||
-            !mounted ||
-            !dialogContext.mounted) {
+        if (failure.callId != null ||
+            failure.kind == RequestErrorKind.internal) {
           return;
         }
-        _subsonicReloginOpen = true;
-        showSubsonicReloginDialog(dialogContext, registry, recordId)
-            .whenComplete(() => _subsonicReloginOpen = false);
+        final noticeContext = rootNavigatorKey.currentState?.overlay?.context;
+        if (noticeContext == null || !mounted || !noticeContext.mounted) return;
+        displayInfoBar(
+          noticeContext,
+          builder: (_, close) => InfoBar(
+            title: Text(
+              requestFailureMessage(
+                S.of(noticeContext),
+                RequestFailure(
+                  failure.request,
+                  failure.kind,
+                  failure.detail,
+                  failure.cause,
+                ),
+              ),
+            ),
+            severity: InfoBarSeverity.error,
+            onClose: close,
+          ),
+        );
       },
     );
 

@@ -8,29 +8,204 @@ mod access_policy_tests {
     use crate::macros::{RequestAccess, request_access, request_scope};
     use crate::messages::{CastLibraryState, RendererAvailability};
     use crate::messages::{DeviceGrantsChange, DeviceGrantsInfo, RemoveTrustedClientRequest};
+    use crate::messages::{
+        GetLikedRequest, GetLyricByTrackIdRequest, GetPrimaryColorByTrackIdRequest,
+        PlayingItemRef, SetLikedRequest,
+    };
     use crate::request_error::ExpectedRequestError;
     use crate::server::libraries::{
         cast_library_state, list_peer_libraries, list_renderer_candidates,
     };
     use crate::server::sync::client::LibrarySession;
     use crate::server::sync_worker::TestPeerSession;
-    use database::actions::stats::{get_liked, set_liked};
-    use database::entities::media_cover_art;
+    use crate::test_wait::{TEST_DEADLINE, wait_until};
+    use database::actions::{file::file_ids_by_uuid, stats::{get_liked, set_liked}};
+    use database::entities::{media_cover_art, media_files};
     use database::library_registry::{
         CatalogPlacement, FsAdapter, ProtocolAdapter, RuneForwardMode,
     };
     use http_request::sync::MetadataPeer;
     use sea_orm::{
-        ActiveValue,
+        ActiveValue, EntityTrait, Set,
         sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions},
     };
+    use sea_orm::prelude::Decimal;
     use std::fs;
+    use std::collections::BTreeMap;
     use sync::protocol::SyncError;
     use tempfile::TempDir;
-    use tokio::{
-        task::yield_now,
-        time::{sleep, timeout},
-    };
+    use tokio::{sync::Mutex, time::sleep};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn liked_requests_cannot_act_on_an_ungranted_body_library() -> Result<()> {
+        let pair = PolicyPair::new().await?;
+        let second_dir = tempfile::tempdir()?;
+        let second = fixture_open_local_library(&pair.a, second_dir.path()).await?;
+        let library_b = second.global_params.library_id.context("second library id")?;
+        let library_b_handle = second
+            .global_params
+            .library
+            .as_ref()
+            .context("second library handle")?;
+        let track = Uuid::new_v4();
+        media_files::Entity::insert(media_files::ActiveModel {
+            id: ActiveValue::NotSet,
+            file_name: Set("track.flac".into()),
+            directory: Set(String::new()),
+            extension: Set("flac".into()),
+            file_hash: Set("test-hash".into()),
+            last_modified: Set(String::new()),
+            change_token: Set(None),
+            cover_art_uuid: Set(None),
+            cover_art_checked_at: Set(None),
+            sample_rate: Set(44_100),
+            duration: Set(Decimal::ONE),
+            local_available: Set(false),
+            content_hash: Set(None),
+            content_size: Set(None),
+            source_uuid: Set(track.to_string()),
+        })
+        .exec(&*library_b_handle.main_db)
+        .await?;
+        let peer = info(&pair.b).await?;
+        let mut grants = DeviceGrants::guest();
+        grants.connection.all_libraries = None;
+        grants.connection.libraries = BTreeMap::from([(pair.id, ConnectionLevel::ViewEdit)]);
+        pair.a
+            .global_params
+            .node
+            .access_policy
+            .set(&peer.fingerprint, grants)?;
+        let user = pair
+            .a
+            .global_params
+            .node
+            .permission_manager
+            .read()
+            .await
+            .verify_by_fingerprint(&peer.fingerprint)
+            .await
+            .context("approved controller")?;
+        let session = Session {
+            fingerprint: user.fingerprint.clone(),
+            public_key: user.public_key.clone(),
+            host: "127.0.0.1".into(),
+        };
+        let second_session = Session {
+            fingerprint: user.fingerprint.clone(),
+            public_key: user.public_key.clone(),
+            host: "127.0.0.1".into(),
+        };
+        let item = PlayingItemRef::LibraryTrack {
+            library_id: library_b.to_string(),
+            track: track.to_string(),
+        };
+        let node = Arc::clone(&pair.a.global_params.node);
+        let set_request = SetLikedRequest {
+            item: Some(item.clone()),
+            liked: true,
+            call_id: Some(101),
+        };
+        let (_, set_result) = node
+            .websocket_service
+            .handle_addressed_message(
+                "SetLikedRequest",
+                rinf::serialize(&set_request)?,
+                Some(second_session),
+                Some(pair.id),
+                &node,
+            )
+            .await
+            .context("SetLikedRequest route")?;
+        let get_request = GetLikedRequest {
+            item: Some(item),
+            call_id: Some(102),
+        };
+        let (_, get_result) = node
+            .websocket_service
+            .handle_addressed_message(
+                "GetLikedRequest",
+                rinf::serialize(&get_request)?,
+                Some(session),
+                Some(pair.id),
+                &node,
+            )
+            .await
+            .context("GetLikedRequest route")?;
+        let lyric_request = GetLyricByTrackIdRequest {
+            item: Some(PlayingItemRef::LibraryTrack {
+                library_id: library_b.to_string(),
+                track: Uuid::new_v4().to_string(),
+            }),
+            call_id: Some(103),
+        };
+        let (_, lyric_result) = node
+            .websocket_service
+            .handle_addressed_message(
+                "GetLyricByTrackIdRequest",
+                rinf::serialize(&lyric_request)?,
+                Some(Session {
+                    fingerprint: user.fingerprint.clone(),
+                    public_key: user.public_key.clone(),
+                    host: "127.0.0.1".into(),
+                }),
+                Some(pair.id),
+                &node,
+            )
+            .await
+            .context("GetLyricByTrackIdRequest route")?;
+        let color_request = GetPrimaryColorByTrackIdRequest {
+            item: Some(PlayingItemRef::LibraryTrack {
+                library_id: library_b.to_string(),
+                track: Uuid::new_v4().to_string(),
+            }),
+            call_id: Some(104),
+        };
+        let (_, color_result) = node
+            .websocket_service
+            .handle_addressed_message(
+                "GetPrimaryColorByTrackIdRequest",
+                rinf::serialize(&color_request)?,
+                Some(Session {
+                    fingerprint: user.fingerprint,
+                    public_key: user.public_key,
+                    host: "127.0.0.1".into(),
+                }),
+                Some(pair.id),
+                &node,
+            )
+            .await
+            .context("GetPrimaryColorByTrackIdRequest route")?;
+
+        for (name, result) in [
+            ("SetLikedRequest", set_result),
+            ("GetLikedRequest", get_result),
+            ("GetLyricByTrackIdRequest", lyric_result),
+            ("GetPrimaryColorByTrackIdRequest", color_result),
+        ] {
+            let error = result.expect_err(name);
+            assert_eq!(classify(&error), RequestErrorKind::PermissionDenied, "{name}");
+            assert!(matches!(
+                error.downcast_ref::<Denial>(),
+                Some(Denial::Action {
+                    action: Action::ConnectionEdit { library_id }
+                }) if *library_id == library_b
+            ) || matches!(
+                error.downcast_ref::<Denial>(),
+                Some(Denial::Action {
+                    action: Action::ConnectionView { library_id }
+                }) if *library_id == library_b
+            ), "{name}: {error:#}");
+        }
+        let track_id = file_ids_by_uuid(&library_b_handle.main_db, &[track])
+            .await?
+            .get(&track)
+            .copied()
+            .context("seeded second-library track")?;
+        assert!(!get_liked(&*library_b_handle.main_db, track_id).await?);
+        pair.close().await?;
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn guest_set_liked_request_returns_typed_connection_edit_denial() -> Result<()> {
@@ -236,9 +411,7 @@ mod access_policy_tests {
             Ok(())
         }
         async fn pass(&self, owner: bool) -> Result<PeerPass> {
-            self.pass_with_timeout(owner, Duration::from_secs(15)).await
-        }
-        async fn pass_with_timeout(&self, owner: bool, limit: Duration) -> Result<PeerPass> {
+            wait_until("peer sync pass to complete", || async {
             let (local, remote, addr) = if owner {
                 (&self.a, &self.b, self.b_addr)
             } else {
@@ -255,23 +428,20 @@ mod access_policy_tests {
                 host: "127.0.0.1".into(),
                 port: addr.port(),
             };
-            timeout(limit, async {
-                loop {
-                    match session
-                        .pass(
-                            local.global_params.clone(),
-                            &local.private_key,
-                            endpoint.clone(),
-                            true,
-                        )
-                        .await?
-                    {
-                        PeerPass::Incomplete => yield_now().await,
-                        result => return Ok::<_, anyhow::Error>(result),
-                    }
+                match session
+                    .pass(
+                        local.global_params.clone(),
+                        &local.private_key,
+                        endpoint.clone(),
+                        true,
+                    )
+                    .await?
+                {
+                    PeerPass::Incomplete => Ok(None),
+                    result => Ok(Some(result)),
                 }
             })
-            .await?
+            .await
         }
         async fn listings(&self) -> Result<serde_json::Value> {
             Ok(self
@@ -320,37 +490,56 @@ mod access_policy_tests {
         Ok(connection)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_sqlite_busy_timeout(fixture: &Fixture) -> Result<()> {
+        let pool = fixture
+            .global_params
+            .test_library()
+            .main_db
+            .get_sqlite_connection_pool();
+        let mut connections = Vec::new();
+        for _ in 0..pool.options().get_max_connections() {
+            connections.push(pool.acquire().await?);
+        }
+        for connection in &mut connections {
+            sea_orm::sqlx::query("PRAGMA busy_timeout = 100")
+                .execute(&mut **connection)
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sync_recovers_after_replica_write_lock_is_released() -> Result<()> {
         let pair = PolicyPair::new_replica().await?;
         let host = pair.a.global_params.test_library();
         let key = write_album(host, "busy recovery").await?;
         let mut lock = lock_replica_library(&pair.b).await?;
-        let pass = tokio::spawn(async move {
-            let result = pair.pass_with_timeout(false, Duration::from_secs(30)).await;
-            (result, pair)
-        });
+        set_sqlite_busy_timeout(&pair.b).await?;
 
-        // The default SQLite busy timeout is five seconds. The first metadata pass also
-        // performs authenticated HTTP setup before reaching its write; release just after
-        // that first busy result so the retry can complete.
-        sleep(Duration::from_millis(11_250)).await;
+        let error = pair
+            .pass(false)
+            .await
+            .expect_err("held SQLite lock must exhaust the bounded retry sequence");
+        assert_eq!(
+            error.downcast_ref::<SyncError>(),
+            Some(&SyncError::StorageBusy)
+        );
         sea_orm::sqlx::query("ROLLBACK").execute(&mut lock).await?;
-        let (result, pair) = pass.await?;
-        assert_eq!(result?, PeerPass::Complete);
+        assert_eq!(pair.pass(false).await?, PeerPass::Complete);
         let replica = pair.b.global_params.test_library();
         assert!(replica.library_sync.get(&key).await?.is_some());
         pair.close().await
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sync_reports_storage_busy_after_retry_cap() -> Result<()> {
         let pair = PolicyPair::new_replica().await?;
         let host = pair.a.global_params.test_library();
         write_album(host, "busy cap").await?;
         let mut lock = lock_replica_library(&pair.b).await?;
+        set_sqlite_busy_timeout(&pair.b).await?;
 
-        let result = pair.pass_with_timeout(false, Duration::from_secs(45)).await;
+        let result = pair.pass(false).await;
         sea_orm::sqlx::query("ROLLBACK").execute(&mut lock).await?;
         let error = result.expect_err("held SQLite lock must exhaust the retry cap");
         assert_eq!(
@@ -372,7 +561,7 @@ mod access_policy_tests {
             content_hash: ActiveValue::Set(Some(cover_hash.clone())),
             content_size: ActiveValue::Set(Some(5)),
             local_available: ActiveValue::Set(true),
-            hlc_uuid: ActiveValue::Set(Uuid::new_v4().to_string()),
+            source_uuid: ActiveValue::Set(Uuid::new_v4().to_string()),
             ..Default::default()
         })
         .exec(&*library.main_db)
@@ -557,7 +746,7 @@ mod access_policy_tests {
         );
         assert!(right.library_sync.get(&album).await?.is_some());
         let remote = media_files::Entity::find()
-            .filter(Column::HlcUuid.eq(&original.hlc_uuid))
+            .filter(Column::SourceUuid.eq(&original.source_uuid))
             .one(&*right.main_db)
             .await?
             .context("replicated track")?;
@@ -574,14 +763,28 @@ mod access_policy_tests {
             format!("https://{}/libraries/{}", pair.addr, pair.id),
             pair.client.clone(),
         );
-        let mut session = LibrarySession::new(right.library_sync.clone())?;
-        let result = timeout(Duration::from_secs(10), async {
-            loop {
-                if session.advance(&peer, Arc::new(|| {})).await? {
-                    return Ok::<(), anyhow::Error>(());
+        let session = Arc::new(Mutex::new(LibrarySession::new(
+            right.library_sync.clone(),
+        )?));
+        let peer = Arc::new(peer);
+        let result = wait_until(
+            "read-only sync pass to reject its write",
+            {
+                let session = session.clone();
+                let peer = peer.clone();
+                move || {
+                    let session = session.clone();
+                    let peer = peer.clone();
+                    async move {
+                        match session.lock().await.advance(&peer, Arc::new(|| {})).await {
+                            Ok(true) => Ok(Some(Ok(()))),
+                            Ok(false) => Ok(None),
+                            Err(error) => Ok(Some(Err(error))),
+                        }
+                    }
                 }
-            }
-        })
+            },
+        )
         .await?;
         let error = result.expect_err("read-only push was accepted");
         assert!(matches!(
@@ -589,7 +792,7 @@ mod access_policy_tests {
             Some(SyncError::Forbidden)
         ));
         for _ in 0..3 {
-            sleep(Duration::from_secs(1)).await;
+            tokio::time::timeout(TEST_DEADLINE, sleep(Duration::from_secs(1))).await?;
             assert_eq!(
                 pair.pass(false).await?,
                 PeerPass::Complete,
@@ -713,23 +916,21 @@ mod access_policy_tests {
             port: c_addr.port(),
         };
         let pass = || async {
-            timeout(Duration::from_secs(15), async {
-                loop {
-                    let result = session
-                        .pass(
-                            pair.b.global_params.clone(),
-                            &pair.b.private_key,
-                            endpoint.clone(),
-                            true,
-                        )
-                        .await?;
-                    if result != PeerPass::Incomplete {
-                        return Ok::<_, anyhow::Error>(result);
-                    }
-                    yield_now().await;
+            wait_until("third party sync pass to complete", || async {
+                match session
+                    .pass(
+                        pair.b.global_params.clone(),
+                        &pair.b.private_key,
+                        endpoint.clone(),
+                        true,
+                    )
+                    .await?
+                {
+                    PeerPass::Incomplete => Ok(None),
+                    result => Ok(Some(result)),
                 }
             })
-            .await?
+            .await
         };
         assert_eq!(pass().await?, PeerPass::Complete);
         assert!(replica.library_sync.get(&injected).await?.is_none());
@@ -1203,7 +1404,7 @@ mod access_policy_tests {
         let failure: RemoteRequestFailed = rinf::deserialize(&payload)?;
         assert_eq!(failure.kind, RequestErrorKind::PermissionDenied);
         assert_eq!(
-            timeout(Duration::from_secs(2), request).await??.status(),
+            tokio::time::timeout(TEST_DEADLINE, request).await??.status(),
             reqwest::StatusCode::FORBIDDEN
         );
         drop(connections);

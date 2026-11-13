@@ -46,7 +46,7 @@ async fn legacy_rows_are_invalid_and_replaced_only_after_success() -> Result<()>
     .await?;
     Migrator::up(&db, None).await?;
     let fs = Arc::new(FsIo::new());
-    let root = fixtures::asset_directory().canonicalize()?;
+    let root = fs.canonicalize(&fixtures::asset_directory())?.path;
     let store = fixtures::open_library(db.clone(), actor, None).await?;
     let node = fs.canonicalize(&root.join("startup_0.ogg"))?;
     let mut descriptions = vec![Some(describe_file(&fs, &node, &Some(root.clone()))?)];
@@ -121,7 +121,7 @@ async fn legacy_rows_are_invalid_and_replaced_only_after_success() -> Result<()>
     assert_eq!(media_analysis::Entity::find().count(&db).await?, 1);
     let new = media_analysis::Entity::find().one(&db).await?.unwrap();
     assert_eq!(new.analysis_version, CURRENT_ANALYSIS_VERSION);
-    assert_ne!(new.hlc_uuid, old.hlc_uuid);
+    assert_ne!(new.source_uuid, old.source_uuid);
     assert_eq!(get_analyze_count(&db).await?, 1);
     assert!(if_analyze_exists(&db, 1).await?);
     sync_recommendation(&db, &recommendations).await?;
@@ -136,7 +136,7 @@ async fn legacy_rows_are_invalid_and_replaced_only_after_success() -> Result<()>
     assert_eq!(media_analysis::Entity::find().one(&db).await?.unwrap(), new);
     // Old clients that omit the new column must still write invalid version 1.
     db.execute_unprepared(
-        "INSERT INTO media_analysis (file_id,rms,hlc_uuid) VALUES (1,999,'late-legacy')",
+        "INSERT INTO media_analysis (file_id,rms,source_uuid) VALUES (1,999,'late-legacy')",
     )
     .await?;
     assert_eq!(get_analyze_count(&db).await?, 1);

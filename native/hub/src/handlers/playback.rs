@@ -20,14 +20,16 @@ use ::database::{
     library_registry::{LibraryRegistry, ProtocolAdapter},
     playing_item::{MediaFileHandle, dispatcher::PlayingItemActionDispatcher},
 };
+use ::playback::PlayerCommand;
 use ::playback::player::{
-    HandoffBlockId as PlayerHandoffBlockId, LibraryItem, Playable, PlaybackSource, PlaybackState,
-    PlayerStatus, PlayingItem, PlaylistEdit, PlaylistLoad, PlaylistPlacement,
+    HandoffBlockId as PlayerHandoffBlockId, LibraryItem, Playable, PlaybackSource,
+    PlaybackState as PlayerPlaybackState, PlayerStatus, PlayingItem, PlaylistEdit, PlaylistLoad,
+    PlaylistPlacement,
 };
 
 use crate::backends::remote::{RendererLink, RendererLinkUse};
 use crate::node::HandoffPlaybackEvent;
-use crate::request_error::ExpectedRequestError;
+use crate::request_error::{ExpectedRequestError, player_command_error};
 use crate::server::libraries::{cast_library_state, cast_library_states, parse_library_ids};
 use crate::subsonic_binding::SubsonicBinding;
 use crate::{
@@ -35,13 +37,24 @@ use crate::{
     library_pool::{LibraryHandle, LibraryPool},
     messages::*,
     node::NodeContext,
-    rpc::dispatch_gui_request,
+    rpc::{TargetRequest, dispatch_gui_request},
     session::{HandoffLoadParams, PlayerSession},
     utils::{
         GlobalParams, ParamsExtractor, files_to_playback_request, find_nearest_index,
         require_library,
     },
 };
+
+async fn apply_player_command(
+    player: &Arc<Mutex<dyn Playable>>,
+    command: PlayerCommand,
+) -> Result<()> {
+    let completion = { player.lock().await.command_with_completion(command) };
+    completion
+        .await
+        .map_err(|error| anyhow::Error::new(player_command_error(error)))?;
+    Ok(())
+}
 
 const HANDOFF_START_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -71,6 +84,32 @@ pub(crate) fn reject_remote_independent_item(
         return Err(ExpectedError::InvalidInput {
             detail: "independent files are only available on this device".into(),
         }
+        .into());
+    }
+    Ok(())
+}
+
+pub(crate) async fn authorize_item_library<R: TargetRequest>(
+    node: &Arc<NodeContext>,
+    session: Option<&Session>,
+    addressed_library_id: Option<Uuid>,
+    item: &PlayingItemRef,
+) -> Result<()> {
+    let (Some(session), PlayingItemRef::LibraryTrack { library_id, .. }) = (session, item) else {
+        return Ok(());
+    };
+    let item_library_id = Uuid::parse_str(library_id).map_err(|error| {
+        ExpectedRequestError::invalid_input(format!("Invalid library id: {error}"))
+    })?;
+    node.authorize_request(session, R::wire_name(), None, Some(item_library_id))
+        .await?;
+    let addressed_library_id = addressed_library_id.ok_or(ExpectedRequestError::Unavailable {
+        what: "addressed library id",
+    })?;
+    if item_library_id != addressed_library_id {
+        return Err(ExpectedRequestError::invalid_input(
+            "request library does not match the item's library",
+        )
         .into());
     }
     Ok(())
@@ -111,10 +150,10 @@ struct PlaylistEditOptions {
 }
 
 fn edit_playlist(
-    player: &mut dyn Playable,
+    player: &dyn Playable,
     prepared: &[(PlayingItem, PlaybackSource)],
     options: PlaylistEditOptions,
-) -> bool {
+) -> (bool, PlaylistEdit) {
     let PlaylistEditOptions {
         mode,
         start_index,
@@ -140,14 +179,16 @@ fn edit_playlist(
         });
     let changed = (mode == PlaylistOperateMode::Replace && !player.get_playlist().is_empty())
         || !prepared.is_empty();
-    player.edit_playlist(PlaylistEdit {
-        tracks: prepared.to_vec(),
-        placement,
-        playback_mode: playback_mode.filter(|mode| *mode != 99).map(Into::into),
-        load,
-        block: None,
-    });
-    changed
+    (
+        changed,
+        PlaylistEdit {
+            tracks: prepared.to_vec(),
+            placement,
+            playback_mode: playback_mode.filter(|mode| *mode != 99).map(Into::into),
+            load,
+            block: None,
+        },
+    )
 }
 
 /// Convert many items to requests, acquiring each library and querying it once.
@@ -305,7 +346,13 @@ impl Signal for LoadRequest {
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let volume = dart_signal.index;
-        player.lock().await.load_applied(volume as usize).await?;
+        apply_player_command(
+            &player,
+            PlayerCommand::Load {
+                index: volume as usize,
+            },
+        )
+        .await?;
         Ok(Some(()))
     }
 }
@@ -328,7 +375,7 @@ impl Signal for PlayRequest {
         _session: Option<Session>,
         _: &Self,
     ) -> Result<Option<Self::Response>> {
-        player.lock().await.play_applied().await?;
+        apply_player_command(&player, PlayerCommand::Play).await?;
         Ok(Some(()))
     }
 }
@@ -351,7 +398,7 @@ impl Signal for PauseRequest {
         _session: Option<Session>,
         _: &Self,
     ) -> Result<Option<Self::Response>> {
-        player.lock().await.pause_applied().await?;
+        apply_player_command(&player, PlayerCommand::Pause).await?;
         Ok(Some(()))
     }
 }
@@ -397,7 +444,7 @@ impl Signal for NextRequest {
     ) -> Result<Option<Self::Response>> {
         record_skip(&node, &player).await?;
 
-        player.lock().await.next_applied().await?;
+        apply_player_command(&player, PlayerCommand::Next).await?;
         Ok(Some(()))
     }
 }
@@ -422,7 +469,7 @@ impl Signal for PreviousRequest {
     ) -> Result<Option<Self::Response>> {
         record_skip(&node, &player).await?;
 
-        player.lock().await.previous_applied().await?;
+        apply_player_command(&player, PlayerCommand::Previous).await?;
         Ok(Some(()))
     }
 }
@@ -446,11 +493,7 @@ impl Signal for SetPlaybackModeRequest {
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let mode = dart_signal.mode;
-        player
-            .lock()
-            .await
-            .set_playback_mode_applied(mode.into())
-            .await?;
+        apply_player_command(&player, PlayerCommand::SetPlaybackMode(mode.into())).await?;
         Ok(Some(()))
     }
 }
@@ -479,6 +522,7 @@ impl Signal for SwitchRequest {
         let mut previous_item = None;
         let mut selected_item: Option<PlayingItem> = None;
         let mut invalid_index = false;
+        let mut completion = None;
         node.session()?
             .edit_queue(dart_signal.expected_revision, |player| {
                 let playlist = player.get_playlist();
@@ -488,7 +532,7 @@ impl Signal for SwitchRequest {
                 }
                 previous_item = player.get_status().item;
                 selected_item = Some(playlist[index].clone());
-                player.switch(index);
+                completion = Some(player.command_with_completion(PlayerCommand::Switch(index)));
                 false
             })
             .await?;
@@ -497,13 +541,11 @@ impl Signal for SwitchRequest {
                 ExpectedRequestError::invalid_input("Invalid switch index: out of range").into(),
             );
         }
-        if let Some(item) = selected_item {
-            node.session()?
-                .player
-                .lock()
+        if selected_item.is_some() {
+            completion
+                .context("Switch command completion was not created")?
                 .await
-                .wait_for_item_applied(item, PlaybackState::Playing)
-                .await?;
+                .map_err(|error| anyhow::Error::new(player_command_error(error)))?;
         }
         record_skip_item(&node, previous_item).await?;
 
@@ -529,11 +571,7 @@ impl Signal for SeekRequest {
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        player
-            .lock()
-            .await
-            .seek_applied(dart_signal.position_seconds)
-            .await?;
+        apply_player_command(&player, PlayerCommand::Seek(dart_signal.position_seconds)).await?;
         Ok(Some(()))
     }
 }
@@ -586,7 +624,7 @@ impl Signal for VolumeRequest {
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let volume = dart_signal.volume;
-        player.lock().await.set_volume_applied(volume).await?;
+        apply_player_command(&player, PlayerCommand::SetVolume(volume)).await?;
         Ok(Some(VolumeResponse {
             call_id: None,
             volume,
@@ -653,11 +691,7 @@ impl Signal for SetRealtimeFFTEnabledRequest {
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let enabled = dart_signal.enabled;
-        player
-            .lock()
-            .await
-            .set_realtime_fft_enabled_applied(enabled)
-            .await?;
+        apply_player_command(&player, PlayerCommand::SetRealtimeFFTEnabled(enabled)).await?;
         Ok(Some(()))
     }
 }
@@ -681,11 +715,7 @@ impl Signal for SetAdaptiveSwitchingEnabledRequest {
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
         let enabled = dart_signal.enabled;
-        player
-            .lock()
-            .await
-            .set_adaptive_switching_enabled_applied(enabled)
-            .await?;
+        apply_player_command(&player, PlayerCommand::SetAdaptiveSwitchingEnabled(enabled)).await?;
         Ok(Some(()))
     }
 }
@@ -708,11 +738,11 @@ impl Signal for SetMixWithOthersRequest {
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
-        player
-            .lock()
-            .await
-            .set_mix_with_others_applied(dart_signal.enabled)
-            .await?;
+        apply_player_command(
+            &player,
+            PlayerCommand::SetMixWithOthers(dart_signal.enabled),
+        )
+        .await?;
         Ok(Some(()))
     }
 }
@@ -899,9 +929,10 @@ impl Signal for LoadResolvedItemsRequest {
                     .map_err(|error| {
                         ExpectedRequestError::invalid_input(format!("Invalid start index: {error}"))
                     })?;
+                let mut completion = None;
                 node.session()?
                     .edit_queue(request.expected_revision, |player| {
-                        edit_playlist(
+                        let (changed, edit) = edit_playlist(
                             player,
                             &prepared,
                             PlaylistEditOptions {
@@ -913,9 +944,17 @@ impl Signal for LoadResolvedItemsRequest {
                                     .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
                                 play: request.play,
                             },
-                        )
+                        );
+                        completion =
+                            Some(player.command_with_completion(PlayerCommand::EditPlaylist(edit)));
+                        changed
                     })
                     .await?;
+                if let Some(completion) = completion {
+                    completion
+                        .await
+                        .map_err(|error| anyhow::Error::new(player_command_error(error)))?;
+                }
                 return Ok(Some(LoadResolvedItemsResponse {
                     call_id: None,
                     result: ResolvedItemsLoadResult::default(),
@@ -1013,9 +1052,10 @@ impl Signal for LoadResolvedItemsRequest {
                         "Invalid playback position: expected a finite, non-negative number of seconds",
                     )
                 })?;
+            let mut completion = None;
             node.session()?
                 .edit_queue(request.expected_revision, |player| {
-                    edit_playlist(
+                    let (changed, edit) = edit_playlist(
                         player,
                         &prepared,
                         PlaylistEditOptions {
@@ -1025,9 +1065,17 @@ impl Signal for LoadResolvedItemsRequest {
                             position,
                             play: request.play,
                         },
-                    )
+                    );
+                    completion =
+                        Some(player.command_with_completion(PlayerCommand::EditPlaylist(edit)));
+                    changed
                 })
                 .await?;
+            if let Some(completion) = completion {
+                completion
+                    .await
+                    .map_err(|error| anyhow::Error::new(player_command_error(error)))?;
+            }
         }
         Ok(Some(LoadResolvedItemsResponse {
             call_id: None,
@@ -1302,9 +1350,10 @@ async fn apply_resolved_items_load(
             })
             .await?;
     } else {
+        let mut completion = None;
         node.session()?
             .edit_queue(request.expected_revision, |player| {
-                edit_playlist(
+                let (changed, edit) = edit_playlist(
                     player,
                     &prepared,
                     PlaylistEditOptions {
@@ -1314,9 +1363,17 @@ async fn apply_resolved_items_load(
                         position,
                         play: request.play,
                     },
-                )
+                );
+                completion =
+                    Some(player.command_with_completion(PlayerCommand::EditPlaylist(edit)));
+                changed
             })
             .await?;
+        if let Some(completion) = completion {
+            completion
+                .await
+                .map_err(|error| anyhow::Error::new(player_command_error(error)))?;
+        }
     }
     Ok((result, handoff_item))
 }
@@ -1648,7 +1705,7 @@ pub(crate) fn session_snapshot_from_status(
             })?,
         position_seconds: status.position.as_secs_f64(),
         playback_mode: status.playback_mode.into(),
-        playing: status.state == PlaybackState::Playing,
+        playing: status.state == PlayerPlaybackState::Playing,
         revision,
     })
 }
@@ -1774,17 +1831,7 @@ impl Signal for HandoffRequest {
                     expected_item.context("handoff current item")?;
                     hand_off_to_renderer(&node, target, block, load, expected_position).await?;
                 }
-                None => {
-                    let expected_item = expected_item.context("handoff current item")?;
-                    hand_off_to_this_device(
-                        &node,
-                        attached.clone(),
-                        &load,
-                        &expected_item,
-                        expected_position,
-                    )
-                    .await?
-                }
+                None => hand_off_to_this_device(&node, attached.clone(), &load).await?,
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -1867,20 +1914,21 @@ async fn pause_handoff_source(
         })
     } else {
         let session = node.session()?;
-        let was_playing = session.player.lock().await.get_status().state == PlaybackState::Playing;
-        session.player.lock().await.pause_applied().await?;
+        let was_playing =
+            session.player.lock().await.get_status().state == PlayerPlaybackState::Playing;
+        apply_player_command(&session.player, PlayerCommand::Pause).await?;
         let snapshot = match session_snapshot(node, &session).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 if was_playing {
-                    session.player.lock().await.play_applied().await?;
+                    apply_player_command(&session.player, PlayerCommand::Play).await?;
                 }
                 return Err(error);
             }
         };
         if snapshot.playing {
             if was_playing {
-                session.player.lock().await.play_applied().await?;
+                apply_player_command(&session.player, PlayerCommand::Play).await?;
             }
             // Something resumed the source while it was being handed off.
             return Err(ExpectedRequestError::HandoffSuperseded.into());
@@ -1909,7 +1957,7 @@ async fn resume_handoff_source(node: &Arc<NodeContext>, paused: PausedHandoffSou
             source.call(&PlayRequest { call_id: None }).await?;
         }
         PausedSource::Local(session) => {
-            session.player.lock().await.play_applied().await?;
+            apply_player_command(&session.player, PlayerCommand::Play).await?;
         }
     }
     Ok(())
@@ -1956,9 +2004,6 @@ async fn hand_off_to_renderer(
         .connect_renderer(target, RendererLinkUse::Control)
         .await?;
     let mut events = node.subscribe_handoff_playback_events();
-    let target_before = connected_link
-        .call(&SessionSnapshotRequest { call_id: None })
-        .await?;
     let handoff = HandoffLoadRequest {
         block: block.into(),
         load,
@@ -1972,7 +2017,10 @@ async fn hand_off_to_renderer(
         }
     };
     let target_item = response.handoff_item;
+    let previous_player = node.current_player_snapshot()?;
     node.install_renderer_link(connected_link, alias)?;
+    node.transition_current_player(previous_player, node.current_player()?)
+        .await?;
     let link = node
         .renderer_link()?
         .context("renderer link disappeared after handoff load")?;
@@ -1995,10 +2043,7 @@ async fn hand_off_to_renderer(
                 warn!("Could not roll back failed handoff block: {rollback_error:#}");
                 return Err(error.context(format!("handoff rollback failed: {rollback_error:#}")));
             }
-            Ok(snapshot) if snapshot.items != target_before.items => {
-                return Err(error.context("handoff rollback retained the unavailable item"));
-            }
-            Ok(_) => {
+            Ok(_removed_block) => {
                 node.take_handoff_block(link.fingerprint()).await;
             }
         }
@@ -2012,15 +2057,10 @@ async fn hand_off_to_this_device(
     node: &Arc<NodeContext>,
     attached: Option<Arc<RendererLink>>,
     load: &LoadResolvedItemsRequest,
-    expected_item: &PlayingItemRef,
-    expected_position: f64,
 ) -> Result<()> {
     let session = node.session()?;
     let original = session_snapshot(node, &session).await?;
-    let mut events = node.subscribe_handoff_playback_events();
-    apply_cast_load(node, load).await?;
-    if let Err(error) = wait_for_handoff_start(&mut events, expected_item, expected_position).await
-    {
+    if let Err(error) = apply_cast_load(node, load).await {
         if original.items.is_empty() {
             if let Err(restore_error) = node
                 .session()?
@@ -2081,7 +2121,7 @@ async fn wait_for_handoff_start(
                         .item_request
                         .as_ref()
                         .is_some_and(|item| same_handoff_item(item, expected_item))
-                        && status.state.eq_ignore_ascii_case("playing")
+                        && status.state == PlaybackState::Playing
                         && status.ready
                         && (f64::from(status.progress_seconds) - expected_position).abs() <= 1.5
                     {
@@ -2103,13 +2143,7 @@ async fn wait_for_handoff_start(
 }
 
 fn same_handoff_item(left: &PlayingItemRef, right: &PlayingItemRef) -> bool {
-    match (left, right) {
-        (
-            PlayingItemRef::LibraryTrack { track: left, .. },
-            PlayingItemRef::LibraryTrack { track: right, .. },
-        ) => left == right,
-        _ => left == right,
-    }
+    left == right
 }
 
 #[cfg(test)]
@@ -2129,7 +2163,7 @@ mod handoff_confirmation_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = delayed_sender.send(HandoffPlaybackEvent::Status(Box::new(PlaybackStatus {
                 session_id: "slow-start".into(),
-                state: "Playing".into(),
+                state: PlaybackState::Playing,
                 progress_seconds: 42.0,
                 progress_percentage: 0.0,
                 artist: None,

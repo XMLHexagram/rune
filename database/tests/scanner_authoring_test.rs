@@ -23,7 +23,7 @@ async fn journal_failure_rolls_back_scanned_file() -> Result<()> {
     let db = fixtures::memory_database(node).await?;
     let store = SeaOrmSyncStore::create_empty(db.clone(), Uuid::from_u128(2), node).await?;
     let fs = FsIo::new();
-    let root = fixtures::asset_directory().canonicalize()?;
+    let root = fs.canonicalize(&fixtures::asset_directory())?.path;
     let audio = fs.canonicalize(&root.join("startup_0.ogg"))?;
     let mut descriptions = vec![Some(describe_file(&fs, &audio, &Some(root))?)];
     db.execute_unprepared("CREATE TRIGGER reject_journal BEFORE INSERT ON sync_journal BEGIN SELECT RAISE(ABORT, 'test failure'); END").await?;
@@ -79,7 +79,7 @@ async fn journal_failure_rolls_back_scanned_file() -> Result<()> {
                 &db,
                 &ObjectKey {
                     collection: Collection::TrackAlbums,
-                    id: file.hlc_uuid.parse()?
+                    id: file.source_uuid.parse()?
                 }
             )
             .await?
@@ -122,7 +122,7 @@ async fn index_reads_metadata_after_acquiring_replica_lock() -> Result<()> {
     migration::up_with_actor(&db, Some(&actor.to_string()), None).await?;
     let library = fixtures::open_library(db.clone(), actor, None).await?;
     let store = library.record_store();
-    let root = fixtures::asset_directory().canonicalize()?;
+    let root = FsIo::new().canonicalize(&fixtures::asset_directory())?.path;
     let file_id = scan_audio_file(
         &FsIo::new(),
         &db,
@@ -141,7 +141,7 @@ async fn index_reads_metadata_after_acquiring_replica_lock() -> Result<()> {
             file_id: Set(file_id),
             meta_key: Set(key.into()),
             meta_value: Set(format!("old {key}")),
-            hlc_uuid: Set(Uuid::new_v4().to_string()),
+            source_uuid: Set(Uuid::new_v4().to_string()),
             position: Set(position as i32),
             ..Default::default()
         })
@@ -159,21 +159,21 @@ async fn index_reads_metadata_after_acquiring_replica_lock() -> Result<()> {
         .await?
         .unwrap();
     let artist_ids: Vec<_> = media_file_artists::Entity::find()
-        .filter(media_file_artists::Column::TrackUuid.eq(&file.hlc_uuid))
+        .filter(media_file_artists::Column::TrackUuid.eq(&file.source_uuid))
         .all(&db)
         .await?
         .into_iter()
         .map(|row| row.artist_uuid)
         .collect();
     let album_ids: Vec<_> = media_file_albums::Entity::find()
-        .filter(media_file_albums::Column::TrackUuid.eq(&file.hlc_uuid))
+        .filter(media_file_albums::Column::TrackUuid.eq(&file.source_uuid))
         .all(&db)
         .await?
         .into_iter()
         .map(|row| row.album_uuid)
         .collect();
     let genre_ids: Vec<_> = media_file_genres::Entity::find()
-        .filter(media_file_genres::Column::TrackUuid.eq(&file.hlc_uuid))
+        .filter(media_file_genres::Column::TrackUuid.eq(&file.source_uuid))
         .all(&db)
         .await?
         .into_iter()
@@ -181,7 +181,7 @@ async fn index_reads_metadata_after_acquiring_replica_lock() -> Result<()> {
         .collect();
     assert_eq!(
         artists::Entity::find()
-            .filter(artists::Column::HlcUuid.is_in(artist_ids))
+            .filter(artists::Column::SourceUuid.is_in(artist_ids))
             .all(&db)
             .await?
             .into_iter()
@@ -191,7 +191,7 @@ async fn index_reads_metadata_after_acquiring_replica_lock() -> Result<()> {
     );
     assert_eq!(
         albums::Entity::find()
-            .filter(albums::Column::HlcUuid.is_in(album_ids))
+            .filter(albums::Column::SourceUuid.is_in(album_ids))
             .all(&db)
             .await?
             .into_iter()
@@ -201,7 +201,7 @@ async fn index_reads_metadata_after_acquiring_replica_lock() -> Result<()> {
     );
     assert_eq!(
         genres::Entity::find()
-            .filter(genres::Column::HlcUuid.is_in(genre_ids))
+            .filter(genres::Column::SourceUuid.is_in(genre_ids))
             .all(&db)
             .await?
             .into_iter()
@@ -237,7 +237,7 @@ async fn index_reads_metadata_after_acquiring_replica_lock() -> Result<()> {
     let record = library
         .get(&ObjectKey {
             collection: Collection::Tracks,
-            id: file.hlc_uuid.parse()?,
+            id: file.source_uuid.parse()?,
         })
         .await?
         .unwrap();

@@ -6,12 +6,9 @@ import 'package:rinf/rinf.dart';
 import '../../bindings/bindings.dart';
 import 'request_failure.dart';
 
-// These ids match search replies to calls; they do not route requests.
-var _nextSearchCallId = 0;
-
 Future<SearchForResponse> searchFor(
   String query, {
-  List<String> fields = const [],
+  List<SearchField> fields = const [],
 }) {
   return _searchFor(
     query,
@@ -24,41 +21,37 @@ Future<SearchForResponse> searchFor(
 @visibleForTesting
 Future<SearchForResponse> searchForWithStreams(
   String query, {
-  required List<String> fields,
+  required List<SearchField> fields,
   required Stream<RustSignalPack<SearchForResponse>> responses,
   required Stream<RequestFailedResponse> failures,
   required void Function(SearchForRequest) sendRequest,
+  Duration timeout = const Duration(seconds: 10),
 }) => _searchFor(
   query,
   fields,
   responses: responses,
   failures: failures,
   sendRequest: sendRequest,
+  timeout: timeout,
 );
 
 Future<SearchForResponse> _searchFor(
   String query,
-  List<String> fields, {
+  List<SearchField> fields, {
   required Stream<RustSignalPack<SearchForResponse>> responses,
   Stream<RequestFailedResponse>? failures,
   required void Function(SearchForRequest) sendRequest,
+  Duration timeout = const Duration(seconds: 10),
 }) async {
   if (!query.endsWith('*')) query = '$query*';
-  final callId = ++_nextSearchCallId;
   final response = await awaitResponse(
     'SearchForRequest',
     responses,
-    timeout: const Duration(seconds: 10),
+    timeout: timeout,
     failures: failures,
-    callId: callId,
-    responseCallId: (signal) => signal.message.callId?.toInt(),
-    send: () => sendRequest(
-      SearchForRequest(
-        callId: Uint64.fromBigInt(BigInt.from(callId)),
-        queryStr: query,
-        n: 30,
-        fields: fields,
-      ),
+    responseCallId: (response) => response.message.callId?.toInt(),
+    send: (callId) => sendRequest(
+      SearchForRequest(callId: callId, queryStr: query, n: 30, fields: fields),
     ),
   );
   return response.message;

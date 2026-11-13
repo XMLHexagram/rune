@@ -129,17 +129,6 @@ pub async fn initialize_opendal_databases(
     })
 }
 
-#[derive(Debug, Default)]
-pub struct TaskTokens {
-    pub scans: HashMap<String, ScanTask>,
-}
-
-#[derive(Debug)]
-pub struct ScanTask {
-    pub token: CancellationToken,
-    pub scan_id: String,
-}
-
 /// The current UI library for a request, or the expected `Unavailable` error
 /// when this process has none open (for example in remote-control mode).
 pub fn require_library(library: Option<LibraryHandle>) -> Result<LibraryHandle> {
@@ -164,7 +153,6 @@ pub struct GlobalParams {
     pub sync_settings: Arc<RwLock<sync_settings::SyncSettings>>,
     pub node_id: Arc<String>,
     pub main_token: Arc<CancellationToken>,
-    pub task_tokens: Arc<Mutex<TaskTokens>>,
     pub library_tasks: Arc<std::sync::Mutex<LibraryTaskOwner>>,
     pub player: Arc<Mutex<dyn Playable>>,
     pub sfx_player: Arc<Mutex<SfxPlayer>>,
@@ -2110,6 +2098,7 @@ async fn open_subsonic_record(
         Arc::clone(&node.gui_broadcaster),
     ));
     node.set_open_subsonic_catalog(Some(record_id), binding)
+        .await
         .map_err(|error| (OpenLibraryFailureKind::Storage, error))
 }
 
@@ -2306,7 +2295,7 @@ async fn run_local_open(
     let library_id = library.library_id;
     info!("Resolved library id: {library_id}");
     local_player_loop(library, node.clone(), Arc::clone(scrobbler)).await?;
-    node.set_open_local_catalog(record_id, library_id)
+    node.set_open_local_catalog(record_id, library_id).await
 }
 
 pub struct CollectionCoverOptions<'a> {
@@ -2508,7 +2497,7 @@ pub async fn parse_media_files(
                 file.title
             },
             duration: file.duration,
-            cover_art_id: file.cover_art_id.unwrap_or(-1),
+            cover_art_id: file.cover_art_id,
             track_number: file.track_number,
             audio_availability: state,
             audio_origin: origin.into(),
@@ -2698,7 +2687,7 @@ mod moved_node_request_tests {
         let params = Arc::new(node.params_for_ui()?.for_library(library.clone()));
         *params.ui_library.lock().await = Some(library);
         node.attach_ui(&params).await;
-        node.set_open_local_catalog(None, library_id)?;
+        node.set_open_local_catalog(None, library_id).await?;
 
         let open_response = handlers
             .handle_get_sync_settings_request(&node_slot, &request)

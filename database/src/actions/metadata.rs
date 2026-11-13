@@ -398,7 +398,7 @@ pub async fn author_track_row(
         store,
         ObjectKey {
             collection: Collection::Tracks,
-            id: file.hlc_uuid.parse()?,
+            id: file.source_uuid.parse()?,
         },
     )
     .await
@@ -600,7 +600,7 @@ async fn insert_new_file(
         ),
         last_modified: ActiveValue::Set(description.last_modified.clone()),
         change_token: ActiveValue::Set(description.change_token.clone()),
-        hlc_uuid: ActiveValue::Set(Uuid::new_v4().to_string()),
+        source_uuid: ActiveValue::Set(Uuid::new_v4().to_string()),
         local_available: ActiveValue::Set(true),
         ..Default::default()
     };
@@ -978,7 +978,7 @@ pub struct MetadataSummary {
     pub album: String,
     pub genre: String,
     pub title: String,
-    pub track_number: i32,
+    pub track_number: Option<i32>,
     pub duration: f64,
     pub cover_art_id: Option<i32>,
     pub file_hash: String,
@@ -1000,10 +1000,10 @@ pub async fn get_metadata_summary_by_files<C: sea_orm::ConnectionTrait>(
     let artwork_ids: HashMap<String, i32> = media_cover_art::Entity::find()
         .select_only()
         .columns([
-            media_cover_art::Column::HlcUuid,
+            media_cover_art::Column::SourceUuid,
             media_cover_art::Column::Id,
         ])
-        .filter(media_cover_art::Column::HlcUuid.is_in(artwork_uuids))
+        .filter(media_cover_art::Column::SourceUuid.is_in(artwork_uuids))
         .into_tuple::<(String, i32)>()
         .all(db)
         .await?
@@ -1048,17 +1048,12 @@ pub async fn get_metadata_summary_by_files<C: sea_orm::ConnectionTrait>(
             .and_then(|id| artwork_ids.get(id))
             .copied();
 
-        let parsed_disk_number = metadata
-            .get("disc_number")
-            .and_then(|s| extract_number(s))
-            .unwrap_or(0);
+        let parsed_disk_number = metadata.get("disc_number").and_then(|s| extract_number(s));
 
-        let parsed_track_number = metadata
-            .get("track_number")
-            .and_then(|s| extract_number(s))
-            .unwrap_or(0);
+        let parsed_track_number = metadata.get("track_number").and_then(|s| extract_number(s));
 
-        let track_number = parsed_disk_number * 1000 + parsed_track_number;
+        let track_number =
+            parsed_track_number.map(|track| parsed_disk_number.unwrap_or(0) * 1000 + track);
 
         let summary = MetadataSummary {
             id: file_id,
@@ -1079,7 +1074,7 @@ pub async fn get_metadata_summary_by_files<C: sea_orm::ConnectionTrait>(
             duration: duration.to_f64().expect("Unable to convert track duration"),
             cover_art_id,
             file_hash: file.file_hash.clone(),
-            file_uuid: file.hlc_uuid.clone(),
+            file_uuid: file.source_uuid.clone(),
         };
 
         results.push(summary);
@@ -1139,7 +1134,7 @@ pub async fn get_parsed_file_by_id(
         .await?;
 
     let artists = artists::Entity::find()
-        .filter(artists::Column::HlcUuid.is_in(artist_ids.into_iter().map(|x| x.artist_uuid)))
+        .filter(artists::Column::SourceUuid.is_in(artist_ids.into_iter().map(|x| x.artist_uuid)))
         .all(db)
         .await?;
 
@@ -1151,7 +1146,7 @@ pub async fn get_parsed_file_by_id(
     let album = match album_id {
         Some(album_id) => {
             albums::Entity::find()
-                .filter(albums::Column::HlcUuid.eq(album_id.album_uuid))
+                .filter(albums::Column::SourceUuid.eq(album_id.album_uuid))
                 .one(db)
                 .await?
         }
