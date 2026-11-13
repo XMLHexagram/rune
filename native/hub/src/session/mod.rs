@@ -1,4 +1,5 @@
 //! Node-owned render state. Catalog resources are leased only while resolving an item.
+pub(crate) mod hosted;
 pub(crate) mod store;
 
 use std::{
@@ -437,6 +438,11 @@ impl PlayerSession {
                 Arc::downgrade(node),
                 String::new(),
             )));
+        // Only this device's own player: the host that plays a hosted track is the app here.
+        player
+            .lock()
+            .await
+            .set_host_bridge(Arc::new(hosted::JsonHostBridge::to_app()));
         let controls = if os_media_controls {
             match MediaControlManager::with_name(&format!(
                 "rune_player_{}_{}",

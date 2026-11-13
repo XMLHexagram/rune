@@ -80,6 +80,8 @@ import 'providers/router_path.dart';
 import 'providers/library_open_state.dart';
 import 'providers/library_registry.dart';
 import 'utils/dialogs/subsonic/subsonic_relogin_dialog.dart';
+import 'utils/hosted_player/apple_music_host.dart';
+import 'utils/hosted_player/hosted_player.dart';
 import 'providers/library_home.dart';
 import 'providers/library_manager.dart';
 import 'providers/local_folder_picker.dart';
@@ -602,6 +604,7 @@ class RuneLifecycleState extends State<RuneLifecycle> {
   late final RemoteConnectionLossHandler _remoteLoss;
   late final RendererLinkLossHandler _rendererLinkLoss;
   late final RemoteLibraryReconnectNotice _remoteReconnect;
+  late final HostedPlayerBridge _hostedPlayer;
   LibraryOpenStateProvider? _libraryState;
   String? _noticeOpenRecordId;
   StreamSubscription<RustSignalPack<RequestFailedResponse>>?
@@ -661,6 +664,9 @@ class RuneLifecycleState extends State<RuneLifecycle> {
         );
       },
     );
+
+    AppleMusicHost.registerOnPlatform();
+    _hostedPlayer = HostedPlayerBridge.attached();
 
     _remoteReconnect = RemoteLibraryReconnectNotice(
       reconnecting: RemoteLibraryReconnecting.rustSignalStream.map(
@@ -782,6 +788,7 @@ class RuneLifecycleState extends State<RuneLifecycle> {
 
     _remoteLoss.dispose();
     _rendererLinkLoss.dispose();
+    _hostedPlayer.dispose();
     _requestFailureSubscription?.cancel();
     _libraryState?.removeListener(_libraryChanged);
     _remoteReconnect.dispose();
