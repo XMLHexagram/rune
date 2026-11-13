@@ -88,6 +88,7 @@ String requestFailureMessage(AppLocalizations s, RequestFailure failure) =>
       RequestFailureCauseReconnecting(:final alias) =>
         s.remoteLibraryReconnecting(alias),
       RequestFailureCauseStorageBusy() => s.requestStorageBusy,
+      RequestFailureCauseLicenseInvalid() => s.registerInvalidSubtitle,
       RequestFailureCauseCertificateMismatch() => s.requestCertificateMismatch,
       RequestFailureCausePublicKeyMismatch() => s.requestPublicKeyMismatch,
       RequestFailureCauseRegistrationConflict() =>

@@ -70,6 +70,8 @@ pub enum ExpectedRequestError {
         library_id: String,
         state: CastLibraryState,
     },
+    #[error("The license key is invalid")]
+    LicenseInvalid,
 }
 
 impl ExpectedRequestError {
@@ -152,6 +154,7 @@ pub fn classify(error: &Error) -> RequestErrorKind {
                     CastLibraryState::Unreachable => RequestErrorKind::Unavailable,
                     CastLibraryState::Ready => RequestErrorKind::Internal,
                 },
+                ExpectedRequestError::LicenseInvalid => RequestErrorKind::InvalidInput,
             };
         }
     }
@@ -205,6 +208,9 @@ pub fn request_failure_cause(error: &Error) -> Option<RequestFailureCause> {
                 }
                 ExpectedRequestError::SubsonicNotAuthorized => {
                     return Some(RequestFailureCause::SubsonicNotAuthorized);
+                }
+                ExpectedRequestError::LicenseInvalid => {
+                    return Some(RequestFailureCause::LicenseInvalid);
                 }
                 _ => {}
             }

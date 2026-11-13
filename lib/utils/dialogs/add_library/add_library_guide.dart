@@ -68,7 +68,7 @@ class AddLibraryGuideDependencies {
   final Future<void> Function(String)? openRecord;
   final Future<void> Function(String)? scanLibrary;
   final Future<String?> Function()? pickLocalFolder;
-  final Future<(bool, bool, String?)> Function(String)? testLocalLibrary;
+  final Future<bool> Function(String)? testLocalLibrary;
   final Future<RegisterLibraryResponse> Function(
     String,
     String,
@@ -394,22 +394,25 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
             ).pickDirectory)();
     if (!mounted || path == null) return;
     try {
-      final result =
+      final initialized =
           await (widget.dependencies.testLocalLibrary ??
               testLibraryInitialized)(path);
       if (!mounted) return;
-      if (!result.$1) {
-        await showFailedToInitializeLibrary(context, result.$3);
-        return;
-      }
       _localPath = path;
-      if (result.$2) {
+      if (initialized) {
         await _registerLocalFolder(null, scanAfterOpen: false);
       } else {
         setState(() {
           _step = 5;
           _selectedChoice = null;
         });
+      }
+    } on RequestFailure catch (failure) {
+      if (mounted) {
+        await showFailedToInitializeLibrary(
+          context,
+          requestFailureMessage(S.of(context), failure),
+        );
       }
     } catch (_) {
       if (mounted) {

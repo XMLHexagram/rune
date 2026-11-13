@@ -1580,6 +1580,43 @@ async fn setting_liked_on_an_item_without_liked_state_returns_a_typed_error() ->
     Ok(())
 }
 
+#[tokio::test]
+async fn liked_requests_without_an_item_are_refused() -> Result<()> {
+    use crate::messages::GetLikedRequest;
+    use crate::request_error::classify;
+
+    let node_dir = tempfile::tempdir()?;
+    let fixture = fixture(node_dir.path()).await?;
+    let set = dispatch_gui_request(
+        &fixture.global_params,
+        &SetLikedRequest {
+            call_id: None,
+            item: None,
+            liked: true,
+        },
+    )
+    .await;
+    let get = dispatch_gui_request(
+        &fixture.global_params,
+        &GetLikedRequest {
+            call_id: None,
+            item: None,
+        },
+    )
+    .await;
+    for (name, result) in [
+        ("SetLikedRequest", set.map(|response| response.is_some())),
+        ("GetLikedRequest", get.map(|response| response.is_some())),
+    ] {
+        let error = match result {
+            Ok(answered) => anyhow::bail!("{name} without an item answered {answered}"),
+            Err(error) => error,
+        };
+        assert_eq!(classify(&error), RequestErrorKind::InvalidInput, "{name}");
+    }
+    Ok(())
+}
+
 async fn attach_test_cover(f: &Fixture, media_file_id: i32, bytes: &[u8]) -> Result<()> {
     let library = f.global_params.test_library();
     let hash = blake3::hash(bytes).to_hex().to_string();

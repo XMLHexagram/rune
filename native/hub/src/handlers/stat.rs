@@ -147,7 +147,7 @@ impl Signal for SetLikedRequest {
             return Ok(Some(response));
         }
 
-        Ok(None)
+        Err(ExpectedRequestError::invalid_input("a liked-state request needs an item").into())
     }
 }
 
@@ -227,6 +227,6 @@ impl Signal for GetLikedRequest {
             return Ok(Some(response));
         }
 
-        Ok(None)
+        Err(ExpectedRequestError::invalid_input("a liked-state request needs an item").into())
     }
 }

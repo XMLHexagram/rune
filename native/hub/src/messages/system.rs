@@ -64,6 +64,7 @@ pub enum RequestFailureCause {
     LibraryTaskAlreadyRunning {
         task: LibraryTaskKind,
     },
+    LicenseInvalid,
 }
 
 #[derive(Deserialize, Serialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]

@@ -36,8 +36,6 @@ pub struct TestLibraryInitializedRequest {
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct TestLibraryInitializedResponse {
     pub path: String,
-    pub success: bool,
-    pub error: Option<String>,
     pub not_ready: bool,
     #[serde(default)]
     pub call_id: Option<u64>,

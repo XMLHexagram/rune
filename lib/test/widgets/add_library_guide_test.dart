@@ -9,6 +9,7 @@ import 'package:rune/providers/library_manager.dart';
 import 'package:rune/providers/library_registry.dart';
 import 'package:rune/providers/broadcast.dart';
 import 'package:rune/utils/add_library_flows.dart';
+import 'package:rune/utils/api/request_failure.dart';
 import 'package:rune/utils/dialogs/add_library/add_library_guide.dart';
 import 'package:rune/providers/responsive_providers.dart';
 
@@ -232,7 +233,7 @@ void main() {
                 context,
                 dependencies: AddLibraryGuideDependencies(
                   pickLocalFolder: () async => '/picked/music',
-                  testLocalLibrary: (_) async => (true, false, null),
+                  testLocalLibrary: (_) async => false,
                   registerLocal: (path, alias, mode) async {
                     expect(path, '/picked/music');
                     expect(alias, 'music');
@@ -294,7 +295,7 @@ void main() {
               context,
               dependencies: AddLibraryGuideDependencies(
                 pickLocalFolder: () async => '/picked/music',
-                testLocalLibrary: (_) async => (true, true, null),
+                testLocalLibrary: (_) async => true,
                 registerLocal: (_, __, mode) async {
                   modes.add(mode);
                   return RegisterLibraryResponse(
@@ -321,6 +322,45 @@ void main() {
     expect(modes, [null]);
     expect(opened, ['record-1']);
     expect(scans, isEmpty);
+  });
+
+  testWidgets('a local folder that cannot be checked shows the failure', (
+    tester,
+  ) async {
+    final registry = _emptyRegistry();
+    final manager = _testManager();
+    addTearDown(registry.dispose);
+    addTearDown(manager.dispose);
+    await tester.pumpWidget(
+      _app(
+        registry: registry,
+        manager: manager,
+        home: Builder(
+          builder: (context) => Button(
+            onPressed: () => showAddLibraryGuide(
+              context,
+              dependencies: AddLibraryGuideDependencies(
+                pickLocalFolder: () async => '/picked/music',
+                testLocalLibrary: (_) async => throw const RequestFailure(
+                  'TestLibraryInitializedRequest',
+                  RequestErrorKind.unavailable,
+                  'library folder unavailable',
+                ),
+              ),
+            ),
+            child: const Text('Open guide'),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Open guide'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Local Folder'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(Button, 'Confirm'));
+    await tester.pumpAndSettle();
+    expect(find.text('Unable to Open Library'), findsOneWidget);
+    expect(find.text('This is not available right now.'), findsOneWidget);
   });
 
   testWidgets('guide pairing rows call the existing pairing flows', (
