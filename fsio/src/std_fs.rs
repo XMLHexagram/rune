@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::fs;
 use walkdir::WalkDir;
 
-use super::{FileIo, FileIoError, FileStream, FsNode};
+use super::{FileIo, FileIoError, FileStream, FsNode, OpenMode, StorageLocation};
 
 /// The canonical form of `path` with its metadata.
 fn canonical_node(path: &Path) -> Result<FsNode, FileIoError> {
@@ -43,16 +43,17 @@ impl FileIo for StdFsIo {
         "Std"
     }
 
-    fn open(&self, path: &Path, open_mode: &str) -> Result<Box<dyn FileStream>, FileIoError> {
-        let mut options = OpenOptions::new();
-        options.read(open_mode.contains('r'));
-        options.write(open_mode.contains('w'));
-        options.append(open_mode.contains('a'));
-        options.truncate(open_mode.contains('t'));
+    fn storage(&self) -> StorageLocation {
+        StorageLocation::Local
+    }
 
-        if open_mode.contains('w') || open_mode.contains('a') || open_mode.contains('t') {
-            options.create(true);
-        }
+    fn open(&self, path: &Path, open_mode: OpenMode) -> Result<Box<dyn FileStream>, FileIoError> {
+        let mut options = OpenOptions::new();
+        options.read(open_mode.reads());
+        options.write(open_mode.writes());
+        options.append(open_mode.appends());
+        options.truncate(open_mode.truncates());
+        options.create(open_mode.creates());
 
         let file = options.open(path)?;
         Ok(Box::new(file))
@@ -61,17 +62,14 @@ impl FileIo for StdFsIo {
     async fn open_async(
         &self,
         path: &Path,
-        open_mode: &str,
+        open_mode: OpenMode,
     ) -> Result<Box<dyn FileStream>, FileIoError> {
         let mut options = fs::OpenOptions::new();
-        options.read(open_mode.contains('r'));
-        options.write(open_mode.contains('w'));
-        options.append(open_mode.contains('a'));
-        options.truncate(open_mode.contains('t'));
-
-        if open_mode.contains('w') || open_mode.contains('a') || open_mode.contains('t') {
-            options.create(true);
-        }
+        options.read(open_mode.reads());
+        options.write(open_mode.writes());
+        options.append(open_mode.appends());
+        options.truncate(open_mode.truncates());
+        options.create(open_mode.creates());
 
         let file = options.open(path).await?;
         Ok(Box::new(file.into_std().await))

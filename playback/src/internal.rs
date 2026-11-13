@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use fsio::{FileIoError, FileStream, FsIo};
+use fsio::{FileIoError, FileStream, FsIo, OpenMode, StorageLocation};
 use log::{debug, error, info, warn};
 use rodio::{PlayError, Sink, Source, source::SeekError};
 use tokio::{
@@ -68,9 +68,10 @@ where
     .context("decoder probe task failed")?
 }
 
-async fn open_local_source(fsio: Arc<FsIo>, path: PathBuf, remote: bool) -> Result<AnySource> {
+async fn open_local_source(fsio: Arc<FsIo>, path: PathBuf) -> Result<AnySource> {
+    let remote = fsio.storage() == StorageLocation::Remote;
     let open_path = path.clone();
-    let stream = tokio::task::spawn_blocking(move || fsio.open(&open_path, "r"))
+    let stream = tokio::task::spawn_blocking(move || fsio.open(&open_path, OpenMode::Read))
         .await
         .context("audio file open task failed")?
         .map_err(|error| {
@@ -1185,7 +1186,6 @@ impl PlayerInternal {
                 let source_future = async {
                     let mut fsio = fsio;
                     let mut resolver = resolver;
-                    let mut remote_storage = false;
                     let library_track_key =
                         if let (PlayingItem::LibraryTrack { library_id, track }, Some(resolver)) =
                             (&item.item, resolver.as_ref())
@@ -1203,7 +1203,6 @@ impl PlayerInternal {
                             (&item.item, resolver.as_ref())
                         && let Some(library) = root.for_library(library_id.to_string()).await?
                     {
-                        remote_storage = library.fsio.name() == "OpenDAL";
                         fsio = library.fsio;
                         resolver = Some(library.resolver);
                     }
@@ -1230,7 +1229,7 @@ impl PlayerInternal {
                                     bail!("library stream resolver unavailable")
                                 }
                             };
-                            let source = open_local_source(fsio, path.clone(), remote_storage)
+                            let source = open_local_source(fsio, path.clone())
                                 .await
                                 .with_context(|| format!("Failed to open file: {path:?}"))?;
                             Ok((source, path, resolved_item.clone()))
@@ -1264,7 +1263,7 @@ impl PlayerInternal {
                                     }
                                 }
                             };
-                            let source = open_local_source(fsio, path.clone(), remote_storage)
+                            let source = open_local_source(fsio, path.clone())
                                 .await
                                 .with_context(|| format!("Failed to open file: {path:?}"))?;
                             Ok((source, path, resolved_item.clone()))
@@ -2498,7 +2497,7 @@ mod stream_open_tests {
     }
 
     async fn decode_opendal_asset(fsio: Arc<FsIo>) -> Result<()> {
-        let source = open_local_source(fsio, PathBuf::from("startup_0.ogg"), true).await?;
+        let source = open_local_source(fsio, PathBuf::from("startup_0.ogg")).await?;
         let duration = source
             .total_duration()
             .context("decoded duration missing")?;
@@ -2567,6 +2566,21 @@ mod stream_open_tests {
     }
 
     #[tokio::test]
+    async fn a_local_open_failure_is_not_a_remote_source_failure() -> Result<()> {
+        let fsio = Arc::new(FsIo::new());
+        assert_eq!(fsio.storage(), StorageLocation::Local);
+        let error = open_local_source(fsio, PathBuf::from("/no/such/dir/missing.ogg"))
+            .await
+            .expect_err("a missing local file must fail the source");
+        anyhow::ensure!(
+            error.downcast_ref::<RemoteAudioError>().is_none(),
+            "a local failure was mapped to a remote one: {error:#}"
+        );
+        anyhow::ensure!(error.downcast_ref::<FileIoError>().is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rejected_opendal_credentials_are_a_typed_source_failure() -> Result<()> {
         use fsio::{OpenDalConfig, test_fixtures::WebDavFixture};
 
@@ -2582,7 +2596,7 @@ mod stream_open_tests {
                 username: "user".into(),
                 password: "wrong".into(),
             })?;
-            let error = open_local_source(fsio, PathBuf::from("startup_0.ogg"), true)
+            let error = open_local_source(fsio, PathBuf::from("startup_0.ogg"))
                 .await
                 .expect_err("rejected credentials must fail the source");
             anyhow::ensure!(

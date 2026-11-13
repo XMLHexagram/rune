@@ -29,7 +29,7 @@ use sea_orm::{
 };
 use tokio_util::sync::CancellationToken;
 
-use ::fsio::{FsIo, FsNode};
+use ::fsio::{FsIo, FsNode, OpenMode};
 use ::metadata::{
     describe::{FileDescription, describe_file},
     reader::get_metadata,
@@ -241,7 +241,7 @@ async fn sync_file_descriptions_inner(
             let old_hash = existing.as_ref().and_then(|file| file.content_hash.clone());
             let prepared = tokio::task::spawn_blocking(move || -> Result<_> {
                 prepared.get_crc(&fs)?;
-                let mut stream = fs.open(&prepared.raw_node.path, "r")?;
+                let mut stream = fs.open(&prepared.raw_node.path, OpenMode::Read)?;
                 let mut hasher = blake3::Hasher::new();
                 let size = std::io::copy(&mut stream, &mut hasher)?;
                 let size = i64::try_from(size).context("File size exceeds supported range")?;

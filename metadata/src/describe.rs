@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use symphonia::core::codecs::CODEC_TYPE_NULL;
 
 use ::analysis::utils::audio_metadata_reader::{get_codec_information, get_format};
-use ::fsio::{FsIo, FsNode};
+use ::fsio::{FsIo, FsNode, OpenMode};
 
 use media_compute::checksum::MediaCrc;
 
@@ -45,7 +45,7 @@ impl FileDescription {
         };
 
         if self.file_hash.is_none() {
-            let file = fsio.open(&full_path, "r")?;
+            let file = fsio.open(&full_path, OpenMode::Read)?;
             let mut reader = BufReader::new(file);
             let mut buffer = vec![0; CHUNK_SIZE];
             let mut crc = MediaCrc::new();
