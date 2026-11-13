@@ -915,11 +915,23 @@ impl NodeContext {
     }
 
     fn refresh_current_player(&self, player: CurrentPlayer) -> Result<()> {
-        VISUALIZER.set_inputs(player.visualizer_inputs());
-        *self
+        let mut current = self
             .current_player
             .lock()
-            .map_err(|_| anyhow::anyhow!("Current player lock poisoned"))? = player;
+            .map_err(|_| anyhow::anyhow!("Current player lock poisoned"))?;
+        *current = player;
+        VISUALIZER.set_inputs(current.visualizer_inputs());
+        Ok(())
+    }
+
+    /// Publishes the current player's visualizer inputs again, for when what that player
+    /// can feed changed while it stayed the current player.
+    fn republish_current_player_inputs(&self) -> Result<()> {
+        let current = self
+            .current_player
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Current player lock poisoned"))?;
+        VISUALIZER.set_inputs(current.visualizer_inputs());
         Ok(())
     }
 
@@ -1013,16 +1025,33 @@ impl NodeContext {
     }
 
     pub(crate) async fn set_open_subsonic_catalog(
-        &self,
+        self: &Arc<Self>,
         record_id: Option<LibraryRecordId>,
         binding: Arc<SubsonicBinding>,
     ) -> Result<u64> {
-        self.set_open_catalog(
-            record_id,
-            Some(binding.library_id),
-            LibraryBinding::Subsonic(binding),
-        )
-        .await
+        let mut feed_changes = binding.subscribe_feed_link_changes();
+        let library_id = binding.library_id;
+        let generation = self
+            .set_open_catalog(
+                record_id,
+                Some(library_id),
+                LibraryBinding::Subsonic(binding),
+            )
+            .await?;
+        // The visualizer inputs are published only from the current player. A feed that
+        // drops or returns publishes them again. The task ends when the binding is dropped.
+        let node = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while feed_changes.changed().await.is_ok() {
+                let Some(node) = node.upgrade() else {
+                    break;
+                };
+                if let Err(error) = node.republish_current_player_inputs() {
+                    log::warn!("Could not republish the visualizer inputs: {error:#}");
+                }
+            }
+        });
+        Ok(generation)
     }
 
     pub(crate) fn subsonic_binding(

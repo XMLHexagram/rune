@@ -303,13 +303,7 @@ impl CurrentPlayer {
         match self {
             Self::Local => VisualizerInputs::Full,
             Self::RunePeer { .. } => VisualizerInputs::Full,
-            Self::SubsonicJukebox(binding) => {
-                if binding.probe.supports_rune_visualizer_feed() {
-                    VisualizerInputs::Full
-                } else {
-                    VisualizerInputs::None
-                }
-            }
+            Self::SubsonicJukebox(binding) => binding.visualizer_inputs(),
         }
     }
 

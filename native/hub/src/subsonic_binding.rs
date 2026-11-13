@@ -4,6 +4,7 @@ use crate::{
         PlaylistUpdate, RequestErrorKind, RequestFailedResponse, RequestFailureCause,
         SetRealtimeFFTEnabledRequest,
     },
+    node::ReconnectConfig,
     utils::Broadcaster,
     visualizer::RANDOM_COVERS,
 };
@@ -11,11 +12,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use visualizer::VisualizerInputs;
 
 use anyhow::Result;
 use database::playing_item::PlayingItemMetadataSummary;
@@ -90,7 +92,33 @@ pub(crate) struct SubsonicBinding {
     jukebox_poll: Mutex<Option<CancellationToken>>,
     jukebox_state: Arc<Mutex<Option<JukeboxPollState>>>,
     playback_starts: Mutex<HashMap<String, u64>>,
-    visualizer_feed: Mutex<Option<CancellationToken>>,
+    visualizer_feed: Mutex<Option<ActiveFeed>>,
+    /// Counts feed link changes, so the node can republish the visualizer inputs.
+    feed_link_changes: watch::Sender<u64>,
+}
+
+/// The running visualizer feed connection loop.
+struct ActiveFeed {
+    cancel: CancellationToken,
+    link: Arc<Mutex<FeedLink>>,
+}
+
+/// Whether the feed is expected to deliver data. A feed that is starting counts
+/// as live, so opening the library does not flicker the scene; only a failed
+/// connect or a dropped connection makes it lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedLink {
+    Live,
+    Lost,
+}
+
+/// One feed connection ended.
+enum FeedSessionEnd {
+    Cancelled,
+    /// The server could not be reached or refused the subscription.
+    NotConnected,
+    /// A working connection ended.
+    Dropped,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -248,6 +276,117 @@ fn jukebox_playback_status(
         ready: current.is_some(),
         cover_art_path,
         lib_path: String::new(),
+    }
+}
+
+/// The only writer of a feed's link. The node republishes the visualizer inputs
+/// when it hears of a change.
+fn set_feed_link(
+    binding: &Weak<SubsonicBinding>,
+    link: &Mutex<FeedLink>,
+    cancellation: &CancellationToken,
+    next: FeedLink,
+) {
+    if cancellation.is_cancelled() {
+        return;
+    }
+    {
+        let Ok(mut current) = link.lock() else {
+            return;
+        };
+        if *current == next {
+            return;
+        }
+        *current = next;
+    }
+    if let Some(binding) = binding.upgrade() {
+        binding.feed_link_changes.send_modify(|count| *count += 1);
+    }
+}
+
+/// Connects to the feed and delivers its events until the connection ends.
+async fn run_feed_session(
+    binding: &Weak<SubsonicBinding>,
+    client: &SubsonicClient,
+    probe: &subsonic::SubsonicProbe,
+    broadcaster: &Arc<dyn Broadcaster>,
+    link: &Mutex<FeedLink>,
+    cancellation: &CancellationToken,
+) -> FeedSessionEnd {
+    let connect = async {
+        let url = match client.rune_visualizer_feed_url(probe).await {
+            Ok(url) => url,
+            Err(error) => {
+                log::warn!("Could not resolve Subsonic visualizer feed: {error}");
+                return None;
+            }
+        };
+        match connect_async(url.as_str()).await {
+            Ok((socket, _)) => Some(socket),
+            Err(error) => {
+                log::warn!("Could not connect to Subsonic visualizer feed: {error}");
+                None
+            }
+        }
+    };
+    let socket = tokio::select! {
+        _ = cancellation.cancelled() => return FeedSessionEnd::Cancelled,
+        socket = connect => socket,
+    };
+    let Some(mut socket) = socket else {
+        return FeedSessionEnd::NotConnected;
+    };
+    let fft_payload = match rinf::serialize(&SetRealtimeFFTEnabledRequest {
+        enabled: true,
+        call_id: None,
+    }) {
+        Ok(payload) => payload,
+        Err(error) => {
+            log::warn!("Could not encode Subsonic visualizer feed request: {error}");
+            return FeedSessionEnd::NotConnected;
+        }
+    };
+    for (name, body) in [
+        ("SubscribeVisualizerFeedRequest", Vec::new()),
+        ("SetRealtimeFFTEnabledRequest", fft_payload),
+    ] {
+        let frame = encode_message(name, &body, None);
+        if let Err(error) = socket.send(Message::Binary(frame.into())).await {
+            log::warn!("Could not subscribe to Subsonic visualizer feed: {error}");
+            return FeedSessionEnd::NotConnected;
+        }
+    }
+    set_feed_link(binding, link, cancellation, FeedLink::Live);
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                let frame = encode_message("UnsubscribeVisualizerFeedRequest", &[], None);
+                let _ = socket.send(Message::Binary(frame.into())).await;
+                let _ = socket.close(None).await;
+                return FeedSessionEnd::Cancelled;
+            }
+            message = socket.next() => match message {
+                Some(Ok(Message::Binary(payload))) => {
+                    if let Err(error) = deliver_visualizer_feed_frame(
+                        &payload,
+                        &**broadcaster,
+                        |status| {
+                            if let Some(binding) = binding.upgrade() {
+                                binding.broadcast_visualizer_feed_status(status);
+                            }
+                        },
+                    ) {
+                        log::debug!("Ignoring Subsonic visualizer feed frame: {error:#}");
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => return FeedSessionEnd::Dropped,
+                Some(Err(error)) => {
+                    log::debug!("Subsonic visualizer feed ended: {error}");
+                    return FeedSessionEnd::Dropped;
+                }
+                Some(Ok(_)) => {}
+            }
+        }
     }
 }
 
@@ -490,6 +629,7 @@ impl SubsonicBinding {
             jukebox_state: Arc::new(Mutex::new(None)),
             playback_starts: Mutex::new(HashMap::new()),
             visualizer_feed: Mutex::new(None),
+            feed_link_changes: watch::channel(0).0,
         }
     }
 
@@ -571,9 +711,34 @@ impl SubsonicBinding {
             token.cancel();
         }
         if let Ok(mut feed) = self.visualizer_feed.lock()
-            && let Some(token) = feed.take()
+            && let Some(active) = feed.take()
         {
-            token.cancel();
+            active.cancel.cancel();
+        }
+    }
+
+    /// Wakes once for every change of what the visualizer can use from this jukebox.
+    pub(crate) fn subscribe_feed_link_changes(&self) -> watch::Receiver<u64> {
+        self.feed_link_changes.subscribe()
+    }
+
+    /// What the visualizer can use from this jukebox right now.
+    pub(crate) fn visualizer_inputs(&self) -> VisualizerInputs {
+        if !self.probe.supports_rune_visualizer_feed() {
+            return VisualizerInputs::None;
+        }
+        let lost = self.visualizer_feed.lock().is_ok_and(|feed| {
+            feed.as_ref().is_some_and(|active| {
+                active
+                    .link
+                    .lock()
+                    .map_or(true, |link| *link == FeedLink::Lost)
+            })
+        });
+        if lost {
+            VisualizerInputs::None
+        } else {
+            VisualizerInputs::Full
         }
     }
 
@@ -611,79 +776,50 @@ impl SubsonicBinding {
         let Ok(mut feed) = self.visualizer_feed.lock() else {
             return;
         };
-        if let Some(token) = feed.take() {
-            token.cancel();
+        if let Some(active) = feed.take() {
+            active.cancel.cancel();
         }
         let cancellation = self.covers.cancellation.child_token();
-        *feed = Some(cancellation.clone());
+        let link = Arc::new(Mutex::new(FeedLink::Live));
+        *feed = Some(ActiveFeed {
+            cancel: cancellation.clone(),
+            link: Arc::clone(&link),
+        });
         let client = Arc::clone(&self.client);
         let probe = self.probe.clone();
         let broadcaster = Arc::clone(&self.covers.broadcaster);
-        let binding = Arc::clone(self);
+        let binding = Arc::downgrade(self);
         tokio::spawn(async move {
-            let url = match client.rune_visualizer_feed_url(&probe).await {
-                Ok(url) => url,
-                Err(error) => {
-                    log::warn!("Could not resolve Subsonic visualizer feed: {error}");
-                    return;
-                }
+            // Same waits as a Rune peer's reconnect; a feed has no deadline because it
+            // lives as long as the jukebox is the current player.
+            let config = ReconnectConfig::default();
+            let backoff = || {
+                config
+                    .delays
+                    .into_iter()
+                    .chain(std::iter::repeat(config.interval))
             };
-            let (mut socket, _) = match connect_async(url.as_str()).await {
-                Ok(socket) => socket,
-                Err(error) => {
-                    log::warn!("Could not connect to Subsonic visualizer feed: {error}");
-                    return;
-                }
-            };
-            let fft_payload = match rinf::serialize(&SetRealtimeFFTEnabledRequest {
-                enabled: true,
-                call_id: None,
-            }) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    log::warn!("Could not encode Subsonic visualizer feed request: {error}");
-                    return;
-                }
-            };
-            for (name, body) in [
-                ("SubscribeVisualizerFeedRequest", Vec::new()),
-                ("SetRealtimeFFTEnabledRequest", fft_payload),
-            ] {
-                let frame = encode_message(name, &body, None);
-                if let Err(error) = socket.send(Message::Binary(frame.into())).await {
-                    log::warn!("Could not subscribe to Subsonic visualizer feed: {error}");
-                    return;
-                }
-            }
+            let mut delays = backoff();
             loop {
+                let end = run_feed_session(
+                    &binding,
+                    &client,
+                    &probe,
+                    &broadcaster,
+                    &link,
+                    &cancellation,
+                )
+                .await;
+                match end {
+                    FeedSessionEnd::Cancelled => break,
+                    FeedSessionEnd::Dropped => delays = backoff(),
+                    FeedSessionEnd::NotConnected => {}
+                }
+                set_feed_link(&binding, &link, &cancellation, FeedLink::Lost);
+                let delay = delays.next().unwrap_or(config.interval);
                 tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        let frame = encode_message(
-                            "UnsubscribeVisualizerFeedRequest",
-                            &[],
-                            None,
-                        );
-                        let _ = socket.send(Message::Binary(frame.into())).await;
-                        let _ = socket.close(None).await;
-                        break;
-                    }
-                    message = socket.next() => match message {
-                        Some(Ok(Message::Binary(payload))) => {
-                            if let Err(error) = deliver_visualizer_feed_frame(
-                                &payload,
-                                &*broadcaster,
-                                |status| binding.broadcast_visualizer_feed_status(status),
-                            ) {
-                                log::debug!("Ignoring Subsonic visualizer feed frame: {error:#}");
-                            }
-                        }
-                        Some(Ok(Message::Close(_))) | None => break,
-                        Some(Err(error)) => {
-                            log::debug!("Subsonic visualizer feed ended: {error}");
-                            break;
-                        }
-                        Some(Ok(_)) => {}
-                    }
+                    _ = cancellation.cancelled() => break,
+                    _ = tokio::time::sleep(delay) => {}
                 }
             }
         });
@@ -1140,6 +1276,10 @@ mod visualizer_feed_tests {
         jukebox: Arc<Mutex<MockJukebox>>,
         feed_status: Arc<Mutex<PlaybackStatus>>,
         feed_release: Arc<Notify>,
+        /// Ends the feed connection from the server side.
+        feed_drop: Arc<Notify>,
+        /// Makes the server answer feed connections with an error.
+        refuse_feed: Arc<AtomicBool>,
         cover_calls: Arc<AtomicUsize>,
         cover_started: Arc<Notify>,
         release_cover: Arc<Notify>,
@@ -1345,6 +1485,8 @@ mod visualizer_feed_tests {
             })),
             feed_status: Arc::new(Mutex::new(default_feed_status())),
             feed_release: Arc::new(Notify::new()),
+            feed_drop: Arc::new(Notify::new()),
+            refuse_feed: Arc::new(AtomicBool::new(false)),
             cover_calls: Arc::new(AtomicUsize::new(0)),
             cover_started: Arc::new(Notify::new()),
             release_cover: Arc::new(Notify::new()),
@@ -1418,8 +1560,18 @@ mod visualizer_feed_tests {
         Query(query): Query<HashMap<String, String>>,
         ws: WebSocketUpgrade,
     ) -> impl IntoResponse {
+        if state.refuse_feed.load(Ordering::SeqCst) {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         *state.auth.lock().unwrap() = Some(query);
-        ws.on_upgrade(move |socket| feed_socket(socket, state))
+        ws.on_upgrade(move |socket| async move {
+            let dropped = state.feed_drop.clone();
+            tokio::select! {
+                _ = dropped.notified() => {}
+                _ = feed_socket(socket, state) => {}
+            }
+        })
+        .into_response()
     }
 
     async fn feed_socket(mut socket: WebSocket, state: MockState) {
@@ -1917,6 +2069,180 @@ mod visualizer_feed_tests {
         .await
         .unwrap();
         assert_eq!(signals.playback_statuses.lock().unwrap().len(), before);
+        binding.stop_jukebox_polling();
+        binding.covers.cancellation.cancel();
+        server.abort();
+    }
+
+    async fn feed_fft_count(signals: &Signals) -> usize {
+        signals
+            .names
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|name| *name == "RealtimeFFT")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn feed_reconnects_after_the_server_closes_it() {
+        let (url, state, server) = server(true, true).await;
+        let root = TempDir::new().unwrap();
+        let signals = Arc::new(Signals::default());
+        let binding = open_binding(url, &root, signals.clone()).await;
+        binding.start_jukebox_polling();
+        wait_until("the first feed connection", || async {
+            Ok((state.connections.load(Ordering::SeqCst) == 1).then_some(()))
+        })
+        .await
+        .unwrap();
+        state.feed_release.notify_one();
+        wait_until("feed data from the first connection", || async {
+            Ok((feed_fft_count(&signals).await >= 1).then_some(()))
+        })
+        .await
+        .unwrap();
+        let before = feed_fft_count(&signals).await;
+
+        state.feed_drop.notify_one();
+        wait_until("the second feed connection", || async {
+            Ok((state.connections.load(Ordering::SeqCst) == 2).then_some(()))
+        })
+        .await
+        .unwrap();
+        state.feed_release.notify_one();
+        wait_until("feed data from the second connection", || async {
+            Ok((feed_fft_count(&signals).await > before).then_some(()))
+        })
+        .await
+        .unwrap();
+
+        binding.stop_jukebox_polling();
+        binding.covers.cancellation.cancel();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn visualizer_inputs_drop_while_the_feed_is_down_and_return_after_it() {
+        let (url, state, server) = server(true, true).await;
+        let root = TempDir::new().unwrap();
+        let binding = open_binding(url, &root, Arc::new(Signals::default())).await;
+        let player = CurrentPlayer::SubsonicJukebox(binding.clone());
+        binding.start_jukebox_polling();
+        wait_until("the feed connection", || async {
+            Ok((state.connections.load(Ordering::SeqCst) == 1).then_some(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(player.visualizer_inputs(), VisualizerInputs::Full);
+
+        state.refuse_feed.store(true, Ordering::SeqCst);
+        state.feed_drop.notify_one();
+        wait_until("inputs to leave Full while the feed is down", || async {
+            Ok((player.visualizer_inputs() == VisualizerInputs::None).then_some(()))
+        })
+        .await
+        .unwrap();
+
+        state.refuse_feed.store(false, Ordering::SeqCst);
+        wait_until("inputs to return once the feed is back", || async {
+            Ok((player.visualizer_inputs() == VisualizerInputs::Full).then_some(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+
+        binding.stop_jukebox_polling();
+        binding.covers.cancellation.cancel();
+        server.abort();
+    }
+
+    /// The node publishes the jukebox's inputs to the visualizer, so a feed that
+    /// drops or returns must reach the visualizer through the node.
+    #[tokio::test]
+    async fn node_publishes_the_jukebox_inputs_as_the_feed_drops_and_returns() {
+        use crate::node::NodeContext;
+        use crate::server::utils::device::RunMode;
+
+        let (url, state, server) = server(true, true).await;
+        let node_dir = TempDir::new().unwrap();
+        let path = node_dir.path().to_string_lossy().into_owned();
+        let node = NodeContext::new(
+            &path,
+            &path,
+            Arc::new(Signals::default()),
+            false,
+            RunMode::App,
+        )
+        .await
+        .unwrap();
+        let root = TempDir::new().unwrap();
+        let binding = open_binding(url, &root, Arc::new(Signals::default())).await;
+        node.set_open_subsonic_catalog(None, binding.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            node.current_player().unwrap(),
+            CurrentPlayer::SubsonicJukebox(_)
+        ));
+        wait_until("the feed connection", || async {
+            Ok((state.connections.load(Ordering::SeqCst) == 1).then_some(()))
+        })
+        .await
+        .unwrap();
+        wait_until("the visualizer to see the live feed", || async {
+            Ok((VISUALIZER.status().inputs == VisualizerInputs::Full).then_some(()))
+        })
+        .await
+        .unwrap();
+
+        state.refuse_feed.store(true, Ordering::SeqCst);
+        state.feed_drop.notify_one();
+        wait_until("the visualizer to lose its inputs", || async {
+            Ok((VISUALIZER.status().inputs == VisualizerInputs::None).then_some(()))
+        })
+        .await
+        .unwrap();
+
+        state.refuse_feed.store(false, Ordering::SeqCst);
+        wait_until("the visualizer to get its inputs back", || async {
+            Ok((VISUALIZER.status().inputs == VisualizerInputs::Full).then_some(()))
+        })
+        .await
+        .unwrap();
+
+        node.close_ui(&node.token).await;
+        node.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn feed_connect_failure_is_retried() {
+        let (url, state, server) = server(true, true).await;
+        state.refuse_feed.store(true, Ordering::SeqCst);
+        let root = TempDir::new().unwrap();
+        let binding = open_binding(url, &root, Arc::new(Signals::default())).await;
+        let player = CurrentPlayer::SubsonicJukebox(binding.clone());
+        binding.start_jukebox_polling();
+        wait_until("inputs to leave Full after the failed connect", || async {
+            Ok((player.visualizer_inputs() == VisualizerInputs::None).then_some(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.connections.load(Ordering::SeqCst), 0);
+
+        state.refuse_feed.store(false, Ordering::SeqCst);
+        wait_until("the retried feed connection", || async {
+            Ok((state.connections.load(Ordering::SeqCst) == 1).then_some(()))
+        })
+        .await
+        .unwrap();
+        wait_until("inputs to return", || async {
+            Ok((player.visualizer_inputs() == VisualizerInputs::Full).then_some(()))
+        })
+        .await
+        .unwrap();
+
         binding.stop_jukebox_polling();
         binding.covers.cancellation.cancel();
         server.abort();
