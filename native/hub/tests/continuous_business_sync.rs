@@ -450,7 +450,6 @@ async fn business_scenario() -> Result<()> {
         &c_store,
         "temporary mix".into(),
         "m".into(),
-        false,
         Some(PlaybackMode::Sequential),
         false,
         vec![("lib::track".into(), c2.to_string())],
@@ -465,7 +464,6 @@ async fn business_scenario() -> Result<()> {
         None,
         None,
         None,
-        None,
     )
     .await?;
     let dangling_mix = mixes::create_mix(
@@ -473,7 +471,6 @@ async fn business_scenario() -> Result<()> {
         &c_store,
         "missing reference".into(),
         "m".into(),
-        false,
         Some(PlaybackMode::Sequential),
         false,
         vec![("lib::playlist".into(), transient.id.to_string())],

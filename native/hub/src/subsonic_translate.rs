@@ -40,7 +40,7 @@ use crate::messages::{
 use crate::request_error::ExpectedRequestError;
 use crate::rpc::{RequestTranslationFuture, Slot, UnsupportedReason};
 use crate::subsonic_binding::{SubsonicBinding, SubsonicIdKind};
-use database::actions::mixes::{QueryOperator, parse_query};
+use database::actions::mixes::QueryOperator;
 use uuid::Uuid;
 
 fn subsonic_track_id(binding: &SubsonicBinding, item: &Option<PlayingItemRef>) -> Result<String> {
@@ -1701,10 +1701,9 @@ fn parse_detail_query(request: &MixQueryRequest) -> Result<DetailQuery> {
     let [query] = request.queries.as_slice() else {
         return Err(unsupported_detail_query().into());
     };
-    let operator = parse_query(&(query.operator.clone(), query.parameter.clone()));
-    match operator {
-        QueryOperator::LibArtist(id) => Ok(DetailQuery::Artist(id)),
-        QueryOperator::LibAlbum(id) => Ok(DetailQuery::Album(id)),
+    match QueryOperator::parse(&query.operator, &query.parameter) {
+        Ok(QueryOperator::LibArtist(id)) => Ok(DetailQuery::Artist(id)),
+        Ok(QueryOperator::LibAlbum(id)) => Ok(DetailQuery::Album(id)),
         _ => Err(unsupported_detail_query().into()),
     }
 }

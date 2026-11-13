@@ -229,7 +229,6 @@ class _MixStudioDialogImplementationState
           widget.mixId!,
           _controller.titleController.text,
           _controller.groupController.text,
-          false,
           editorData.mode,
           queries,
         );
@@ -237,7 +236,6 @@ class _MixStudioDialogImplementationState
         response = await createMix(
           _controller.titleController.text,
           _controller.groupController.text,
-          false,
           editorData.mode,
           queries,
         );

@@ -81,7 +81,6 @@ async fn alpha_database_with_bookkeeping_columns_still_works() -> Result<()> {
         &store,
         "new mix".into(),
         "g".into(),
-        false,
         Some(PlaybackMode::Sequential),
         false,
         vec![("lib::directory.deep".into(), "/music".into())],

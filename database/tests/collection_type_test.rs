@@ -84,7 +84,6 @@ async fn a_mix_with_genre_and_directory_queries_reads_back() -> Result<()> {
         &library.record_store(),
         "Genres and folders".to_owned(),
         "Mine".to_owned(),
-        false,
         None,
         false,
         vec![],

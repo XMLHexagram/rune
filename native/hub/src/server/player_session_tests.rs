@@ -12056,7 +12056,6 @@ async fn created_mixes_keep_the_playback_mode_they_were_given() -> Result<()> {
             &CreateMixRequest {
                 name: name.into(),
                 group: "modes".into(),
-                scriptlet_mode: false,
                 mode,
                 queries: queries(),
                 call_id: None,
@@ -12073,7 +12072,6 @@ async fn created_mixes_keep_the_playback_mode_they_were_given() -> Result<()> {
             mix_id: created[1].0,
             name: "repeat all".into(),
             group: "modes".into(),
-            scriptlet_mode: false,
             mode: None,
             queries: queries(),
             call_id: None,

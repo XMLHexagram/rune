@@ -157,7 +157,6 @@ class CreateEditMixDialogState extends State<CreateEditMixDialog> {
                               widget.mixId!,
                               titleController.text,
                               groupController.text,
-                              false,
                               null,
                               operator == null ? [] : [operator],
                             );
@@ -165,7 +164,6 @@ class CreateEditMixDialogState extends State<CreateEditMixDialog> {
                             response = await createMix(
                               titleController.text,
                               groupController.text,
-                              false,
                               null,
                               operator == null ? [] : [operator],
                             );

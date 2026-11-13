@@ -91,7 +91,6 @@ impl Signal for CreateMixRequest {
             &store,
             request.name.clone(),
             request.group.clone(),
-            request.scriptlet_mode,
             request.mode.map(Into::into),
             false,
             request
@@ -144,7 +143,6 @@ impl Signal for UpdateMixRequest {
             request.mix_id,
             Some(request.name.clone()),
             Some(request.group.clone()),
-            Some(request.scriptlet_mode),
             Some(request.mode.map(Into::into)),
             Some(false),
             Some(

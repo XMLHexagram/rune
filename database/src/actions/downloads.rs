@@ -21,45 +21,38 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub fn validate_queries(queries: &[(String, String)]) -> Result<()> {
+    use crate::actions::mixes::QueryOperator;
     let mut selects = false;
     for (operator, parameter) in queries {
-        let valid = match operator.as_str() {
-            "lib::all" => {
-                let value = parameter.parse::<bool>()?;
-                selects |= value;
-                true
-            }
-            "lib::artist" | "lib::album" | "lib::genre" | "lib::playlist" | "lib::track"
-            | "lib::random" => {
+        match QueryOperator::parse(operator, parameter)? {
+            QueryOperator::LibAll(value) | QueryOperator::LibQueue(value) => selects |= value,
+            QueryOperator::LibArtist(id)
+            | QueryOperator::LibAlbum(id)
+            | QueryOperator::LibGenre(id)
+            | QueryOperator::LibPlaylist(id)
+            | QueryOperator::LibTrack(id)
+            | QueryOperator::LibRandom(id) => {
                 selects = true;
-                parameter.parse::<i32>().is_ok_and(|n| n > 0)
+                ensure!(id > 0, "invalid offline query operator or parameter");
             }
-            "lib::queue" => {
-                let value = parameter.parse::<bool>()?;
-                selects |= value;
-                true
-            }
-            "lib::directory.deep" | "lib::directory.shallow" => {
+            QueryOperator::LibDirectoryDeep(path) | QueryOperator::LibDirectoryShallow(path) => {
                 selects = true;
-                !parameter.is_empty()
+                ensure!(
+                    !path.is_empty(),
+                    "invalid offline query operator or parameter"
+                );
             }
-            "filter::liked" | "filter::analyzed" | "filter::with_cover_art" => {
-                selects = true;
-                parameter.parse::<bool>().is_ok()
-            }
-            "sort::track_number"
-            | "sort::last_modified"
-            | "sort::duration"
-            | "sort::playedthrough"
-            | "sort::skipped" => parameter.parse::<bool>().is_ok(),
-            "pipe::limit" => parameter.parse::<u64>().is_ok(),
-            "pipe::recommend" => {
-                selects = true;
-                parameter.parse::<i32>().is_ok()
-            }
-            _ => false,
-        };
-        ensure!(valid, "invalid offline query operator or parameter");
+            QueryOperator::FilterLiked(_)
+            | QueryOperator::FilterAnalyzed(_)
+            | QueryOperator::FilterWithCoverArt(_)
+            | QueryOperator::PipeRecommend(_) => selects = true,
+            QueryOperator::SortTrackNumber(_)
+            | QueryOperator::SortLastModified(_)
+            | QueryOperator::SortDuration(_)
+            | QueryOperator::SortPlayedthrough(_)
+            | QueryOperator::SortSkipped(_)
+            | QueryOperator::PipeLimit(_) => {}
+        }
     }
     ensure!(selects, "offline query has no selection");
     Ok(())

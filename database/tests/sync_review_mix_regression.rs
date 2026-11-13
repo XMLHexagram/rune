@@ -23,7 +23,6 @@ async fn deleting_referenced_playlist_does_not_block_unrelated_sync() -> Result<
         &store,
         "Uses playlist".into(),
         "Test".into(),
-        false,
         Some(PlaybackMode::Sequential),
         false,
         vec![("lib::playlist".into(), playlist.id.to_string())],

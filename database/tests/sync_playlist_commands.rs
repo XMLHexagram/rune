@@ -99,7 +99,6 @@ async fn commands_publish_playlist_and_occurrence_removals() -> Result<()> {
         &record_store,
         "dependent".into(),
         "d".into(),
-        false,
         Some(PlaybackMode::Sequential),
         false,
         vec![("lib::playlist".into(), list.id.to_string())],

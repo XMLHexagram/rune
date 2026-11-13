@@ -1,5 +1,6 @@
 use crate::actions::search::{add_term, remove_term};
 use crate::error::ExpectedError;
+use crate::mix_operator::{MixOperator, UnknownOperator};
 use crate::sync::{
     SeaOrmSyncStore,
     bindings::apply,
@@ -11,7 +12,6 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use log::warn;
 use migration::{ExprTrait, Func, IntoCondition, SimpleExpr};
 use sea_orm::entity::prelude::*;
 use sea_orm::{
@@ -238,7 +238,6 @@ pub async fn create_mix(
     store: &SeaOrmSyncStore,
     name: String,
     group: String,
-    scriptlet_mode: bool,
     mode: Option<PlaybackMode>,
     locked: bool,
     queries: Vec<(String, String)>,
@@ -248,7 +247,8 @@ pub async fn create_mix(
     let row = mixes::ActiveModel {
         name: Set(name),
         group: Set(group),
-        scriptlet_mode: Set(scriptlet_mode),
+        // The flag is a synced field of the mix; no mix is a scriptlet, so it is always false.
+        scriptlet_mode: Set(false),
         mode: Set(Some(stored_mix_mode(mode))),
         locked: Set(locked),
         source_uuid: Set(Uuid::new_v4().to_string()),
@@ -281,7 +281,6 @@ pub async fn update_mix(
     id: i32,
     name: Option<String>,
     group: Option<String>,
-    scriptlet_mode: Option<bool>,
     // `None` leaves the mode as it is; `Some(None)` makes the mix keep the player's mode.
     mode: Option<Option<PlaybackMode>>,
     locked: Option<bool>,
@@ -299,9 +298,6 @@ pub async fn update_mix(
     }
     if let Some(v) = group {
         model.group = Set(v);
-    }
-    if let Some(v) = scriptlet_mode {
-        model.scriptlet_mode = Set(v);
     }
     if let Some(v) = mode {
         model.mode = Set(Some(stored_mix_mode(v)));
@@ -418,7 +414,7 @@ pub async fn remove_mix_query(
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryOperator {
     LibAll(bool),
     LibArtist(i32),
@@ -440,21 +436,6 @@ pub enum QueryOperator {
     FilterAnalyzed(bool),
     PipeLimit(u64),
     PipeRecommend(i32),
-    Unknown(String),
-}
-
-fn parse_parameter<T>(parameter: &str, operator: &str) -> Option<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Debug,
-{
-    match parameter.parse::<T>() {
-        Ok(x) => Some(x),
-        Err(_) => {
-            warn!("Unable to parse the parameter of operator: {operator}({parameter})");
-            None
-        }
-    }
 }
 
 pub async fn add_item_to_mix(
@@ -518,66 +499,111 @@ pub async fn initialize_mix_queries_before_replication(db: &DatabaseConnection) 
     Ok(())
 }
 
-pub fn parse_query(query: &(String, String)) -> QueryOperator {
-    let (operator, parameter) = query;
-    match operator.as_str() {
-        "lib::all" => parse_parameter::<bool>(parameter, operator)
-            .map(QueryOperator::LibAll)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "lib::artist" => parse_parameter::<i32>(parameter, operator)
-            .map(QueryOperator::LibArtist)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "lib::album" => parse_parameter::<i32>(parameter, operator)
-            .map(QueryOperator::LibAlbum)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "lib::genre" => parse_parameter::<i32>(parameter, operator)
-            .map(QueryOperator::LibGenre)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "lib::playlist" => parse_parameter::<i32>(parameter, operator)
-            .map(QueryOperator::LibPlaylist)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "lib::track" => parse_parameter::<i32>(parameter, operator)
-            .map(QueryOperator::LibTrack)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "lib::random" => parse_parameter::<i32>(parameter, operator)
-            .map(QueryOperator::LibRandom)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "lib::queue" => parse_parameter::<bool>(parameter, operator)
-            .map(QueryOperator::LibQueue)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "lib::directory.deep" => QueryOperator::LibDirectoryDeep(parameter.clone()),
-        "lib::directory.shallow" => QueryOperator::LibDirectoryShallow(parameter.clone()),
-        "sort::track_number" => parse_parameter::<bool>(parameter, operator)
-            .map(QueryOperator::SortTrackNumber)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "sort::last_modified" => parse_parameter::<bool>(parameter, operator)
-            .map(QueryOperator::SortLastModified)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "sort::duration" => parse_parameter::<bool>(parameter, operator)
-            .map(QueryOperator::SortDuration)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "sort::playedthrough" => parse_parameter::<bool>(parameter, operator)
-            .map(QueryOperator::SortPlayedthrough)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "sort::skipped" => parse_parameter::<bool>(parameter, operator)
-            .map(QueryOperator::SortSkipped)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "filter::liked" => parse_parameter::<bool>(parameter, operator)
-            .map(QueryOperator::FilterLiked)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "filter::analyzed" => parse_parameter::<bool>(parameter, operator)
-            .map(QueryOperator::FilterAnalyzed)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "filter::with_cover_art" => parse_parameter::<bool>(parameter, operator)
-            .map(QueryOperator::FilterWithCoverArt)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "pipe::limit" => parse_parameter::<u64>(parameter, operator)
-            .map(QueryOperator::PipeLimit)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        "pipe::recommend" => parse_parameter::<i32>(parameter, operator)
-            .map(QueryOperator::PipeRecommend)
-            .unwrap_or(QueryOperator::Unknown(operator.clone())),
-        _ => QueryOperator::Unknown(operator.clone()),
+/// The text of a clause is not a valid use of the mix query language.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum QueryParseError {
+    #[error(transparent)]
+    UnknownOperator(#[from] UnknownOperator),
+    #[error("invalid parameter `{parameter}` for mix query operator `{}`", operator.syntax())]
+    InvalidParameter {
+        operator: MixOperator,
+        parameter: String,
+    },
+}
+
+impl From<QueryParseError> for ExpectedError {
+    fn from(error: QueryParseError) -> Self {
+        ExpectedError::InvalidInput {
+            detail: error.to_string(),
+        }
+    }
+}
+
+impl QueryOperator {
+    /// Reads one clause of the syntax: an operator and its parameter text.
+    pub fn parse(operator: &str, parameter: &str) -> Result<Self, QueryParseError> {
+        let operator = MixOperator::from_syntax(operator)?;
+        let invalid = || QueryParseError::InvalidParameter {
+            operator,
+            parameter: parameter.to_owned(),
+        };
+        let flag = || parameter.parse::<bool>().map_err(|_| invalid());
+        let number = || parameter.parse::<i32>().map_err(|_| invalid());
+        Ok(match operator {
+            MixOperator::LibAll => Self::LibAll(flag()?),
+            MixOperator::LibArtist => Self::LibArtist(number()?),
+            MixOperator::LibAlbum => Self::LibAlbum(number()?),
+            MixOperator::LibGenre => Self::LibGenre(number()?),
+            MixOperator::LibPlaylist => Self::LibPlaylist(number()?),
+            MixOperator::LibTrack => Self::LibTrack(number()?),
+            MixOperator::LibRandom => Self::LibRandom(number()?),
+            MixOperator::LibQueue => Self::LibQueue(flag()?),
+            MixOperator::LibDirectoryDeep => Self::LibDirectoryDeep(parameter.to_owned()),
+            MixOperator::LibDirectoryShallow => Self::LibDirectoryShallow(parameter.to_owned()),
+            MixOperator::SortTrackNumber => Self::SortTrackNumber(flag()?),
+            MixOperator::SortLastModified => Self::SortLastModified(flag()?),
+            MixOperator::SortDuration => Self::SortDuration(flag()?),
+            MixOperator::SortPlayedthrough => Self::SortPlayedthrough(flag()?),
+            MixOperator::SortSkipped => Self::SortSkipped(flag()?),
+            MixOperator::FilterLiked => Self::FilterLiked(flag()?),
+            MixOperator::FilterWithCoverArt => Self::FilterWithCoverArt(flag()?),
+            MixOperator::FilterAnalyzed => Self::FilterAnalyzed(flag()?),
+            MixOperator::PipeLimit => {
+                Self::PipeLimit(parameter.parse::<u64>().map_err(|_| invalid())?)
+            }
+            MixOperator::PipeRecommend => Self::PipeRecommend(number()?),
+        })
+    }
+
+    pub fn operator(&self) -> MixOperator {
+        match self {
+            Self::LibAll(_) => MixOperator::LibAll,
+            Self::LibArtist(_) => MixOperator::LibArtist,
+            Self::LibAlbum(_) => MixOperator::LibAlbum,
+            Self::LibGenre(_) => MixOperator::LibGenre,
+            Self::LibPlaylist(_) => MixOperator::LibPlaylist,
+            Self::LibTrack(_) => MixOperator::LibTrack,
+            Self::LibRandom(_) => MixOperator::LibRandom,
+            Self::LibQueue(_) => MixOperator::LibQueue,
+            Self::LibDirectoryDeep(_) => MixOperator::LibDirectoryDeep,
+            Self::LibDirectoryShallow(_) => MixOperator::LibDirectoryShallow,
+            Self::SortTrackNumber(_) => MixOperator::SortTrackNumber,
+            Self::SortLastModified(_) => MixOperator::SortLastModified,
+            Self::SortDuration(_) => MixOperator::SortDuration,
+            Self::SortPlayedthrough(_) => MixOperator::SortPlayedthrough,
+            Self::SortSkipped(_) => MixOperator::SortSkipped,
+            Self::FilterLiked(_) => MixOperator::FilterLiked,
+            Self::FilterWithCoverArt(_) => MixOperator::FilterWithCoverArt,
+            Self::FilterAnalyzed(_) => MixOperator::FilterAnalyzed,
+            Self::PipeLimit(_) => MixOperator::PipeLimit,
+            Self::PipeRecommend(_) => MixOperator::PipeRecommend,
+        }
+    }
+
+    /// The clause as the syntax writes it.
+    pub fn syntax(&self) -> (&'static str, String) {
+        let parameter = match self {
+            Self::LibAll(value)
+            | Self::LibQueue(value)
+            | Self::SortTrackNumber(value)
+            | Self::SortLastModified(value)
+            | Self::SortDuration(value)
+            | Self::SortPlayedthrough(value)
+            | Self::SortSkipped(value)
+            | Self::FilterLiked(value)
+            | Self::FilterWithCoverArt(value)
+            | Self::FilterAnalyzed(value) => value.to_string(),
+            Self::LibArtist(id)
+            | Self::LibAlbum(id)
+            | Self::LibGenre(id)
+            | Self::LibPlaylist(id)
+            | Self::LibTrack(id)
+            | Self::LibRandom(id)
+            | Self::PipeRecommend(id) => id.to_string(),
+            Self::LibDirectoryDeep(path) | Self::LibDirectoryShallow(path) => path.clone(),
+            Self::PipeLimit(limit) => limit.to_string(),
+        };
+        (self.operator().syntax(), parameter)
     }
 }
 
@@ -708,7 +734,7 @@ pub async fn query_mix_media_files(
     let mut pipe_recommend: Option<i32> = None;
 
     for query in queries {
-        match parse_query(&query) {
+        match QueryOperator::parse(&query.0, &query.1).map_err(ExpectedError::from)? {
             QueryOperator::LibAll(is_all) => all = is_all,
             QueryOperator::LibArtist(id) => artist_ids.push(id),
             QueryOperator::LibAlbum(id) => album_ids.push(id),
@@ -729,7 +755,6 @@ pub async fn query_mix_media_files(
             QueryOperator::FilterAnalyzed(analyzed) => filter_analyzed = Some(analyzed),
             QueryOperator::PipeLimit(limit) => pipe_limit = Some(limit),
             QueryOperator::PipeRecommend(recommend) => pipe_recommend = Some(recommend),
-            QueryOperator::Unknown(op) => warn!("Unknown operator: {op}"),
         }
     }
 
@@ -1188,11 +1213,19 @@ pub struct MixQueryView {
     pub target_uuid: Option<Uuid>,
     pub available: bool,
 }
+// A stored or synced clause keeps its operator as text, because changing that changes the sync
+// journal format. This is where the text becomes a `MixOperator` for the storage code.
+fn stored_operator(text: &str) -> Result<MixOperator, ExpectedError> {
+    MixOperator::from_syntax(text).map_err(|error| ExpectedError::InvalidInput {
+        detail: error.to_string(),
+    })
+}
+
 pub async fn query_views_on<C: sea_orm::ConnectionTrait>(
     db: &C,
     mix_uuid: &str,
 ) -> Result<Vec<MixQueryView>> {
-    use crate::sync::model::{RuneModel, mix_target_collection};
+    use crate::sync::model::RuneModel;
     use sea_orm::{QueryOrder, QuerySelect};
     use sync::protocol::SyncModel;
     let rows = mix_queries::Entity::find()
@@ -1209,17 +1242,18 @@ pub async fn query_views_on<C: sea_orm::ConnectionTrait>(
             .as_deref()
             .map(str::parse::<Uuid>)
             .transpose()?;
-        let (parameter, available) = if let Some(tag) = mix_target_collection(&row.operator) {
+        let operator = stored_operator(&row.operator)?;
+        let (parameter, available) = if let Some(target_kind) = operator.target_collection() {
             let id = target.context("mix reference missing UUID")?;
-            let collection =
-                RuneModel::collection_from_tag(tag).context("unregistered mix reference")?;
+            let collection = RuneModel::collection_from_tag(target_kind.tag())
+                .context("unregistered mix reference")?;
             let local =
                 RuneModel::local_id_on(db, &sync::protocol::ObjectKey { collection, id }).await?;
             (
                 local.map_or_else(|| id.to_string(), |id| id.to_string()),
                 local.is_some(),
             )
-        } else if row.operator.starts_with("lib::directory.") {
+        } else if operator.is_directory() {
             (
                 row.local_directory.clone().unwrap_or_default(),
                 row.local_directory.is_some(),
@@ -1270,8 +1304,9 @@ async fn replace_queries_on(
     let mut incoming = Vec::with_capacity(queries.len());
     let mut directories = Vec::new();
     for (position, (operator, parameter)) in queries.into_iter().enumerate() {
-        let target = resolve_target_on(tx, &operator, &parameter).await?;
-        let directory = operator.starts_with("lib::directory.");
+        let kind = stored_operator(&operator)?;
+        let target = resolve_target_on(tx, kind, &parameter).await?;
+        let directory = kind.is_directory();
         let portable = if target.is_some() || directory {
             String::new()
         } else {
@@ -1335,14 +1370,15 @@ async fn replace_queries_on(
 }
 async fn resolve_target_on(
     tx: &DatabaseTransaction,
-    operator: &str,
+    operator: MixOperator,
     parameter: &str,
 ) -> Result<Option<Uuid>> {
-    use crate::sync::model::{RuneModel, mix_target_collection};
+    use crate::sync::model::RuneModel;
     use sync::SyncModel;
-    let Some(tag) = mix_target_collection(operator) else {
+    let Some(target_kind) = operator.target_collection() else {
         return Ok(None);
     };
+    let tag = target_kind.tag();
     if let Ok(id) = parameter.parse::<Uuid>() {
         return Ok(Some(id));
     }
@@ -1366,7 +1402,8 @@ async fn add_query_on(
     use sync_orm::owned_list::{ListBudget, OwnedListPolicy};
     type Clauses = OwnedListPolicy<mix_queries::Entity, MixClauseMap>;
     let views = query_views_on(tx, mix_uuid).await?;
-    let directory = operator.starts_with("lib::directory.");
+    let kind = stored_operator(&operator)?;
+    let directory = kind.is_directory();
     let existing = views.iter().find(|view| {
         view.operator == operator && view.parameter == parameter && (!directory || view.available)
     });
@@ -1377,7 +1414,7 @@ async fn add_query_on(
         let mut clauses = Clauses::read_on(tx, &owner, Clauses::read_ceiling()).await?;
         anyhow::ensure!(clauses.len() < 128, "mix exceeds clause limit");
         let id = Uuid::new_v4();
-        let target = resolve_target_on(tx, &operator, &parameter).await?;
+        let target = resolve_target_on(tx, kind, &parameter).await?;
         clauses.push(MixClause {
             id,
             position: i32::try_from(clauses.len())?,

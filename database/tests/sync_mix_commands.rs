@@ -28,7 +28,6 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
             &store,
             "invalid".into(),
             "m".into(),
-            false,
             Some(PlaybackMode::Sequential),
             false,
             vec![("invalid".into(), "x".into())]
@@ -49,7 +48,6 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
         &store,
         "mix".into(),
         "m".into(),
-        false,
         Some(PlaybackMode::Sequential),
         false,
         vec![("lib::all".into(), "true".into())],
@@ -71,7 +69,6 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
             mix.id,
             Some("bad".into()),
             Some("m".into()),
-            Some(false),
             Some(Some(PlaybackMode::Sequential)),
             Some(false),
             Some(vec![("invalid".into(), "x".into())])
@@ -136,7 +133,6 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
         None,
         None,
         None,
-        None,
     )
     .await?;
     assert!(library.head().await?.sequence > before.sequence);
@@ -145,7 +141,6 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
         &store,
         mix.id,
         Some("renamed again".into()),
-        None,
         None,
         None,
         None,
@@ -173,7 +168,6 @@ async fn each_mix_command_replicates_its_result() -> Result<()> {
         &store,
         "Original".into(),
         "Group".into(),
-        false,
         Some(PlaybackMode::Sequential),
         false,
         vec![("lib::all".into(), "true".into())],
@@ -201,7 +195,6 @@ async fn each_mix_command_replicates_its_result() -> Result<()> {
         &store,
         mix.id,
         Some("Updated".into()),
-        None,
         None,
         None,
         None,
@@ -268,7 +261,6 @@ async fn directory_binding_stays_local_and_clause_identity_survives_reordering()
         &store,
         "Directories".into(),
         "Test".into(),
-        false,
         Some(PlaybackMode::Sequential),
         false,
         vec![
@@ -324,7 +316,6 @@ async fn a_mix_reads_back_the_playback_mode_it_was_stored_with() -> Result<()> {
             &store,
             "mode".into(),
             "m".into(),
-            false,
             mode,
             false,
             vec![("lib::all".into(), "true".into())],
@@ -344,28 +335,16 @@ async fn a_mix_reads_back_the_playback_mode_it_was_stored_with() -> Result<()> {
         &store,
         "update".into(),
         "m".into(),
-        false,
         Some(PlaybackMode::Shuffle),
         false,
         vec![("lib::all".into(), "true".into())],
     )
     .await?;
     for mode in [None, Some(PlaybackMode::RepeatAll)] {
-        let updated = update_mix(
-            &db,
-            &store,
-            mix.id,
-            None,
-            None,
-            None,
-            Some(mode),
-            None,
-            None,
-        )
-        .await?;
+        let updated = update_mix(&db, &store, mix.id, None, None, Some(mode), None, None).await?;
         assert_eq!(mix_playback_mode(&updated)?, mode);
     }
-    let untouched = update_mix(&db, &store, mix.id, None, None, None, None, None, None).await?;
+    let untouched = update_mix(&db, &store, mix.id, None, None, None, None, None).await?;
     assert_eq!(
         mix_playback_mode(&untouched)?,
         Some(PlaybackMode::RepeatAll)

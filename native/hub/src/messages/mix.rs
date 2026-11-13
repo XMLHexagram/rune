@@ -77,7 +77,6 @@ pub struct FetchAllMixesResponse {
 pub struct CreateMixRequest {
     pub name: String,
     pub group: String,
-    pub scriptlet_mode: bool,
     pub mode: Option<PlaybackMode>,
     pub queries: Vec<MixQuery>,
     #[serde(default)]
@@ -96,7 +95,6 @@ pub struct UpdateMixRequest {
     pub mix_id: i32,
     pub name: String,
     pub group: String,
-    pub scriptlet_mode: bool,
     pub mode: Option<PlaybackMode>,
     pub queries: Vec<MixQuery>,
     #[serde(default)]
