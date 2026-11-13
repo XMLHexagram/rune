@@ -1973,9 +1973,7 @@ mod lifecycle_tests {
             .context("worker")?
             .id();
         for _ in 0..2 {
-            let response = slot.handle(&request, Arc::new(Quiet)).await;
-            assert!(response.success);
-            assert!(response.error_kind.is_none());
+            slot.handle(&request, Arc::new(Quiet)).await?;
             let same = slot
                 .initialize(
                     &request.config_path,
@@ -1996,7 +1994,7 @@ mod lifecycle_tests {
                 worker
             );
         }
-        let response = slot
+        let error = match slot
             .handle(
                 &InitializeNodeRequest {
                     call_id: None,
@@ -2004,15 +2002,13 @@ mod lifecycle_tests {
                 },
                 Arc::new(Quiet),
             )
-            .await;
-        assert!(!response.success);
-        assert_eq!(response.error_kind, Some(RequestErrorKind::InvalidInput));
-        assert!(
-            response
-                .error
-                .context("path error")?
-                .contains("configuration path cannot change")
-        );
+            .await
+        {
+            Ok(_) => anyhow::bail!("another configuration path must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(classify(&error), RequestErrorKind::InvalidInput);
+        assert!(format!("{error:#}").contains("configuration path cannot change"));
         node.shutdown().await?;
         Ok(())
     }

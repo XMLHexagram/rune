@@ -141,7 +141,7 @@ void main(List<String> arguments) async {
   // failure here is not fatal: opening a library retries and reports it.
   try {
     final configPath = await getSettingsPath();
-    final nodeResponse = (await awaitResponse(
+    await awaitResponse(
       'InitializeNodeRequest',
       InitializeNodeResponse.rustSignalStream,
       responseCallId: (response) => response.message.callId?.toInt(),
@@ -149,10 +149,7 @@ void main(List<String> arguments) async {
         configPath: configPath,
         callId: callId,
       ).sendSignalToRust(),
-    )).message;
-    if (!nodeResponse.success) {
-      error$('Could not initialize this device: ${nodeResponse.error}');
-    }
+    );
   } on TimeoutException {
     error$('Device initialization did not answer within 30 seconds');
   } on RequestFailure catch (failure) {

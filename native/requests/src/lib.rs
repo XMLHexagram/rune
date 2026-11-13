@@ -1800,7 +1800,9 @@ pub fn define_request_types(_input: TokenStream) -> TokenStream {
             }
         }
 
-        fn answer_node_request<T>(
+        /// Answer one request outside the GUI listeners: its reply or its typed failure,
+        /// tagged with its call id.
+        pub(crate) fn answer_node_request<T>(
             request: &T,
             result: Result<Option<T::Response>>,
             emit: &impl Fn(&dyn RinfRustSignal),

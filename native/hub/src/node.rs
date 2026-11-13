@@ -31,7 +31,7 @@ use playback::{
     player::{HandoffBlockId as PlayerHandoffBlockId, PlaybackState},
     sfx_player::SfxPlayer,
 };
-use rinf::{DartSignal, RustSignal};
+use rinf::DartSignal;
 use tokio::{
     sync::{Mutex, RwLock, broadcast},
     task::JoinHandle,
@@ -41,8 +41,8 @@ use tokio_util::sync::CancellationToken;
 use crate::access_policy::{Action, Denial, RuneAccessPolicy};
 use crate::backends::remote::{RemoteConnectError, RendererLink, RendererLinkUse};
 use crate::macros::{
-    RequestAccess, RequestScope, StandaloneRequestReceiver, capability_snapshot, request_access,
-    request_scope,
+    RequestAccess, RequestScope, StandaloneRequestReceiver, answer_node_request,
+    capability_snapshot, request_access, request_scope,
 };
 use crate::request_error::{ExpectedRequestError, player_command_error};
 use crate::request_owner::{CurrentPlayer, Implementation, OpenLibrary};
@@ -61,7 +61,6 @@ use crate::{
         RemoteLossKind, RendererAttachmentChanged, RendererLinkLost, RequestCapabilities,
         RequestCapability, TrustListUpdated, TrustedClientsChanged, TrustedServerCertificate,
     },
-    request_error::classify,
     server::{
         ServerManager, WebSocketService,
         utils::device::{RunMode, load_device_info},
@@ -1481,19 +1480,11 @@ impl NodeSlot {
         &self,
         request: &InitializeNodeRequest,
         broadcaster: Arc<dyn Broadcaster>,
-    ) -> InitializeNodeResponse {
+    ) -> Result<InitializeNodeResponse> {
         let path = &request.config_path;
-        let result = self.initialize(path, path, broadcaster, RunMode::App).await;
-        let (error_kind, error) = match result {
-            Ok(_) => (None, None),
-            Err(error) => (Some(classify(&error)), Some(format!("{error:#}"))),
-        };
-        InitializeNodeResponse {
-            call_id: None,
-            success: error.is_none(),
-            error_kind,
-            error,
-        }
+        self.initialize(path, path, broadcaster, RunMode::App)
+            .await?;
+        Ok(InitializeNodeResponse { call_id: None })
     }
     pub async fn initialize(
         &self,
@@ -1530,11 +1521,21 @@ pub async fn initialize_node(
 
 pub async fn receive_initialize_node() {
     let receiver = InitializeNodeRequest::get_dart_signal_receiver();
+    let emit = |signal: &dyn RinfRustSignal| signal.send_to_dart();
     while let Some(signal) = receiver.recv().await {
-        NODE.handle(&signal.message, Arc::new(LocalGuiBroadcaster))
-            .await
-            .send_signal_to_dart();
+        answer_initialize_node(&NODE, &signal.message, Arc::new(LocalGuiBroadcaster), &emit).await;
     }
+}
+
+/// Initialize the node for one request and answer it like a catalogue request.
+async fn answer_initialize_node(
+    slot: &NodeSlot,
+    request: &InitializeNodeRequest,
+    broadcaster: Arc<dyn Broadcaster>,
+    emit: &impl Fn(&dyn RinfRustSignal),
+) {
+    let result = slot.handle(request, broadcaster).await.map(Some);
+    answer_node_request(request, result, emit);
 }
 
 impl StandaloneRequestReceiver for InitializeNodeRequest {
@@ -1646,5 +1647,66 @@ mod tests {
         assert!(received.try_recv().is_err());
         broadcaster.broadcast(&LibraryContentChanged { path: "a".into() });
         assert!(received.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn node_initialization_answers_name_their_call_and_failures_are_typed()
+    -> anyhow::Result<()> {
+        use super::{NodeSlot, answer_initialize_node};
+        use crate::messages::{
+            InitializeNodeRequest, InitializeNodeResponse, RequestErrorKind, RequestFailedResponse,
+        };
+        use crate::utils::sync_settings::SyncSettings;
+
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        SyncSettings {
+            listen: false,
+            ..SyncSettings::default()
+        }
+        .save(first.path())?;
+        let slot = NodeSlot::new();
+        let answers = StdMutex::new(Vec::new());
+        let emit = |signal: &dyn RinfRustSignal| {
+            let any = signal.as_any();
+            let answer = if let Some(response) = any.downcast_ref::<InitializeNodeResponse>() {
+                (response.call_id, None)
+            } else if let Some(failure) = any.downcast_ref::<RequestFailedResponse>() {
+                (failure.call_id, Some(failure.kind))
+            } else {
+                panic!("unexpected answer {}", signal.name());
+            };
+            answers.lock().unwrap().push(answer);
+        };
+
+        let request = |path: &std::path::Path, call_id| InitializeNodeRequest {
+            config_path: path.to_string_lossy().into_owned(),
+            call_id: Some(call_id),
+        };
+        answer_initialize_node(
+            &slot,
+            &request(first.path(), 7),
+            Arc::new(Quiet(None)),
+            &emit,
+        )
+        .await;
+        // The node exists, so another configuration path is refused.
+        answer_initialize_node(
+            &slot,
+            &request(second.path(), 8),
+            Arc::new(Quiet(None)),
+            &emit,
+        )
+        .await;
+
+        assert_eq!(
+            *answers.lock().unwrap(),
+            [
+                (Some(7), None),
+                (Some(8), Some(RequestErrorKind::InvalidInput))
+            ]
+        );
+        slot.current().await?.shutdown().await?;
+        Ok(())
     }
 }
