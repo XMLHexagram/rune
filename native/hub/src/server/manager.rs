@@ -841,9 +841,8 @@ pub async fn update_root_password<P: AsRef<Path>>(config_path: P, password: &str
 #[cfg(test)]
 mod lifecycle_tests {
     use super::super::sync_worker;
-    use super::super::sync_worker::{
-        PeerEndpoint, PeerPass, TestPeerSession, authenticated_client, test_peer_pass,
-    };
+    use super::super::sync_worker::share_worker_tests::{TestPeerSession, test_peer_pass};
+    use super::super::sync_worker::{PeerEndpoint, PeerPass, authenticated_client};
     use super::super::utils::device::RunMode;
     use crate::Signal;
     use crate::macros::{RequestScope, dispatch_remote, request_scope};
@@ -1109,24 +1108,28 @@ mod lifecycle_tests {
         broadcaster: Arc<dyn Broadcaster>,
         reconnect_config: ReconnectConfig,
     ) -> Result<Fixture> {
-        fixture_with_run_mode(
+        fixture_with_player(
             dir,
             library_id,
             idle_timeout,
             broadcaster,
             reconnect_config,
             RunMode::App,
+            crate::session::PlayerSession::real_player(),
         )
         .await
     }
 
-    async fn fixture_with_run_mode(
+    /// A fixture whose node runs in `run_mode` and plays through the player `wrap_player`
+    /// makes of the real one.
+    async fn fixture_with_player(
         dir: &Path,
         library_id: Uuid,
         idle_timeout: Duration,
         broadcaster: Arc<dyn Broadcaster>,
         reconnect_config: ReconnectConfig,
         run_mode: RunMode,
+        wrap_player: crate::session::PlayerWrap,
     ) -> Result<Fixture> {
         use database::credentials::CredentialStore;
 
@@ -1169,6 +1172,7 @@ mod lifecycle_tests {
             false,
             run_mode,
             reconnect_config,
+            wrap_player,
         )
         .await?;
         fixture_from_library(node_context, library).await
@@ -2698,13 +2702,14 @@ mod lifecycle_tests {
 
         let first = tempfile::tempdir()?;
         let second = tempfile::tempdir()?;
-        let server = fixture_with_run_mode(
+        let server = fixture_with_player(
             first.path(),
             Uuid::new_v4(),
             Duration::from_secs(300),
             Arc::new(Quiet),
             ReconnectConfig::default(),
             RunMode::Server,
+            crate::session::PlayerSession::real_player(),
         )
         .await?;
         let viewer = fixture(second.path()).await?;

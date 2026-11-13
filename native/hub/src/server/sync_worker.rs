@@ -293,11 +293,6 @@ struct StoredSyncToken {
 }
 
 impl SyncTokenStore {
-    #[cfg(test)]
-    pub(crate) fn insert_stale_for_test(&self, fingerprint: &str, base: &str) {
-        self.insert(fingerprint, base, "unknown-to-peer".to_owned());
-    }
-
     /// Serializes authorization per peer endpoint, so concurrent passes against one
     /// peer share a single challenge round trip while other peers are not blocked.
     fn authorization_lock(&self, fingerprint: &str, base: &str) -> Arc<Mutex<()>> {
@@ -732,7 +727,7 @@ fn share_push_failure(error: SharePushError) -> ShareSyncFailure {
 
 #[cfg(test)]
 #[path = "sync_worker_tests.rs"]
-mod share_worker_tests;
+pub(super) mod share_worker_tests;
 
 async fn eligible_libraries(global: &NodeContext) -> Vec<Uuid> {
     match global.library_pool.served_library_ids().await {
@@ -1180,61 +1175,6 @@ fn classify_peer_pass(result: Result<bool>) -> Result<PeerPass> {
         }
         Err(error) => Err(error),
     }
-}
-
-#[cfg(test)]
-#[derive(Default)]
-pub(super) struct TestPeerSession {
-    locks: ReplicaLocks,
-}
-
-#[cfg(test)]
-impl TestPeerSession {
-    pub(super) async fn pass(
-        &self,
-        params: Arc<GlobalParams>,
-        private_key: &str,
-        endpoint: PeerEndpoint,
-        metadata: bool,
-    ) -> Result<PeerPass> {
-        let global = params.node.clone();
-        let credentials = LocalCredentials {
-            fingerprint: global.device_info().await?.fingerprint,
-            private_key: private_key.into(),
-        };
-        let library = global
-            .library_pool
-            .acquire_background(params.library_id.unwrap())
-            .await?;
-        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-        classify_peer_pass(
-            sync_one(
-                &global,
-                &library,
-                &notify,
-                &endpoint,
-                PassOptions {
-                    credentials: &credentials,
-                    metadata,
-                    locks: &self.locks,
-                    cancel: &params.node.token,
-                },
-            )
-            .await,
-        )
-    }
-}
-
-#[cfg(test)]
-pub(super) async fn test_peer_pass(
-    params: Arc<GlobalParams>,
-    private_key: &str,
-    endpoint: PeerEndpoint,
-    metadata: bool,
-) -> Result<PeerPass> {
-    TestPeerSession::default()
-        .pass(params, private_key, endpoint, metadata)
-        .await
 }
 
 struct PassOptions<'a> {

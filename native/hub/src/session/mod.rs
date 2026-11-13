@@ -80,6 +80,9 @@ pub(crate) struct HandoffLoadParams {
     pub playback_mode: Option<PlaybackMode>,
 }
 
+/// Builds the player a session plays through from the real one.
+pub(crate) type PlayerWrap = Box<dyn FnOnce(Player) -> Arc<Mutex<dyn Playable>> + Send>;
+
 pub struct PlayerSession {
     pub player: Arc<Mutex<dyn Playable>>,
     pub scrobbler: Arc<Mutex<dyn ScrobblingServiceManager>>,
@@ -426,10 +429,17 @@ impl PlayerSession {
             .collect())
     }
 
+    /// The player a session plays through, made of the real one. Production uses the real
+    /// player as it is; tests put a player of their own around it.
+    pub(crate) fn real_player() -> PlayerWrap {
+        Box::new(|player| Arc::new(Mutex::new(player)))
+    }
+
     pub(crate) async fn new(
         node: &Arc<NodeContext>,
         name: &str,
         os_media_controls: bool,
+        wrap_player: PlayerWrap,
     ) -> Result<Arc<Self>> {
         let path = Path::new(&*node.config_path)
             .join("sessions")
@@ -440,10 +450,7 @@ impl PlayerSession {
         let fsio = FsIo::new();
         #[cfg(target_os = "android")]
         let fsio = FsIo::new(Path::new(".rune/.android-fs.db"), "")?;
-        let player: Arc<Mutex<dyn Playable>> = Arc::new(Mutex::new(Player::new(
-            Arc::new(fsio),
-            Some(cancel.child_token()),
-        )));
+        let player = wrap_player(Player::new(Arc::new(fsio), Some(cancel.child_token())));
         player
             .lock()
             .await
@@ -493,11 +500,6 @@ impl PlayerSession {
             state.playback_mode(),
         );
         Ok(session)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn persistence_write_count(&self) -> usize {
-        self.persistence_writes.load(Ordering::Acquire)
     }
 
     /// Flush durable state and await the event listeners before terminating playback.
@@ -1229,5 +1231,16 @@ mod scrobbler_error_tests {
         assert!(detail.contains("token rejected"));
         assert!(detail.contains("status=401"));
         assert!(!detail.contains("secret-token-value"));
+    }
+}
+
+#[cfg(test)]
+mod test_access {
+    use super::*;
+
+    impl PlayerSession {
+        pub(crate) fn persistence_write_count(&self) -> usize {
+            self.persistence_writes.load(Ordering::Acquire)
+        }
     }
 }

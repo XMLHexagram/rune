@@ -214,17 +214,6 @@ pub async fn initialize_library_replica(
     Ok(library)
 }
 
-#[cfg(test)]
-impl GlobalParams {
-    /// The library a test fixture opened. Fixtures that build `GlobalParams`
-    /// for a local library always set it, so a missing one is a broken fixture.
-    pub fn test_library(&self) -> &LibraryHandle {
-        self.library
-            .as_ref()
-            .expect("test fixture opened no library")
-    }
-}
-
 impl Debug for GlobalParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GlobalParams")
@@ -2589,6 +2578,19 @@ pub fn init_logging() {
 
 #[cfg(test)]
 mod moved_node_request_tests {
+    use super::GlobalParams;
+    use crate::library_pool::LibraryHandle;
+
+    impl GlobalParams {
+        /// The library a test fixture opened. Fixtures that build `GlobalParams`
+        /// for a local library always set it, so a missing one is a broken fixture.
+        pub fn test_library(&self) -> &LibraryHandle {
+            self.library
+                .as_ref()
+                .expect("test fixture opened no library")
+        }
+    }
+
     use std::{sync::Arc, time::Duration};
 
     use crate::server::utils::device::RunMode;

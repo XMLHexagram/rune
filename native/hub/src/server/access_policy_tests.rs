@@ -21,7 +21,7 @@ mod access_policy_tests {
         cast_library_state, list_peer_libraries, list_renderer_candidates,
     };
     use crate::server::sync::client::LibrarySession;
-    use crate::server::sync_worker::TestPeerSession;
+    use crate::server::sync_worker::share_worker_tests::TestPeerSession;
     use crate::test_wait::{TEST_DEADLINE, wait_until};
     use database::actions::{file::file_ids_by_uuid, stats::{get_liked, set_liked}};
     use database::entities::{media_cover_art, media_files};

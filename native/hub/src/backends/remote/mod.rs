@@ -744,25 +744,6 @@ fn chart_item(item: &PlayingItemRef) -> ChartItem {
     item.clone().into()
 }
 
-#[cfg(test)]
-pub(crate) async fn connect_remote(
-    host: &str,
-    port: u16,
-    config_path: &str,
-    validator: CertValidator,
-    sync_tokens: &SyncTokenStore,
-) -> std::result::Result<RemoteStream, RemoteConnectError> {
-    connect_remote_with_version(
-        host,
-        port,
-        config_path,
-        validator,
-        sync_tokens,
-        PROTOCOL_VERSION,
-    )
-    .await
-}
-
 async fn connect_remote_with_version(
     host: &str,
     port: u16,
@@ -1006,8 +987,29 @@ pub(crate) async fn select_renderer_host(
 }
 
 #[cfg(test)]
+pub(crate) use loss_tests::connect_remote;
+
+#[cfg(test)]
 mod loss_tests {
     use super::*;
+
+    pub(crate) async fn connect_remote(
+        host: &str,
+        port: u16,
+        config_path: &str,
+        validator: CertValidator,
+        sync_tokens: &SyncTokenStore,
+    ) -> std::result::Result<RemoteStream, RemoteConnectError> {
+        connect_remote_with_version(
+            host,
+            port,
+            config_path,
+            validator,
+            sync_tokens,
+            PROTOCOL_VERSION,
+        )
+        .await
+    }
 
     #[test]
     fn remote_failure_keeps_typed_detail() {

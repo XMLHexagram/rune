@@ -2318,3 +2318,61 @@ mod revocation_tests {
         Ok(())
     }
 }
+
+impl SyncTokenStore {
+    pub(crate) fn insert_stale_for_test(&self, fingerprint: &str, base: &str) {
+        self.insert(fingerprint, base, "unknown-to-peer".to_owned());
+    }
+}
+
+#[derive(Default)]
+pub(in crate::server) struct TestPeerSession {
+    locks: ReplicaLocks,
+}
+
+impl TestPeerSession {
+    pub(in crate::server) async fn pass(
+        &self,
+        params: Arc<GlobalParams>,
+        private_key: &str,
+        endpoint: PeerEndpoint,
+        metadata: bool,
+    ) -> Result<PeerPass> {
+        let global = params.node.clone();
+        let credentials = LocalCredentials {
+            fingerprint: global.device_info().await?.fingerprint,
+            private_key: private_key.into(),
+        };
+        let library = global
+            .library_pool
+            .acquire_background(params.library_id.unwrap())
+            .await?;
+        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        classify_peer_pass(
+            sync_one(
+                &global,
+                &library,
+                &notify,
+                &endpoint,
+                PassOptions {
+                    credentials: &credentials,
+                    metadata,
+                    locks: &self.locks,
+                    cancel: &params.node.token,
+                },
+            )
+            .await,
+        )
+    }
+}
+
+pub(in crate::server) async fn test_peer_pass(
+    params: Arc<GlobalParams>,
+    private_key: &str,
+    endpoint: PeerEndpoint,
+    metadata: bool,
+) -> Result<PeerPass> {
+    TestPeerSession::default()
+        .pass(params, private_key, endpoint, metadata)
+        .await
+}

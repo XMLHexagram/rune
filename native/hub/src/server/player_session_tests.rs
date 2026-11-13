@@ -6388,7 +6388,8 @@ pub(super) async fn replicate_host_library_at(
     peer: &Fixture,
     host_addr: SocketAddr,
 ) -> Result<(SocketAddr, Fixture)> {
-    use crate::server::sync_worker::{PeerEndpoint, TestPeerSession};
+    use crate::server::sync_worker::share_worker_tests::TestPeerSession;
+    use crate::server::sync_worker::PeerEndpoint;
 
     let host_info = info(host).await?;
     let peer_info = info(peer).await?;
@@ -6466,30 +6467,36 @@ async fn materialize_replica_file(
     Ok(())
 }
 
-async fn attached_handoff_source(
-    hold_source_library: bool,
-) -> Result<(Vec<TempDir>, Fixture, Fixture, String)> {
-    attached_handoff_source_recorded(hold_source_library, None).await
-}
-
 async fn attached_handoff_source_recorded(
     hold_source_library: bool,
     source_signals: Option<Arc<RecordedSignals>>,
 ) -> Result<(Vec<TempDir>, Fixture, Fixture, String)> {
+    attached_handoff_source_with_player(hold_source_library, source_signals, None).await
+}
+
+/// `source_player` makes the source's player of the real one; none keeps the real player.
+async fn attached_handoff_source_with_player(
+    hold_source_library: bool,
+    source_signals: Option<Arc<RecordedSignals>>,
+    source_player: Option<crate::session::PlayerWrap>,
+) -> Result<(Vec<TempDir>, Fixture, Fixture, String)> {
     let controller_dir = tempfile::tempdir()?;
     let source_dir = tempfile::tempdir()?;
     let controller = fixture(controller_dir.path()).await?;
-    let source = if let Some(signals) = source_signals {
-        fixture_with_broadcaster(
-            source_dir.path(),
-            Uuid::new_v4(),
-            Duration::from_secs(300),
-            signals,
-        )
-        .await?
-    } else {
-        fixture(source_dir.path()).await?
+    let broadcaster: Arc<dyn Broadcaster> = match source_signals {
+        Some(signals) => signals,
+        None => Arc::new(Quiet),
     };
+    let source = fixture_with_player(
+        source_dir.path(),
+        Uuid::new_v4(),
+        Duration::from_secs(300),
+        broadcaster,
+        ReconnectConfig::default(),
+        RunMode::App,
+        source_player.unwrap_or_else(crate::session::PlayerSession::real_player),
+    )
+    .await?;
     let source_id = session_audio(&source, "handoff-retry-source.ogg").await?;
     queue_session(&source, &[source_id]).await?;
     // The fixture track lasts a few seconds; repeat it so a slow run never sees it end.
@@ -6549,11 +6556,216 @@ async fn hand_off(controller: &Fixture, target: Option<String>) -> Result<()> {
     Ok(())
 }
 
+mod faulty_player {
+    use super::*;
+    use futures::future::BoxFuture;
+    use playback::player::{
+        ClearHandoffBlocksResult, HandoffBlockId, HandoffLoadResult, InterruptedItem,
+        PausedPlayback, PlaybackSourceResolver, Player, PlayerCommandError, PlaylistEdit,
+        PlaylistStatus, TakeBackBlockResult,
+    };
+    use playback::pcm_tap::PcmTap;
+    use playback::{InternalLog, PlayerCommand, SimpleReceiver};
+    use tokio::sync::oneshot::{self, Receiver};
+
+    /// The real player, except that a pause is answered with a failure: a device whose player
+    /// cannot pause, so that handing its session off fails at the pause and nowhere else.
+    pub(super) struct PauseFails(pub(super) Player);
+
+    impl Playable for PauseFails {
+        fn command_with_completion(
+            &mut self,
+            command: PlayerCommand,
+        ) -> BoxFuture<
+            'static,
+            std::result::Result<(), PlayerCommandError>,
+        > {
+            if matches!(command, PlayerCommand::Pause) {
+                return Box::pin(std::future::ready(Err(
+                    PlayerCommandError::CannotApply,
+                )));
+            }
+            self.0.command_with_completion(command)
+        }
+        fn command_completion(
+            &mut self,
+        ) -> BoxFuture<
+            'static,
+            std::result::Result<PlayerStatus, PlayerCommandError>,
+        > {
+            self.0.command_completion()
+        }
+        fn load(&self, index: usize) {
+            self.0.load(index)
+        }
+        fn load_at_position(&self, index: usize, position: Duration, play: bool) {
+            self.0.load_at_position(index, position, play)
+        }
+        fn play(&self) {
+            self.0.play()
+        }
+        fn pause(&self) {
+            self.0.pause()
+        }
+        fn stop(&self) {
+            self.0.stop()
+        }
+        fn next(&self) {
+            self.0.next()
+        }
+        fn previous(&self) {
+            self.0.previous()
+        }
+        fn switch(&self, index: usize) {
+            self.0.switch(index)
+        }
+        fn seek(&self, position_seconds: f64) {
+            self.0.seek(position_seconds)
+        }
+        fn add_to_playlist(&self, tracks: Vec<(PlayingItem, PathBuf)>, mode: AddMode) {
+            self.0.add_to_playlist(tracks, mode)
+        }
+        fn add_to_playlist_with_sources(
+            &self,
+            tracks: Vec<(PlayingItem, PlaybackSource)>,
+            mode: AddMode,
+        ) {
+            self.0.add_to_playlist_with_sources(tracks, mode)
+        }
+        fn edit_playlist(&mut self, edit: PlaylistEdit) {
+            self.0.edit_playlist(edit)
+        }
+        fn handoff_load(
+            &self,
+            tracks: Vec<(PlayingItem, PlaybackSource)>,
+            block: HandoffBlockId,
+            start_index: Option<usize>,
+            position: Duration,
+            play: bool,
+            playback_mode: Option<PlaybackMode>,
+        ) -> Receiver<HandoffLoadResult> {
+            self.0
+                .handoff_load(tracks, block, start_index, position, play, playback_mode)
+        }
+        fn take_back_block(
+            &self,
+            block: HandoffBlockId,
+            interrupted: InterruptedItem,
+        ) -> Receiver<Option<TakeBackBlockResult>> {
+            self.0.take_back_block(block, interrupted)
+        }
+        fn clear_handoff_blocks(
+            &self,
+        ) -> Receiver<ClearHandoffBlocksResult> {
+            self.0.clear_handoff_blocks()
+        }
+        fn pause_reporting(&self) -> Receiver<PausedPlayback> {
+            // This pause fails as well: its answer is dropped unsent.
+            oneshot::channel().1
+        }
+        fn restore(
+            &self,
+            tracks: Vec<(PlayingItem, PlaybackSource)>,
+            index: Option<usize>,
+            position: Duration,
+            mode: PlaybackMode,
+        ) {
+            self.0.restore(tracks, index, position, mode)
+        }
+        fn restore_tagged(
+            &self,
+            entries: Vec<QueueEntry>,
+            index: Option<usize>,
+            position: Duration,
+            mode: PlaybackMode,
+        ) {
+            self.0.restore_tagged(entries, index, position, mode)
+        }
+        fn set_source_resolver(&self, resolver: Arc<dyn PlaybackSourceResolver>) {
+            self.0.set_source_resolver(resolver)
+        }
+        fn remove_from_playlist(&self, index: usize) {
+            self.0.remove_from_playlist(index)
+        }
+        fn clear_playlist(&self) {
+            self.0.clear_playlist()
+        }
+        fn move_playlist_item(&self, old_index: usize, new_index: usize) {
+            self.0.move_playlist_item(old_index, new_index)
+        }
+        fn set_playback_mode(&mut self, mode: PlaybackMode) {
+            self.0.set_playback_mode(mode)
+        }
+        fn set_volume(&mut self, volume: f32) {
+            self.0.set_volume(volume)
+        }
+        fn set_realtime_fft_enabled(&mut self, enabled: bool) {
+            self.0.set_realtime_fft_enabled(enabled)
+        }
+        fn pcm_tap(&self) -> Arc<PcmTap> {
+            self.0.pcm_tap()
+        }
+        fn set_adaptive_switching_enabled(&mut self, enabled: bool) {
+            self.0.set_adaptive_switching_enabled(enabled)
+        }
+        fn set_mix_with_others(&mut self, enabled: bool) {
+            self.0.set_mix_with_others(enabled)
+        }
+        fn terminate(&self) {
+            self.0.terminate()
+        }
+        fn get_status(&self) -> PlayerStatus {
+            self.0.get_status()
+        }
+        fn status_after_pending(&self) -> BoxFuture<'static, PlayerStatus> {
+            self.0.status_after_pending()
+        }
+        fn get_playlist(&self) -> Vec<PlayingItem> {
+            self.0.get_playlist()
+        }
+        fn subscribe_status(&self) -> SimpleReceiver<PlayerStatus> {
+            self.0.subscribe_status()
+        }
+        fn subscribe_played_through(&self) -> SimpleReceiver<PlayingItem> {
+            self.0.subscribe_played_through()
+        }
+        fn subscribe_playlist(&self) -> SimpleReceiver<PlaylistStatus> {
+            self.0.subscribe_playlist()
+        }
+        fn subscribe_realtime_fft(&self) -> SimpleReceiver<Vec<f32>> {
+            self.0.subscribe_realtime_fft()
+        }
+        fn subscribe_crash(&self) -> SimpleReceiver<String> {
+            self.0.subscribe_crash()
+        }
+        fn subscribe_log(&self) -> SimpleReceiver<InternalLog> {
+            self.0.subscribe_log()
+        }
+    }
+}
+use faulty_player::PauseFails;
+
+/// A handoff source whose player cannot pause.
+async fn attached_handoff_source_that_cannot_pause()
+-> Result<(Vec<TempDir>, Fixture, Fixture, String)> {
+    attached_handoff_source_with_player(
+        true,
+        None,
+        Some(Box::new(|player| Arc::new(Mutex::new(PauseFails(player))))),
+    )
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn handoff_pause_failure_leaves_destination_unchanged() -> Result<()> {
-    let (_dirs, controller, source, _) = attached_handoff_source(true).await?;
-    controller.global_params.node.fail_next_handoff_pauses(1);
-    assert!(hand_off(&controller, None).await.is_err());
+    let (_dirs, controller, source, _) = attached_handoff_source_that_cannot_pause().await?;
+    let error = hand_off(&controller, None).await.unwrap_err();
+    // The handoff stops at the pause that failed, not at a later check.
+    assert_eq!(
+        crate::request_error::classify(&error),
+        RequestErrorKind::InvalidInput,
+        "{error:#}"
+    );
     assert_eq!(
         controller
             .global_params
@@ -6776,9 +6988,14 @@ async fn handoff_dispatch_appends_to_idle_renderer_queue_and_starts_source_curso
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn failed_pause_does_not_block_a_later_handoff() -> Result<()> {
-    let (_dirs, controller, source, source_fingerprint) = attached_handoff_source(true).await?;
-    controller.global_params.node.fail_next_handoff_pauses(1);
-    assert!(hand_off(&controller, None).await.is_err());
+    let (_dirs, controller, source, source_fingerprint) =
+        attached_handoff_source_that_cannot_pause().await?;
+    let error = hand_off(&controller, None).await.unwrap_err();
+    assert_eq!(
+        crate::request_error::classify(&error),
+        RequestErrorKind::InvalidInput,
+        "{error:#}"
+    );
     hand_off(&controller, Some(source_fingerprint)).await?;
     wait_player(&source, |status| status.state == PlayerPlaybackState::Playing).await?;
     controller.global_params.node.shutdown().await?;

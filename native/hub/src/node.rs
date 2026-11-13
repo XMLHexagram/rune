@@ -48,6 +48,7 @@ use crate::request_error::{ExpectedRequestError, player_command_error};
 use crate::request_owner::{CurrentPlayer, Implementation, OpenLibrary};
 use crate::rpc::{Slot, TargetRequest};
 use crate::server::sync_worker::SyncTokenStore;
+use crate::session::PlayerWrap;
 use crate::subsonic_binding::SubsonicBinding;
 use crate::visualizer::VISUALIZER;
 use crate::{Session, session::PlayerSession};
@@ -165,8 +166,6 @@ pub struct NodeContext {
     handoff_generation: AtomicU64,
     handoff_gate: Mutex<()>,
     handoff_blocks: Mutex<HashMap<String, PlayerHandoffBlockId>>,
-    #[cfg(test)]
-    handoff_pause_failures: AtomicUsize,
 }
 
 impl Debug for NodeContext {
@@ -288,6 +287,7 @@ impl NodeContext {
             os_media_controls,
             run_mode,
             ReconnectConfig::default(),
+            PlayerSession::real_player(),
         )
         .await
     }
@@ -299,6 +299,7 @@ impl NodeContext {
         os_media_controls: bool,
         run_mode: RunMode,
         reconnect_config: ReconnectConfig,
+        wrap_player: PlayerWrap,
     ) -> Result<Arc<Self>> {
         #[cfg(unix)]
         raise_nofile_soft_limit();
@@ -360,8 +361,6 @@ impl NodeContext {
             handoff_generation: AtomicU64::new(0),
             handoff_gate: Mutex::new(()),
             handoff_blocks: Mutex::new(HashMap::new()),
-            #[cfg(test)]
-            handoff_pause_failures: AtomicUsize::new(0),
         });
         let policy = node.access_policy.clone();
         let revoked_tokens = node.sync_tokens.clone();
@@ -396,7 +395,7 @@ impl NodeContext {
             .set(manager.clone())
             .map_err(|_| anyhow::anyhow!("Node server already initialized"))?;
         node.local_session
-            .set(PlayerSession::new(&node, "local", os_media_controls).await?)
+            .set(PlayerSession::new(&node, "local", os_media_controls, wrap_player).await?)
             .map_err(|_| anyhow::anyhow!("Local session already initialized"))?;
         node.refresh_current_player(node.current_player()?)?;
         node.start_notifications().await;
@@ -538,17 +537,6 @@ impl NodeContext {
             return Ok(false);
         }
 
-        #[cfg(test)]
-        if self
-            .handoff_pause_failures
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
-            anyhow::bail!("test pause failure");
-        }
-
         match source.call(&PauseRequest { call_id: None }).await {
             Ok(()) => Ok(true),
             Err(first_error) => {
@@ -564,12 +552,6 @@ impl NodeContext {
                     .or(Err(first_error))
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_handoff_pauses(&self, attempts: usize) {
-        self.handoff_pause_failures
-            .store(attempts, Ordering::Release);
     }
 
     pub async fn session_queue_for_library(&self, library_id: Uuid) -> Result<Vec<i32>> {
