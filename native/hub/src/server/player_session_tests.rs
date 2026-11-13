@@ -11,7 +11,7 @@ use crate::messages::{
     CapabilityReason, LoadPlay, CloseLibraryRequest, CloseLibraryResponse, CreatePlaylistRequest,
     FetchAllPlaylistsRequest, FetchAllPlaylistsResponse, GetPlaylistByIdRequest,
     LibraryContentChanged, LibraryInitializeMode, ListLocalLibrariesRequest, MixQuery,
-    OpenLibraryRequest, OpenLibraryResult, PlaybackState, PlaybackStatus, PlaylistOperateMode,
+    OpenLibraryRequest, PlaybackState, PlaybackStatus, PlaylistOperateMode,
     RegisterLibraryFailureKind, RegisterLibraryOutcome, RemoteConnectionLost,
     RemoteLibraryReconnected, RemoteLibraryReconnecting, RemoteLossKind, RequestCapabilities,
     RequestCapability, RequestFailedResponse, LibraryRecordKindSummary, LibraryRecordSummary,
@@ -446,7 +446,7 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
         CollectionType, FetchAllPlaylistsRequest, FetchCollectionByIdsRequest,
         FetchCollectionGroupSummaryRequest, FetchCollectionGroupsRequest,
         FetchMediaFileByIdsRequest, LoadResolvedItemsRequest, MixQueryRequest,
-        OpenLibraryFailureKind, OpenLibraryRequest, OpenLibraryResult, SearchForRequest,
+        OpenLibraryFailureKind, OpenLibraryRequest, SearchForRequest,
     };
     use database::library_registry::{
         CatalogPlacement, LibraryRecord, LibraryRecordId, LibraryRegistry, ProtocolAdapter,
@@ -491,7 +491,7 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
         10,
         Duration::from_secs(5),
     )));
-    let opened = open_library_by_record_on_node(
+    open_library_by_record_on_node(
         &OpenLibraryRequest {
             call_id: Some(1),
             record_id: record.record_id.0.to_string(),
@@ -499,8 +499,7 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
         node.clone(),
         scrobbler.clone(),
     )
-    .await;
-    assert_eq!(opened.result, OpenLibraryResult::Opened);
+    .await?;
     assert!(matches!(
         node.current_library(),
         Ok(OpenLibrary::Subsonic(_))
@@ -935,8 +934,15 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
         scrobbler.clone(),
     )
     .await;
-    assert!(
-        matches!(rejected.result, OpenLibraryResult::Failed(failure) if failure.kind == OpenLibraryFailureKind::RemoteNotAuthorized && !failure.detail.contains("t=") && !failure.detail.contains("p=") && !failure.detail.contains("s="))
+    let rejected = match rejected {
+        Ok(_) => anyhow::bail!("a rejected Subsonic account must not open"),
+        Err(error) => error,
+    };
+    let detail = format!("{rejected:#}");
+    assert!(!detail.contains("t=") && !detail.contains("p=") && !detail.contains("s="));
+    assert_eq!(
+        opened_failure_kind(Err(rejected))?,
+        OpenLibraryFailureKind::RemoteNotAuthorized
     );
     assert_eq!(*bad_calls.lock().unwrap(), ["ping", "getUser"]);
 
@@ -975,9 +981,7 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
         scrobbler,
     )
     .await;
-    assert!(
-        matches!(unreachable.result, OpenLibraryResult::Failed(failure) if failure.kind == OpenLibraryFailureKind::RemoteUnreachable)
-    );
+    assert_eq!(opened_failure_kind(unreachable)?, OpenLibraryFailureKind::RemoteUnreachable);
 
     reject_stream.store(false, Ordering::Release);
     let fixture = reopen_fixture(&fixture).await?;
@@ -1011,7 +1015,7 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subsonic_relogin_replaces_only_a_verified_secret() -> Result<()> {
-    use crate::messages::{OpenLibraryRequest, OpenLibraryResult, ReplaceSubsonicCredentialRequest};
+    use crate::messages::{OpenLibraryRequest, ReplaceSubsonicCredentialRequest};
     use crate::request_error::request_failure_cause;
     use database::library_registry::{
         CatalogPlacement, LibraryRecord, LibraryRecordId, LibraryRegistry, ProtocolAdapter,
@@ -1080,7 +1084,7 @@ async fn subsonic_relogin_replaces_only_a_verified_secret() -> Result<()> {
         ProtocolAdapter::SubsonicTranslate { credential: stored_ref, .. } if stored_ref == credential
     ));
 
-    let opened = open_library_by_record_on_node(
+    open_library_by_record_on_node(
         &OpenLibraryRequest {
             call_id: Some(2),
             record_id: record.record_id.0.to_string(),
@@ -1091,8 +1095,7 @@ async fn subsonic_relogin_replaces_only_a_verified_secret() -> Result<()> {
             Duration::from_secs(5),
         ))),
     )
-    .await;
-    assert_eq!(opened.result, OpenLibraryResult::Opened);
+    .await?;
 
     server.abort();
     node.close_ui(&fixture.global_params.main_token).await;
@@ -1796,6 +1799,34 @@ async fn removing_trust_with_an_unreadable_trust_store_fails() -> Result<()> {
         RequestErrorKind::Internal
     );
     Ok(())
+}
+
+/// The failure kind of a library record removal that must fail.
+fn removal_failure_kind(
+    result: Result<Option<crate::messages::RemoveLibraryRecordResponse>>,
+) -> Result<crate::messages::RemoveLibraryRecordFailureKind> {
+    let error = match result {
+        Ok(_) => anyhow::bail!("the record removal must fail"),
+        Err(error) => error,
+    };
+    match crate::request_error::request_failure_cause(&error) {
+        Some(RequestFailureCause::LibraryRecordRemovalFailed { kind }) => Ok(kind),
+        cause => anyhow::bail!("removal failed without its kind ({cause:?}): {error:#}"),
+    }
+}
+
+/// The failure kind of a library that must not open.
+fn opened_failure_kind(
+    result: Result<crate::messages::OpenLibraryResponse>,
+) -> Result<OpenLibraryFailureKind> {
+    let error = match result {
+        Ok(response) => anyhow::bail!("record {} must not open", response.record_id),
+        Err(error) => error,
+    };
+    match crate::request_error::request_failure_cause(&error) {
+        Some(RequestFailureCause::LibraryOpenFailed { kind }) => Ok(kind),
+        cause => anyhow::bail!("opening failed without its kind ({cause:?}): {error:#}"),
+    }
 }
 
 /// The failure kind of a library registration that must fail.
@@ -9922,7 +9953,7 @@ async fn local_session_signals_are_hidden_during_subsonic_remote_control() -> Re
         node.clone(),
         Arc::new(Mutex::new(ScrobblingManager::new(10, Duration::from_secs(5)))),
     )
-    .await;
+    .await?;
     anyhow::ensure!(
         matches!(node.current_player()?, CurrentPlayer::SubsonicJukebox(_)),
         "Subsonic remote-control player did not become current"
@@ -10056,7 +10087,7 @@ async fn opening_local_library_restores_local_session_signals() -> Result<()> {
         node.clone(),
         Arc::new(Mutex::new(ScrobblingManager::new(10, Duration::from_secs(5)))),
     )
-    .await;
+    .await?;
 
     signals.clear();
     node.set_open_local_catalog(
@@ -10144,7 +10175,7 @@ async fn subsonic_remote_control_pauses_and_restores_local_session_position() ->
         node.clone(),
         Arc::new(Mutex::new(ScrobblingManager::new(10, Duration::from_secs(5)))),
     )
-    .await;
+    .await?;
 
     let paused = node.session()?.playback_snapshot().await.0;
     assert_eq!(paused.state, PlayerPlaybackState::Paused);
@@ -10287,7 +10318,7 @@ async fn subsonic_visualizer_covers_use_the_bounded_server_cover_cache() -> Resu
     )
     .await?;
     let record = registration.record.context("registered Subsonic library")?;
-    let opened = open_library_by_record_on_node(
+    open_library_by_record_on_node(
         &OpenLibraryRequest {
             call_id: None,
             record_id: record.record_id.clone(),
@@ -10298,8 +10329,7 @@ async fn subsonic_visualizer_covers_use_the_bounded_server_cover_cache() -> Resu
             Duration::from_secs(5),
         ))),
     )
-    .await;
-    anyhow::ensure!(matches!(opened.result, OpenLibraryResult::Opened));
+    .await?;
     let library_id = match node.current_library()? {
         OpenLibrary::Subsonic(binding) => binding.library_id,
         _ => anyhow::bail!("registered Subsonic library was not opened"),
@@ -10542,9 +10572,9 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
     use crate::messages::{
         InvalidRecordReasonSummary, LibraryInitializeMode, LibraryRecordKindSummary,
         LibraryRecordsChanged, ListLibraryRecordsRequest, OpenLibraryFailureKind,
-        OpenLibraryRequest, OpenLibraryResult, RegisterLibraryFailureKind, RegisterLibraryOutcome,
+        OpenLibraryRequest, RegisterLibraryFailureKind, RegisterLibraryOutcome,
         RegisterLocalLibraryRequest, RegisterRemoteControlRequest, RemoveLibraryRecordFailureKind,
-        RemoveLibraryRecordOutcome, RemoveLibraryRecordRequest,
+        RemoveLibraryRecordRequest,
     };
     use database::library_registry::{
         CatalogPlacement, FsAdapter, LibraryRecord, LibraryRecordId, LibraryRegistry,
@@ -10610,8 +10640,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         node.clone(),
         scrobbler.clone(),
     )
-    .await;
-    assert_eq!(opened.result, OpenLibraryResult::Opened);
+    .await?;
     let first_generation = opened.generation;
     assert!(first_generation > 0);
     let first_snapshot = capability_snapshot(&node)?;
@@ -10651,8 +10680,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         node.clone(),
         scrobbler.clone(),
     )
-    .await;
-    assert_eq!(second_opened.result, OpenLibraryResult::Opened);
+    .await?;
     assert!(second_opened.generation > first_generation);
     let second_snapshot = capability_snapshot(&node)?;
     assert_eq!(
@@ -10675,7 +10703,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         .context("registry libraries")?
         .push(serde_json::to_value(&invalid_record)?);
     std::fs::write(&registry_path, serde_json::to_vec_pretty(&registry_json)?)?;
-    let valid_reopen = open_library_by_record_on_node(
+    open_library_by_record_on_node(
         &OpenLibraryRequest {
             call_id: Some(30),
             record_id: record_id.clone(),
@@ -10683,8 +10711,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         node.clone(),
         scrobbler.clone(),
     )
-    .await;
-    assert_eq!(valid_reopen.result, OpenLibraryResult::Opened);
+    .await?;
     let invalid_open = open_library_by_record_on_node(
         &OpenLibraryRequest {
             call_id: Some(31),
@@ -10694,17 +10721,14 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         scrobbler.clone(),
     )
     .await;
-    assert!(
-        matches!(invalid_open.result, OpenLibraryResult::Failed(failure)
-        if failure.kind == OpenLibraryFailureKind::InvalidRecord)
-    );
+    assert_eq!(opened_failure_kind(invalid_open)?, OpenLibraryFailureKind::InvalidRecord);
     assert!(
         LibraryRegistry::load(PathBuf::from(&*node.config_path).as_path())?
             .invalid
             .iter()
             .any(|(id, _)| *id == invalid_id)
     );
-    let valid_again = open_library_by_record_on_node(
+    open_library_by_record_on_node(
         &OpenLibraryRequest {
             call_id: Some(32),
             record_id: second_record_id.clone(),
@@ -10712,8 +10736,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         node.clone(),
         scrobbler.clone(),
     )
-    .await;
-    assert_eq!(valid_again.result, OpenLibraryResult::Opened);
+    .await?;
     let current = node.current_ui().await?;
 
     let unknown = open_library_by_record_on_node(
@@ -10725,8 +10748,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         scrobbler.clone(),
     )
     .await;
-    assert!(matches!(unknown.result, OpenLibraryResult::Failed(failure)
-        if failure.kind == OpenLibraryFailureKind::RecordNotFound));
+    assert_eq!(opened_failure_kind(unknown)?, OpenLibraryFailureKind::RecordNotFound);
 
     let unreachable = format!("unreachable-{}", Uuid::new_v4());
     let missing_replica = LibraryRecord {
@@ -10760,8 +10782,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         scrobbler.clone(),
     )
     .await;
-    assert!(matches!(missing.result, OpenLibraryResult::Failed(failure)
-        if failure.kind == OpenLibraryFailureKind::MediaFolderMissing));
+    assert_eq!(opened_failure_kind(missing)?, OpenLibraryFailureKind::MediaFolderMissing);
 
     let subsonic_credential = node
         .credentials
@@ -10797,10 +10818,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         scrobbler.clone(),
     )
     .await;
-    assert!(
-        matches!(unreachable_subsonic.result, OpenLibraryResult::Failed(failure)
-        if failure.kind == OpenLibraryFailureKind::RemoteUnreachable)
-    );
+    assert_eq!(opened_failure_kind(unreachable_subsonic)?, OpenLibraryFailureKind::RemoteUnreachable);
 
     node.cert_validator
         .read()
@@ -10890,7 +10908,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         scrobbler,
     )
     .await;
-    assert!(matches!(failure.result, OpenLibraryResult::Failed(_)));
+    opened_failure_kind(failure)?;
     let after_failure = node.current_ui().await?;
     assert!(Arc::ptr_eq(&current, &after_failure));
     dispatch_gui_request(&after_failure, &FetchAllPlaylistsRequest { call_id: None }).await?;
@@ -10907,37 +10925,32 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
             record_id: second_record_id.clone(),
         },
     )
-    .await?
-    .context("open record removal")?;
+    .await;
     assert_eq!(
-        open_removal.outcome,
-        RemoveLibraryRecordOutcome::Failed(RemoveLibraryRecordFailureKind::RecordIsOpen)
+        removal_failure_kind(open_removal)?,
+        RemoveLibraryRecordFailureKind::RecordIsOpen
     );
     let unknown_removal = RemoveLibraryRecordRequest {
         call_id: None,
         record_id: Uuid::new_v4().to_string(),
     };
     assert_eq!(
-        unknown_removal
-            .handle(node.clone(), None, &unknown_removal)
-            .await?
-            .context("unknown record removal")?
-            .outcome,
-        RemoveLibraryRecordOutcome::Failed(RemoveLibraryRecordFailureKind::RecordNotFound)
+        removal_failure_kind(
+            unknown_removal
+                .handle(node.clone(), None, &unknown_removal)
+                .await
+        )?,
+        RemoveLibraryRecordFailureKind::RecordNotFound
     );
     let remove_remote = RemoveLibraryRecordRequest {
         call_id: None,
         record_id: remote_id.clone(),
     };
     signals.clear();
-    assert_eq!(
-        remove_remote
-            .handle(node.clone(), None, &remove_remote)
-            .await?
-            .context("remote record removal")?
-            .outcome,
-        RemoveLibraryRecordOutcome::Removed
-    );
+    remove_remote
+        .handle(node.clone(), None, &remove_remote)
+        .await?
+        .context("remote record removal")?;
     let subsonic_cache = PathBuf::from(&*node.config_path)
         .join("subsonic-covers")
         .join(subsonic.record_id.0.to_string());
@@ -10947,27 +10960,19 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
         call_id: None,
         record_id: subsonic.record_id.0.to_string(),
     };
-    assert_eq!(
-        remove_subsonic
-            .handle(node.clone(), None, &remove_subsonic)
-            .await?
-            .context("Subsonic record removal")?
-            .outcome,
-        RemoveLibraryRecordOutcome::Removed
-    );
+    remove_subsonic
+        .handle(node.clone(), None, &remove_subsonic)
+        .await?
+        .context("Subsonic record removal")?;
     assert!(!subsonic_cache.exists());
     let remove_invalid = RemoveLibraryRecordRequest {
         call_id: None,
         record_id: invalid_id.0.to_string(),
     };
-    assert_eq!(
-        remove_invalid
-            .handle(node.clone(), None, &remove_invalid)
-            .await?
-            .context("invalid record removal")?
-            .outcome,
-        RemoveLibraryRecordOutcome::Removed
-    );
+    remove_invalid
+        .handle(node.clone(), None, &remove_invalid)
+        .await?
+        .context("invalid record removal")?;
     assert!(
         signals
             .decoded::<LibraryRecordsChanged>("LibraryRecordsChanged")
@@ -11005,7 +11010,7 @@ async fn library_records_register_open_and_preserve_previous_ui_on_failure() -> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn registered_remote_control_opens_and_routes_library_and_session_requests() -> Result<()> {
     use crate::messages::{
-        OpenLibraryRequest, OpenLibraryResult, RegisterLibraryOutcome, RegisterRemoteControlRequest,
+        OpenLibraryRequest, RegisterLibraryOutcome, RegisterRemoteControlRequest,
     };
     use scrobbling::manager::ScrobblingManager;
     use tokio::sync::Mutex;
@@ -11041,7 +11046,7 @@ async fn registered_remote_control_opens_and_routes_library_and_session_requests
         10,
         Duration::from_secs(5),
     )));
-    let opened = open_library_by_record_on_node(
+    open_library_by_record_on_node(
         &OpenLibraryRequest {
             call_id: Some(22),
             record_id,
@@ -11049,8 +11054,7 @@ async fn registered_remote_control_opens_and_routes_library_and_session_requests
         a.global_params.node.clone(),
         scrobbler,
     )
-    .await;
-    assert_eq!(opened.result, OpenLibraryResult::Opened);
+    .await?;
     let params = a.global_params.node.current_ui().await?;
     assert_eq!(params.library_id, b.global_params.library_id);
     let other_id = super::held_owned_library(&b, &b_dir.path().join("other-library")).await?;
@@ -11068,7 +11072,7 @@ async fn registered_remote_control_opens_and_routes_library_and_session_requests
 
     let registry = LibraryRegistry::load(Path::new(&*b.global_params.config_path))?;
     let record_id = registry.catalog(other_id)?.record_id.0.to_string();
-    let opened = open_library_by_record_on_node(
+    open_library_by_record_on_node(
         &OpenLibraryRequest {
             call_id: None,
             record_id,
@@ -11079,8 +11083,7 @@ async fn registered_remote_control_opens_and_routes_library_and_session_requests
             Duration::from_secs(5),
         ))),
     )
-    .await;
-    assert_eq!(opened.result, OpenLibraryResult::Opened);
+    .await?;
     let link = a
         .global_params
         .node
@@ -11644,7 +11647,7 @@ async fn controller_capabilities_follow_catalogue_access_grants() -> Result<()> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_scopes_resolve_to_the_current_implementations() -> Result<()> {
     use crate::messages::{
-        FetchAllPlaylistsRequest, HandoffRequest, OpenLibraryRequest, OpenLibraryResult,
+        FetchAllPlaylistsRequest, HandoffRequest, OpenLibraryRequest,
         PauseRequest,
     };
     use scrobbling::manager::ScrobblingManager;
@@ -11750,7 +11753,7 @@ async fn request_scopes_resolve_to_the_current_implementations() -> Result<()> {
         .await?;
         assert_eq!(registered.outcome, RegisterLibraryOutcome::Registered);
         let record = registered.record.context("Subsonic record")?;
-        let opened = open_library_by_record_on_node(
+        open_library_by_record_on_node(
             &OpenLibraryRequest {
                 call_id: Some(1),
                 record_id: record.record_id,
@@ -11761,8 +11764,7 @@ async fn request_scopes_resolve_to_the_current_implementations() -> Result<()> {
                 Duration::from_secs(5),
             ))),
         )
-        .await;
-        assert_eq!(opened.result, OpenLibraryResult::Opened);
+        .await?;
         if jukebox {
             assert_scopes!(
                 subsonic_node.global_params.node,

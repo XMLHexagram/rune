@@ -4,8 +4,9 @@ use thiserror::Error as ThisError;
 
 use crate::access_policy::Denial;
 use crate::messages::{
-    CastLibraryState, LibraryOpenErrorKind, LibraryTaskKind, ProtocolUpdateSide,
-    RegisterLibraryFailureKind, RequestErrorKind, RequestFailureCause,
+    CastLibraryState, LibraryOpenErrorKind, LibraryTaskKind, OpenLibraryFailureKind,
+    ProtocolUpdateSide, RegisterLibraryFailureKind, RemoveLibraryRecordFailureKind,
+    RequestErrorKind, RequestFailureCause,
 };
 use crate::rpc::UnsupportedReason;
 use discovery::protocol_version::ProtocolVersion;
@@ -77,6 +78,12 @@ pub enum ExpectedRequestError {
     LibraryRegistrationFailed { kind: RegisterLibraryFailureKind },
     #[error("Remote library could not be opened: {kind:?}")]
     RemoteOpenFailed { kind: LibraryOpenErrorKind },
+    #[error("Library could not be opened: {kind:?}")]
+    LibraryOpenFailed { kind: OpenLibraryFailureKind },
+    #[error("Library record could not be removed: {kind:?}")]
+    LibraryRecordRemovalFailed {
+        kind: RemoveLibraryRecordFailureKind,
+    },
 }
 
 impl ExpectedRequestError {
@@ -141,6 +148,20 @@ fn registration_failure_kind(kind: RegisterLibraryFailureKind) -> RequestErrorKi
     }
 }
 
+/// The request failure kind of a library that could not be opened.
+fn open_failure_kind(kind: OpenLibraryFailureKind) -> RequestErrorKind {
+    use OpenLibraryFailureKind as Kind;
+    match kind {
+        Kind::InvalidRecord => RequestErrorKind::InvalidInput,
+        Kind::RecordNotFound | Kind::MediaFolderMissing => RequestErrorKind::NotFound,
+        Kind::RemoteUntrusted | Kind::RemoteNotAuthorized => RequestErrorKind::PermissionDenied,
+        Kind::ProtocolIncompatible => RequestErrorKind::PeerNeedsUpdate,
+        Kind::RemoteUnreachable | Kind::RemoteProtocol | Kind::NotSupportedYet | Kind::Storage => {
+            RequestErrorKind::Unavailable
+        }
+    }
+}
+
 /// Classify a request failure without relying on its diagnostic text.
 pub fn classify(error: &Error) -> RequestErrorKind {
     if sync_orm::is_storage_busy(error) {
@@ -197,6 +218,11 @@ pub fn classify(error: &Error) -> RequestErrorKind {
                     }
                     LibraryOpenErrorKind::RemoteUnreachable
                     | LibraryOpenErrorKind::RemoteProtocol => RequestErrorKind::Unavailable,
+                },
+                ExpectedRequestError::LibraryOpenFailed { kind } => open_failure_kind(*kind),
+                ExpectedRequestError::LibraryRecordRemovalFailed { kind } => match kind {
+                    RemoveLibraryRecordFailureKind::RecordNotFound => RequestErrorKind::NotFound,
+                    RemoveLibraryRecordFailureKind::RecordIsOpen => RequestErrorKind::Conflict,
                 },
             };
         }
@@ -260,6 +286,12 @@ pub fn request_failure_cause(error: &Error) -> Option<RequestFailureCause> {
                 }
                 ExpectedRequestError::RemoteOpenFailed { kind } => {
                     return Some(RequestFailureCause::RemoteOpenFailed { kind: *kind });
+                }
+                ExpectedRequestError::LibraryOpenFailed { kind } => {
+                    return Some(RequestFailureCause::LibraryOpenFailed { kind: *kind });
+                }
+                ExpectedRequestError::LibraryRecordRemovalFailed { kind } => {
+                    return Some(RequestFailureCause::LibraryRecordRemovalFailed { kind: *kind });
                 }
                 _ => {}
             }

@@ -34,7 +34,6 @@ OpenLibraryResponse _opened(String recordId, int callId) => OpenLibraryResponse(
   callId: Uint64.fromBigInt(BigInt.from(callId)),
   recordId: recordId,
   generation: Uint64.fromBigInt(BigInt.from(1)),
-  result: const OpenLibraryResultOpened(),
 );
 
 Widget _app({

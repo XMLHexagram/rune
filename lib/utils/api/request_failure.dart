@@ -95,6 +95,10 @@ String requestFailureMessage(AppLocalizations s, RequestFailure failure) =>
         libraryRegistryFailureMessage(s, kind),
       RequestFailureCauseRemoteOpenFailed(:final kind) =>
         remoteOpenErrorMessage(s, kind),
+      RequestFailureCauseLibraryOpenFailed(:final kind) =>
+        libraryRegistryFailureMessage(s, kind),
+      RequestFailureCauseLibraryRecordRemovalFailed(:final kind) =>
+        libraryRegistryFailureMessage(s, kind),
       RequestFailureCauseCertificateMismatch() => s.requestCertificateMismatch,
       RequestFailureCausePublicKeyMismatch() => s.requestPublicKeyMismatch,
       RequestFailureCauseRegistrationConflict() =>

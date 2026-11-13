@@ -1,6 +1,5 @@
 import 'package:fluent_ui/fluent_ui.dart';
 
-import '../../../bindings/bindings.dart';
 import '../../api/request_failure.dart';
 import '../../l10n.dart';
 import '../../router/navigation.dart';
@@ -113,11 +112,8 @@ Future<void> openLibraryWithSubsonicRelogin(
 ) async {
   try {
     await registry.open(recordId);
-  } on LibraryRegistryFailure catch (error) {
-    if (error.kind != OpenLibraryFailureKind.remoteNotAuthorized ||
-        !context.mounted) {
-      rethrow;
-    }
+  } on RequestFailure catch (error) {
+    if (!needsLibraryRelogin(error) || !context.mounted) rethrow;
     final updated = await showSubsonicReloginDialog(
       context,
       registry,

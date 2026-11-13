@@ -14,8 +14,8 @@ use crate::{
         InvalidLibraryRecordSummary, InvalidRecordReasonSummary, LibraryRecordKindSummary,
         LibraryRecordSummary, LibraryRecordsChanged, ListLibraryRecordsRequest,
         ListLibraryRecordsResponse, ListLocalLibrariesRequest, ListLocalLibrariesResponse,
-        LocalLibrary, OpenRecord, RemoveLibraryRecordFailureKind, RemoveLibraryRecordOutcome,
-        RemoveLibraryRecordRequest, RemoveLibraryRecordResponse, SetLibraryBackgroundSyncRequest,
+        LocalLibrary, OpenRecord, RemoveLibraryRecordFailureKind, RemoveLibraryRecordRequest,
+        RemoveLibraryRecordResponse, SetLibraryBackgroundSyncRequest,
         SetLibraryBackgroundSyncResponse,
     },
     node::NodeContext,
@@ -178,12 +178,9 @@ impl Signal for RemoveLibraryRecordRequest {
         request: &Self,
     ) -> Result<Option<Self::Response>> {
         let Ok(id) = Uuid::parse_str(&request.record_id) else {
-            return Ok(Some(RemoveLibraryRecordResponse {
-                call_id: None,
-                outcome: RemoveLibraryRecordOutcome::Failed(
-                    RemoveLibraryRecordFailureKind::RecordNotFound,
-                ),
-            }));
+            return Err(removal_failure(
+                RemoveLibraryRecordFailureKind::RecordNotFound,
+            ));
         };
         let (open_id, _, _) = node.capability_library_identity()?;
         if open_id
@@ -191,12 +188,9 @@ impl Signal for RemoveLibraryRecordRequest {
             .and_then(|record_id| Uuid::parse_str(record_id).ok())
             == Some(id)
         {
-            return Ok(Some(RemoveLibraryRecordResponse {
-                call_id: None,
-                outcome: RemoveLibraryRecordOutcome::Failed(
-                    RemoveLibraryRecordFailureKind::RecordIsOpen,
-                ),
-            }));
+            return Err(removal_failure(
+                RemoveLibraryRecordFailureKind::RecordIsOpen,
+            ));
         }
         let config = Path::new(&*node.config_path);
         let registry = LibraryRegistry::load(config)?;
@@ -210,12 +204,9 @@ impl Signal for RemoveLibraryRecordRequest {
                 .iter()
                 .any(|(record_id, _)| record_id.0 == id)
         {
-            return Ok(Some(RemoveLibraryRecordResponse {
-                call_id: None,
-                outcome: RemoveLibraryRecordOutcome::Failed(
-                    RemoveLibraryRecordFailureKind::RecordNotFound,
-                ),
-            }));
+            return Err(removal_failure(
+                RemoveLibraryRecordFailureKind::RecordNotFound,
+            ));
         }
         let library_id = record.and_then(|record| record.catalog_library_id());
         let subsonic_library_id = record.and_then(|record| {
@@ -223,12 +214,9 @@ impl Signal for RemoveLibraryRecordRequest {
                 .then(|| record.catalog_library_id().unwrap_or(record.record_id.0))
         });
         if !LibraryRegistry::remove_record(config, LibraryRecordId(id), &node.credentials).await? {
-            return Ok(Some(RemoveLibraryRecordResponse {
-                call_id: None,
-                outcome: RemoveLibraryRecordOutcome::Failed(
-                    RemoveLibraryRecordFailureKind::RecordNotFound,
-                ),
-            }));
+            return Err(removal_failure(
+                RemoveLibraryRecordFailureKind::RecordNotFound,
+            ));
         }
         if let Some(library_id) = library_id {
             node.stop_library_sync(library_id).await;
@@ -238,11 +226,13 @@ impl Signal for RemoveLibraryRecordRequest {
             delete_subsonic_cover_cache(config, library_id).await?;
         }
         publish_library_records_changed(&node).await?;
-        Ok(Some(RemoveLibraryRecordResponse {
-            call_id: None,
-            outcome: RemoveLibraryRecordOutcome::Removed,
-        }))
+        Ok(Some(RemoveLibraryRecordResponse { call_id: None }))
     }
+}
+
+/// A library record that could not be removed, of `kind`.
+fn removal_failure(kind: RemoveLibraryRecordFailureKind) -> anyhow::Error {
+    ExpectedRequestError::LibraryRecordRemovalFailed { kind }.into()
 }
 
 impl ParamsExtractor for ListLocalLibrariesRequest {

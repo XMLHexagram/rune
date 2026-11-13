@@ -931,9 +931,8 @@ mod lifecycle_tests {
     use crate::library_pool::{LibraryHandle, LibraryPool};
     use crate::messages::{
         DeviceConnectionLevel, DeviceSyncLevel, LibraryInitializeMode, OpenLibraryRequest,
-        OpenLibraryResult, PlaybackState, PlaybackStatus, RegisterLocalLibraryRequest,
-        RegisterRemoteControlRequest, RequestErrorKind, RequestFailureCause, TrustListUpdated,
-        TrustedServerCertificate,
+        PlaybackState, PlaybackStatus, RegisterLocalLibraryRequest, RegisterRemoteControlRequest,
+        RequestErrorKind, RequestFailureCause, TrustListUpdated, TrustedServerCertificate,
     };
     use crate::node::{NodeSlot, ReconnectConfig};
     use crate::request_error::{ExpectedRequestError, request_failure_cause};
@@ -1004,11 +1003,9 @@ mod lifecycle_tests {
                 Duration::from_secs(5),
             ))),
         )
-        .await;
-        match opened.result {
-            OpenLibraryResult::Opened => node.current_ui().await,
-            OpenLibraryResult::Failed(failure) => Err(anyhow::anyhow!(failure.detail)),
-        }
+        .await?;
+        anyhow::ensure!(opened.record_id == record_id, "opened another record");
+        node.current_ui().await
     }
 
     async fn peer_step<T>(
@@ -1828,11 +1825,10 @@ mod lifecycle_tests {
             call_id: None,
             record_id: record.record_id.0.to_string(),
         };
-        let response = request
+        request
             .handle(owner.global_params.node.clone(), None, &request)
             .await?
             .context("remove response")?;
-        anyhow::ensure!(response.outcome == RemoveLibraryRecordOutcome::Removed);
         anyhow::ensure!(worker_token.is_cancelled(), "sync worker was not cancelled");
         let after: Vec<ListedLibrary> = client
             .get(format!("https://{address}/libraries"))

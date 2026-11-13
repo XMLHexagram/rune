@@ -310,12 +310,7 @@ mod node_request_loop_tests {
             _: &NodeSlot,
             _: &RemoveLibraryRecordRequest,
         ) -> impl Future<Output = Result<Option<RemoveLibraryRecordResponse>>> + Send {
-            async {
-                Ok(Some(RemoveLibraryRecordResponse {
-                    call_id: None,
-                    outcome: RemoveLibraryRecordOutcome::Removed,
-                }))
-            }
+            async { Ok(Some(RemoveLibraryRecordResponse { call_id: None })) }
         }
 
         fn handle_register_local_library_request(
@@ -381,7 +376,6 @@ mod node_request_loop_tests {
                 call_id: request.call_id,
                 record_id: request.record_id.clone(),
                 generation: 1,
-                result: OpenLibraryResult::Opened,
             };
             async move { Ok(Some(response)) }
         }

@@ -370,15 +370,8 @@ pub enum RemoveLibraryRecordFailureKind {
     RecordIsOpen,
 }
 
-#[derive(Serialize, Deserialize, SignalPiece, Clone, Debug, PartialEq, Eq)]
-pub enum RemoveLibraryRecordOutcome {
-    Removed,
-    Failed(RemoveLibraryRecordFailureKind),
-}
-
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct RemoveLibraryRecordResponse {
-    pub outcome: RemoveLibraryRecordOutcome,
     #[serde(default)]
     pub call_id: Option<u64>,
 }
@@ -459,25 +452,12 @@ pub enum OpenLibraryFailureKind {
     Storage,
 }
 
-#[derive(Serialize, Deserialize, SignalPiece, Clone, Debug, PartialEq, Eq)]
-pub enum OpenLibraryResult {
-    Opened,
-    Failed(OpenLibraryFailure),
-}
-
-#[derive(Serialize, Deserialize, SignalPiece, Clone, Debug, PartialEq, Eq)]
-pub struct OpenLibraryFailure {
-    pub kind: OpenLibraryFailureKind,
-    pub detail: String,
-}
-
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct OpenLibraryResponse {
     #[serde(default)]
     pub call_id: Option<u64>,
     pub record_id: String,
     pub generation: u64,
-    pub result: OpenLibraryResult,
 }
 
 #[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]

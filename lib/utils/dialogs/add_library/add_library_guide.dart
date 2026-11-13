@@ -17,7 +17,6 @@ import '../../../utils/dialogs/failed_to_initialize_library.dart';
 import '../../../utils/dialogs/information/error.dart';
 import '../../../utils/dialogs/subsonic/subsonic_relogin_dialog.dart';
 import '../../../utils/l10n.dart';
-import '../../../utils/library_registry_messages.dart';
 import '../../../utils/library_ui/library_ui_state.dart';
 import '../../../utils/file_storage/mac_secure_manager.dart';
 import '../../../utils/router/navigation.dart';
@@ -862,9 +861,7 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
       if (!mounted) return false;
       await showFailedToInitializeLibrary(
         context,
-        error is LibraryRegistryFailure
-            ? libraryRegistryFailureMessage(S.of(context), error.kind)
-            : S.of(context).unknownError,
+        libraryFailureMessage(S.of(context), error),
       );
       return false;
     }

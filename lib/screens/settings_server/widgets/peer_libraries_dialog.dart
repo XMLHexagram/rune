@@ -4,7 +4,6 @@ import 'package:provider/provider.dart';
 
 import '../../../bindings/bindings.dart';
 import '../../../providers/library_registry.dart';
-import '../../../utils/library_registry_messages.dart';
 import '../../../utils/api/library_registry.dart';
 import '../../../utils/api/request_failure.dart';
 import '../../../utils/dialogs/failed_to_initialize_library.dart';
@@ -179,9 +178,7 @@ class _PeerLibrariesDialogState extends State<PeerLibrariesDialog> {
       if (!mounted) return;
       await showFailedToInitializeLibrary(
         context,
-        error is LibraryRegistryFailure
-            ? libraryRegistryFailureMessage(S.of(context), error.kind)
-            : S.of(context).unknownError,
+        libraryFailureMessage(S.of(context), error),
       );
       if (mounted) $$replace('/');
       return;

@@ -1,7 +1,10 @@
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
 
-use super::{CastLibraryState, LibraryOpenErrorKind, LibraryTaskKind, RegisterLibraryFailureKind};
+use super::{
+    CastLibraryState, LibraryOpenErrorKind, LibraryTaskKind, OpenLibraryFailureKind,
+    RegisterLibraryFailureKind, RemoveLibraryRecordFailureKind,
+};
 
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SystemInfoRequest {
@@ -70,6 +73,12 @@ pub enum RequestFailureCause {
     },
     RemoteOpenFailed {
         kind: LibraryOpenErrorKind,
+    },
+    LibraryOpenFailed {
+        kind: OpenLibraryFailureKind,
+    },
+    LibraryRecordRemovalFailed {
+        kind: RemoveLibraryRecordFailureKind,
     },
 }
 

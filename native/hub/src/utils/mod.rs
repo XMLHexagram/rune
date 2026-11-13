@@ -896,7 +896,11 @@ impl NodeRequestHandlers for ProductionNodeRequestHandlers {
         request: &OpenLibraryRequest,
     ) -> impl Future<Output = Result<Option<OpenLibraryResponse>>> + Send {
         let scrobbler = Arc::clone(&self.scrobbler);
-        async move { Ok(Some(open_library_by_record(node, request, scrobbler).await)) }
+        async move {
+            open_library_by_record(node, request, scrobbler)
+                .await
+                .map(Some)
+        }
     }
 }
 
@@ -1831,38 +1835,26 @@ async fn open_library_by_record(
     node_slot: &NodeSlot,
     request: &OpenLibraryRequest,
     scrobbler: Arc<Mutex<ScrobblingManager>>,
-) -> OpenLibraryResponse {
-    let node = match node_slot.current().await {
-        Ok(node) => node,
-        Err(error) => {
-            return OpenLibraryResponse {
-                call_id: request.call_id,
-                record_id: request.record_id.clone(),
-                generation: 0,
-                result: OpenLibraryResult::Failed(OpenLibraryFailure {
-                    kind: OpenLibraryFailureKind::Storage,
-                    detail: format!("{error:#}"),
-                }),
-            };
-        }
-    };
+) -> Result<OpenLibraryResponse> {
+    let node = node_slot
+        .current()
+        .await
+        .map_err(|error| open_failure(OpenLibraryFailureKind::Storage, error))?;
     open_library_by_record_on_node(request, node, scrobbler).await
+}
+
+/// A library that could not be opened, of `kind`; the error goes to the logs.
+fn open_failure(kind: OpenLibraryFailureKind, error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(ExpectedRequestError::LibraryOpenFailed { kind })
+        .context(format!("{error:#}"))
 }
 
 pub(crate) async fn open_library_by_record_on_node(
     request: &OpenLibraryRequest,
     node: Arc<NodeContext>,
     scrobbler: Arc<Mutex<ScrobblingManager>>,
-) -> OpenLibraryResponse {
-    let failed = |kind, error: anyhow::Error| OpenLibraryResponse {
-        call_id: request.call_id,
-        record_id: request.record_id.clone(),
-        generation: 0,
-        result: OpenLibraryResult::Failed(OpenLibraryFailure {
-            kind,
-            detail: format!("{error:#}"),
-        }),
-    };
+) -> Result<OpenLibraryResponse> {
+    let failed = |kind, error: anyhow::Error| Err(open_failure(kind, error));
     let record_id = match Uuid::parse_str(&request.record_id) {
         Ok(id) => LibraryRecordId(id),
         Err(error) => return failed(OpenLibraryFailureKind::RecordNotFound, error.into()),
@@ -1984,12 +1976,11 @@ pub(crate) async fn open_library_by_record_on_node(
             {
                 log::error!("Could not persist last open library record: {error:#}");
             }
-            OpenLibraryResponse {
+            Ok(OpenLibraryResponse {
                 call_id: request.call_id,
                 record_id: request.record_id.clone(),
                 generation,
-                result: OpenLibraryResult::Opened,
-            }
+            })
         }
         Err((kind, error)) => failed(kind, error),
     }

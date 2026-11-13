@@ -717,9 +717,7 @@ class RuneLifecycleState extends State<RuneLifecycle> {
     if (!_startupReloginChecked) {
       _startupReloginChecked = true;
       libraryPath.initialOpen.then((_) {
-        final failure = libraryPath.initialOpenFailure;
-        if (!mounted ||
-            failure?.kind != OpenLibraryFailureKind.remoteNotAuthorized) {
+        if (!mounted || !needsLibraryRelogin(libraryPath.initialOpenFailure)) {
           return;
         }
         final recordId = libraryPath.registry.lastOpenRecordId;

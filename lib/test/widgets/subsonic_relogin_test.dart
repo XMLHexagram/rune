@@ -16,19 +16,20 @@ LibraryRecordSummary _record() => const LibraryRecordSummary(
 );
 
 OpenLibraryResponse _openResponse(int callId, {required bool authorized}) =>
-    OpenLibraryResponse(
-      callId: Uint64.fromBigInt(BigInt.from(callId)),
-      recordId: 'subsonic-record',
-      generation: Uint64.fromBigInt(BigInt.one),
-      result: authorized
-          ? const OpenLibraryResultOpened()
-          : const OpenLibraryResultFailed(
-              value: OpenLibraryFailure(
-                kind: OpenLibraryFailureKind.remoteNotAuthorized,
-                detail: 'The Subsonic credentials were rejected',
-              ),
+    authorized
+        ? OpenLibraryResponse(
+            callId: Uint64.fromBigInt(BigInt.from(callId)),
+            recordId: 'subsonic-record',
+            generation: Uint64.fromBigInt(BigInt.one),
+          )
+        : throw const RequestFailure(
+            'OpenLibraryRequest',
+            RequestErrorKind.permissionDenied,
+            'The Subsonic credentials were rejected',
+            RequestFailureCauseLibraryOpenFailed(
+              kind: OpenLibraryFailureKind.remoteNotAuthorized,
             ),
-    );
+          );
 
 LibraryRegistryProvider _registry({required bool succeed}) {
   var attempts = 0;
