@@ -3,10 +3,11 @@ use database::library_registry::{
     CatalogPlacement, FsAdapter, InvalidRecord, LibraryAccess, LibraryConnectionAccess,
     LibraryRecord, ProtocolAdapter, RuneForwardMode, SubsonicOpenMode,
 };
+use requests::NamedLibraries;
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, DartSignal)]
+#[derive(Serialize, Deserialize, DartSignal, NamedLibraries)]
 pub struct GetOpenLibraryRequest {
     #[serde(default)]
     pub call_id: Option<u64>,

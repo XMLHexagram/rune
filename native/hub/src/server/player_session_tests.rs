@@ -11871,7 +11871,7 @@ async fn rr_capability_snapshot_uses_rune_library_and_local_close_slots() -> Res
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_owned_calls_stay_local_with_remote_library_and_attached_renderer() -> Result<()> {
     use crate::TypedRequest;
-    use crate::macros::{RequestAccess, RequestSlots};
+    use crate::macros::{BodyLibraries, RequestAccess, RequestSlots};
     use crate::messages::{
         AttachRendererRequest, CloseLibraryRequest, DetachControllerRequest, DetachRendererRequest,
         GetSyncSettingsRequest, HandoffRequest, ListControllersRequest, ListRenderersRequest,
@@ -11897,6 +11897,7 @@ async fn node_owned_calls_stay_local_with_remote_library_and_attached_renderer()
     impl TargetRequest for NodeLocalSessionProbe {
         const SCOPE: RequestScope = RequestScope::Session;
         const ACCESS: RequestAccess = RequestAccess::NodeLocal;
+        const BODY_LIBRARIES: BodyLibraries = BodyLibraries::NoLibrary;
         const INTRODUCED_MINOR: u32 = 0;
 
         fn slot(slots: &RequestSlots) -> Slot {

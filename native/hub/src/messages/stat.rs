@@ -1,9 +1,10 @@
+use requests::NamedLibraries;
 use rinf::{DartSignal, RustSignal};
 use serde::{Deserialize, Serialize};
 
 use super::playback::PlayingItemRef;
 
-#[derive(Serialize, Deserialize, DartSignal)]
+#[derive(Serialize, Deserialize, DartSignal, NamedLibraries)]
 pub struct SetLikedRequest {
     pub item: Option<PlayingItemRef>,
     pub liked: bool,
@@ -20,7 +21,7 @@ pub struct SetLikedResponse {
     pub call_id: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, DartSignal)]
+#[derive(Serialize, Deserialize, DartSignal, NamedLibraries)]
 pub struct GetLikedRequest {
     pub item: Option<PlayingItemRef>,
     #[serde(default)]

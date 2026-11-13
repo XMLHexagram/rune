@@ -352,6 +352,7 @@ Before a cast the controller checks the player (reachable, accepts any granted l
 
 - Every library call from another device names its library. A call without a `library_id` is rejected; it is never served from the library open in the UI.
 - Every call in the request catalogue has an access rule for calls from other devices. This-device calls (trust management, scrobbling sign-in, server control, logs, licences) are refused when they come from another device.
+- A call whose body names libraries, through its items, also declares in the catalogue what they mean: the call acts on each of them, so each is authorized with the call's access rule and must be the library the call names; or the player reads them under its own grants (load, cast, handoff). The libraries are found from the body's types and checked where the call is authorized, before any handler runs.
 - Short-lived tokens, issued only to approved devices after a signature challenge, authenticate the WebSocket, the file and media routes and sync.
 - The capability snapshot sent to a controller marks every call its grants do not allow as unavailable.
 
