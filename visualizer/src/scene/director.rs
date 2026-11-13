@@ -137,8 +137,8 @@ pub struct ShotState {
     pub index: u32,
     /// How many cuts so far.
     pub cuts: u32,
-    /// The size of the shot: 0 wide, 1 medium, 2 close, 3 detail, 4 top.
-    pub size: u32,
+    /// The size of the shot.
+    pub size: ShotSize,
     /// The dutch angle of this shot in radians, signed.
     pub roll: f32,
     /// 0 to 1, fixed for the shot.
@@ -161,7 +161,7 @@ impl ShotState {
         let words = [
             self.index.to_le_bytes(),
             self.cuts.to_le_bytes(),
-            self.size.to_le_bytes(),
+            self.size.index().to_le_bytes(),
             self.roll.to_le_bytes(),
             self.seed.to_le_bytes(),
             self.age.to_le_bytes(),
@@ -390,7 +390,7 @@ impl Director {
             state: ShotState {
                 index: 0,
                 cuts: 0,
-                size: 0,
+                size: ShotSize::Wide,
                 roll: 0.0,
                 seed: 0.0,
                 age: 0.0,
@@ -423,7 +423,7 @@ impl Director {
         };
         let index = director.pick(Why::Opening, 0.0, 0, None);
         director.state.index = index as u32;
-        director.state.size = director.shots[index].0 as u32;
+        director.state.size = director.shots[index].0;
         director.state.seed = label_hash(0.0, 0);
         director
     }
@@ -1017,7 +1017,7 @@ impl Director {
         self.state = ShotState {
             index: index as u32,
             cuts: self.state.cuts,
-            size: size as u32,
+            size,
             roll,
             seed,
             age: 0.0,
@@ -1305,7 +1305,7 @@ mod tests {
         let state = ShotState {
             index: 1,
             cuts: 2,
-            size: 3,
+            size: ShotSize::Detail,
             roll: 0.5,
             seed: 0.25,
             age: 1.5,
@@ -1322,6 +1322,24 @@ mod tests {
         assert_eq!(u32::from_le_bytes(word(7)), 4);
         assert_eq!(u32::from_le_bytes(word(8)), 1);
         assert!(bytes[36..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn each_shot_size_reaches_the_scene_as_its_own_number() {
+        use ShotSize::*;
+        for (size, number) in [(Wide, 0), (Medium, 1), (Close, 2), (Detail, 3), (Top, 4)] {
+            let mut director = Director::new(camera(0.0), &[shot(size, ShotMove::Cut)]);
+            let base = song(0.5);
+            beats(&mut director, 0, 1, &base, |_, m| start(0.0, m));
+            let state = *director.state();
+            assert_eq!(state.size, size);
+            let bytes = state.bytes();
+            assert_eq!(
+                u32::from_le_bytes(<[u8; 4]>::try_from(&bytes[8..12]).unwrap()),
+                number,
+                "{size:?}"
+            );
+        }
     }
 
     fn glides() -> Vec<Shot> {
@@ -1422,7 +1440,7 @@ mod tests {
     fn it_starts_on_a_wide_shot_before_any_cut() {
         let director = Director::new(camera(0.3), &each_size());
         let state = director.state();
-        assert_eq!((state.size, state.cuts), (0, 0));
+        assert_eq!((state.size, state.cuts), (ShotSize::Wide, 0));
         assert_eq!((state.roll, state.length, state.fill), (0.0, -1.0, 0));
     }
 
@@ -2533,9 +2551,9 @@ mod tests {
         let mut cuts = Vec::new();
         for _ in 0..3 {
             let cut = director.force_cut(&base);
-            assert_ne!(cut.size as u32, last);
+            assert_ne!(cut.size, last);
             assert!(cut.index < 6);
-            last = cut.size as u32;
+            last = cut.size;
             cuts.push(cut);
         }
         let state = *director.state();
@@ -2565,7 +2583,7 @@ mod tests {
         let cut = director.hold_shot(2, &base).expect("shot 2 exists");
         assert_eq!(cut.index, 2);
         assert_eq!(director.state().index, 2);
-        assert_eq!(director.state().size, ShotSize::Close as u32);
+        assert_eq!(director.state().size, ShotSize::Close);
         assert_eq!(director.state().cuts, 2);
         assert!(director.view(&base).held);
         // A high section cuts every 10 s and a section start cuts at once; none happens.
