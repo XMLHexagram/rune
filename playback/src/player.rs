@@ -194,17 +194,19 @@ pub struct LibraryItem {
     pub file_uuid: Uuid,
 }
 
-/// A track in a Subsonic catalog, addressed without carrying authorization data.
+/// A track of a streaming service's library, addressed by the id that service gives it, without
+/// carrying authorization data.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SubsonicItem {
+pub struct ServiceItem {
     pub library_id: Uuid,
-    pub track_id: String,
+    pub track: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibraryTrackKey {
     Rune(Uuid),
-    Subsonic(String),
+    /// A track of a streaming service's library, by its id in that service.
+    Service(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -233,11 +235,11 @@ impl From<LibraryItem> for PlayingItem {
     }
 }
 
-impl From<SubsonicItem> for PlayingItem {
-    fn from(item: SubsonicItem) -> Self {
+impl From<ServiceItem> for PlayingItem {
+    fn from(item: ServiceItem) -> Self {
         Self::LibraryTrack {
             library_id: item.library_id,
-            track: item.track_id,
+            track: item.track,
         }
     }
 }
@@ -330,6 +332,12 @@ pub struct LibraryPlaybackSource {
     pub resolver: Arc<dyn PlaybackSourceResolver>,
 }
 
+/// How a track of a streaming service plays.
+pub enum ServiceTarget {
+    /// From audio that this player decodes.
+    Stream(RemoteAudioSource),
+}
+
 pub trait PlaybackSourceResolver: Send + Sync {
     fn resolve_track(
         &self,
@@ -363,11 +371,10 @@ pub trait PlaybackSourceResolver: Send + Sync {
     }
     fn resolve(&self, id: i32) -> BoxFuture<'static, Result<RemoteAudioSource>>;
 
-    fn resolve_subsonic(
-        &self,
-        _item: SubsonicItem,
-    ) -> BoxFuture<'static, Result<RemoteAudioSource>> {
-        Box::pin(async { anyhow::bail!("Subsonic playback resolver unavailable") })
+    /// Says how a track of a streaming service plays, for a track that
+    /// [`Self::resolve_track`] gave a [`LibraryTrackKey::Service`] key.
+    fn resolve_service(&self, _item: ServiceItem) -> BoxFuture<'static, Result<ServiceTarget>> {
+        Box::pin(async { anyhow::bail!("Service playback resolver unavailable") })
     }
 }
 

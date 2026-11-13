@@ -325,11 +325,11 @@ impl From<playback::player::LibraryItem> for PlayingItemRef {
     }
 }
 
-impl From<playback::player::SubsonicItem> for PlayingItemRef {
-    fn from(item: playback::player::SubsonicItem) -> Self {
+impl From<playback::player::ServiceItem> for PlayingItemRef {
+    fn from(item: playback::player::ServiceItem) -> Self {
         Self::LibraryTrack {
             library_id: item.library_id.to_string(),
-            track: item.track_id,
+            track: item.track,
         }
     }
 }
