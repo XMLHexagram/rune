@@ -98,11 +98,21 @@ fn first_of<T>(page: Page<T>, what: &str) -> Result<T> {
         .ok_or_else(|| Error::NotFound(what.to_owned()))
 }
 
+/// The catalog needs only the developer token; personal mixes belong to the user.
+fn catalog_auth(kind: &str, id: &str) -> Auth {
+    if kind == "playlists" && id.starts_with(PERSONAL_MIX) {
+        Auth::User
+    } else {
+        Auth::Developer
+    }
+}
+
 impl AppleMusicClient {
     /// Follows `next` links and yields every page of a collection. `carry` lists
     /// query pairs that every page must keep.
     fn page_stream<T>(
         &self,
+        auth: Auth,
         first: String,
         carry: Vec<(&'static str, String)>,
     ) -> BoxStream<'static, Result<Vec<T>>>
@@ -118,7 +128,7 @@ impl AppleMusicClient {
                     return Ok::<_, Error>(None);
                 };
                 let page: Page<T> = client
-                    .execute_json(Method::GET, &current, None, Auth::User)
+                    .execute_json(Method::GET, &current, None, auth)
                     .await?;
                 let next = page
                     .next
@@ -133,13 +143,14 @@ impl AppleMusicClient {
     /// Follows `next` links and yields every item of a collection.
     fn paged<T>(
         &self,
+        auth: Auth,
         first: String,
         carry: Vec<(&'static str, String)>,
     ) -> BoxStream<'static, Result<T>>
     where
         T: DeserializeOwned + Send + 'static,
     {
-        self.page_stream(first, carry)
+        self.page_stream(auth, first, carry)
             .map_ok(|items| stream::iter(items.into_iter().map(Ok::<T, Error>)))
             .try_flatten()
             .boxed()
@@ -188,7 +199,9 @@ impl AppleMusicClient {
                         .buffered(parallel.max(1))
                         .boxed()
                 }
-                (Some(next), _, _) => client.page_stream(carry_query(next, &carry), carry),
+                (Some(next), _, _) => {
+                    client.page_stream(Auth::User, carry_query(next, &carry), carry)
+                }
                 (None, _, _) => stream::empty().boxed(),
             };
             Ok::<_, Error>(stream::once(async move { Ok(page.data) }).chain(rest))
@@ -203,7 +216,7 @@ impl AppleMusicClient {
     {
         let mut q = vec![("limit", LIBRARY_PAGE_SIZE.to_string())];
         q.extend(include_query(include));
-        self.paged(target(path, &q), q)
+        self.paged(Auth::User, target(path, &q), q)
     }
 
     async fn library_resource<T>(&self, path: &str, include: &[&str], what: &str) -> Result<T>
@@ -460,7 +473,7 @@ impl AppleMusicClient {
     /// [`RECENTLY_ADDED_MAX_PAGES`] pages.
     pub fn recently_added(&self) -> BoxStream<'static, Result<LibraryEntry>> {
         let q = vec![("limit", RECENTLY_ADDED_LIMIT.to_string())];
-        self.page_stream(target("/v1/me/library/recently-added", &q), q)
+        self.page_stream(Auth::User, target("/v1/me/library/recently-added", &q), q)
             .take(RECENTLY_ADDED_MAX_PAGES)
             .map_ok(|items| stream::iter(items.into_iter().map(Ok::<LibraryEntry, Error>)))
             .try_flatten()
@@ -600,11 +613,14 @@ impl AppleMusicClient {
     /// following `next`. Music videos are skipped. Personal mixes need a user token.
     pub async fn catalog_playlist_tracks(&self, id: &str) -> Result<Vec<Song>> {
         let storefront = self.storefront().await?;
-        self.catalog_songs_of(format!(
-            "/v1/catalog/{}/playlists/{}/tracks",
-            segment(&storefront),
-            segment(id)
-        ))
+        self.catalog_songs_of(
+            catalog_auth("playlists", id),
+            format!(
+                "/v1/catalog/{}/playlists/{}/tracks",
+                segment(&storefront),
+                segment(id)
+            ),
+        )
         .await
     }
 
@@ -612,11 +628,14 @@ impl AppleMusicClient {
     /// following `next`. Music videos are skipped.
     pub async fn catalog_album_tracks(&self, id: &str) -> Result<Vec<Song>> {
         let storefront = self.storefront().await?;
-        self.catalog_songs_of(format!(
-            "/v1/catalog/{}/albums/{}/tracks",
-            segment(&storefront),
-            segment(id)
-        ))
+        self.catalog_songs_of(
+            Auth::Developer,
+            format!(
+                "/v1/catalog/{}/albums/{}/tracks",
+                segment(&storefront),
+                segment(id)
+            ),
+        )
         .await
     }
 
@@ -649,7 +668,9 @@ impl AppleMusicClient {
             segment(&storefront),
             segment(id)
         );
-        self.paged(path, Vec::new()).try_collect().await
+        self.paged(Auth::Developer, path, Vec::new())
+            .try_collect()
+            .await
     }
 
     async fn catalog_resource<T: DeserializeOwned>(
@@ -667,19 +688,19 @@ impl AppleMusicClient {
         );
         let q: Vec<_> = include_query(include).into_iter().collect();
         // The catalog needs only the developer token; personal mixes belong to the user.
-        let auth = if kind == "playlists" && id.starts_with(PERSONAL_MIX) {
-            Auth::User
-        } else {
-            Auth::Developer
-        };
         let page: Page<T> = self
-            .execute_json(Method::GET, &target(&path, &q), None, auth)
+            .execute_json(
+                Method::GET,
+                &target(&path, &q),
+                None,
+                catalog_auth(kind, id),
+            )
             .await?;
         first_of(page, what)
     }
 
-    async fn catalog_songs_of(&self, path: String) -> Result<Vec<Song>> {
-        let songs: Vec<Song> = self.paged(path, Vec::new()).try_collect().await?;
+    async fn catalog_songs_of(&self, auth: Auth, path: String) -> Result<Vec<Song>> {
+        let songs: Vec<Song> = self.paged(auth, path, Vec::new()).try_collect().await?;
         Ok(songs
             .into_iter()
             .filter(|song| song.kind == "songs")

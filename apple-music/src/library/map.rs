@@ -2,10 +2,13 @@
 
 use std::time::Duration;
 
-use super::types::{Album, Artist, Artwork, Playlist, Track, TrackKey};
+use super::types::{
+    Album, AlbumItem, Artist, ArtistItem, Artwork, ItemId, Playlist, PlaylistItem,
+    RecommendationGroup, RecommendationKind, Track, TrackKey,
+};
 use crate::models::{
     self, LibraryAlbum, LibraryArtist, LibraryPlaylist, LibrarySong, LibrarySongAttributes,
-    Relationship, Song, SongAttributes, TrackRef,
+    Recommendation, Relationship, Song, SongAttributes, TrackRef,
 };
 
 impl TrackKey {
@@ -211,4 +214,221 @@ pub(super) fn joins_song_list(entry: &LibraryPlaylist) -> bool {
 
 fn year(release_date: Option<&str>) -> Option<u32> {
     release_date?.get(..4)?.parse().ok()
+}
+
+// Items ----------------------------------------------------------------
+
+/// A library album as an item, in the library by definition.
+pub(super) fn library_album_item(entry: &LibraryAlbum) -> AlbumItem {
+    let album = album(entry);
+    AlbumItem {
+        id: ItemId::library_apple(album.id),
+        name: album.name,
+        artist: album.artist,
+        artist_id: album.artist_id.map(ItemId::library_apple),
+        track_count: album.track_count,
+        year: album.year,
+        genre: album.genre,
+        artwork: album.artwork,
+        in_library: true,
+    }
+}
+
+/// A library artist as an item.
+pub(super) fn library_artist_item(entry: &LibraryArtist) -> ArtistItem {
+    let artist = artist(entry);
+    ArtistItem {
+        id: ItemId::library_apple(artist.id),
+        name: artist.name,
+        artwork: None,
+        in_library: true,
+    }
+}
+
+/// A library playlist as an item.
+pub(super) fn library_playlist_item(entry: &LibraryPlaylist) -> PlaylistItem {
+    let playlist = playlist(entry);
+    PlaylistItem {
+        id: ItemId::library_apple(playlist.id),
+        name: playlist.name,
+        curator: None,
+        can_append: playlist.can_append,
+        artwork: playlist.artwork,
+        in_library: true,
+    }
+}
+
+/// A catalog album, outside the library until marked otherwise.
+pub(super) fn catalog_album_item(entry: &models::Album) -> AlbumItem {
+    let attributes = entry.attributes.clone().unwrap_or_default();
+    AlbumItem {
+        id: ItemId::catalog_apple(entry.id.clone()),
+        name: attributes.name.unwrap_or_default(),
+        artist: attributes.artist_name,
+        artist_id: entry
+            .relationships
+            .as_ref()
+            .and_then(|relationships| first_id(relationships.artists.as_ref()))
+            .map(ItemId::catalog_apple),
+        track_count: attributes.track_count,
+        year: year(attributes.release_date.as_deref()),
+        genre: attributes.genre_names.first().cloned(),
+        artwork: artwork(attributes.artwork.as_ref()),
+        in_library: false,
+    }
+}
+
+/// A catalog artist, outside the library until marked otherwise.
+pub(super) fn catalog_artist_item(entry: &models::Artist) -> ArtistItem {
+    let attributes = entry.attributes.as_ref();
+    ArtistItem {
+        id: ItemId::catalog_apple(entry.id.clone()),
+        name: attributes
+            .and_then(|attributes| attributes.name.clone())
+            .unwrap_or_default(),
+        artwork: artwork(attributes.and_then(|attributes| attributes.artwork.as_ref())),
+        in_library: false,
+    }
+}
+
+/// A catalog playlist: nothing of it can be changed through Apple's API.
+pub(super) fn catalog_playlist_item(entry: &models::Playlist) -> PlaylistItem {
+    let attributes = entry.attributes.clone().unwrap_or_default();
+    PlaylistItem {
+        id: ItemId::catalog_apple(entry.id.clone()),
+        name: attributes.name.unwrap_or_default(),
+        curator: attributes.curator_name,
+        can_append: false,
+        artwork: artwork(attributes.artwork.as_ref()),
+        in_library: false,
+    }
+}
+
+/// A catalog album as the library's kept album list holds it, until Apple lists the
+/// library's copy.
+pub(super) fn added_album(entry: &models::Album) -> Album {
+    let item = catalog_album_item(entry);
+    Album {
+        id: format!("{}{}", super::types::CATALOG_PREFIX, entry.id),
+        name: item.name,
+        artist: item.artist,
+        artist_id: None,
+        track_count: item.track_count,
+        year: item.year,
+        genre: item.genre,
+        artwork: item.artwork,
+        catalog_id: Some(entry.id.clone()),
+    }
+}
+
+/// A recommendation as a group of albums and playlists, or `None` when it holds neither.
+/// Stations and other kinds of item are left out; membership of catalog items is marked
+/// by the caller.
+pub(super) fn recommendation_group(entry: &Recommendation) -> Option<RecommendationGroup> {
+    let attributes = entry.attributes.clone().unwrap_or_default();
+    let mut group = RecommendationGroup {
+        id: entry.id.clone(),
+        title: attributes
+            .title
+            .and_then(|title| title.string_for_display)
+            .unwrap_or_default(),
+        kind: recommendation_kind(attributes.kind.as_deref()),
+        albums: Vec::new(),
+        playlists: Vec::new(),
+    };
+    let items = entry
+        .relationships
+        .as_ref()
+        .and_then(|relationships| relationships.contents.as_ref())
+        .map(|contents| contents.data.as_slice())
+        .unwrap_or_default();
+    for item in items {
+        let attributes = item.attributes.clone().unwrap_or_default();
+        let (library, catalog) = match item.kind.as_str() {
+            "albums" | "playlists" => (false, true),
+            // Not documented as recommendation contents; taken as library items if they come.
+            "library-albums" | "library-playlists" => (true, false),
+            _ => (false, false),
+        };
+        if !library && !catalog {
+            continue;
+        }
+        let id = if library {
+            ItemId::library_apple(item.id.clone())
+        } else {
+            ItemId::catalog_apple(item.id.clone())
+        };
+        let name = attributes.name.unwrap_or_default();
+        let cover = artwork(attributes.artwork.as_ref());
+        if item.kind.ends_with("albums") {
+            group.albums.push(AlbumItem {
+                id,
+                name,
+                artist: attributes.artist_name,
+                artist_id: None,
+                track_count: None,
+                year: None,
+                genre: None,
+                artwork: cover,
+                in_library: library,
+            });
+        } else {
+            group.playlists.push(PlaylistItem {
+                id,
+                name,
+                curator: attributes.curator_name,
+                // How far a library playlist can be edited is known only once it is read.
+                can_append: false,
+                artwork: cover,
+                in_library: library,
+            });
+        }
+    }
+    (!group.albums.is_empty() || !group.playlists.is_empty()).then_some(group)
+}
+
+/// Apple's recommendation kinds onto ours. Apple documents `music-recommendations` and
+/// `recently-played`; the others are guesses at undocumented values.
+fn recommendation_kind(kind: Option<&str>) -> RecommendationKind {
+    match kind.unwrap_or_default() {
+        "music-recommendations" => RecommendationKind::Personal,
+        // Undocumented for the second.
+        "recently-played" | "heavy-rotation" => RecommendationKind::Recent,
+        // Undocumented.
+        kind if kind.contains("genre") => RecommendationKind::Genre,
+        _ => RecommendationKind::Other,
+    }
+}
+
+/// A name as it is compared across library and catalog: case and spacing ignored.
+pub(super) fn name_key(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_compare_without_case_or_spacing() {
+        assert_eq!(name_key("  Dawn   Album "), name_key("dawn album"));
+        assert_ne!(name_key("Dawn Album"), name_key("Dusk Album"));
+    }
+
+    #[test]
+    fn recommendation_kinds_map_as_far_as_known() {
+        for (kind, expected) in [
+            (Some("music-recommendations"), RecommendationKind::Personal),
+            (Some("recently-played"), RecommendationKind::Recent),
+            (Some("heavy-rotation"), RecommendationKind::Recent),
+            (Some("by-genre"), RecommendationKind::Genre),
+            (Some("other"), RecommendationKind::Other),
+            (None, RecommendationKind::Other),
+        ] {
+            assert_eq!(recommendation_kind(kind), expected, "{kind:?}");
+        }
+    }
 }
