@@ -23,6 +23,7 @@ import 'utils/api/close_library.dart';
 import 'utils/api/request_failure.dart';
 import 'utils/dialogs/failed_to_initialize_library.dart';
 import 'utils/remote_connection_messages.dart';
+import 'utils/share_sync_messages.dart';
 import 'utils/router/navigation.dart';
 import 'utils/locale.dart';
 import 'utils/rune_log.dart';
@@ -89,6 +90,7 @@ import 'providers/controllers.dart';
 import 'providers/renderer_attachment.dart';
 import 'providers/request_capabilities.dart';
 import 'providers/renderer_link_loss.dart';
+import 'providers/library_share_sync.dart';
 import 'providers/remote_library_reconnect.dart';
 import 'providers/responsive_providers.dart';
 
@@ -591,6 +593,7 @@ class RuneLifecycleState extends State<RuneLifecycle> {
   bool _shouldCallUpdate = false;
   late final RemoteConnectionLossHandler _remoteLoss;
   late final RendererLinkLossHandler _rendererLinkLoss;
+  late final LibraryShareSyncNotice _shareSyncNotice;
   late final RemoteLibraryReconnectNotice _remoteReconnect;
   LibraryOpenStateProvider? _libraryState;
   String? _noticeOpenRecordId;
@@ -669,6 +672,25 @@ class RuneLifecycleState extends State<RuneLifecycle> {
             showFailedToInitializeLibrary(rootContext, message);
           }
         });
+      },
+    );
+    _shareSyncNotice = LibraryShareSyncNotice(
+      updates: LibrarySyncStatusUpdated.rustSignalStream.map(
+        (signal) => signal.message,
+      ),
+      showNotice: (failure) {
+        final context = rootNavigatorKey.currentState?.overlay?.context;
+        if (context == null || !context.mounted) return;
+        final message = shareSyncFailureMessage(S.of(context), failure);
+        if (message == null) return;
+        displayInfoBar(
+          context,
+          builder: (_, close) => InfoBar(
+            title: Text(message),
+            severity: InfoBarSeverity.warning,
+            onClose: close,
+          ),
+        );
       },
     );
     _rendererLinkLoss = RendererLinkLossHandler(
@@ -761,6 +783,7 @@ class RuneLifecycleState extends State<RuneLifecycle> {
 
     _remoteLoss.dispose();
     _rendererLinkLoss.dispose();
+    _shareSyncNotice.dispose();
     _requestFailureSubscription?.cancel();
     _libraryState?.removeListener(_libraryChanged);
     _remoteReconnect.dispose();

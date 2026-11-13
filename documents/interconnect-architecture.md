@@ -256,6 +256,8 @@ Own-prefix garbage collection runs through the same writer as push and deletes o
 - One writer per prefix also inside a device: push, acknowledgement-only head writes, roll-up, base cut and garbage collection go through one serialized writer.
 - Only a real 404 or a digest mismatch can trigger reconciliation, `library.json` creation, rotation or retirement. 423, 5xx, timeouts and failed listings are transient typed errors with backoff.
 - `library.json` is re-validated on every pass. If it disappears or names another library under an existing binding, the device stops with a typed state and never recreates it.
+- On a store without create-if-absent, `library.json` is written with a plain PUT and read back at once. No wait could tell whether another library is writing it at the same moment, so the rule is: the library that wrote `library.json` last owns the folder. The other device finds another library on its next pass and stops with the typed state. The two libraries never merge, because every head names its library and pull skips heads of another library.
+- A device that wrote `library.json` and finds another library there before its creation held removes its own prefix, the only prefix it writes. The creation holds once the device finds its own `library.json` again after it has written its first head. Nothing is removed when the device did not write `library.json`, after the creation held, when `library.json` is missing or names this library, or when a head in the prefix was written by another writer session.
 - A share sync failure reaches the UI as a typed state of that library.
 
 ### Storage primitives

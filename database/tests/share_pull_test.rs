@@ -1926,3 +1926,179 @@ async fn deleted_floor_base_reconciles_from_another_live_base() -> Result<()> {
     );
     Ok(())
 }
+
+async fn share_prefix_keys(store: &MemoryObjectStore, prefix: &str) -> Result<Vec<String>> {
+    store
+        .list_prefix(&format!("devices/{prefix}/"))
+        .await
+        .map_err(|error| anyhow::anyhow!("list prefix {prefix}: {error:?}"))
+}
+
+/// Another library's upload of library.json lands after this share was created.
+async fn hand_share_to_another_library(store: &MemoryObjectStore) -> Result<Uuid> {
+    let other = Uuid::new_v4();
+    let library = LibraryFile {
+        format: share::FORMAT_VERSION,
+        library_id: other,
+        model: RuneModel::model_id().to_owned(),
+        schema: RuneModel::schema_id().to_owned(),
+    };
+    store
+        .put(&share::library_key(), &share::encode_library(&library)?)
+        .await
+        .map_err(|error| anyhow::anyhow!("replace library.json: {error:?}"))?;
+    Ok(other)
+}
+
+async fn publish_first_share_pass(
+    device: &SqlLibrary,
+    store: &Arc<MemoryObjectStore>,
+    namespace: Uuid,
+    id: u128,
+) -> Result<String> {
+    device
+        .library
+        .write_local(
+            ObjectKey {
+                collection: Collection::Playlists,
+                id: Uuid::from_u128(id),
+            },
+            support::playlist("share creation race"),
+        )
+        .await?;
+    device
+        .library
+        .push_share(store.clone(), namespace, cache_path(), Default::default())
+        .await?;
+    let prefix = device.library.share_prefix(cache_path()).await?;
+    ensure!(
+        !share_prefix_keys(store, &prefix).await?.is_empty(),
+        "the device published nothing to its prefix"
+    );
+    Ok(prefix)
+}
+
+#[tokio::test]
+async fn device_that_lost_the_share_creation_removes_only_its_own_prefix() -> Result<()> {
+    let namespace = Uuid::new_v4();
+    let store = Arc::new(MemoryObjectStore::default());
+    // The creator writes library.json with a plain PUT, as on a store without conditional
+    // create, and publishes in the same pass. Another device of the library joins after it.
+    let creator = SqlLibrary::new(namespace, Uuid::new_v4()).await?;
+    let creator_prefix = publish_first_share_pass(&creator, &store, namespace, 1701).await?;
+    let joiner = SqlLibrary::new(namespace, Uuid::new_v4()).await?;
+    let joiner_prefix = publish_first_share_pass(&joiner, &store, namespace, 1702).await?;
+
+    // Another library's upload of library.json lands late, and that library publishes too.
+    let other_namespace = hand_share_to_another_library(&store).await?;
+    let other = SqlLibrary::new(other_namespace, Uuid::new_v4()).await?;
+    let other_prefix = publish_first_share_pass(&other, &store, other_namespace, 1703).await?;
+    let joiner_keys = share_prefix_keys(&store, &joiner_prefix).await?;
+    let other_keys = share_prefix_keys(&store, &other_prefix).await?;
+
+    // The creator meets the other library on its next pass and removes what it wrote.
+    assert_eq!(
+        creator
+            .library
+            .pull_share(store.clone(), namespace, cache_path(), Default::default())
+            .await
+            .unwrap_err(),
+        SharePullError::ShareChanged
+    );
+    assert_eq!(
+        share_prefix_keys(&store, &creator_prefix).await?,
+        Vec::<String>::new()
+    );
+
+    // A device that did not create library.json keeps its prefix, and so does the other library,
+    // which owns the share and keeps syncing.
+    assert_eq!(
+        joiner
+            .library
+            .pull_share(store.clone(), namespace, cache_path(), Default::default())
+            .await
+            .unwrap_err(),
+        SharePullError::ShareChanged
+    );
+    assert_eq!(
+        share_prefix_keys(&store, &joiner_prefix).await?,
+        joiner_keys
+    );
+    assert_eq!(share_prefix_keys(&store, &other_prefix).await?, other_keys);
+    other
+        .library
+        .pull_share(
+            store.clone(),
+            other_namespace,
+            cache_path(),
+            Default::default(),
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn device_keeps_its_prefix_once_its_share_creation_held() -> Result<()> {
+    let namespace = Uuid::new_v4();
+    let store = Arc::new(MemoryObjectStore::default());
+    let creator = SqlLibrary::new(namespace, Uuid::new_v4()).await?;
+    let creator_prefix = publish_first_share_pass(&creator, &store, namespace, 1711).await?;
+    // The next pass after the first publication still finds this library's library.json.
+    creator
+        .library
+        .pull_share(store.clone(), namespace, cache_path(), Default::default())
+        .await?;
+    let creator_keys = share_prefix_keys(&store, &creator_prefix).await?;
+
+    hand_share_to_another_library(&store).await?;
+    assert_eq!(
+        creator
+            .library
+            .pull_share(store.clone(), namespace, cache_path(), Default::default())
+            .await
+            .unwrap_err(),
+        SharePullError::ShareChanged
+    );
+    assert_eq!(
+        share_prefix_keys(&store, &creator_prefix).await?,
+        creator_keys
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn share_prefix_whose_head_another_writer_session_wrote_is_never_removed() -> Result<()> {
+    let namespace = Uuid::new_v4();
+    let store = Arc::new(MemoryObjectStore::default());
+    let replica = Uuid::new_v4();
+    let creator = SqlLibrary::new(namespace, replica).await?;
+    let creator_prefix = publish_first_share_pass(&creator, &store, namespace, 1721).await?;
+    let creator_keys = share_prefix_keys(&store, &creator_prefix).await?;
+    // This database now holds another writer session than the one that wrote the prefix's head,
+    // as a restored copy of the device does.
+    let mut state = load_or_create_state(
+        &creator.db,
+        replica,
+        namespace,
+        cache_path(),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    state.writer_session = Uuid::new_v4();
+    save_state(&creator.db, &state).await?;
+
+    hand_share_to_another_library(&store).await?;
+    assert_eq!(
+        creator
+            .library
+            .pull_share(store.clone(), namespace, cache_path(), Default::default())
+            .await
+            .unwrap_err(),
+        SharePullError::ShareChanged
+    );
+    assert_eq!(
+        share_prefix_keys(&store, &creator_prefix).await?,
+        creator_keys
+    );
+    Ok(())
+}
