@@ -4,7 +4,8 @@ use thiserror::Error as ThisError;
 
 use crate::access_policy::Denial;
 use crate::messages::{
-    CastLibraryState, LibraryTaskKind, ProtocolUpdateSide, RequestErrorKind, RequestFailureCause,
+    CastLibraryState, LibraryOpenErrorKind, LibraryTaskKind, ProtocolUpdateSide,
+    RegisterLibraryFailureKind, RequestErrorKind, RequestFailureCause,
 };
 use crate::rpc::UnsupportedReason;
 use discovery::protocol_version::ProtocolVersion;
@@ -72,6 +73,10 @@ pub enum ExpectedRequestError {
     },
     #[error("The license key is invalid")]
     LicenseInvalid,
+    #[error("Library registration failed: {kind:?}")]
+    LibraryRegistrationFailed { kind: RegisterLibraryFailureKind },
+    #[error("Remote library could not be opened: {kind:?}")]
+    RemoteOpenFailed { kind: LibraryOpenErrorKind },
 }
 
 impl ExpectedRequestError {
@@ -106,6 +111,33 @@ pub struct FailedCall {
 impl std::fmt::Display for FailedCall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "call {}", self.call_id)
+    }
+}
+
+/// The request failure kind of a library registration failure.
+fn registration_failure_kind(kind: RegisterLibraryFailureKind) -> RequestErrorKind {
+    use RegisterLibraryFailureKind as Kind;
+    match kind {
+        Kind::InvalidRecord
+        | Kind::InvalidSource
+        | Kind::SubsonicNotSubsonic
+        | Kind::OpenDalNotFolder
+        | Kind::OpenDalShareInvalid
+        | Kind::OpenDalShareChanged => RequestErrorKind::InvalidInput,
+        Kind::Untrusted
+        | Kind::RemoteUntrusted
+        | Kind::RemoteNotAuthorized
+        | Kind::SubsonicWrongCredentials
+        | Kind::SubsonicRoleMissing
+        | Kind::OpenDalAuthenticationRejected
+        | Kind::OpenDalReadOnly => RequestErrorKind::PermissionDenied,
+        Kind::Storage
+        | Kind::RemoteUnreachable
+        | Kind::RemoteProtocol
+        | Kind::SubsonicUnreachable
+        | Kind::SubsonicServerTooOld
+        | Kind::SubsonicClientTooOld
+        | Kind::OpenDalUnreachable => RequestErrorKind::Unavailable,
     }
 }
 
@@ -155,6 +187,17 @@ pub fn classify(error: &Error) -> RequestErrorKind {
                     CastLibraryState::Ready => RequestErrorKind::Internal,
                 },
                 ExpectedRequestError::LicenseInvalid => RequestErrorKind::InvalidInput,
+                ExpectedRequestError::LibraryRegistrationFailed { kind } => {
+                    registration_failure_kind(*kind)
+                }
+                ExpectedRequestError::RemoteOpenFailed { kind } => match kind {
+                    LibraryOpenErrorKind::RemoteUntrusted
+                    | LibraryOpenErrorKind::RemoteNotAuthorized => {
+                        RequestErrorKind::PermissionDenied
+                    }
+                    LibraryOpenErrorKind::RemoteUnreachable
+                    | LibraryOpenErrorKind::RemoteProtocol => RequestErrorKind::Unavailable,
+                },
             };
         }
     }
@@ -211,6 +254,12 @@ pub fn request_failure_cause(error: &Error) -> Option<RequestFailureCause> {
                 }
                 ExpectedRequestError::LicenseInvalid => {
                     return Some(RequestFailureCause::LicenseInvalid);
+                }
+                ExpectedRequestError::LibraryRegistrationFailed { kind } => {
+                    return Some(RequestFailureCause::LibraryRegistrationFailed { kind: *kind });
+                }
+                ExpectedRequestError::RemoteOpenFailed { kind } => {
+                    return Some(RequestFailureCause::RemoteOpenFailed { kind: *kind });
                 }
                 _ => {}
             }

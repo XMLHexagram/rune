@@ -348,7 +348,6 @@ mod node_request_loop_tests {
         ) -> impl Future<Output = Result<Option<ReplaceSubsonicCredentialResponse>>> + Send
         {
             let response = ReplaceSubsonicCredentialResponse {
-                result: ReplaceSubsonicCredentialResult::Updated,
                 call_id: request.call_id,
             };
             async move { Ok(Some(response)) }

@@ -5,6 +5,8 @@ import 'package:fluent_ui/fluent_ui.dart';
 import '../../bindings/bindings.dart';
 import '../../l10n/app_localizations.dart';
 import '../l10n.dart';
+import '../library_registry_messages.dart';
+import '../remote_connection_messages.dart';
 import 'call_id.dart';
 
 class RequestFailure implements Exception {
@@ -89,6 +91,10 @@ String requestFailureMessage(AppLocalizations s, RequestFailure failure) =>
         s.remoteLibraryReconnecting(alias),
       RequestFailureCauseStorageBusy() => s.requestStorageBusy,
       RequestFailureCauseLicenseInvalid() => s.registerInvalidSubtitle,
+      RequestFailureCauseLibraryRegistrationFailed(:final kind) =>
+        libraryRegistryFailureMessage(s, kind),
+      RequestFailureCauseRemoteOpenFailed(:final kind) =>
+        remoteOpenErrorMessage(s, kind),
       RequestFailureCauseCertificateMismatch() => s.requestCertificateMismatch,
       RequestFailureCausePublicKeyMismatch() => s.requestPublicKeyMismatch,
       RequestFailureCauseRegistrationConflict() =>

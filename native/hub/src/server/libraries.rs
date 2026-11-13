@@ -569,14 +569,11 @@ pub(crate) async fn add_remote_library(
     access_level: DeviceSyncLevel,
 ) -> Result<String> {
     let mut registry = LibraryRegistry::load(config_dir)?;
-    let descriptor = create_replica(
-        config_dir,
-        &mut registry,
-        Uuid::parse_str(library_id)?,
-        alias,
-        fingerprint,
-    )
-    .await?;
+    let library_id = Uuid::parse_str(library_id).map_err(|error| {
+        ExpectedRequestError::invalid_input(format!("Invalid library id: {error}"))
+    })?;
+    let descriptor =
+        create_replica(config_dir, &mut registry, library_id, alias, fingerprint).await?;
     LibraryRegistry::set_access_level(
         config_dir,
         descriptor

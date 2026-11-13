@@ -117,6 +117,7 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
   ClientSummary? _device;
   int _step = 1;
   ListPeerLibrariesResponse? _libraries;
+  RequestFailure? _librariesFailure;
   bool? _canControl;
   String? _selectedChoice;
   String? _selectedLibraryId;
@@ -736,7 +737,10 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
       return const Center(child: ProgressRing());
     }
     final response = _libraries;
-    final state = response == null ? null : peerLibrariesState(s, response);
+    final failure = _librariesFailure;
+    final state = response == null && failure == null
+        ? null
+        : peerLibrariesState(s, response, failure: failure);
     if (state == null || state.status == PeerLibrariesStatus.error) {
       return Text(state?.error ?? s.unknownError);
     }
@@ -782,6 +786,7 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
       _step = 3;
       _loading = true;
       _libraries = null;
+      _librariesFailure = null;
       _canControl = false;
     });
     try {
@@ -797,6 +802,13 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
         _canControl = (results[1] as GetDeviceGrantsResponse).grants.control;
         _loading = false;
       });
+    } on RequestFailure catch (failure) {
+      if (mounted) {
+        setState(() {
+          _librariesFailure = failure;
+          _loading = false;
+        });
+      }
     } catch (_) {
       if (mounted) setState(() => _loading = false);
     }
@@ -810,13 +822,6 @@ class _AddLibraryGuideDialogState extends State<_AddLibraryGuideDialog> {
         library,
         device.fingerprint,
       );
-      if (result.error != null) {
-        throw RequestFailure(
-          'AddRemoteLibraryRequest',
-          RequestErrorKind.internal,
-          result.error!,
-        );
-      }
       await _openRecord(result.recordId);
     } catch (error) {
       if (mounted) {

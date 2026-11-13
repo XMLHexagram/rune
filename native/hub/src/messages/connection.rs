@@ -110,18 +110,8 @@ pub struct ReplaceSubsonicCredentialRequest {
     pub call_id: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplaceSubsonicCredentialResult {
-    Updated,
-    Rejected,
-    Unreachable,
-    InvalidRecord,
-    Storage,
-}
-
 #[derive(Deserialize, Serialize, RustSignal)]
 pub struct ReplaceSubsonicCredentialResponse {
-    pub result: ReplaceSubsonicCredentialResult,
     #[serde(default)]
     pub call_id: Option<u64>,
 }

@@ -1011,10 +1011,8 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subsonic_relogin_replaces_only_a_verified_secret() -> Result<()> {
-    use crate::messages::{
-        OpenLibraryRequest, OpenLibraryResult, ReplaceSubsonicCredentialRequest,
-        ReplaceSubsonicCredentialResult,
-    };
+    use crate::messages::{OpenLibraryRequest, OpenLibraryResult, ReplaceSubsonicCredentialRequest};
+    use crate::request_error::request_failure_cause;
     use database::library_registry::{
         CatalogPlacement, LibraryRecord, LibraryRecordId, LibraryRegistry, ProtocolAdapter,
         SubsonicOpenMode,
@@ -1058,18 +1056,21 @@ async fn subsonic_relogin_replaces_only_a_verified_secret() -> Result<()> {
         password: password.into(),
         call_id: Some(1),
     };
+    let rejected_error =
+        replace_subsonic_credential_on_node(&replacement("wrong-password"), &node)
+            .await
+            .expect_err("a rejected password must not replace the credential");
     assert_eq!(
-        replace_subsonic_credential_on_node(&replacement("wrong-password"), &node).await,
-        ReplaceSubsonicCredentialResult::Rejected,
+        request_failure_cause(&rejected_error),
+        Some(RequestFailureCause::LibraryRegistrationFailed {
+            kind: RegisterLibraryFailureKind::SubsonicWrongCredentials
+        }),
     );
     let old = node.credentials.get(credential).await?;
     assert_eq!(old.secret.as_bytes(), b"old-password");
 
     rejected.store(false, Ordering::SeqCst);
-    assert_eq!(
-        replace_subsonic_credential_on_node(&replacement("new-password"), &node).await,
-        ReplaceSubsonicCredentialResult::Updated,
-    );
+    replace_subsonic_credential_on_node(&replacement("new-password"), &node).await?;
     let updated = node.credentials.get(credential).await?;
     assert_eq!(updated.secret.as_bytes(), b"new-password");
     let stored = LibraryRegistry::load(Path::new(&*node.config_path))?;
@@ -6365,12 +6366,7 @@ pub(super) async fn replicate_host_library_at(
         .libraries
         .iter()
         .find(|library| library.library_id == host_library_id.to_string())
-        .with_context(|| {
-            format!(
-                "host library was not listed (error {:?}, libraries {:?})",
-                listed.error_kind, listed.libraries
-            )
-        })?;
+        .with_context(|| format!("host library was not listed (libraries {:?})", listed.libraries))?;
     let replica_path = request_add_library(peer, &host_info.fingerprint, hosted).await?;
     let replica = fixture_open_record(peer, replica_path).await?;
     let endpoint = PeerEndpoint {

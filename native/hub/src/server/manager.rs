@@ -3556,6 +3556,19 @@ mod lifecycle_tests {
             .context("list response")
     }
 
+    /// The typed cause of a peer library listing that must fail.
+    async fn refused_peer_libraries(
+        manager: &Fixture,
+        fingerprint: &str,
+    ) -> Result<Option<RequestFailureCause>> {
+        use crate::request_error::request_failure_cause;
+
+        match request_peer_libraries(manager, fingerprint).await {
+            Ok(listed) => anyhow::bail!("peer libraries were listed: {:?}", listed.libraries),
+            Err(error) => Ok(request_failure_cause(&error)),
+        }
+    }
+
     async fn request_add_library(
         manager: &Fixture,
         fingerprint: &str,
@@ -3577,7 +3590,6 @@ mod lifecycle_tests {
             )
             .await?
             .context("add response")?;
-        anyhow::ensure!(response.error.is_none(), "add failed: {:?}", response.error);
         Ok(response.record_id)
     }
 
@@ -3673,10 +3685,11 @@ mod lifecycle_tests {
             .await
             .replace_hosts_for_fingerprint(&fingerprint, vec![format!("127.0.0.1:{}", addr.port())])
             .await?;
-        let unknown = request_peer_libraries(&b, "unknown").await?;
         assert_eq!(
-            unknown.error_kind,
-            Some(LibraryOpenErrorKind::RemoteUntrusted)
+            refused_peer_libraries(&b, "unknown").await?,
+            Some(RequestFailureCause::RemoteOpenFailed {
+                kind: LibraryOpenErrorKind::RemoteUntrusted
+            })
         );
         let unauthed = reqwest::Client::builder()
             .use_preconfigured_tls(sync_worker::tls_config(
@@ -3693,7 +3706,6 @@ mod lifecycle_tests {
             reqwest::StatusCode::UNAUTHORIZED
         );
         let listed = request_peer_libraries(&b, &fingerprint).await?;
-        assert_eq!(listed.error_kind, None);
         let libraries = listed.libraries;
         assert_eq!(libraries.len(), 1);
         assert_eq!(libraries[0].library_id, library_id.to_string());
@@ -3761,7 +3773,6 @@ mod lifecycle_tests {
             Some(remote)
         );
         let listed = request_peer_libraries(&replica, &fingerprint).await?;
-        assert_eq!(listed.error_kind, None);
         let libraries = listed.libraries;
         assert_eq!(libraries.len(), 1);
         assert!(libraries[0].added);
@@ -3779,11 +3790,13 @@ mod lifecycle_tests {
         let registry_path = first.path().join("libraries.json");
         let saved = std::fs::read(&registry_path)?;
         std::fs::write(&registry_path, b"invalid registry")?;
-        let malformed = request_peer_libraries(&replica, &fingerprint).await?;
+        let malformed = refused_peer_libraries(&replica, &fingerprint).await?;
         std::fs::write(&registry_path, saved)?;
         assert_eq!(
-            malformed.error_kind,
-            Some(LibraryOpenErrorKind::RemoteProtocol)
+            malformed,
+            Some(RequestFailureCause::RemoteOpenFailed {
+                kind: LibraryOpenErrorKind::RemoteProtocol
+            })
         );
         a.global_params
             .permission_manager
@@ -3791,16 +3804,18 @@ mod lifecycle_tests {
             .await
             .change_user_status(&info(&b).await?.fingerprint, UserStatus::Pending)
             .await?;
-        let denied = request_peer_libraries(&replica, &fingerprint).await?;
         assert_eq!(
-            denied.error_kind,
-            Some(LibraryOpenErrorKind::RemoteNotAuthorized)
+            refused_peer_libraries(&replica, &fingerprint).await?,
+            Some(RequestFailureCause::RemoteOpenFailed {
+                kind: LibraryOpenErrorKind::RemoteNotAuthorized
+            })
         );
         a.stop().await?;
-        let offline = request_peer_libraries(&replica, &fingerprint).await?;
         assert_eq!(
-            offline.error_kind,
-            Some(LibraryOpenErrorKind::RemoteUnreachable)
+            refused_peer_libraries(&replica, &fingerprint).await?,
+            Some(RequestFailureCause::RemoteOpenFailed {
+                kind: LibraryOpenErrorKind::RemoteUnreachable
+            })
         );
         for manager in [&a, &b, &replica] {
             manager.stop_worker().await?;
