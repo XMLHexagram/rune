@@ -6926,7 +6926,6 @@ async fn handoff_unplayable_and_decode_failures_roll_back_and_resume_source() ->
     let source_before =
         wait_player(&source, |status| status.state == PlayerPlaybackState::Playing).await?;
     let expected_item = source_before.item.clone().context("source item")?;
-    let mut expected_position = source_before.position;
 
     let source_fingerprint = info(&source).await?.fingerprint;
     let host_fingerprint = info(&host).await?.fingerprint;
@@ -7005,6 +7004,9 @@ async fn handoff_unplayable_and_decode_failures_roll_back_and_resume_source() ->
         call_id: None,
         target: Some(target_fingerprint.clone()),
     };
+    // The source plays on until a handoff pauses it, so where it resumes is compared with where
+    // it stood right before the handoff was asked for.
+    let mut expected_position = source.global_params.player.lock().await.get_status().position;
     let unplayable_result = timeout(
         TEST_DEADLINE,
         dispatch_gui_request(&source.global_params, &handoff),
@@ -7046,7 +7048,6 @@ async fn handoff_unplayable_and_decode_failures_roll_back_and_resume_source() ->
     assert!(
         source_after_unplayable.position.abs_diff(expected_position) <= Duration::from_millis(1500)
     );
-    expected_position = source_after_unplayable.position;
 
     let host_file = Path::new(&host.global_params.test_library().media_root)
         .join("handoff-source-corrupt-on-target.ogg");
@@ -7064,6 +7065,7 @@ async fn handoff_unplayable_and_decode_failures_roll_back_and_resume_source() ->
         call_id: None,
         target: handoff.target.clone(),
     };
+    expected_position = source.global_params.player.lock().await.get_status().position;
     let handoff_task = tokio::spawn(async move {
         dispatch_gui_request(&source_params, &handoff_request).await
     });
