@@ -1,7 +1,7 @@
 use crate::{
     messages::{
-        LibraryContentChanged, PlaybackState, PlaybackStatus, PlayingItemRef, PlaylistItem,
-        PlaylistUpdate, RequestErrorKind, RequestFailedResponse, RequestFailureCause,
+        LibraryContentChanged, PlaybackMode, PlaybackState, PlaybackStatus, PlayingItemRef,
+        PlaylistItem, PlaylistUpdate, RequestErrorKind, RequestFailedResponse, RequestFailureCause,
         SetRealtimeFFTEnabledRequest,
     },
     node::ReconnectConfig,
@@ -272,7 +272,7 @@ fn jukebox_playback_status(
             library_id: library_id.to_string(),
             track: song.id.clone(),
         }),
-        playback_mode: 0,
+        playback_mode: PlaybackMode::Sequential,
         ready: current.is_some(),
         cover_art_path,
         lib_path: String::new(),
@@ -1258,8 +1258,8 @@ mod visualizer_feed_tests {
     use crate::{
         backends::remote::{decode_message, encode_message},
         messages::{
-            PlaybackState, PlaybackStatus, PlayingItemRef, RealtimeFFT, VisualizerFeedChart,
-            VisualizerFeedCovers,
+            PlaybackMode, PlaybackState, PlaybackStatus, PlayingItemRef, RealtimeFFT,
+            VisualizerFeedChart, VisualizerFeedCovers,
         },
         utils::{Broadcaster, RinfRustSignal},
     };
@@ -1427,7 +1427,7 @@ mod visualizer_feed_tests {
                 library_id: Uuid::new_v4().to_string(),
                 track: "track-1".into(),
             }),
-            playback_mode: 7,
+            playback_mode: PlaybackMode::Shuffle,
             ready: false,
             cover_art_path: Some("/feed/cover".into()),
             lib_path: "/feed/library".into(),
@@ -2007,7 +2007,7 @@ mod visualizer_feed_tests {
                 library_id: "third-party-library".into(),
                 track: "song-a".into(),
             }),
-            playback_mode: 7,
+            playback_mode: PlaybackMode::Shuffle,
             ready: false,
             cover_art_path: Some("/third-party/cover".into()),
             lib_path: "/third-party/library".into(),
@@ -2040,7 +2040,7 @@ mod visualizer_feed_tests {
                     track: "song-a".into(),
                 })
         );
-        assert_eq!(status.playback_mode, 0);
+        assert_eq!(status.playback_mode, PlaybackMode::Sequential);
         assert!(status.ready);
         assert_eq!(status.cover_art_path, None);
         assert_eq!(status.lib_path, "");

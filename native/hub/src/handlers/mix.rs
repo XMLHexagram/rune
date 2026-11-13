@@ -7,7 +7,10 @@ use anyhow::{Context, Result};
 use ::database::actions::{
     cover_art::bake_cover_art_by_media_files,
     metadata::get_metadata_summary_by_files,
-    mixes::{get_all_mixes, get_mix_by_id, get_mix_queries_by_mix_id, query_mix_media_files},
+    mixes::{
+        get_all_mixes, get_mix_by_id, get_mix_queries_by_mix_id, mix_playback_mode,
+        query_mix_media_files,
+    },
 };
 
 use crate::library_pool::LibraryHandle;
@@ -48,14 +51,16 @@ impl Signal for FetchAllMixesRequest {
             call_id: None,
             mixes: mixes
                 .into_iter()
-                .map(|mix| Mix {
-                    id: mix.id,
-                    name: mix.name,
-                    group: mix.group,
-                    locked: mix.locked,
-                    mode: mix.mode.expect("Mix mode not exists"),
+                .map(|mix| -> Result<Mix> {
+                    Ok(Mix {
+                        mode: mix_playback_mode(&mix)?.map(Into::into),
+                        id: mix.id,
+                        name: mix.name,
+                        group: mix.group,
+                        locked: mix.locked,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
         }))
     }
 }
@@ -87,7 +92,7 @@ impl Signal for CreateMixRequest {
             request.name.clone(),
             request.group.clone(),
             request.scriptlet_mode,
-            request.mode,
+            request.mode.map(Into::into),
             false,
             request
                 .queries
@@ -102,11 +107,11 @@ impl Signal for CreateMixRequest {
         Ok(Some(CreateMixResponse {
             call_id: None,
             mix: Mix {
+                mode: mix_playback_mode(&mix)?.map(Into::into),
                 id: mix.id,
                 name: mix.name,
                 group: mix.group,
                 locked: mix.locked,
-                mode: mix.mode.expect("Mix mode not exists"),
             },
         }))
     }
@@ -140,7 +145,7 @@ impl Signal for UpdateMixRequest {
             Some(request.name.clone()),
             Some(request.group.clone()),
             Some(request.scriptlet_mode),
-            Some(request.mode),
+            Some(request.mode.map(Into::into)),
             Some(false),
             Some(
                 request
@@ -157,11 +162,11 @@ impl Signal for UpdateMixRequest {
         Ok(Some(UpdateMixResponse {
             call_id: None,
             mix: Mix {
+                mode: mix_playback_mode(&mix)?.map(Into::into),
                 id: mix.id,
                 name: mix.name,
                 group: mix.group,
                 locked: mix.locked,
-                mode: mix.mode.expect("Mix mode not exists"),
             },
         }))
     }
@@ -273,11 +278,11 @@ impl Signal for GetMixByIdRequest {
         Ok(Some(GetMixByIdResponse {
             call_id: None,
             mix: Mix {
+                mode: mix_playback_mode(&mix)?.map(Into::into),
                 id: mix.id,
                 name: mix.name,
                 group: mix.group,
                 locked: mix.locked,
-                mode: mix.mode.expect("Mix mode not exists"),
             },
         }))
     }

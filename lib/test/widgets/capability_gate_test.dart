@@ -433,7 +433,7 @@ PlaybackStatus _playbackStatus(PlaybackState state) => PlaybackStatus(
   progressSeconds: 0,
   progressPercentage: 0,
   duration: 10,
-  playbackMode: 0,
+  playbackMode: PlaybackMode.sequential,
   ready: true,
   libPath: '',
 );

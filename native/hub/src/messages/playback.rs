@@ -1,7 +1,10 @@
 use crate::request_error::ExpectedRequestError;
-use playback::player::{
-    HandoffBlockId as PlaybackHandoffBlockId, PlaybackState as PlayerPlaybackState,
-    UnavailableReason,
+use playback::{
+    PlaybackMode as PlayerPlaybackMode,
+    player::{
+        HandoffBlockId as PlaybackHandoffBlockId, PlaybackState as PlayerPlaybackState,
+        UnavailableReason,
+    },
 };
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
@@ -20,7 +23,7 @@ pub struct PlaybackStatus {
     pub index: Option<i32>,
     pub item: Option<String>,
     pub item_request: Option<PlayingItemRef>,
-    pub playback_mode: u32,
+    pub playback_mode: PlaybackMode,
     pub ready: bool,
     pub cover_art_path: Option<String>,
     pub lib_path: String,
@@ -59,7 +62,7 @@ pub struct PreviousRequest {
 
 #[derive(Serialize, Deserialize, DartSignal)]
 pub struct SetPlaybackModeRequest {
-    pub mode: u32,
+    pub mode: PlaybackMode,
     #[serde(default)]
     pub call_id: Option<u64>,
 }
@@ -209,6 +212,49 @@ pub struct VolumeResponse {
     pub call_id: Option<u64>,
 }
 
+/// How the queue moves on from a track.
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackMode {
+    Sequential,
+    RepeatOne,
+    RepeatAll,
+    Shuffle,
+}
+
+impl From<PlayerPlaybackMode> for PlaybackMode {
+    fn from(mode: PlayerPlaybackMode) -> Self {
+        match mode {
+            PlayerPlaybackMode::Sequential => Self::Sequential,
+            PlayerPlaybackMode::RepeatOne => Self::RepeatOne,
+            PlayerPlaybackMode::RepeatAll => Self::RepeatAll,
+            PlayerPlaybackMode::Shuffle => Self::Shuffle,
+        }
+    }
+}
+
+impl From<PlaybackMode> for PlayerPlaybackMode {
+    fn from(mode: PlaybackMode) -> Self {
+        match mode {
+            PlaybackMode::Sequential => Self::Sequential,
+            PlaybackMode::RepeatOne => Self::RepeatOne,
+            PlaybackMode::RepeatAll => Self::RepeatAll,
+            PlaybackMode::Shuffle => Self::Shuffle,
+        }
+    }
+}
+
+/// Whether a load starts playing.
+#[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoadPlay {
+    /// Start playing the loaded track.
+    Play,
+    /// Leave the loaded track paused.
+    Pause,
+    /// Play, except that a load which names a position without a playback mode stays paused.
+    #[default]
+    Auto,
+}
+
 #[derive(Serialize, Deserialize, SignalPiece, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaylistOperateMode {
     AppendToEnd,
@@ -262,7 +308,7 @@ pub struct SessionSnapshotResponse {
     pub items: Vec<PlayingItemRef>,
     pub index: Option<u32>,
     pub position_seconds: f64,
-    pub playback_mode: u32,
+    pub playback_mode: PlaybackMode,
     pub playing: bool,
     pub revision: u64,
     #[serde(default)]
@@ -342,11 +388,11 @@ pub struct LoadResolvedItemsRequest {
     #[serde(default)]
     pub expected_revision: Option<u64>,
     #[serde(default)]
-    pub playback_mode: Option<u32>,
+    pub playback_mode: Option<PlaybackMode>,
     #[serde(default)]
     pub position_seconds: Option<f64>,
     #[serde(default)]
-    pub play: Option<bool>,
+    pub play: LoadPlay,
     #[serde(default)]
     pub call_id: Option<u64>,
 }

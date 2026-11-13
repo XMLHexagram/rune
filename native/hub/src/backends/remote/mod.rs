@@ -1039,7 +1039,7 @@ mod loss_tests {
             index: Some(0),
             item: None,
             item_request: None,
-            playback_mode: 0,
+            playback_mode: PlaybackMode::Sequential,
             ready: true,
             cover_art_path: None,
             lib_path: String::new(),

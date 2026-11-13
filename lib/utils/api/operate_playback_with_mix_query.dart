@@ -9,9 +9,29 @@ import '../../utils/dialogs/no_analysis/show_no_analysis_dialog.dart';
 import '../../bindings/bindings.dart';
 import '../playing_item.dart';
 
+/// A load that leaves the player's playback mode alone when [playbackMode] is
+/// `null` and decides by itself whether to start playing.
+LoadResolvedItemsRequest loadResolvedItemsRequest({
+  required List<PlayingItemRef> items,
+  required int? startIndex,
+  required PlaylistOperateMode operateMode,
+  required Uint64? expectedRevision,
+  required PlaybackMode? playbackMode,
+}) {
+  return LoadResolvedItemsRequest(
+    items: items,
+    startIndex: startIndex,
+    mode: operateMode,
+    expectedRevision: expectedRevision,
+    playbackMode: playbackMode,
+    positionSeconds: null,
+    play: LoadPlay.auto,
+  );
+}
+
 Future<List<PlayingItem>> operatePlaybackWithMixQuery({
   required QueryList queries,
-  required int playbackMode,
+  required PlaybackMode? playbackMode,
   required int hintPosition,
   required int initialPlaybackId,
   required bool instantlyPlay,
@@ -78,14 +98,12 @@ Future<List<PlayingItem>> operatePlaybackWithMixQuery({
             send: (callId) =>
                 PlaylistRevisionRequest(callId: callId).sendSignalToRust(),
           )).message.revision;
-    final load = LoadResolvedItemsRequest(
+    final load = loadResolvedItemsRequest(
       items: items,
       startIndex: startIndex,
-      mode: operateMode,
+      operateMode: operateMode,
       expectedRevision: expectedRevision,
       playbackMode: instantlyPlay ? playbackMode : null,
-      positionSeconds: null,
-      play: null,
     );
     if (castTo != null && !castTo.attach) {
       final response = await awaitResponse(
@@ -160,7 +178,7 @@ Future<void> restoreCastAttachmentAfterLoadFailure({
 Future<List<PlayingItem>> safeOperatePlaybackWithMixQuery({
   required BuildContext context,
   required QueryList queries,
-  required int playbackMode,
+  required PlaybackMode? playbackMode,
   required int hintPosition,
   required int initialPlaybackId,
   required bool instantlyPlay,

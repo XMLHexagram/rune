@@ -364,29 +364,6 @@ pub enum PlaybackMode {
     Shuffle,
 }
 
-impl From<u32> for PlaybackMode {
-    fn from(value: u32) -> Self {
-        match value {
-            0 => PlaybackMode::Sequential,
-            1 => PlaybackMode::RepeatOne,
-            2 => PlaybackMode::RepeatAll,
-            3 => PlaybackMode::Shuffle,
-            _ => PlaybackMode::Sequential,
-        }
-    }
-}
-
-impl From<PlaybackMode> for u32 {
-    fn from(mode: PlaybackMode) -> Self {
-        match mode {
-            PlaybackMode::Sequential => 0,
-            PlaybackMode::RepeatOne => 1,
-            PlaybackMode::RepeatAll => 2,
-            PlaybackMode::Shuffle => 3,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum PlayerCommand {
     WithCompletion {

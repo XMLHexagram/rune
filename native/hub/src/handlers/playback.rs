@@ -144,9 +144,9 @@ async fn resolve_open_subsonic_tracks(
 struct PlaylistEditOptions {
     mode: PlaylistOperateMode,
     start_index: Option<usize>,
-    playback_mode: Option<u32>,
+    playback_mode: Option<PlaybackMode>,
     position: Option<Duration>,
-    play: Option<bool>,
+    play: LoadPlay,
 }
 
 fn edit_playlist(
@@ -171,10 +171,10 @@ fn edit_playlist(
         .map(|start_index| PlaylistLoad {
             start_index,
             position: position.unwrap_or_default(),
-            play: if position.is_some() || play.is_some() {
-                play.unwrap_or(playback_mode.is_some())
-            } else {
-                true
+            play: match play {
+                LoadPlay::Play => true,
+                LoadPlay::Pause => false,
+                LoadPlay::Auto => position.is_none() || playback_mode.is_some(),
             },
         });
     let changed = (mode == PlaylistOperateMode::Replace && !player.get_playlist().is_empty())
@@ -184,7 +184,7 @@ fn edit_playlist(
         PlaylistEdit {
             tracks: prepared.to_vec(),
             placement,
-            playback_mode: playback_mode.filter(|mode| *mode != 99).map(Into::into),
+            playback_mode: playback_mode.map(Into::into),
             load,
             block: None,
         },
@@ -1334,7 +1334,7 @@ async fn apply_resolved_items_load(
     };
     if let Some(block) = block {
         let position = position.unwrap_or_default();
-        let play = request.play.unwrap_or(true);
+        let play = request.play != LoadPlay::Pause;
         node.session()?
             .handoff_load_queue(HandoffLoadParams {
                 expected_revision: request.expected_revision,
@@ -1343,10 +1343,7 @@ async fn apply_resolved_items_load(
                 start_index,
                 position,
                 play,
-                playback_mode: request
-                    .playback_mode
-                    .filter(|mode| *mode != 99)
-                    .map(Into::into),
+                playback_mode: request.playback_mode.map(Into::into),
             })
             .await?;
     } else {
@@ -1988,7 +1985,11 @@ fn handoff_load(
         expected_revision: None,
         playback_mode: Some(snapshot.playback_mode),
         position_seconds: Some(snapshot.position_seconds),
-        play: Some(snapshot.playing),
+        play: if snapshot.playing {
+            LoadPlay::Play
+        } else {
+            LoadPlay::Pause
+        },
     }
 }
 
@@ -2173,7 +2174,7 @@ mod handoff_confirmation_tests {
                 index: Some(0),
                 item: None,
                 item_request: Some(delayed_item),
-                playback_mode: 0,
+                playback_mode: PlaybackMode::Sequential,
                 ready: true,
                 cover_art_path: None,
                 lib_path: String::new(),

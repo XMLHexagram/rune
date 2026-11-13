@@ -158,7 +158,7 @@ class CreateEditMixDialogState extends State<CreateEditMixDialog> {
                               titleController.text,
                               groupController.text,
                               false,
-                              99,
+                              null,
                               operator == null ? [] : [operator],
                             );
                           } else {
@@ -166,7 +166,7 @@ class CreateEditMixDialogState extends State<CreateEditMixDialog> {
                               titleController.text,
                               groupController.text,
                               false,
-                              99,
+                              null,
                               operator == null ? [] : [operator],
                             );
                           }

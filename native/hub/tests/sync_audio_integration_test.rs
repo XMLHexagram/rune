@@ -3,6 +3,7 @@ mod fixtures;
 use anyhow::Result;
 use axum::body::Body;
 use axum::http::Response;
+use database::actions::mixes::mix_playback_mode;
 use database::sync::model::*;
 use database::{
     actions::{
@@ -29,6 +30,7 @@ use hub::server::sync::{
     library_router,
 };
 use migration::catalog_identity::ParentKind;
+use playback::PlaybackMode;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::sync::{
     Arc,
@@ -320,7 +322,7 @@ async fn metadata_is_automatic_and_audio_follows_track_artist_album_and_mix_rule
                     "Offline mix".into(),
                     "O".into(),
                     false,
-                    0,
+                    Some(PlaybackMode::Sequential),
                     false,
                     vec![("lib::track".into(), id.to_string())],
                 )
@@ -399,7 +401,7 @@ async fn metadata_is_automatic_and_audio_follows_track_artist_album_and_mix_rule
                 Some(mix.name.clone()),
                 Some(mix.group.clone()),
                 Some(mix.scriptlet_mode),
-                Some(mix.mode.unwrap_or(0)),
+                Some(mix_playback_mode(mix)?),
                 Some(mix.locked),
                 Some(vec![("lib::track".into(), other.to_string())]),
             )

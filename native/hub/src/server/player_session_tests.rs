@@ -5,8 +5,9 @@ use crate::Session;
 use crate::macros::{
     RequestAccess, RequestScope, RequestSlots, capability_snapshot, request_scope,
 };
+use crate::messages::PlaybackMode as WirePlaybackMode;
 use crate::messages::{
-    CapabilityReason, CloseLibraryRequest, CloseLibraryResponse, CreatePlaylistRequest,
+    CapabilityReason, LoadPlay, CloseLibraryRequest, CloseLibraryResponse, CreatePlaylistRequest,
     FetchAllPlaylistsRequest, FetchAllPlaylistsResponse, GetPlaylistByIdRequest,
     LibraryContentChanged, LibraryInitializeMode, ListLocalLibrariesRequest, MixQuery,
     OpenLibraryRequest, OpenLibraryResult, PlaybackState, PlaybackStatus, PlaylistOperateMode,
@@ -342,7 +343,7 @@ async fn subsonic_relogin_response(
 
 struct MixPlaybackTestRequest {
     queries: Vec<MixQuery>,
-    playback_mode: u32,
+    playback_mode: WirePlaybackMode,
     hint_position: i32,
     initial_playback_item: Option<PlayingItemRef>,
     instantly_play: bool,
@@ -385,7 +386,7 @@ impl MixPlaybackTestRequest {
         let load = LoadResolvedItemsRequest {
             call_id: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
             items: resolved.playing_items.clone(),
             start_index: resolved.start_index,
             mode: self.operate_mode,
@@ -739,9 +740,9 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
         start_index: Some(0),
         mode: PlaylistOperateMode::Replace,
         expected_revision: None,
-        playback_mode: Some(0),
+        playback_mode: Some(WirePlaybackMode::Sequential),
         position_seconds: Some(0.0),
-        play: Some(true),
+        play: LoadPlay::Play,
         call_id: None,
     };
     dispatch_gui_request(&fixture.global_params, &load).await?;
@@ -1280,7 +1281,7 @@ async fn repeat_one_single_item_queue() -> Result<(TempDir, Fixture)> {
         &fixture.global_params,
         &SetPlaybackModeRequest {
             call_id: None,
-            mode: 1,
+            mode: WirePlaybackMode::RepeatOne,
         },
     )
     .await?;
@@ -1808,7 +1809,7 @@ async fn renderer_link_forwards_controls_routes_status_and_keeps_local_queue() -
         &a.global_params,
         &SetPlaybackModeRequest {
             call_id: None,
-            mode: 2,
+            mode: WirePlaybackMode::RepeatAll,
         },
     )
     .await?;
@@ -2670,7 +2671,7 @@ async fn attached_mix_query_resolves_for_controller_library_and_loads_resolved_i
 
     let request = MixPlaybackTestRequest {
         queries: query.clone(),
-        playback_mode: 0,
+        playback_mode: WirePlaybackMode::Sequential,
         hint_position: -1,
         initial_playback_item: None,
         instantly_play: true,
@@ -2877,7 +2878,7 @@ async fn attached_mix_query_rejects_items_outside_renderer_libraries() -> Result
     )?;
     let independent_request = MixPlaybackTestRequest {
         queries: Vec::new(),
-        playback_mode: 0,
+        playback_mode: WirePlaybackMode::Sequential,
         hint_position: -1,
         initial_playback_item: None,
         instantly_play: false,
@@ -2915,7 +2916,7 @@ async fn attached_mix_query_rejects_items_outside_renderer_libraries() -> Result
     let item = library_track_for_id(&controller, id).await?;
     let request = MixPlaybackTestRequest {
         queries: Vec::new(),
-        playback_mode: 0,
+        playback_mode: WirePlaybackMode::Sequential,
         hint_position: -1,
         initial_playback_item: None,
         instantly_play: false,
@@ -3045,7 +3046,7 @@ async fn chosen_renderer_cast_preserves_local_playback_and_can_switch_targets() 
             operator: "lib::track".into(),
             parameter: file_id.to_string(),
         }],
-        playback_mode: 0,
+        playback_mode: WirePlaybackMode::Sequential,
         hint_position: -1,
         initial_playback_item: None,
         instantly_play: true,
@@ -3173,7 +3174,7 @@ async fn chosen_renderer_cast_preserves_local_playback_and_can_switch_targets() 
 
     let append = MixPlaybackTestRequest {
         queries: Vec::new(),
-        playback_mode: 0,
+        playback_mode: WirePlaybackMode::Sequential,
         hint_position: -1,
         initial_playback_item: None,
         instantly_play: false,
@@ -3290,9 +3291,9 @@ async fn chosen_renderer_cast_preserves_local_playback_and_can_switch_targets() 
             start_index: Some(1),
             mode: PlaylistOperateMode::Replace,
             expected_revision: Some(stale_revision),
-            playback_mode: Some(3),
+            playback_mode: Some(WirePlaybackMode::Shuffle),
             position_seconds: Some(7.25),
-            play: Some(false),
+            play: LoadPlay::Pause,
         },
     };
     let error = match dispatch_gui_request(&controller_replica.global_params, &stale_cast).await {
@@ -3309,9 +3310,9 @@ async fn chosen_renderer_cast_preserves_local_playback_and_can_switch_targets() 
             start_index: Some(1),
             mode: PlaylistOperateMode::Replace,
             expected_revision: Some(revision_response.revision),
-            playback_mode: Some(3),
+            playback_mode: Some(WirePlaybackMode::Shuffle),
             position_seconds: Some(7.25),
-            play: Some(false),
+            play: LoadPlay::Pause,
         },
     };
     dispatch_gui_request(&controller_replica.global_params, &targeted_load).await?;
@@ -3361,7 +3362,7 @@ async fn chosen_renderer_cast_preserves_local_playback_and_can_switch_targets() 
             expected_revision: None,
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
         },
     };
     dispatch_gui_request(&controller_replica.global_params, &play_next_when_idle).await?;
@@ -4725,7 +4726,7 @@ async fn cast_preflight_and_load_check_renderer_library_grants_over_websocket() 
             expected_revision: None,
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
         },
     };
     let response: CastResolvedItemsResponse =
@@ -4770,7 +4771,7 @@ async fn cast_preflight_and_load_check_renderer_library_grants_over_websocket() 
             expected_revision: Some(revision),
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
         })?,
     )
     .await?;
@@ -4811,7 +4812,7 @@ async fn cast_preflight_and_load_check_renderer_library_grants_over_websocket() 
             expected_revision: Some(revision),
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
         },
         call_id: None,
     };
@@ -4856,7 +4857,7 @@ async fn cast_preflight_and_load_check_renderer_library_grants_over_websocket() 
         mode: PlaylistOperateMode::Replace,
         playback_mode: None,
         position_seconds: None,
-        play: None,
+        play: LoadPlay::Auto,
     };
     let queue_before_stale = renderer.global_params.player.lock().await.get_playlist();
     let (name, payload, _) = controller_request(
@@ -4920,7 +4921,7 @@ async fn cast_preflight_and_load_check_renderer_library_grants_over_websocket() 
             expected_revision: Some(revision),
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
         })?,
     )
     .await?;
@@ -4977,7 +4978,7 @@ async fn cast_preflight_and_load_check_renderer_library_grants_over_websocket() 
             expected_revision: Some(revision),
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
         })?,
     )
     .await?;
@@ -5022,7 +5023,7 @@ async fn cast_preflight_and_load_check_renderer_library_grants_over_websocket() 
             expected_revision: Some(revision),
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
         })?,
     )
     .await?;
@@ -5074,7 +5075,7 @@ async fn cast_preflight_and_load_check_renderer_library_grants_over_websocket() 
             expected_revision: Some(revision),
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
         })?,
     )
     .await?;
@@ -5104,9 +5105,9 @@ fn cast_resolved_items_request_serializes_one_complete_load() -> Result<()> {
             start_index: Some(2),
             mode: PlaylistOperateMode::PlayNext,
             expected_revision: Some(17),
-            playback_mode: Some(3),
+            playback_mode: Some(WirePlaybackMode::Shuffle),
             position_seconds: Some(12.5),
-            play: Some(true),
+            play: LoadPlay::Play,
         },
         call_id: Some(23),
     };
@@ -5116,9 +5117,9 @@ fn cast_resolved_items_request_serializes_one_complete_load() -> Result<()> {
     assert_eq!(value["load"]["start_index"], 2);
     assert_eq!(value["load"]["mode"], "PlayNext");
     assert_eq!(value["load"]["expected_revision"], 17);
-    assert_eq!(value["load"]["playback_mode"], 3);
+    assert_eq!(value["load"]["playback_mode"], "Shuffle");
     assert_eq!(value["load"]["position_seconds"], 12.5);
-    assert_eq!(value["load"]["play"], true);
+    assert_eq!(value["load"]["play"], "Play");
     assert_eq!(value["load"]["items"][0]["library_track"]["track"], "track");
     Ok(())
 }
@@ -5349,7 +5350,7 @@ async fn renderer_link_request_round_trip_errors_and_cast_start_modes() -> Resul
         expected_revision: Some(initial_revision),
         playback_mode: None,
         position_seconds: None,
-        play: None,
+        play: LoadPlay::Auto,
     };
     link.call(&append_without_switch).await?;
     wait_player(&renderer, |status| status.playlist.len() == 2).await?;
@@ -5394,7 +5395,7 @@ async fn renderer_link_request_round_trip_errors_and_cast_start_modes() -> Resul
             ),
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
         };
         link.call(&request).await?;
         wait_player(&renderer, |status| {
@@ -5428,7 +5429,7 @@ async fn renderer_link_request_round_trip_errors_and_cast_start_modes() -> Resul
         expected_revision: None,
         playback_mode: None,
         position_seconds: None,
-        play: None,
+        play: LoadPlay::Auto,
     };
     let error = match link.call(&invalid).await {
         Ok(_) => anyhow::bail!("malformed cast load unexpectedly succeeded"),
@@ -5458,7 +5459,7 @@ async fn renderer_link_request_round_trip_errors_and_cast_start_modes() -> Resul
         expected_revision: None,
         playback_mode: None,
         position_seconds: None,
-        play: None,
+        play: LoadPlay::Auto,
     };
     let error = match link.call(&not_held).await {
         Ok(_) => anyhow::bail!("cast to a library the renderer does not hold succeeded"),
@@ -5529,9 +5530,9 @@ async fn renderer_link_request_round_trip_errors_and_cast_start_modes() -> Resul
         start_index: Some(1),
         mode: PlaylistOperateMode::PlayNext,
         expected_revision: Some(revision_before_invalid),
-        playback_mode: Some(3),
+        playback_mode: Some(WirePlaybackMode::Shuffle),
         position_seconds: Some(1.25),
-        play: Some(true),
+        play: LoadPlay::Play,
     };
     link.call(&handoff).await?;
     let merged = wait_player(&renderer, |status| {
@@ -5576,7 +5577,7 @@ async fn renderer_link_request_round_trip_errors_and_cast_start_modes() -> Resul
         expected_revision: None,
         playback_mode: None,
         position_seconds: Some(0.9),
-        play: Some(true),
+        play: LoadPlay::Play,
     };
     link.call(&idle_handoff).await?;
     let idle_merged = wait_player(&renderer, |status| {
@@ -5609,7 +5610,7 @@ async fn renderer_link_request_round_trip_errors_and_cast_start_modes() -> Resul
         expected_revision: None,
         playback_mode: None,
         position_seconds: Some(0.7),
-        play: Some(true),
+        play: LoadPlay::Play,
     };
     link.call(&empty_handoff).await?;
     let empty_loaded = wait_player(&renderer, |status| {
@@ -6756,7 +6757,7 @@ async fn handoff_unplayable_and_decode_failures_roll_back_and_resume_source() ->
             expected_revision: None,
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
         })
         .await?;
     wait_player(&target, |status| {
@@ -6912,7 +6913,7 @@ async fn handoff_moves_queue_and_position_and_preserves_source_sessions() -> Res
     let controller = &a_g_replica;
     let shuffle = SetPlaybackModeRequest {
         call_id: None,
-        mode: 3,
+        mode: WirePlaybackMode::Shuffle,
     };
     shuffle
         .handle(
@@ -7117,7 +7118,7 @@ async fn handoff_moves_queue_and_position_and_preserves_source_sessions() -> Res
             expected_revision: None,
             playback_mode: None,
             position_seconds: Some(0.0),
-            play: Some(true),
+            play: LoadPlay::Play,
         })
         .await?;
     let after_insert = wait_player(&b, |status| {
@@ -7182,7 +7183,7 @@ async fn handoff_moves_queue_and_position_and_preserves_source_sessions() -> Res
             expected_revision: None,
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
         })
         .await?;
     let mut expected_target_queue = target_queue.clone();
@@ -7931,7 +7932,7 @@ async fn typed_renderer_call_rejects_wrong_reply_name() -> Result<()> {
         expected_revision: None,
         playback_mode: None,
         position_seconds: None,
-        play: None,
+        play: LoadPlay::Auto,
     };
     let error = match timeout(TEST_DEADLINE, link.call(&request))
         .await
@@ -8255,7 +8256,7 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
         index: None,
         item: None,
         item_request: None,
-        playback_mode: 0,
+        playback_mode: WirePlaybackMode::Sequential,
         ready: true,
         cover_art_path: None,
         lib_path: String::new(),
@@ -8470,14 +8471,14 @@ async fn rr_library_routes_gui_edits_events_and_lifecycle_between_real_nodes() -
         &remote,
         &LoadResolvedItemsRequest {
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
 
             call_id: None,
             items: resolved.playing_items,
             start_index: resolved.start_index,
             mode: PlaylistOperateMode::Replace,
             expected_revision: None,
-            playback_mode: Some(0),
+            playback_mode: Some(WirePlaybackMode::Sequential),
         },
     )
     .await?;
@@ -9319,9 +9320,9 @@ async fn assert_opendal_library_scan(service_kind: OpenDalServiceKind) -> Result
             start_index: Some(0),
             mode: PlaylistOperateMode::Replace,
             expected_revision: None,
-            playback_mode: Some(0),
+            playback_mode: Some(WirePlaybackMode::Sequential),
             position_seconds: Some(0.0),
-            play: Some(true),
+            play: LoadPlay::Play,
         };
         dispatch_gui_request(&fixture.global_params, &load).await?;
         let played = wait_player(&fixture, |status| {
@@ -9905,9 +9906,9 @@ async fn subsonic_visualizer_covers_use_the_bounded_server_cover_cache() -> Resu
         start_index: Some(0),
         mode: PlaylistOperateMode::Replace,
         expected_revision: None,
-        playback_mode: Some(0),
+        playback_mode: Some(WirePlaybackMode::Sequential),
         position_seconds: Some(0.0),
-        play: Some(true),
+        play: LoadPlay::Play,
     };
     dispatch_gui_request(&fixture.global_params, &load).await?;
     wait_player(&fixture, |status| {
@@ -11941,5 +11942,182 @@ async fn capability_snapshot_agrees_with_unsupported_dispatch_by_scope() -> Resu
     assert!(dispatch_gui_request(params, &library_request).await.is_ok());
 
     fixture.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+#[test]
+fn a_playback_mode_the_wire_does_not_know_is_refused() {
+    assert!(serde_json::from_str::<WirePlaybackMode>("\"Bogus\"").is_err());
+    assert!(serde_json::from_str::<SetPlaybackModeRequest>(r#"{"mode":99}"#).is_err());
+    assert!(serde_json::from_str::<SetPlaybackModeRequest>("{}").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_load_keeps_the_playback_mode_unless_it_names_one_and_follows_play() -> Result<()> {
+    let node_dir = tempfile::tempdir()?;
+    let fixture = fixture(node_dir.path()).await?;
+    let first = session_audio(&fixture, "load-mode-a.ogg").await?;
+    let second = session_audio(&fixture, "load-mode-b.ogg").await?;
+    let items: Vec<_> = vec![
+        library_track_for_id(&fixture, first).await?.into(),
+        library_track_for_id(&fixture, second).await?.into(),
+    ];
+    dispatch_gui_request(
+        &fixture.global_params,
+        &SetPlaybackModeRequest {
+            call_id: None,
+            mode: WirePlaybackMode::RepeatAll,
+        },
+    )
+    .await?;
+    wait_player(&fixture, |status| {
+        status.playback_mode == PlaybackMode::RepeatAll
+    })
+    .await?;
+    let load = |playback_mode, position_seconds, play| LoadResolvedItemsRequest {
+        call_id: None,
+        items: items.clone(),
+        start_index: Some(0),
+        mode: PlaylistOperateMode::Replace,
+        expected_revision: None,
+        playback_mode,
+        position_seconds,
+        play,
+    };
+
+    // No mode named: the player's own mode stays. Pause: the track is loaded but not started.
+    dispatch_gui_request(&fixture.global_params, &load(None, None, LoadPlay::Pause)).await?;
+    wait_player(&fixture, |status| {
+        status.playlist.len() == 2
+            && status.state == PlayerPlaybackState::Paused
+            && status.playback_mode == PlaybackMode::RepeatAll
+    })
+    .await?;
+
+    // Play: started, and the mode is still the player's.
+    dispatch_gui_request(&fixture.global_params, &load(None, None, LoadPlay::Play)).await?;
+    wait_player(&fixture, |status| {
+        status.state == PlayerPlaybackState::Playing
+            && status.playback_mode == PlaybackMode::RepeatAll
+    })
+    .await?;
+
+    // Pause a playing player through a load, naming a mode: the mode changes, the track pauses.
+    dispatch_gui_request(
+        &fixture.global_params,
+        &load(Some(WirePlaybackMode::Shuffle), None, LoadPlay::Pause),
+    )
+    .await?;
+    wait_player(&fixture, |status| {
+        status.state == PlayerPlaybackState::Paused && status.playback_mode == PlaybackMode::Shuffle
+    })
+    .await?;
+
+    // Auto with a position and no mode stays paused, and without a position it plays.
+    dispatch_gui_request(
+        &fixture.global_params,
+        &load(None, Some(1.0), LoadPlay::Auto),
+    )
+    .await?;
+    wait_player(&fixture, |status| {
+        status.state == PlayerPlaybackState::Paused && status.playback_mode == PlaybackMode::Shuffle
+    })
+    .await?;
+    dispatch_gui_request(&fixture.global_params, &load(None, None, LoadPlay::Auto)).await?;
+    wait_player(&fixture, |status| {
+        status.state == PlayerPlaybackState::Playing
+    })
+    .await?;
+
+    fixture.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn created_mixes_keep_the_playback_mode_they_were_given() -> Result<()> {
+    use crate::messages::{CreateMixRequest, FetchAllMixesRequest, UpdateMixRequest};
+
+    let dir = tempfile::tempdir()?;
+    let fixture = fixture(dir.path()).await?;
+    let params = &fixture.global_params;
+    let queries = || {
+        vec![MixQuery {
+            operator: "lib::all".into(),
+            parameter: "true".into(),
+        }]
+    };
+    let mut created = Vec::new();
+    for (name, mode) in [
+        ("default mode", None),
+        ("repeat all", Some(WirePlaybackMode::RepeatAll)),
+    ] {
+        let response = dispatch_gui_request(
+            params,
+            &CreateMixRequest {
+                name: name.into(),
+                group: "modes".into(),
+                scriptlet_mode: false,
+                mode,
+                queries: queries(),
+                call_id: None,
+            },
+        )
+        .await?
+        .context("created mix")?;
+        assert_eq!(response.mix.mode, mode);
+        created.push((response.mix.id, mode));
+    }
+    let updated = dispatch_gui_request(
+        params,
+        &UpdateMixRequest {
+            mix_id: created[1].0,
+            name: "repeat all".into(),
+            group: "modes".into(),
+            scriptlet_mode: false,
+            mode: None,
+            queries: queries(),
+            call_id: None,
+        },
+    )
+    .await?
+    .context("updated mix")?;
+    assert_eq!(updated.mix.mode, None);
+    created[1].1 = None;
+    let all = dispatch_gui_request(params, &FetchAllMixesRequest { call_id: None })
+        .await?
+        .context("all mixes")?;
+    for (id, mode) in created {
+        let mix = all.mixes.iter().find(|mix| mix.id == id).context("mix")?;
+        assert_eq!(mix.mode, mode);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mix_without_a_stored_mode_keeps_the_players_mode_instead_of_failing_requests()
+-> Result<()> {
+    use crate::messages::FetchAllMixesRequest;
+    use database::entities::mixes;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let dir = tempfile::tempdir()?;
+    let fixture = fixture(dir.path()).await?;
+    let library = fixture.global_params.test_library();
+    let row = mixes::Entity::find()
+        .one(library.main_db.as_ref())
+        .await?
+        .context("a built-in mix")?;
+    let id = row.id;
+    let mut unset: mixes::ActiveModel = row.into();
+    unset.mode = Set(None);
+    unset.update(library.main_db.as_ref()).await?;
+    let all = dispatch_gui_request(
+        &fixture.global_params,
+        &FetchAllMixesRequest { call_id: None },
+    )
+    .await?
+    .context("all mixes")?;
+    let mix = all.mixes.iter().find(|mix| mix.id == id).context("mix")?;
+    assert_eq!(mix.mode, None);
     Ok(())
 }

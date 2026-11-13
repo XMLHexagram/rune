@@ -21,7 +21,7 @@ PlaybackStatus _jukeboxStatus({String? coverArtPath}) => PlaybackStatus(
   progressPercentage: 0.1,
   title: 'Song',
   duration: 10,
-  playbackMode: 0,
+  playbackMode: PlaybackMode.sequential,
   ready: true,
   coverArtPath: coverArtPath,
   libPath: '',

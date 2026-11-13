@@ -230,7 +230,7 @@ class _MixStudioDialogImplementationState
           _controller.titleController.text,
           _controller.groupController.text,
           false,
-          int.parse(_controller.modeController.selectedValue ?? '99'),
+          editorData.mode,
           queries,
         );
       } else {
@@ -238,7 +238,7 @@ class _MixStudioDialogImplementationState
           _controller.titleController.text,
           _controller.groupController.text,
           false,
-          int.parse(_controller.modeController.selectedValue ?? '99'),
+          editorData.mode,
           queries,
         );
       }

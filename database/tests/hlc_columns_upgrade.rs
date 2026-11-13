@@ -5,6 +5,7 @@ use database::actions::{metadata::sync_file_descriptions, mixes, playlists};
 use fsio::FsIo;
 use metadata::describe::describe_file;
 use migration::{Migrator, MigratorTrait};
+use playback::PlaybackMode;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use uuid::Uuid;
 
@@ -81,7 +82,7 @@ async fn alpha_database_with_bookkeeping_columns_still_works() -> Result<()> {
         "new mix".into(),
         "g".into(),
         false,
-        0,
+        Some(PlaybackMode::Sequential),
         false,
         vec![("lib::directory.deep".into(), "/music".into())],
     )

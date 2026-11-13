@@ -17,6 +17,7 @@ use database::{
 };
 use http_request::sync::{MetadataPeer, MetadataStore, router};
 use migration::{Migrator, MigratorTrait};
+use playback::PlaybackMode;
 use sea_orm::{ColumnTrait, Database, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::time::Duration;
 use std::{
@@ -450,7 +451,7 @@ async fn business_scenario() -> Result<()> {
         "temporary mix".into(),
         "m".into(),
         false,
-        0,
+        Some(PlaybackMode::Sequential),
         false,
         vec![("lib::track".into(), c2.to_string())],
     )
@@ -473,7 +474,7 @@ async fn business_scenario() -> Result<()> {
         "missing reference".into(),
         "m".into(),
         false,
-        0,
+        Some(PlaybackMode::Sequential),
         false,
         vec![("lib::playlist".into(), transient.id.to_string())],
     )

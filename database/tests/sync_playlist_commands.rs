@@ -1,3 +1,4 @@
+use playback::PlaybackMode;
 use support::fixtures;
 
 #[path = "support/causal_library.rs"]
@@ -99,7 +100,7 @@ async fn commands_publish_playlist_and_occurrence_removals() -> Result<()> {
         "dependent".into(),
         "d".into(),
         false,
-        0,
+        Some(PlaybackMode::Sequential),
         false,
         vec![("lib::playlist".into(), list.id.to_string())],
     )

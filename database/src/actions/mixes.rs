@@ -5,6 +5,7 @@ use crate::sync::{
     bindings::apply,
     model::{Collection, MixClauseMap, ObjectKey, author_source_on},
 };
+use ::playback::PlaybackMode;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -193,6 +194,44 @@ async fn author_mix(
     .await
 }
 
+/// A stored mix mode that is not one of the known numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MixModeError {
+    #[error("unknown stored mix playback mode {0}")]
+    Unknown(i32),
+}
+
+// The stored and synced form of a mix's playback mode stays numeric, because changing it
+// changes the sync journal format. These two functions are the only place the numbers exist;
+// 99, and a missing value, stand for "keep the player's mode".
+const STORED_KEEP_PLAYBACK_MODE: i32 = 99;
+
+/// The number a mix's playback mode is stored and synced as.
+pub fn stored_mix_mode(mode: Option<PlaybackMode>) -> i32 {
+    match mode {
+        Some(PlaybackMode::Sequential) => 0,
+        Some(PlaybackMode::RepeatOne) => 1,
+        Some(PlaybackMode::RepeatAll) => 2,
+        Some(PlaybackMode::Shuffle) => 3,
+        None => STORED_KEEP_PLAYBACK_MODE,
+    }
+}
+
+/// The playback mode of a stored mix row, `None` when the mix keeps the player's mode.
+pub fn mix_playback_mode(row: &mixes::Model) -> Result<Option<PlaybackMode>, MixModeError> {
+    let Some(stored) = row.mode else {
+        return Ok(None);
+    };
+    match stored {
+        0 => Ok(Some(PlaybackMode::Sequential)),
+        1 => Ok(Some(PlaybackMode::RepeatOne)),
+        2 => Ok(Some(PlaybackMode::RepeatAll)),
+        3 => Ok(Some(PlaybackMode::Shuffle)),
+        STORED_KEEP_PLAYBACK_MODE => Ok(None),
+        other => Err(MixModeError::Unknown(other)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_mix(
     db: &DatabaseConnection,
@@ -200,7 +239,7 @@ pub async fn create_mix(
     name: String,
     group: String,
     scriptlet_mode: bool,
-    mode: i32,
+    mode: Option<PlaybackMode>,
     locked: bool,
     queries: Vec<(String, String)>,
 ) -> Result<mixes::Model> {
@@ -210,7 +249,7 @@ pub async fn create_mix(
         name: Set(name),
         group: Set(group),
         scriptlet_mode: Set(scriptlet_mode),
-        mode: Set(Some(mode)),
+        mode: Set(Some(stored_mix_mode(mode))),
         locked: Set(locked),
         source_uuid: Set(Uuid::new_v4().to_string()),
         ..Default::default()
@@ -243,7 +282,8 @@ pub async fn update_mix(
     name: Option<String>,
     group: Option<String>,
     scriptlet_mode: Option<bool>,
-    mode: Option<i32>,
+    // `None` leaves the mode as it is; `Some(None)` makes the mix keep the player's mode.
+    mode: Option<Option<PlaybackMode>>,
     locked: Option<bool>,
     queries: Option<Vec<(String, String)>>,
 ) -> Result<mixes::Model> {
@@ -264,7 +304,7 @@ pub async fn update_mix(
         model.scriptlet_mode = Set(v);
     }
     if let Some(v) = mode {
-        model.mode = Set(Some(v));
+        model.mode = Set(Some(stored_mix_mode(v)));
     }
     if let Some(v) = locked {
         model.locked = Set(v);

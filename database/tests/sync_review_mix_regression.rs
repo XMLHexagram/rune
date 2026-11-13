@@ -7,6 +7,7 @@ use database::{
     actions::mixes::{create_mix, executable_mix_queries},
     sync::model::*,
 };
+use playback::PlaybackMode;
 use support::{SqlLibrary, key};
 use uuid::Uuid;
 
@@ -23,7 +24,7 @@ async fn deleting_referenced_playlist_does_not_block_unrelated_sync() -> Result<
         "Uses playlist".into(),
         "Test".into(),
         false,
-        0,
+        Some(PlaybackMode::Sequential),
         false,
         vec![("lib::playlist".into(), playlist.id.to_string())],
     )

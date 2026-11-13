@@ -716,7 +716,7 @@ class RuneLifecycleState extends State<RuneLifecycle> {
               ("filter::analyzed", "true"),
               ("pipe::recommend", "-1"),
             ]),
-            playbackMode: 99,
+            playbackMode: null,
             hintPosition: -1,
             initialPlaybackId: -1,
             instantlyPlay: true,

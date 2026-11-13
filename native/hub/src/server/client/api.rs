@@ -152,14 +152,14 @@ pub async fn operate_playback_with_mix_query_request(
     let _: LoadResolvedItemsResponse = connection
         .request(&LoadResolvedItemsRequest {
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
 
             call_id: None,
             items: resolved.playing_items.clone(),
             start_index: resolved.start_index,
             mode: operate_mode.into(),
             expected_revision: None,
-            playback_mode: instant_play.then(|| playback_mode.into()),
+            playback_mode: instant_play.then(|| playback_mode.requested()).flatten(),
         })
         .await?;
     Ok(resolved)
@@ -214,9 +214,12 @@ pub async fn send_set_playback_mode_request(
     playback_mode: PlaybackMode,
     connection: &WSConnection,
 ) -> Result<()> {
+    let Some(mode) = playback_mode.requested() else {
+        return Ok(());
+    };
     let request = SetPlaybackModeRequest {
         call_id: None,
-        mode: playback_mode.into(),
+        mode,
     };
 
     connection.request_simple(&request).await

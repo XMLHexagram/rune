@@ -24,6 +24,7 @@ use database::{
     },
 };
 use fsio::FsIo;
+use playback::PlaybackMode;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, EntityTrait, IntoActiveModel,
     ModelTrait, QueryFilter, Set, TransactionTrait, sea_query::Expr,
@@ -1078,7 +1079,7 @@ async fn saved_mix_uses_stable_references_across_local_ids() -> Result<()> {
         "Portable mix".into(),
         "S".into(),
         false,
-        2,
+        Some(PlaybackMode::RepeatAll),
         false,
         clauses.clone(),
     )
@@ -1198,7 +1199,7 @@ async fn mix_waits_for_dependencies_and_directory_paths_stay_local() -> Result<(
         "Private directory".into(),
         "Group".into(),
         false,
-        0,
+        Some(PlaybackMode::Sequential),
         false,
         vec![("lib::directory.deep".into(), "/private/music".into())],
     )

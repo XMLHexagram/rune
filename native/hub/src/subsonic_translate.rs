@@ -23,11 +23,11 @@ use crate::messages::{
     FetchMediaFilesRequest, FetchMediaFilesResponse, FetchParsedMediaFileRequest,
     FetchParsedMediaFileResponse, GetLikedRequest, GetLikedResponse, GetLyricByTrackIdRequest,
     GetLyricByTrackIdResponse, GetMediaFilesCountRequest, GetMediaFilesCountResponse,
-    GetPlaylistByIdRequest, GetPlaylistByIdResponse, HandoffLoadRequest, LoadRequest,
+    GetPlaylistByIdRequest, GetPlaylistByIdResponse, HandoffLoadRequest, LoadPlay, LoadRequest,
     LoadResolvedItemsRequest, LoadResolvedItemsResponse, LyricContentLine, LyricContentLineSection,
     MediaFile, MediaFileSummary, MixQueryRequest, MixQueryResponse, MovePlaylistItemRequest,
-    NextRequest, PauseRequest, PlayRequest, PlayingItemRef, Playlist, PlaylistOperateMode,
-    PreviousRequest, RefreshSessionRequest, RemoveItemFromPlaylistRequest,
+    NextRequest, PauseRequest, PlayRequest, PlaybackMode, PlayingItemRef, Playlist,
+    PlaylistOperateMode, PreviousRequest, RefreshSessionRequest, RemoveItemFromPlaylistRequest,
     RemoveItemFromPlaylistResponse, RemovePlaylistRequest, RemovePlaylistResponse, RemoveRequest,
     ReorderPlaylistItemPositionRequest, ReorderPlaylistItemPositionResponse,
     SearchCollectionSummaryRequest, SearchCollectionSummaryResponse, SearchForRequest,
@@ -1239,7 +1239,7 @@ async fn jukebox_playback_mode_request(
     binding: &SubsonicBinding,
     request: &SetPlaybackModeRequest,
 ) -> Result<Option<()>> {
-    if request.mode != 3 {
+    if request.mode != PlaybackMode::Shuffle {
         return Err(ExpectedRequestError::Unsupported {
             request: SetPlaybackModeRequest::wire_name(),
             reason: UnsupportedReason::NotImplemented,
@@ -1298,10 +1298,10 @@ fn subsonic_track_ids(
 /// own queue edit: an explicit choice wins, a position alone means "do not
 /// assume", and a plain load plays.
 fn load_plays(request: &LoadResolvedItemsRequest) -> bool {
-    if request.position_seconds.is_some() || request.play.is_some() {
-        request.play.unwrap_or(request.playback_mode.is_some())
-    } else {
-        true
+    match request.play {
+        LoadPlay::Play => true,
+        LoadPlay::Pause => false,
+        LoadPlay::Auto => request.position_seconds.is_none() || request.playback_mode.is_some(),
     }
 }
 
@@ -1475,7 +1475,7 @@ async fn jukebox_session_snapshot_request(
         items,
         index: jukebox.status.current_index,
         position_seconds: f64::from(jukebox.status.position_secs.unwrap_or_default()),
-        playback_mode: 0,
+        playback_mode: PlaybackMode::Sequential,
         playing: jukebox.status.playing,
         revision,
         call_id: request.call_id,
@@ -2043,12 +2043,12 @@ mod tests {
             FetchDirectoryTreeRequest, FetchMediaFileByIdsRequest, FetchMediaFilesRequest,
             FetchParsedMediaFileRequest, FetchPlaylistOccurrencesRequest, GetLikedRequest,
             GetLyricByTrackIdRequest, GetMediaFilesCountRequest, GetPlaylistByIdRequest,
-            HandoffLoadRequest, LoadRequest, LoadResolvedItemsRequest, MixQuery, MixQueryRequest,
-            MovePlaylistItemRequest, NextRequest, PauseRequest, PlayRequest, PlayingItemRef,
-            PlaylistOperateMode, PreviousRequest, RefreshSessionRequest,
-            RemoveItemFromPlaylistRequest, RemovePlaylistRequest, RemoveRequest,
-            ReorderPlaylistItemPositionRequest, SearchCollectionSummaryRequest, SearchForRequest,
-            SearchMediaFileSummaryRequest, SeekRequest, SessionSnapshotRequest,
+            HandoffLoadRequest, LoadPlay, LoadRequest, LoadResolvedItemsRequest, MixQuery,
+            MixQueryRequest, MovePlaylistItemRequest, NextRequest, PauseRequest, PlayRequest,
+            PlaybackMode, PlayingItemRef, PlaylistOperateMode, PreviousRequest,
+            RefreshSessionRequest, RemoveItemFromPlaylistRequest, RemovePlaylistRequest,
+            RemoveRequest, ReorderPlaylistItemPositionRequest, SearchCollectionSummaryRequest,
+            SearchForRequest, SearchMediaFileSummaryRequest, SeekRequest, SessionSnapshotRequest,
             SetAdaptiveSwitchingEnabledRequest, SetLikedRequest, SetPlaybackModeRequest,
             SetRealtimeFFTEnabledRequest, SwitchRequest, TakeBackHandoffBlockRequest,
             UpdatePlaylistRequest, VolumeRequest,
@@ -3491,7 +3491,7 @@ mod tests {
             expected_revision: None,
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
             call_id: Some(17),
         }
     }
@@ -3514,7 +3514,7 @@ mod tests {
             expected_revision: None,
             playback_mode: None,
             position_seconds: None,
-            play: None,
+            play: LoadPlay::Auto,
             call_id: None,
         }
     }
@@ -3604,7 +3604,7 @@ mod tests {
     #[tokio::test]
     async fn load_starts_the_requested_song_at_the_requested_position() {
         let tracks = ["t-1", "t-2", "t-3", "t-4", "t-5", "t-6"];
-        for (play, expected_playing) in [(Some(true), true), (Some(false), false)] {
+        for (play, expected_playing) in [(LoadPlay::Play, true), (LoadPlay::Pause, false)] {
             let root = TempDir::new().unwrap();
             let (binding, _server) = mock_subsonic(&root, true).await;
             let mut request =
@@ -3687,7 +3687,7 @@ mod tests {
         RequestTranslator::translate_set_playback_mode_request(
             &binding,
             &SetPlaybackModeRequest {
-                mode: 3,
+                mode: PlaybackMode::Shuffle,
                 call_id: None,
             },
         )
@@ -3697,7 +3697,7 @@ mod tests {
         let unsupported_mode = RequestTranslator::translate_set_playback_mode_request(
             &binding,
             &SetPlaybackModeRequest {
-                mode: 1,
+                mode: PlaybackMode::RepeatOne,
                 call_id: None,
             },
         )

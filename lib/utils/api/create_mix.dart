@@ -5,7 +5,7 @@ Future<Mix> createMix(
   String name,
   String group,
   bool scriptletMode,
-  int mode,
+  PlaybackMode? mode,
   Iterable<(String, String)> queries,
 ) async {
   final createRequest = CreateMixRequest(

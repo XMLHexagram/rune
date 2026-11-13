@@ -4053,7 +4053,7 @@ mod lifecycle_tests {
             index: None,
             item: None,
             item_request: None,
-            playback_mode: 0,
+            playback_mode: PlaybackMode::Sequential,
             ready: true,
             cover_art_path: None,
             lib_path: a.global_params.test_library().media_root.clone(),
