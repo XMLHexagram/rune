@@ -7938,7 +7938,7 @@ async fn rpc_target_session_and_library_catalogue_matches_registered_peer_handle
         let session = Session {
             public_key: "untrusted key".into(),
             fingerprint: "untrusted peer".into(),
-            host: "127.0.0.1".into(),
+            base_url: url::Url::parse("https://127.0.0.1:7863/").unwrap(),
         };
         let dispatched =
             dispatch_remote(name, &[255], Some(session), None, &peer.global_params.node).await;

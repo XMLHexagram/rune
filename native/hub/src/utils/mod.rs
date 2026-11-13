@@ -2416,7 +2416,7 @@ pub fn process_cover_art_path(
         .unwrap_or_default();
     format!(
         "{}/files/cache/{file_name}?library_id={library_id}",
-        session.host
+        session.base_url.as_str().trim_end_matches('/')
     )
 }
 
@@ -2730,7 +2730,7 @@ mod cover_art_url_tests {
         let remote_session = Session {
             public_key: "key".to_string(),
             fingerprint: "fingerprint".to_string(),
-            host: "https://peer.example".to_string(),
+            base_url: url::Url::parse("https://peer.example").unwrap(),
         };
 
         assert_eq!(process_cover_art_path(path, library_id, None), path);

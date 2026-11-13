@@ -89,12 +89,12 @@ mod access_policy_tests {
         let session = Session {
             fingerprint: user.fingerprint.clone(),
             public_key: user.public_key.clone(),
-            host: "127.0.0.1".into(),
+            base_url: url::Url::parse("https://127.0.0.1:7863/").unwrap(),
         };
         let second_session = Session {
             fingerprint: user.fingerprint.clone(),
             public_key: user.public_key.clone(),
-            host: "127.0.0.1".into(),
+            base_url: url::Url::parse("https://127.0.0.1:7863/").unwrap(),
         };
         let item = PlayingItemRef::LibraryTrack {
             library_id: library_b.to_string(),
@@ -147,7 +147,7 @@ mod access_policy_tests {
                 Some(Session {
                     fingerprint: user.fingerprint.clone(),
                     public_key: user.public_key.clone(),
-                    host: "127.0.0.1".into(),
+                    base_url: url::Url::parse("https://127.0.0.1:7863/").unwrap(),
                 }),
                 Some(pair.id),
                 &node,
@@ -169,7 +169,7 @@ mod access_policy_tests {
                 Some(Session {
                     fingerprint: user.fingerprint,
                     public_key: user.public_key,
-                    host: "127.0.0.1".into(),
+                    base_url: url::Url::parse("https://127.0.0.1:7863/").unwrap(),
                 }),
                 Some(pair.id),
                 &node,
@@ -229,7 +229,7 @@ mod access_policy_tests {
         let session = Session {
             fingerprint: user.fingerprint,
             public_key: user.public_key,
-            host: "127.0.0.1".into(),
+            base_url: url::Url::parse("https://127.0.0.1:7863/").unwrap(),
         };
 
         let node = Arc::clone(&pair.a.global_params.node);

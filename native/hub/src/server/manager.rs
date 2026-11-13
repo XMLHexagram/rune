@@ -2590,6 +2590,84 @@ mod lifecycle_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn controller_cover_urls_name_the_port_it_connected_to() -> Result<()> {
+        use database::entities::media_cover_art;
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let renderer = fixture(first.path()).await?;
+        let controller = fixture(second.path()).await?;
+        let renderer_id = renderer
+            .global_params
+            .library_id
+            .context("renderer library")?;
+        let track = scan_held_track(&renderer, renderer_id, "covered.ogg").await?;
+        let library = renderer
+            .global_params
+            .library_pool
+            .acquire(renderer_id)
+            .await?;
+        let cover_bytes = b"cover bytes for the port test".to_vec();
+        let digest = blake3::hash(&cover_bytes).to_hex().to_string();
+        let cover_uuid = migration::catalog_identity::artwork(&digest).to_string();
+        media_cover_art::ActiveModel {
+            id: sea_orm::NotSet,
+            file_hash: Set(String::new()),
+            binary: Set(cover_bytes.clone()),
+            primary_color: Set(None),
+            content_hash: Set(Some(digest.clone())),
+            content_size: Set(Some(i64::try_from(cover_bytes.len())?)),
+            local_available: Set(true),
+            source_uuid: Set(cover_uuid.clone()),
+        }
+        .insert(&*library.main_db)
+        .await?;
+        let mut file = track.clone().into_active_model();
+        file.cover_art_uuid = Set(Some(cover_uuid));
+        file.update(&*library.main_db).await?;
+
+        let addr = paired_full(&renderer, &controller).await?;
+        assert_ne!(
+            addr.port(),
+            discovery::endpoint::DEFAULT_DEVICE_PORT,
+            "the test must run on a port other than the default"
+        );
+        let validator = controller.global_params.cert_validator.read().await.clone();
+        let mut socket = connect_remote(
+            "127.0.0.1",
+            addr.port(),
+            &controller.global_params.config_path,
+            validator,
+            &controller.global_params.node.sync_tokens,
+        )
+        .await?;
+        let request = rinf::serialize(&FetchMediaFilesRequest {
+            cursor: 0,
+            page_size: 10,
+            bake_cover_arts: true,
+            call_id: None,
+        })?;
+        let (name, payload) = socket_request_for_library(
+            &mut socket,
+            "FetchMediaFilesRequest",
+            &request,
+            renderer_id,
+        )
+        .await?;
+        assert_eq!(name, "FetchMediaFilesResponse");
+        let response: FetchMediaFilesResponse = rinf::deserialize(&payload)?;
+        assert_eq!(
+            response.cover_art_map.get(&track.id),
+            Some(&format!(
+                "https://127.0.0.1:{}/files/cache/{digest}?library_id={renderer_id}",
+                addr.port()
+            ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn addressed_websocket_requests_select_and_authorize_the_named_library() -> Result<()> {
         use crate::Session;
         use crate::access_policy::{ConnectionLevel, DeviceGrants, LibraryGrants};
@@ -2636,7 +2714,7 @@ mod lifecycle_tests {
         let peer_session = Session {
             fingerprint: user.fingerprint,
             public_key: user.public_key,
-            host: "127.0.0.2".into(),
+            base_url: url::Url::parse("https://127.0.0.2:7863/").unwrap(),
         };
         renderer.global_params.node.access_policy.set(
             &controller_fingerprint,
@@ -2732,7 +2810,7 @@ mod lifecycle_tests {
             Some(Session {
                 fingerprint: peer_session.fingerprint.clone(),
                 public_key: peer_session.public_key.clone(),
-                host: peer_session.host.clone(),
+                base_url: peer_session.base_url.clone(),
             }),
             None,
             &renderer.global_params.node,

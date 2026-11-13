@@ -31,7 +31,6 @@ use tokio_tungstenite::{
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
-use urlencoding::encode;
 use uuid::Uuid;
 
 use crate::{
@@ -814,14 +813,9 @@ async fn connect_remote_with_version(
             error!("Could not obtain renderer token at {host}:{port}: {error:#}");
             token_error(error)
         })?;
-        let url = device_url(
-            host,
-            port,
-            DeviceScheme::Wss,
-            &format!("/ws?host={}", encode(host)),
-        )
-        .map_err(protocol)?
-        .to_string();
+        let url = device_url(host, port, DeviceScheme::Wss, "/ws")
+            .map_err(protocol)?
+            .to_string();
         let mut request = url.as_str().into_client_request().map_err(protocol)?;
         request.headers_mut().insert(
             reqwest::header::AUTHORIZATION,
