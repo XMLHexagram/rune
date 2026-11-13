@@ -264,13 +264,13 @@ async fn local_write_before_first_head_publication_reaches_every_hub_on(
     };
     let (seed_write, prefix, existing_prefix) = tokio::join!(
         existing_library
-            .library
+            .sync_store
             .write_local(seed_key.clone(), support::playlist("")),
         library
-            .library
+            .sync_store
             .share_prefix(env::temp_dir().join(format!("hub-share-{}", Uuid::new_v4()))),
         existing_library
-            .library
+            .sync_store
             .share_prefix(env::temp_dir().join(format!("hub-share-{}", Uuid::new_v4()))),
     );
     seed_write?;
@@ -354,7 +354,12 @@ async fn local_write_before_first_head_publication_reaches_every_hub_on(
         "joining hub reached first head publication without fetching the existing hub's head"
     );
     anyhow::ensure!(
-        joining_hub.library.library.get(&seed_key).await?.is_some(),
+        joining_hub
+            .library
+            .sync_store
+            .get(&seed_key)
+            .await?
+            .is_some(),
         "joining hub reached first head publication before pulling the seed"
     );
     let write_key = ObjectKey {
@@ -363,7 +368,7 @@ async fn local_write_before_first_head_publication_reaches_every_hub_on(
     };
     joining_hub
         .library
-        .library
+        .sync_store
         .write_local(write_key.clone(), support::playlist(""))
         .await?;
     let last_passes: Vec<_> = hubs_successful_passes(&[&existing_hub, &joining_hub]);
@@ -418,11 +423,11 @@ async fn wait_for_keys_after_worker_events(
             last_passes = current;
             if observed_passes.iter().all(|observed| *observed) {
                 wait_until("share keys to reach every hub", || async {
-                    let records = try_join_all(
-                        hubs.iter()
-                            .flat_map(|hub| keys.iter().map(|key| hub.library.library.get(key))),
-                    )
-                    .await?;
+                    let records =
+                        try_join_all(hubs.iter().flat_map(|hub| {
+                            keys.iter().map(|key| hub.library.sync_store.get(key))
+                        }))
+                        .await?;
                     Ok(records.iter().all(Option::is_some).then_some(()))
                 })
                 .await?;

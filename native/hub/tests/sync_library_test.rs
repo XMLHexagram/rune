@@ -1,4 +1,6 @@
 use anyhow::Result;
+use database::entities::*;
+use database::test_fixtures::causal_library as support;
 use database::{
     actions::{
         collection::CollectionQueryType,
@@ -32,9 +34,6 @@ use sea_orm::{
 use std::sync::Arc;
 use support::fixtures;
 use sync::{CheckpointKey, ReceiveStore, SyncStore};
-#[path = "support/causal_library.rs"]
-mod support;
-use database::entities::*;
 use uuid::Uuid;
 
 async fn setup() -> Result<(sea_orm::DatabaseConnection, tempfile::TempDir)> {

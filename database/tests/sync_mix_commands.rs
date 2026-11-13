@@ -152,8 +152,7 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
     Ok(())
 }
 
-#[path = "support/causal_library.rs"]
-mod support;
+use database::test_fixtures::causal_library as support;
 
 #[tokio::test]
 async fn each_mix_command_replicates_its_result() -> Result<()> {
@@ -162,7 +161,7 @@ async fn each_mix_command_replicates_its_result() -> Result<()> {
     let actor = Uuid::new_v4();
     let source = support::SqlLibrary::new(namespace, actor).await?;
     let target = support::SqlLibrary::new(namespace, Uuid::new_v4()).await?;
-    let store = source.library.record_store();
+    let store = source.sync_store.record_store();
     let mix = create_mix(
         &source.db,
         &store,
@@ -255,7 +254,7 @@ async fn directory_binding_stays_local_and_clause_identity_survives_reordering()
     let actor = Uuid::new_v4();
     let source = support::SqlLibrary::new(namespace, actor).await?;
     let target = support::SqlLibrary::new(namespace, Uuid::new_v4()).await?;
-    let store = source.library.record_store();
+    let store = source.sync_store.record_store();
     let mix = create_mix(
         &source.db,
         &store,

@@ -1,7 +1,5 @@
 //! Deterministic business commands interleaved with bounded metadata sessions.
 
-#[path = "support/fixtures.rs"]
-mod fixtures;
 use anyhow::{Context, Result, ensure};
 use axum::{
     body::{Body, to_bytes},
@@ -10,6 +8,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
+use database::test_fixtures::fixtures;
 use database::{
     actions::{file::get_media_files, mixes, playlists, stats},
     entities::{media_file_stats, media_files, playlists as playlist_rows},

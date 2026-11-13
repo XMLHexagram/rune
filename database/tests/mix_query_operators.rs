@@ -1,4 +1,5 @@
 use anyhow::Result;
+use database::test_fixtures::fixtures;
 use database::{
     actions::mixes::{
         QueryOperator, QueryParseError, add_item_to_mix, create_mix, executable_mix_queries,
@@ -10,7 +11,6 @@ use database::{
     mix_operator::{MixOperator, UnknownOperator},
 };
 use sea_orm::{Database, EntityTrait};
-use support::fixtures;
 use uuid::Uuid;
 
 /// A parameter each operator accepts.
@@ -155,6 +155,3 @@ async fn clauses_come_back_from_storage_as_written_and_unknown_ones_are_refused(
     );
     Ok(())
 }
-
-#[path = "support/causal_library.rs"]
-mod support;

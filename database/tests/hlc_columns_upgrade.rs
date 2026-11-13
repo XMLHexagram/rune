@@ -1,7 +1,6 @@
-#[path = "support/fixtures.rs"]
-mod fixtures;
 use anyhow::Result;
 use database::actions::{metadata::sync_file_descriptions, mixes, playlists};
+use database::test_fixtures::fixtures;
 use fsio::FsIo;
 use metadata::describe::describe_file;
 use migration::{Migrator, MigratorTrait};

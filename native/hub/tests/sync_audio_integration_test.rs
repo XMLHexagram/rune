@@ -1,10 +1,9 @@
-#[path = "support/fixtures.rs"]
-mod fixtures;
 use anyhow::Result;
 use axum::body::Body;
 use axum::http::Response;
 use database::actions::mixes::mix_playback_mode;
 use database::sync::model::*;
+use database::test_fixtures::fixtures;
 use database::{
     actions::{
         cover_art::assign_inspected,

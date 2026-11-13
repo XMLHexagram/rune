@@ -8,3 +8,6 @@ pub mod playing_item;
 pub mod sync;
 
 pub mod library_registry;
+
+#[cfg(feature = "test-fixtures")]
+pub mod test_fixtures;
