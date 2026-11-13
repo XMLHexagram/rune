@@ -369,12 +369,26 @@ impl WorkerHub {
     }
 }
 
+/// A node generates an RSA device certificate on first start, which takes seconds in a
+/// debug build, and the share worker never uses it. Starting from an elliptic-curve
+/// identity written beforehand, made in milliseconds, avoids that wait.
+fn write_quick_identity(directory: &std::path::Path) -> Result<()> {
+    let key = rcgen::KeyPair::generate()?;
+    let certificate =
+        rcgen::CertificateParams::new(vec!["share-test".to_owned()])?.self_signed(&key)?;
+    std::fs::write(directory.join("cid"), "R-share-test")?;
+    std::fs::write(directory.join("certificate.pem"), certificate.pem())?;
+    std::fs::write(directory.join("private_key.pem"), key.serialize_pem())?;
+    Ok(())
+}
+
 async fn register_worker_library(
     directory: &tempfile::TempDir,
     namespace: Uuid,
     library: &support::SqlLibrary,
 ) -> Result<(Arc<NodeContext>, Arc<QuietBroadcaster>, LibraryHandle)> {
     let path = directory.path().to_string_lossy().into_owned();
+    write_quick_identity(directory.path())?;
     let broadcaster = Arc::new(QuietBroadcaster::default());
     let node = NodeContext::new(&path, &path, broadcaster.clone(), false, RunMode::App).await?;
     let record = test_record(namespace);

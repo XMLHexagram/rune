@@ -1,6 +1,9 @@
 use super::*;
 use std::{env, slice};
-use sync::share::{chunk_key, decode_chunk, decode_manifest, decode_segment, parse_key};
+use sync::share::{
+    FORMAT_VERSION, LibraryFile, chunk_key, decode_chunk, decode_manifest, decode_segment,
+    encode_library, library_key, parse_key,
+};
 use tokio::time::timeout;
 
 #[derive(Clone)]
@@ -235,6 +238,20 @@ async fn local_write_before_first_head_publication_reaches_every_hub_on(
 ) -> Result<()> {
     let namespace = Uuid::new_v4();
     let (_fixture, session) = real_share(backend).await;
+    // Without conditional create, the first pass to find no library file writes it and
+    // then waits five seconds for a racing writer to settle. This test is about the
+    // window before a head, not about creating the share, so the file is already there.
+    let library_file = LibraryFile {
+        format: FORMAT_VERSION,
+        library_id: namespace,
+        model: RuneModel::model_id().to_owned(),
+        schema: RuneModel::schema_id().to_owned(),
+    };
+    session
+        .store
+        .put(&library_key(), &encode_library(&library_file)?)
+        .await
+        .map_err(|error| anyhow::anyhow!("write library file: {error:?}"))?;
 
     let (existing_library, library) = tokio::join!(
         support::SqlLibrary::new(namespace, Uuid::new_v4()),
