@@ -2,45 +2,18 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-use apple_music::library::{
-    AppleLibrary, Clock, LibraryError, SignInChange, SongList, Tokens, Track, TrackKey,
+use apple_music::library::{AppleLibrary, LibraryError, SignInChange, SongList, Tokens, TrackKey};
+use common::{
+    assert_not_found, fast_retry, fixture, key, keys, until, FixtureServer, ManualClock, Reply,
+    Seen, DEVELOPER_TOKEN, TTL, USER_TOKEN,
 };
-use common::{fast_retry, FixtureServer, Reply, Seen};
 use serde_json::{json, Value};
 
-const USER_TOKEN: &str = "music-user-token";
-const DEVELOPER_TOKEN: &str = "developer-token";
 const LIBRARY_PAGE_1: &str = "/v1/me/library/songs?limit=100&include=albums,artists";
 const LIBRARY_PAGE_2: &str = "/v1/me/library/songs?offset=2&limit=100&include=albums,artists";
-const TTL: Duration = Duration::from_secs(10 * 60);
-
-/// A clock that moves only when told to.
-struct ManualClock {
-    start: Instant,
-    elapsed: Mutex<Duration>,
-}
-
-impl ManualClock {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            start: Instant::now(),
-            elapsed: Mutex::default(),
-        })
-    }
-
-    fn advance(&self, by: Duration) {
-        *self.elapsed.lock().unwrap() += by;
-    }
-}
-
-impl Clock for ManualClock {
-    fn now(&self) -> Instant {
-        self.start + *self.elapsed.lock().unwrap()
-    }
-}
 
 fn library_for(fixtures: &FixtureServer) -> AppleLibrary {
     let base_url = fixtures.base_url.clone();
@@ -60,17 +33,6 @@ fn tokens_of(user: &str) -> Tokens {
     Tokens::new(DEVELOPER_TOKEN, user).unwrap()
 }
 
-/// Waits until `condition` holds.
-async fn until(condition: impl Fn() -> bool) {
-    for _ in 0..500 {
-        if condition() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("timed out");
-}
-
 /// Waits until the fixture server has seen a request for `method path`.
 async fn seen_request(fixtures: &FixtureServer, method: &str, path: &str) {
     until(|| !fixtures.seen_for(method, path).is_empty()).await;
@@ -80,10 +42,6 @@ fn signed_in(fixtures: &FixtureServer) -> AppleLibrary {
     let library = library_for(fixtures);
     library.sign_in(tokens());
     library
-}
-
-fn fixture(name: &str) -> Reply {
-    Reply::fixture(name)
 }
 
 fn library_song(id: &str, name: &str) -> Value {
@@ -104,14 +62,6 @@ fn library_song(id: &str, name: &str) -> Value {
 
 fn body_json(body: &str) -> Value {
     serde_json::from_str(body).unwrap()
-}
-
-fn key(text: &str) -> TrackKey {
-    text.parse().unwrap()
-}
-
-fn keys(tracks: &[Track]) -> Vec<String> {
-    tracks.iter().map(|track| track.key.to_string()).collect()
 }
 
 fn id_count(request: &Seen) -> usize {
@@ -138,13 +88,6 @@ fn library_page_reads(fixtures: &FixtureServer) -> usize {
 
 fn assert_signed_out<T: std::fmt::Debug>(result: Result<T, LibraryError>) {
     assert!(matches!(result, Err(LibraryError::SignedOut)), "{result:?}");
-}
-
-fn assert_not_found<T: std::fmt::Debug>(result: Result<T, LibraryError>) {
-    assert!(
-        matches!(result, Err(LibraryError::NotFound(_))),
-        "{result:?}"
-    );
 }
 
 fn assert_refused<T: std::fmt::Debug>(result: Result<T, LibraryError>) {

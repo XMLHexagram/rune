@@ -7,8 +7,14 @@
 //!
 //! Songs are named by [`TrackKey`]: library songs by Apple's library id (`i.…`), catalog
 //! songs as `catalog:<id>`. Library albums, artists and playlists keep Apple's library ids.
+//!
+//! The catalog sits beside the library: [`AppleLibrary::search`] merges both, catalog
+//! albums, artists and playlists open by [`ItemId::Catalog`] ids, and
+//! [`AppleLibrary::add_to_library`] moves catalog items over. What the library holds is
+//! told by [`AppleLibrary::membership`].
 
 mod cache;
+mod catalog;
 mod map;
 mod types;
 
@@ -29,10 +35,13 @@ use crate::models::{LibraryEntry, LibraryPlaylist, LibrarySong, RatingValue, Sto
 use crate::tokens::TokenSource;
 use crate::ID_BATCH;
 use cache::{Caches, Slot, TTL};
+pub use catalog::DEFAULT_RECOMMENDATIONS;
 use types::is_library_id;
 pub use types::{
-    Album, AlbumDetail, Artist, ArtistDetail, Artwork, ParseTrackKeyError, Playlist, SongList,
-    Track, TrackKey,
+    Additions, Album, AlbumDetail, AlbumItem, Artist, ArtistDetail, ArtistItem, Artwork,
+    Candidates, CatalogAlbumDetail, CatalogArtistDetail, CatalogPlaylistDetail, ItemId, Membership,
+    ParseItemIdError, ParseTrackKeyError, Playlist, PlaylistItem, RecommendationGroup,
+    RecommendationKind, SearchResults, SearchScope, SongList, Track, TrackKey,
 };
 
 /// Relationships read with library songs, for their album and artist ids.
@@ -239,8 +248,10 @@ impl AppleLibrary {
         if !self.tokens.replace(Some(tokens)) {
             return SignInChange::Unchanged;
         }
-        self.caches.start_session();
+        // The storefront first: a read that starts after the new session began must not
+        // find the old account's.
         self.client.forget_storefront();
+        self.caches.start_session();
         SignInChange::Changed
     }
 
@@ -248,8 +259,8 @@ impl AppleLibrary {
     /// [`LibraryError::SignedOut`] until the next sign-in.
     pub fn sign_out(&self) {
         if self.tokens.replace(None) {
-            self.caches.start_session();
             self.client.forget_storefront();
+            self.caches.start_session();
         }
     }
 
@@ -536,7 +547,8 @@ impl AppleLibrary {
                             .caches
                             .songs
                             .peek()
-                            .is_some_and(|list| list.in_library(key));
+                            .is_some_and(|list| list.in_library(key))
+                            || self.added_song(catalog_id);
                         song
                     })
                 }),
@@ -765,13 +777,15 @@ impl AppleLibrary {
     /// it is shared behind an `Arc`; the shorter lists of artists and playlists are read
     /// afresh on every call.
     pub async fn albums(&self) -> Result<Arc<Vec<Album>>> {
-        self.signed_in_read(Missing::Album, || async {
-            self.kept(
-                |caches| &caches.albums,
-                |library| async move { library.build_album_list().await }.boxed(),
-            )
+        self.signed_in_read(Missing::Album, || self.album_list())
             .await
-        })
+    }
+
+    async fn album_list(&self) -> Outcome<Arc<Vec<Album>>> {
+        self.kept(
+            |caches| &caches.albums,
+            |library| async move { library.build_album_list().await }.boxed(),
+        )
         .await
     }
 
