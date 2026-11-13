@@ -45,7 +45,6 @@ pub(crate) enum CurrentPlayer {
     Local,
     RunePeer {
         link: Option<Arc<RendererLink>>,
-        attached: bool,
         reconnecting: Option<String>,
     },
     SubsonicJukebox(Arc<SubsonicBinding>),
@@ -341,7 +340,6 @@ mod tests {
         );
         let player = CurrentPlayer::RunePeer {
             link: None,
-            attached: true,
             reconnecting: None,
         };
         assert_eq!(player.visualizer_inputs(), VisualizerInputs::Full);

@@ -834,7 +834,6 @@ impl NodeContext {
                 ..
             }) => CurrentPlayer::RunePeer {
                 link: renderer_link.clone(),
-                attached: false,
                 reconnecting: reconnect.as_ref().map(|task| task.alias.clone()),
             },
             UiLibrary::Open(OpenLibraryState {
@@ -848,7 +847,6 @@ impl NodeContext {
             _ => match renderer_link {
                 Some(link) => CurrentPlayer::RunePeer {
                     link: Some(link),
-                    attached: true,
                     reconnecting: None,
                 },
                 None => CurrentPlayer::Local,
@@ -942,29 +940,13 @@ impl NodeContext {
     ) -> Result<()> {
         let leaving_local = matches!(
             (&previous, &current),
-            (
-                CurrentPlayer::Local,
-                CurrentPlayer::RunePeer { attached: true, .. }
-            ) | (
-                CurrentPlayer::Local,
-                CurrentPlayer::RunePeer {
-                    attached: false,
-                    ..
-                }
-            ) | (CurrentPlayer::Local, CurrentPlayer::SubsonicJukebox(_))
+            (CurrentPlayer::Local, CurrentPlayer::RunePeer { .. })
+                | (CurrentPlayer::Local, CurrentPlayer::SubsonicJukebox(_))
         );
         let returning_local = matches!(
             (&previous, &current),
-            (
-                CurrentPlayer::RunePeer { attached: true, .. },
-                CurrentPlayer::Local
-            ) | (
-                CurrentPlayer::RunePeer {
-                    attached: false,
-                    ..
-                },
-                CurrentPlayer::Local
-            ) | (CurrentPlayer::SubsonicJukebox(_), CurrentPlayer::Local)
+            (CurrentPlayer::RunePeer { .. }, CurrentPlayer::Local)
+                | (CurrentPlayer::SubsonicJukebox(_), CurrentPlayer::Local)
         );
         let renderer_lost = matches!(
             (&previous, &current),
