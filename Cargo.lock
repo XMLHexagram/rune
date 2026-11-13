@@ -5642,6 +5642,8 @@ dependencies = [
  "rodio",
  "rtrb",
  "rustfft",
+ "serde",
+ "serde_json",
  "simple_channel",
  "souvlaki",
  "stream-download",
