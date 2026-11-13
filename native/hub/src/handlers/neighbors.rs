@@ -33,7 +33,7 @@ use ::discovery::{
     client::{
         CertValidator, CertValidatorError, fetch_server_certificate, select_best_host, try_connect,
     },
-    endpoint::{DEFAULT_DEVICE_PORT, DeviceAddress},
+    endpoint::{DEFAULT_DEVICE_PORT, DeviceAddress, DeviceScheme},
     protocol::DiscoveryService,
     server::{PermissionManager, UserStatus},
     utils::{DeviceInfo, DeviceType},
@@ -57,7 +57,11 @@ pub(crate) async fn select_pinned_pair_host(
         .collect::<Result<Vec<_>>>()?;
     let urls = addresses
         .iter()
-        .map(|address| address.url("https", "/").map(|url| url.to_string()))
+        .map(|address| {
+            address
+                .url(DeviceScheme::Https, "/")
+                .map(|url| url.to_string())
+        })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     match select_best_host(
         urls.clone(),
@@ -588,7 +592,7 @@ impl Signal for ServerAvailabilityTestRequest {
             .iter()
             .map(|host| {
                 host.parse::<DeviceAddress>()
-                    .and_then(|address| address.url("https", "/"))
+                    .and_then(|address| address.url(DeviceScheme::Https, "/"))
                     .map(|url| url.to_string())
             })
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -642,7 +646,7 @@ async fn has_fingerprint_mismatch(hosts: &[String], validator: &CertValidator) -
         let Ok(address) = host.parse::<DeviceAddress>() else {
             continue;
         };
-        let Ok(url) = address.url("https", "/ping") else {
+        let Ok(url) = address.url(DeviceScheme::Https, "/ping") else {
             continue;
         };
         let Ok(Ok(server_certificate)) = timeout(

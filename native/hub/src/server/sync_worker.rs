@@ -27,7 +27,7 @@ use database::sync::model::RuneModel;
 use database::sync::share::{ShareCapabilities, SharePullError, SharePushError};
 use database::sync::{LibrarySyncStore, replica::PendingShareChange};
 use discovery::access_policy::{AccessPolicy, PeerIdentity};
-use discovery::endpoint::{DeviceAddress, device_url};
+use discovery::endpoint::{DeviceAddress, DeviceScheme, device_url};
 use discovery::server::UserStatus;
 use fsio::{OpenDalConfig, OpenDalObjectStore};
 use futures::future::BoxFuture;
@@ -1727,7 +1727,7 @@ pub(crate) fn invalidate_sync_token(
 
 /// The base URL of a peer's HTTPS server, bracketing IPv6 hosts.
 pub(crate) fn peer_base(host: &str, port: u16) -> Result<String> {
-    let url = device_url(host, port, "https", "/").map_err(anyhow::Error::msg)?;
+    let url = device_url(host, port, DeviceScheme::Https, "/").map_err(anyhow::Error::msg)?;
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 

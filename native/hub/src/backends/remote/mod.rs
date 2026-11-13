@@ -58,7 +58,7 @@ use ::discovery::protocol_version::{
 };
 use ::discovery::{
     client::{CertValidator, select_best_host},
-    endpoint::{DEFAULT_DEVICE_PORT, DeviceAddress, device_url},
+    endpoint::{DEFAULT_DEVICE_PORT, DeviceAddress, DeviceScheme, device_url},
 };
 
 pub fn encode_message(type_name: &str, payload: &[u8], uuid: Option<Uuid>) -> Vec<u8> {
@@ -249,7 +249,7 @@ impl RendererLink {
                 value
                     .parse::<DeviceAddress>()
                     .map_err(protocol)?
-                    .url("https", "/")
+                    .url(DeviceScheme::Https, "/")
                     .map(|url| url.to_string())
                     .map_err(protocol)
             })
@@ -814,9 +814,14 @@ async fn connect_remote_with_version(
             error!("Could not obtain renderer token at {host}:{port}: {error:#}");
             token_error(error)
         })?;
-        let url = device_url(host, port, "wss", &format!("/ws?host={}", encode(host)))
-            .map_err(protocol)?
-            .to_string();
+        let url = device_url(
+            host,
+            port,
+            DeviceScheme::Wss,
+            &format!("/ws?host={}", encode(host)),
+        )
+        .map_err(protocol)?
+        .to_string();
         let mut request = url.as_str().into_client_request().map_err(protocol)?;
         request.headers_mut().insert(
             reqwest::header::AUTHORIZATION,
@@ -990,7 +995,7 @@ pub(crate) async fn select_renderer_host(
             } else {
                 let address = host.parse::<DeviceAddress>().map_err(protocol)?;
                 address
-                    .url("https", "/")
+                    .url(DeviceScheme::Https, "/")
                     .map(|url| url.to_string())
                     .map_err(protocol)
             }

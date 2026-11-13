@@ -1,6 +1,6 @@
 use crate::access_policy::{Action, ConnectionLevel, LibraryGrants, SyncLevel};
 use discovery::access_policy::{AccessPolicy, PeerIdentity};
-use discovery::endpoint::{DEFAULT_DEVICE_PORT, DeviceAddress, device_url};
+use discovery::endpoint::{DEFAULT_DEVICE_PORT, DeviceAddress, DeviceScheme, device_url};
 use std::path::Path;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -213,7 +213,8 @@ async fn probe_renderer(
     let hosts = endpoints
         .iter()
         .map(|endpoint| {
-            device_url(&endpoint.host, endpoint.port, "https", "/").map(|url| url.to_string())
+            device_url(&endpoint.host, endpoint.port, DeviceScheme::Https, "/")
+                .map(|url| url.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
     let selected = select_renderer_host(&node, hosts).await?;
