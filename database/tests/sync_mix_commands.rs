@@ -8,6 +8,7 @@ use database::{
     entities::{mixes, mixes::Column, search_index},
     sync::model::{Collection, ObjectKey, Payload},
 };
+use playback::PlaybackMode;
 use sea_orm::{Database, EntityTrait, PaginatorTrait};
 use support::fixtures;
 use uuid::Uuid;
@@ -27,8 +28,7 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
             &store,
             "invalid".into(),
             "m".into(),
-            false,
-            0,
+            Some(PlaybackMode::Sequential),
             false,
             vec![("invalid".into(), "x".into())]
         )
@@ -48,8 +48,7 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
         &store,
         "mix".into(),
         "m".into(),
-        false,
-        0,
+        Some(PlaybackMode::Sequential),
         false,
         vec![("lib::all".into(), "true".into())],
     )
@@ -70,8 +69,7 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
             mix.id,
             Some("bad".into()),
             Some("m".into()),
-            Some(false),
-            Some(0),
+            Some(Some(PlaybackMode::Sequential)),
             Some(false),
             Some(vec![("invalid".into(), "x".into())])
         )
@@ -135,7 +133,6 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
         None,
         None,
         None,
-        None,
     )
     .await?;
     assert!(library.head().await?.sequence > before.sequence);
@@ -148,7 +145,6 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
         None,
         None,
         None,
-        None,
     )
     .await?;
     remove_mix(&db, &store, mix.id).await?;
@@ -156,8 +152,7 @@ async fn commands_author_and_reject_invalid_queries_atomically() -> Result<()> {
     Ok(())
 }
 
-#[path = "support/causal_library.rs"]
-mod support;
+use database::test_fixtures::causal_library as support;
 
 #[tokio::test]
 async fn each_mix_command_replicates_its_result() -> Result<()> {
@@ -166,14 +161,13 @@ async fn each_mix_command_replicates_its_result() -> Result<()> {
     let actor = Uuid::new_v4();
     let source = support::SqlLibrary::new(namespace, actor).await?;
     let target = support::SqlLibrary::new(namespace, Uuid::new_v4()).await?;
-    let store = source.library.record_store();
+    let store = source.sync_store.record_store();
     let mix = create_mix(
         &source.db,
         &store,
         "Original".into(),
         "Group".into(),
-        false,
-        0,
+        Some(PlaybackMode::Sequential),
         false,
         vec![("lib::all".into(), "true".into())],
     )
@@ -200,7 +194,6 @@ async fn each_mix_command_replicates_its_result() -> Result<()> {
         &store,
         mix.id,
         Some("Updated".into()),
-        None,
         None,
         None,
         None,
@@ -261,14 +254,13 @@ async fn directory_binding_stays_local_and_clause_identity_survives_reordering()
     let actor = Uuid::new_v4();
     let source = support::SqlLibrary::new(namespace, actor).await?;
     let target = support::SqlLibrary::new(namespace, Uuid::new_v4()).await?;
-    let store = source.library.record_store();
+    let store = source.sync_store.record_store();
     let mix = create_mix(
         &source.db,
         &store,
         "Directories".into(),
         "Test".into(),
-        false,
-        0,
+        Some(PlaybackMode::Sequential),
         false,
         vec![
             ("lib::directory.deep".into(), "/local/music".into()),
@@ -297,5 +289,76 @@ async fn directory_binding_stays_local_and_clause_identity_survives_reordering()
     assert_eq!(remote[1].clause_id, initial[0].clause_id);
     assert!(!remote[1].available);
     assert!(remote[1].parameter.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_mix_reads_back_the_playback_mode_it_was_stored_with() -> Result<()> {
+    use database::actions::mixes::{MixModeError, mix_playback_mode};
+    use sea_orm::{ActiveModelTrait, Set};
+
+    let db = Database::connect("sqlite::memory:").await?;
+    let actor = Uuid::new_v4();
+    fixtures::migrate(&db, actor).await?;
+    let library = fixtures::open_library(db.clone(), actor, Some(Uuid::new_v4())).await?;
+    let store = library.record_store();
+    let cases = [
+        (Some(PlaybackMode::Sequential), 0),
+        (Some(PlaybackMode::RepeatOne), 1),
+        (Some(PlaybackMode::RepeatAll), 2),
+        (Some(PlaybackMode::Shuffle), 3),
+        (None, 99),
+    ];
+    for (mode, stored) in cases {
+        let created = create_mix(
+            &db,
+            &store,
+            "mode".into(),
+            "m".into(),
+            mode,
+            false,
+            vec![("lib::all".into(), "true".into())],
+        )
+        .await?;
+        let row = mixes::Entity::find_by_id(created.id)
+            .one(&db)
+            .await?
+            .unwrap();
+        assert_eq!(row.mode, Some(stored));
+        assert_eq!(mix_playback_mode(&row)?, mode);
+    }
+
+    // An update sets the mode, including back to keeping the player's.
+    let mix = create_mix(
+        &db,
+        &store,
+        "update".into(),
+        "m".into(),
+        Some(PlaybackMode::Shuffle),
+        false,
+        vec![("lib::all".into(), "true".into())],
+    )
+    .await?;
+    for mode in [None, Some(PlaybackMode::RepeatAll)] {
+        let updated = update_mix(&db, &store, mix.id, None, None, Some(mode), None, None).await?;
+        assert_eq!(mix_playback_mode(&updated)?, mode);
+    }
+    let untouched = update_mix(&db, &store, mix.id, None, None, None, None, None).await?;
+    assert_eq!(
+        mix_playback_mode(&untouched)?,
+        Some(PlaybackMode::RepeatAll)
+    );
+
+    // Any other stored number is an error, never a mode.
+    let mut broken: mixes::ActiveModel = untouched.clone().into();
+    broken.mode = Set(Some(7));
+    assert_eq!(
+        mix_playback_mode(&broken.update(&db).await?),
+        Err(MixModeError::Unknown(7))
+    );
+    let mut missing: mixes::ActiveModel = untouched.into();
+    missing.mode = Set(None);
+    // No stored value keeps the player's mode, like 99.
+    assert_eq!(mix_playback_mode(&missing.update(&db).await?), Ok(None));
     Ok(())
 }
