@@ -11,6 +11,7 @@ FluentThemeData darkVariantOf(FluentThemeData theme) {
     visualDensity: theme.visualDensity,
     fontFamily: theme.typography.body?.fontFamily,
     cursorOpacityAnimates: theme.cursorOpacityAnimates,
+    infoBarTheme: theme.infoBarTheme,
   );
 }
 

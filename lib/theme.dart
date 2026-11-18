@@ -12,6 +12,16 @@ import 'utils/rune_log.dart';
 
 enum NavigationIndicators { sticky, end }
 
+/// The icon of an info bar of each severity. The info bar's own success and
+/// error icons come from Material Icons, which the app does not bundle, so all
+/// four are the solid Fluent icons that info and warning already use.
+IconData infoBarIcon(InfoBarSeverity severity) => switch (severity) {
+  InfoBarSeverity.info => FluentIcons.info_solid,
+  InfoBarSeverity.warning => FluentIcons.critical_error_solid,
+  InfoBarSeverity.success => FluentIcons.completed_solid,
+  InfoBarSeverity.error => FluentIcons.status_error_full,
+};
+
 class AppTheme extends ChangeNotifier {
   AccentColor? _color;
   AccentColor get color => _color ?? systemAccentColor;
@@ -71,6 +81,7 @@ class AppTheme extends ChangeNotifier {
       accentColor: color,
       visualDensity: VisualDensity.standard,
       cursorOpacityAnimates: !cursorBlinks,
+      infoBarTheme: const InfoBarThemeData(icon: infoBarIcon),
     );
   }
 
