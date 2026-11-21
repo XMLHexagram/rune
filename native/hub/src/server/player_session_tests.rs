@@ -53,6 +53,7 @@ use std::{
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
     },
 };
 #[cfg(target_os = "linux")]
@@ -76,8 +77,9 @@ use crate::{
     messages::{
         CastLibraryState, CastPreflightRequest, CastResolvedItemsRequest, CastTarget,
         GetMediaFilesCountRequest, ListControllersRequest, ListRenderersRequest,
-        LoadResolvedItemsRequest, PlayingItemRef, PlaylistUpdate, RendererAvailability,
-        RendererCandidate, RequestErrorKind, RequestFailureCause, ResolveMixQueryRequest,
+        LoadResolvedItemsRequest, MediaFile, PlayingItemRef, PlaylistRevisionRequest,
+        PlaylistUpdate, RendererAvailability, RendererCandidate, RequestErrorKind,
+        RequestFailureCause, ResolveMixQueryRequest, ResolveMixQueryResponse,
         SessionSnapshotRequest, SwitchRequest, VolumeRequest,
     },
     request_error::{ExpectedRequestError, classify},
@@ -117,7 +119,7 @@ use serde::de::DeserializeOwned;
 use tokio::net::TcpListener as TokioTcpListener;
 #[cfg(target_os = "linux")]
 use tokio::runtime::Builder;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::{accept_async, connect_async};
@@ -202,7 +204,16 @@ async fn subsonic_hub_response(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let action = action.strip_suffix(".view").unwrap_or(&action).to_owned();
-    state.calls.lock().unwrap().push(action.clone());
+    let call = match action.as_str() {
+        // A now-playing report and a completed play differ only in their parameters.
+        "scrobble" => format!(
+            "scrobble id={} submission={}",
+            query.get("id").map(String::as_str).unwrap_or_default(),
+            query.get("submission").map(String::as_str).unwrap_or_default(),
+        ),
+        _ => action.clone(),
+    };
+    state.calls.lock().unwrap().push(call);
     if action == "stream" {
         let range = headers
             .get(RANGE)
@@ -261,7 +272,16 @@ async fn subsonic_hub_response(
             json!({ "subsonic-response": { "status": "ok", "user": { "streamRole": true, "downloadRole": true } } })
         }
         "search3" => {
-            json!({ "subsonic-response": { "status": "ok", "searchResult3": { "song": { "id": "song-opaque", "title": "Song title", "artist": "Artist", "album": "Album", "artistId": "artist-opaque", "albumId": "album-opaque", "duration": 90, "track": 4 }, "artist": { "id": "artist-opaque", "name": "Artist" }, "album": { "id": "album-opaque", "name": "Album", "artist": "Artist", "artistId": "artist-opaque" } } } })
+            let song_offset = query
+                .get("songOffset")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_default();
+            let songs = if song_offset == 0 {
+                json!({ "id": "song-opaque", "title": "Song title", "artist": "Artist", "album": "Album", "artistId": "artist-opaque", "albumId": "album-opaque", "duration": 90, "track": 4 })
+            } else {
+                json!([])
+            };
+            json!({ "subsonic-response": { "status": "ok", "searchResult3": { "song": songs, "artist": { "id": "artist-opaque", "name": "Artist" }, "album": { "id": "album-opaque", "name": "Album", "artist": "Artist", "artistId": "artist-opaque" } } } })
         }
         "getArtists" => {
             json!({ "subsonic-response": { "status": "ok", "artists": { "index": [ { "name": "A", "artist": { "id": "artist-opaque", "name": "Artist", "albumCount": 1 } }, { "name": "B", "artist": { "id": "artist-beta", "name": "Beta" } } ] } } })
@@ -295,8 +315,14 @@ async fn subsonic_hub_response(
             json!({ "subsonic-response": { "status": "ok", "albumList2": { "album": albums } } })
         }
         "getSong" => {
-            json!({ "subsonic-response": { "status": "ok", "song": { "id": "song-opaque", "title": "Song title", "artist": "Artist", "album": "Album", "artistId": "artist-opaque", "albumId": "album-opaque", "coverArt": state.visualizer_covers.then(|| "cover-playing".to_owned()), "duration": 90, "track": 4 } } })
+            // The album's later disc shares its cover; every other id is the searched song.
+            let (id, title) = match query.get("id").map(String::as_str) {
+                Some("song-later") => ("song-later", "Later disc"),
+                _ => ("song-opaque", "Song title"),
+            };
+            json!({ "subsonic-response": { "status": "ok", "song": { "id": id, "title": title, "artist": "Artist", "album": "Album", "artistId": "artist-opaque", "albumId": "album-opaque", "coverArt": state.visualizer_covers.then(|| "cover-playing".to_owned()), "duration": 90, "track": 4 } } })
         }
+        "scrobble" => json!({ "subsonic-response": { "status": "ok" } }),
         "getArtist" => {
             json!({ "subsonic-response": { "status": "ok", "artist": { "id": "artist-opaque", "name": "Artist", "albumCount": 1, "album": { "id": "album-opaque", "name": "Album", "artist": "Artist", "artistId": "artist-opaque" } } } })
         }
@@ -1008,6 +1034,173 @@ async fn subsonic_open_search_fetch_and_unsupported_requests() -> Result<()> {
     unreachable_server.abort();
     server.abort();
     bad_server.abort();
+    node.close_ui(&fixture.global_params.main_token).await;
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// What a track list does when one of its tracks is clicked: resolve the list around the
+/// track, leaving out the current queue, read the current player's queue revision and
+/// replace the queue with the result.
+async fn play_clicked_track(
+    params: &GlobalParams,
+    queries: Vec<MixQuery>,
+    hint_position: i32,
+    track: PlayingItemRef,
+    queue: Vec<PlayingItemRef>,
+) -> Result<ResolveMixQueryResponse> {
+    let resolved = dispatch_gui_request(
+        params,
+        &ResolveMixQueryRequest {
+            call_id: None,
+            queries,
+            hint_position,
+            initial_playback_item: Some(track),
+            instantly_play: true,
+            fallback_playing_items: Vec::new(),
+            excluded: ExcludedItems { items: queue },
+        },
+    )
+    .await?
+    .context("resolved track list")?;
+    let revision = dispatch_gui_request(params, &PlaylistRevisionRequest { call_id: None })
+        .await?
+        .context("current player queue revision")?
+        .revision;
+    dispatch_gui_request(
+        params,
+        &LoadResolvedItemsRequest {
+            items: resolved.playing_items.clone(),
+            start_index: resolved.start_index,
+            mode: PlaylistOperateMode::Replace,
+            expected_revision: Some(revision),
+            playback_mode: None,
+            position_seconds: None,
+            play: LoadPlay::Auto,
+            call_id: None,
+        },
+    )
+    .await?;
+    Ok(resolved)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clicked_subsonic_tracks_play_on_this_device() -> Result<()> {
+    use crate::messages::{FetchMediaFilesRequest, MixQueryRequest, SearchForRequest};
+
+    let dir = tempfile::tempdir()?;
+    let fixture = super::fixture(dir.path()).await?;
+    let node = fixture.global_params.node.clone();
+    let (endpoint, _, _, _, _, server) = subsonic_hub_mock(false).await;
+    let registered = register_subsonic_library_on_node(
+        &subsonic_registration_request(
+            endpoint,
+            "test-secret",
+            Some(SubsonicOpenModeMessage::PlayOnThisDevice),
+        ),
+        &node,
+    )
+    .await?;
+    let record = registered.record.context("Subsonic record")?;
+    open_registered_library_record(node.clone(), record.record_id).await?;
+    assert!(matches!(node.current_player()?, CurrentPlayer::Local));
+    let track_ref = |file: &MediaFile| PlayingItemRef::LibraryTrack {
+        library_id: file.library_id.clone(),
+        track: file.track.clone(),
+    };
+
+    let tracks_page = dispatch_gui_request(
+        &fixture.global_params,
+        &FetchMediaFilesRequest {
+            cursor: 0,
+            page_size: 100,
+            bake_cover_arts: false,
+            call_id: None,
+        },
+    )
+    .await?
+    .context("Subsonic tracks page")?
+    .media_files;
+    let first_click = track_ref(&tracks_page[0]);
+    let resolved = play_clicked_track(
+        &fixture.global_params,
+        vec![MixQuery {
+            operator: "lib::all".into(),
+            parameter: "true".into(),
+        }],
+        0,
+        first_click.clone(),
+        Vec::new(),
+    )
+    .await?;
+    assert_eq!(resolved.playing_items, vec![first_click.clone()]);
+    assert_eq!(resolved.start_index, Some(0));
+    let first_track = playing_item_from_request(first_click.clone(), None).await?;
+    wait_player(&fixture, |status| {
+        status.state == PlayerPlaybackState::Playing && status.item.as_ref() == Some(&first_track)
+    })
+    .await?;
+
+    let album = dispatch_gui_request(
+        &fixture.global_params,
+        &SearchForRequest {
+            call_id: None,
+            query_str: "Album".into(),
+            fields: Vec::new(),
+            n: 10,
+        },
+    )
+    .await?
+    .context("Subsonic album search")?
+    .albums[0];
+    let album_query = vec![MixQuery {
+        operator: "lib::album".into(),
+        parameter: album.to_string(),
+    }];
+    let album_page = dispatch_gui_request(
+        &fixture.global_params,
+        &MixQueryRequest {
+            call_id: None,
+            queries: album_query.clone(),
+            cursor: 0,
+            page_size: 30,
+            bake_cover_arts: false,
+            queue: CallerQueue::default(),
+        },
+    )
+    .await?
+    .context("Subsonic album page")?
+    .files;
+    let album_tracks = album_page.iter().map(track_ref).collect::<Vec<_>>();
+    let resolved = play_clicked_track(
+        &fixture.global_params,
+        album_query,
+        1,
+        album_tracks[1].clone(),
+        vec![first_click],
+    )
+    .await?;
+    assert_eq!(resolved.playing_items, album_tracks);
+    assert_eq!(resolved.start_index, Some(1));
+    let mut album_items = Vec::with_capacity(album_tracks.len());
+    for track in album_tracks {
+        album_items.push(playing_item_from_request(track, None).await?);
+    }
+    let playing = wait_player(&fixture, |status| {
+        status.state == PlayerPlaybackState::Playing && status.item.as_ref() == Some(&album_items[1])
+    })
+    .await?;
+    assert_eq!(
+        playing
+            .playlist
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>(),
+        album_items
+    );
+
+    fixture.global_params.player.lock().await.stop();
+    server.abort();
     node.close_ui(&fixture.global_params.main_token).await;
     node.shutdown().await?;
     Ok(())
@@ -2485,6 +2678,14 @@ async fn attach_pair_with_signals(
     b: &Fixture,
     signals: &Arc<RecordedSignals>,
 ) -> Result<String> {
+    let fingerprint = pair_renderer(a, b).await?;
+    signals.0.lock().unwrap().clear();
+    a.global_params.node.attach_renderer(&fingerprint).await?;
+    Ok(fingerprint)
+}
+
+/// Pairs `b` so that `a` can attach it as its renderer, and returns `b`'s fingerprint.
+async fn pair_renderer(a: &Fixture, b: &Fixture) -> Result<String> {
     let b_address = super::paired_full(b, a).await?;
     let b_info = super::info(b).await?;
     a.global_params
@@ -2495,11 +2696,6 @@ async fn attach_pair_with_signals(
             &b_info.fingerprint,
             vec![format!("127.0.0.1:{}", b_address.port())],
         )
-        .await?;
-    signals.0.lock().unwrap().clear();
-    a.global_params
-        .node
-        .attach_renderer(&b_info.fingerprint)
         .await?;
     Ok(b_info.fingerprint)
 }
@@ -11001,6 +11197,228 @@ async fn subsonic_remote_control_pauses_and_restores_local_session_position() ->
     Ok(())
 }
 
+/// Opens a Subsonic library that plays on its server's jukebox, which makes the jukebox the
+/// current player.
+async fn open_subsonic_jukebox(node: Arc<NodeContext>, endpoint: String) -> Result<()> {
+    let registration = register_subsonic_library_on_node(
+        &subsonic_registration_request(
+            endpoint,
+            "player-change-test-password",
+            Some(SubsonicOpenModeMessage::RemoteControl),
+        ),
+        &node,
+    )
+    .await?;
+    let record = registration.record.context("registered Subsonic record")?;
+    open_library_by_record_on_node(
+        &OpenLibraryRequest {
+            call_id: None,
+            record_id: record.record_id,
+        },
+        node,
+        Arc::new(Mutex::new(ScrobblingManager::new(10, Duration::from_secs(5)))),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn wait_for_jukebox_player(node: &NodeContext) -> Result<()> {
+    wait_until("the jukebox to become the current player", || async {
+        Ok(
+            matches!(node.current_player_snapshot()?, CurrentPlayer::SubsonicJukebox(_))
+                .then_some(()),
+        )
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_load_still_pending_when_a_renderer_becomes_current_never_plays() -> Result<()> {
+    let a_dir = tempfile::tempdir()?;
+    let b_dir = tempfile::tempdir()?;
+    let a = fixture(a_dir.path()).await?;
+    let b = fixture(b_dir.path()).await?;
+    let node = a.global_params.node.clone();
+    let track = library_track_for_id(&a, session_audio(&a, "pending-load-before-renderer.ogg").await?)
+        .await?;
+    let renderer = pair_renderer(&a, &b).await?;
+
+    // Holding the local player keeps the load from reaching it until the renderer is current.
+    // Attaching a renderer keeps the open library, so nothing but the player change can stop
+    // the load.
+    let held_player = a.global_params.player.lock().await;
+    let params = a.global_params.clone();
+    let mut load = Box::pin(async move {
+        dispatch_gui_request(
+            &params,
+            &LoadResolvedItemsRequest {
+                items: vec![PlayingItemRef::LibraryTrack {
+                    library_id: track.library_id.to_string(),
+                    track: track.file_uuid.to_string(),
+                }],
+                start_index: Some(0),
+                mode: PlaylistOperateMode::Replace,
+                expected_revision: None,
+                playback_mode: None,
+                position_seconds: None,
+                play: LoadPlay::Play,
+                call_id: None,
+            },
+        )
+        .await
+    });
+    assert!(
+        futures::poll!(&mut load).is_pending(),
+        "the load waits for the local player"
+    );
+    let load = tokio::spawn(load);
+    let attach_node = node.clone();
+    let attach = tokio::spawn(async move { attach_node.attach_renderer(&renderer).await });
+    wait_until("the renderer to become the current player", || async {
+        Ok(matches!(node.current_player_snapshot()?, CurrentPlayer::RunePeer { .. }).then_some(()))
+    })
+    .await?;
+    drop(held_player);
+    attach.await??;
+
+    let error = load
+        .await?
+        .err()
+        .context("a load sent to the local player before the switch must not complete")?;
+    assert!(matches!(
+        error.downcast_ref::<ExpectedRequestError>(),
+        Some(ExpectedRequestError::PlayerChanged)
+    ));
+    assert_eq!(classify(&error), RequestErrorKind::Conflict);
+    let paused = a.global_params.player.lock().await.pause_reporting();
+    assert_eq!(paused.await?, playback::player::PausedPlayback::NotPlaying);
+
+    node.shutdown().await?;
+    b.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_play_queued_just_before_the_jukebox_becomes_current_is_paused() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = fixture(dir.path()).await?;
+    let node = fixture.global_params.node.clone();
+    let track = session_audio(&fixture, "queued-play-before-switch.ogg").await?;
+    queue_session(&fixture, &[track]).await?;
+    let server = fake_subsonic_server(FakeSubsonicRoles {
+        stream: true,
+        jukebox: true,
+        wrong_password: false,
+    })
+    .await?;
+
+    let held_player = fixture.global_params.player.lock().await;
+    let switch = tokio::spawn(open_subsonic_jukebox(node.clone(), server.endpoint.clone()));
+    wait_for_jukebox_player(&node).await?;
+    // The Play reaches the local player just before the switch does, so the player's status
+    // does not show it yet when the switch looks.
+    held_player.play();
+    drop(held_player);
+    switch.await??;
+
+    let paused = fixture.global_params.player.lock().await.pause_reporting();
+    assert_eq!(paused.await?, playback::player::PausedPlayback::NotPlaying);
+
+    node.close_ui(&fixture.global_params.main_token).await;
+    server.task.abort();
+    node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_departure_whose_request_is_cancelled_still_pauses_the_local_player() -> Result<()> {
+    let a_dir = tempfile::tempdir()?;
+    let b_dir = tempfile::tempdir()?;
+    let a = fixture(a_dir.path()).await?;
+    let b = fixture(b_dir.path()).await?;
+    let node = a.global_params.node.clone();
+    let track = session_audio(&a, "play-before-cancelled-departure.ogg").await?;
+    queue_session(&a, &[track]).await?;
+    let renderer = pair_renderer(&a, &b).await?;
+
+    // The Play is queued before the player changes, and the player stays held until the
+    // attachment has been cancelled, so only a pause sent after the cancellation can stop it.
+    let held_player = a.global_params.player.lock().await;
+    held_player.play();
+    // A local request still running keeps the departure waiting while the attachment that
+    // started it is cancelled.
+    let tenure = node.local_player_tenure()?;
+    let running = tenure.enter().await?;
+    let attach_node = node.clone();
+    let attach = tokio::spawn(async move { attach_node.attach_renderer(&renderer).await });
+    timeout(TEST_DEADLINE, tenure.ended())
+        .await
+        .context("attaching the renderer did not end the local player's tenure")?;
+    attach.abort();
+    let cancelled = attach
+        .await
+        .expect_err("the attachment was cancelled while the departure waited");
+    assert!(cancelled.is_cancelled());
+
+    drop(running);
+    drop(held_player);
+    // The departure installs a new tenure only once its pause is queued, so the pause below
+    // follows the departure's.
+    wait_until("the departure to install a new tenure", || async {
+        Ok((!Arc::ptr_eq(&node.local_player_tenure()?, &tenure)).then_some(()))
+    })
+    .await?;
+    let paused = a.global_params.player.lock().await.pause_reporting();
+    assert_eq!(paused.await?, playback::player::PausedPlayback::NotPlaying);
+
+    node.shutdown().await?;
+    b.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_during_a_departure_is_refused_until_the_departure_has_paused() -> Result<()> {
+    let a_dir = tempfile::tempdir()?;
+    let b_dir = tempfile::tempdir()?;
+    let a = fixture(a_dir.path()).await?;
+    let b = fixture(b_dir.path()).await?;
+    let node = a.global_params.node.clone();
+    let renderer = pair_renderer(&a, &b).await?;
+
+    // A local request still running keeps the departure from pausing.
+    let tenure = node.local_player_tenure()?;
+    let running = tenure.enter().await?;
+    let attach_node = node.clone();
+    let attach = tokio::spawn(async move { attach_node.attach_renderer(&renderer).await });
+    timeout(TEST_DEADLINE, tenure.ended())
+        .await
+        .context("attaching the renderer did not end the local player's tenure")?;
+
+    // A request arriving now, for instance after a quick return to the local player, finds the
+    // ended tenure. The tenure lets no request in while its end waits for the running one, so
+    // the entry is answered only after that request has left, and is then refused.
+    let arriving = node.local_player_tenure()?;
+    let entry = arriving.enter();
+    drop(running);
+    let error = timeout(TEST_DEADLINE, entry)
+        .await
+        .context("a request arriving during the departure was neither admitted nor refused")?
+        .expect_err("a request arriving during the departure must be refused");
+    assert!(matches!(
+        error.downcast_ref::<ExpectedRequestError>(),
+        Some(ExpectedRequestError::PlayerChanged)
+    ));
+    attach.await??;
+
+    // The departure has queued its pause, so a new tenure admits requests.
+    let fresh = node.local_player_tenure()?;
+    drop(fresh.enter().await?);
+
+    node.shutdown().await?;
+    b.global_params.node.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rr_library_pauses_and_restores_local_session_position() -> Result<()> {
     use crate::messages::PlayRequest;
@@ -11077,6 +11495,432 @@ async fn rr_library_pauses_and_restores_local_session_position() -> Result<()> {
 
     a.global_params.node.shutdown().await?;
     b.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+/// Records every signal, and stops a session's event loop in the broadcast of its next status
+/// until released, as a loop that falls behind its player would be.
+#[derive(Default)]
+struct HeldStatusSignals {
+    signals: RecordedSignals,
+    hold: StdMutex<Option<StatusHold>>,
+}
+
+struct StatusHold {
+    session_id: String,
+    held: oneshot::Sender<Duration>,
+    release: std_mpsc::Receiver<()>,
+}
+
+impl HeldStatusSignals {
+    /// Holds the event loop of session `session_id` in the broadcast of its next status. Returns
+    /// where that status put the track, and what releases the loop.
+    async fn hold_next_status(&self, session_id: &str) -> Result<(Duration, std_mpsc::Sender<()>)> {
+        let (held, loop_held) = oneshot::channel();
+        let (release, released) = std_mpsc::channel();
+        *self.hold.lock().unwrap() = Some(StatusHold {
+            session_id: session_id.to_owned(),
+            held,
+            release: released,
+        });
+        let held_at = timeout(TEST_DEADLINE, loop_held)
+            .await
+            .context("the event loop sent no status to hold")??;
+        Ok((held_at, release))
+    }
+
+    /// The statuses of session `session_id` recorded so far, as state and position.
+    fn statuses(&self, session_id: &str) -> Vec<(PlaybackState, Duration)> {
+        self.signals
+            .decoded::<PlaybackStatus>("PlaybackStatus")
+            .into_iter()
+            .filter(|status| status.session_id == session_id)
+            .map(|status| {
+                let position = Duration::from_secs_f64(f64::from(status.progress_seconds));
+                (status.state, position)
+            })
+            .collect()
+    }
+}
+
+impl Broadcaster for HeldStatusSignals {
+    fn broadcast(&self, message: &dyn RinfRustSignal) {
+        self.signals.broadcast(message);
+        let Some(status) = message.as_any().downcast_ref::<PlaybackStatus>() else {
+            return;
+        };
+        let hold = self
+            .hold
+            .lock()
+            .unwrap()
+            .take_if(|hold| hold.session_id == status.session_id);
+        if let Some(hold) = hold {
+            let _ = hold
+                .held
+                .send(Duration::from_secs_f64(f64::from(status.progress_seconds)));
+            // Blocking here hands this worker's other tasks on, which only the multi-thread
+            // runtime does.
+            let _ = tokio::task::block_in_place(|| hold.release.recv());
+        }
+    }
+}
+
+/// Two paired nodes, the second a host the first can open as an @RR library. The first, which
+/// sends its UI to `signals`, plays a track of its own.
+async fn local_playing_beside_rr_host(
+    signals: Arc<HeldStatusSignals>,
+) -> Result<(Vec<TempDir>, Fixture, Fixture, String)> {
+    use crate::messages::PlayRequest;
+
+    let a_dir = tempfile::tempdir()?;
+    let b_dir = tempfile::tempdir()?;
+    let a = fixture_with_broadcaster(
+        a_dir.path(),
+        Uuid::new_v4(),
+        Duration::from_secs(300),
+        signals,
+    )
+    .await?;
+    let b = fixture(b_dir.path()).await?;
+    b.global_params
+        .node
+        .set_open_local_catalog(
+            None,
+            b.global_params.library_id.context("renderer library id")?,
+        )
+        .await?;
+    let address = super::paired_full(&b, &a).await?;
+    let fingerprint = super::info(&b).await?.fingerprint;
+    a.global_params
+        .cert_validator
+        .read()
+        .await
+        .replace_hosts_for_fingerprint(&fingerprint, vec![format!("127.0.0.1:{}", address.port())])
+        .await?;
+
+    let local_track = session_audio(&a, "local-held-behind-rr.ogg").await?;
+    queue_session(&a, &[local_track]).await?;
+    dispatch_gui_request(&a.global_params, &PlayRequest { call_id: None }).await?;
+    wait_player(&a, |status| status.state == PlayerPlaybackState::Playing).await?;
+    Ok((vec![a_dir, b_dir], a, b, fingerprint))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rr_library_close_shows_no_local_status_from_before_the_pause() -> Result<()> {
+    use crate::backends::remote::decode_message;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let signals = Arc::new(HeldStatusSignals::default());
+    let (_dirs, a, b, fingerprint) = local_playing_beside_rr_host(signals.clone()).await?;
+    let node = a.global_params.node.clone();
+    let local_session_id = node.session()?.session_id().await;
+    // What the session sends controllers shows what its event loop handled, shown in the UI
+    // or not.
+    let mut sent = node.websocket_service.broadcast_tx.subscribe();
+
+    // The session's event loop falls behind its player: it stops in the broadcast of one status
+    // while the player goes on reporting that it plays. The player's status queue holds 16
+    // reports and clears when full, so the loop is held briefly.
+    let (held_at, release) = signals.hold_next_status(&local_session_id).await?;
+    let held_since = Instant::now();
+    wait_player(&a, |status| {
+        status.position >= held_at + Duration::from_millis(150)
+    })
+    .await?;
+
+    let remote = super::open_remote_control_record(node.clone(), &fingerprint).await?;
+    let paused = node.session()?.playback_snapshot().await.0;
+    assert_eq!(paused.state, PlayerPlaybackState::Paused);
+    let paused_position = paused.position;
+
+    signals.signals.clear();
+    let closing = tokio::spawn({
+        let node = node.clone();
+        let token = remote.main_token.clone();
+        async move { node.close_ui(&token).await }
+    });
+    wait_until("this device's player to be current again", || async {
+        Ok(matches!(node.current_player_snapshot()?, CurrentPlayer::Local).then_some(()))
+    })
+    .await?;
+    let held_for = held_since.elapsed();
+    release.send(())?;
+    closing.await?;
+
+    // The loop has handled what it held once it sends a paused status.
+    let stale = timeout(TEST_DEADLINE, async {
+        let mut stale = 0;
+        loop {
+            let frame = match sent.recv().await {
+                Ok(frame) => frame,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let Some(status) = decode_message(&frame)
+                .filter(|(name, _, _)| name == "PlaybackStatus")
+                .and_then(|(_, payload, _)| rinf::deserialize::<PlaybackStatus>(&payload).ok())
+                .filter(|status| status.session_id == local_session_id)
+            else {
+                continue;
+            };
+            let position = Duration::from_secs_f64(f64::from(status.progress_seconds));
+            match status.state {
+                PlaybackState::Playing if position > held_at => stale += 1,
+                PlaybackState::Paused => return Ok(stale),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("the session's event loop sent no paused status")??;
+    assert!(
+        stale > 0,
+        "inconclusive: the status queue overflowed while the loop was held for {held_for:?}"
+    );
+
+    let shown = signals.statuses(&local_session_id);
+    assert!(!shown.is_empty(), "the local session was not shown again");
+    for (state, position) in &shown {
+        assert!(
+            *state == PlaybackState::Paused
+                && position.abs_diff(paused_position) <= Duration::from_millis(100),
+            "the local session showed more than its pause at {paused_position:?}: {shown:?}"
+        );
+    }
+
+    node.shutdown().await?;
+    b.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rr_library_close_lets_a_renderer_attached_meanwhile_stay_current() -> Result<()> {
+    let signals = Arc::new(HeldStatusSignals::default());
+    let (_dirs, a, b, fingerprint) = local_playing_beside_rr_host(signals.clone()).await?;
+    let node = a.global_params.node.clone();
+    let session = node.session()?;
+    let local_session_id = session.session_id().await;
+    let (_, release) = signals.hold_next_status(&local_session_id).await?;
+    let remote = super::open_remote_control_record(node.clone(), &fingerprint).await?;
+
+    // The close makes this device's player current again, and its session waits for the held
+    // loop to be shown again.
+    let closing = tokio::spawn({
+        let node = node.clone();
+        let token = remote.main_token.clone();
+        async move { node.close_ui(&token).await }
+    });
+    wait_until("this device's player to be current again", || async {
+        Ok(matches!(node.current_player_snapshot()?, CurrentPlayer::Local).then_some(()))
+    })
+    .await?;
+    // Meanwhile this device's player plays, as a handoff back to it starts the track before
+    // the player is current, and the host is attached as a renderer.
+    a.global_params.player.lock().await.play();
+    wait_player(&a, |status| status.state == PlayerPlaybackState::Playing).await?;
+    node.attach_renderer(&fingerprint).await?;
+    assert!(
+        !closing.is_finished(),
+        "inconclusive: the close stopped waiting for the session's event loop"
+    );
+    signals.signals.clear();
+    release.send(())?;
+    closing.await?;
+
+    // The renderer attached last is the current player, as stored and as the node sees it.
+    for player in [node.current_player_snapshot()?, node.current_player()?] {
+        assert!(
+            matches!(
+                player,
+                CurrentPlayer::RunePeer { link: Some(link), .. }
+                    if link.fingerprint() == fingerprint
+            ),
+            "the attached renderer is not the current player"
+        );
+    }
+    // This device's player, left for the renderer, is paused, and its session stays out of the
+    // UI.
+    assert_eq!(
+        session.playback_snapshot().await.0.state,
+        PlayerPlaybackState::Paused
+    );
+    let shown = signals.statuses(&local_session_id);
+    assert!(
+        shown.is_empty(),
+        "the local session was shown beside the renderer: {shown:?}"
+    );
+
+    node.shutdown().await?;
+    b.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rr_library_close_shows_the_local_session_when_its_caller_stops_waiting() -> Result<()> {
+    let signals = Arc::new(HeldStatusSignals::default());
+    let (_dirs, a, b, fingerprint) = local_playing_beside_rr_host(signals.clone()).await?;
+    let node = a.global_params.node.clone();
+    let local_session_id = node.session()?.session_id().await;
+    let (_, release) = signals.hold_next_status(&local_session_id).await?;
+    let remote = super::open_remote_control_record(node.clone(), &fingerprint).await?;
+
+    // The close waits for the held loop to show the session again, and its caller stops waiting
+    // meanwhile.
+    signals.signals.clear();
+    let closing = tokio::spawn({
+        let node = node.clone();
+        let token = remote.main_token.clone();
+        async move { node.close_ui(&token).await }
+    });
+    wait_until("this device's player to be current again", || async {
+        Ok(matches!(node.current_player_snapshot()?, CurrentPlayer::Local).then_some(()))
+    })
+    .await?;
+    closing.abort();
+    assert!(
+        closing.await.is_err_and(|error| error.is_cancelled()),
+        "the close finished before its caller stopped waiting"
+    );
+    release.send(())?;
+
+    // The loop shows the session again all the same.
+    wait_until("the local session to be shown again", || async {
+        Ok(signals
+            .statuses(&local_session_id)
+            .iter()
+            .any(|(state, _)| *state == PlaybackState::Paused)
+            .then_some(()))
+    })
+    .await?;
+
+    node.shutdown().await?;
+    b.global_params.node.shutdown().await?;
+    Ok(())
+}
+
+/// Plays the Subsonic track `track` on this device through the UI's load request.
+async fn play_subsonic_track_here(
+    fixture: &Fixture,
+    library_id: Uuid,
+    track: &str,
+) -> Result<PlayingItemRef> {
+    let item = PlayingItemRef::LibraryTrack {
+        library_id: library_id.to_string(),
+        track: track.into(),
+    };
+    let load = LoadResolvedItemsRequest {
+        call_id: None,
+        items: vec![item.clone()],
+        start_index: Some(0),
+        mode: PlaylistOperateMode::Replace,
+        expected_revision: None,
+        playback_mode: Some(WirePlaybackMode::Sequential),
+        position_seconds: Some(0.0),
+        play: LoadPlay::Play,
+    };
+    dispatch_gui_request(&fixture.global_params, &load).await?;
+    Ok(item)
+}
+
+/// The playback statuses this device's session reported for `item`, in order.
+fn statuses_for(
+    signals: &RecordedSignals,
+    session_id: &str,
+    item: &PlayingItemRef,
+) -> Vec<PlaybackStatus> {
+    signals
+        .decoded::<PlaybackStatus>("PlaybackStatus")
+        .into_iter()
+        .filter(|status| status.session_id == session_id && status.item_request.as_ref() == Some(item))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subsonic_tracks_played_here_report_their_title_and_cover() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let signals = Arc::new(RecordedSignals::default());
+    let fixture = fixture_with_broadcaster(
+        dir.path(),
+        Uuid::new_v4(),
+        Duration::from_secs(300),
+        signals.clone(),
+    )
+    .await?;
+    let node = fixture.global_params.node.clone();
+    let (endpoint, calls, _, _, _, server) = subsonic_hub_mock_with_covers(false, true).await;
+    let registration = register_subsonic_library_on_node(
+        &subsonic_registration_request(
+            endpoint,
+            "test-secret",
+            Some(SubsonicOpenModeMessage::PlayOnThisDevice),
+        ),
+        &node,
+    )
+    .await?;
+    let record = registration.record.context("registered Subsonic library")?;
+    open_library_by_record_on_node(
+        &OpenLibraryRequest {
+            call_id: None,
+            record_id: record.record_id.clone(),
+        },
+        node.clone(),
+        Arc::new(Mutex::new(ScrobblingManager::new(
+            10,
+            Duration::from_secs(5),
+        ))),
+    )
+    .await?;
+    let library_id = match node.current_library()? {
+        OpenLibrary::Subsonic(binding) => binding.library_id,
+        _ => anyhow::bail!("registered Subsonic library was not opened"),
+    };
+    let session_id = node.session()?.session_id().await.to_string();
+
+    let first = play_subsonic_track_here(&fixture, library_id, "song-opaque").await?;
+    let playing = wait_until("the first track playing", || async {
+        Ok(statuses_for(&signals, &session_id, &first)
+            .into_iter()
+            .find(|status| status.state == PlaybackState::Playing))
+    })
+    .await?;
+    assert_eq!(playing.title.as_deref(), Some("Song title"));
+    assert_eq!(playing.artist.as_deref(), Some("Artist"));
+    // The cover is not cached when the first track starts, so it is shown once it arrives.
+    let cold = wait_until("the first track's status with its cover", || async {
+        Ok(statuses_for(&signals, &session_id, &first)
+            .into_iter()
+            .find(|status| status.cover_art_path.is_some()))
+    })
+    .await?;
+    assert_eq!(cold.title.as_deref(), Some("Song title"));
+    let cover = cold
+        .cover_art_path
+        .clone()
+        .context("first track's cover path")?;
+    assert_eq!(std::fs::read(&cover)?, b"mock-cover-bytes");
+    wait_until("the now-playing report of the first track", || async {
+        Ok(calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "scrobble id=song-opaque submission=false")
+            .then_some(()))
+    })
+    .await?;
+
+    // The next track has the same cover, now cached, so it shows from its first status.
+    let second = play_subsonic_track_here(&fixture, library_id, "song-later").await?;
+    let warm = wait_until("the second track's first status", || async {
+        Ok(statuses_for(&signals, &session_id, &second)
+            .into_iter()
+            .next())
+    })
+    .await?;
+    assert_eq!(warm.title.as_deref(), Some("Later disc"));
+    assert_eq!(warm.cover_art_path.as_deref(), Some(cover.as_str()));
+
+    server.abort();
+    node.shutdown().await?;
     Ok(())
 }
 

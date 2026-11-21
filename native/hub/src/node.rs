@@ -1,8 +1,6 @@
 mod reconnect;
 pub(crate) use reconnect::ReconnectConfig;
 use reconnect::ReconnectTask;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 
 use std::{
     collections::HashMap,
@@ -10,8 +8,8 @@ use std::{
     fs,
     path::Path,
     sync::{
-        Arc, Mutex as StdMutex, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, Weak,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 #[cfg(unix)]
@@ -27,13 +25,11 @@ use discovery::{
     server::{PermissionManager, UserStatus},
 };
 use playback::{
-    PlayerCommand,
-    player::{HandoffBlockId as PlayerHandoffBlockId, PlaybackState},
-    sfx_player::SfxPlayer,
+    PlayerCommand, player::HandoffBlockId as PlayerHandoffBlockId, sfx_player::SfxPlayer,
 };
 use rinf::DartSignal;
 use tokio::{
-    sync::{Mutex, RwLock, broadcast},
+    sync::{Mutex, RwLock, RwLockReadGuard, broadcast},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -131,6 +127,89 @@ enum LibraryBinding {
     },
 }
 
+/// The local player's time as the UI's player. Requests routed to the local player run inside
+/// it, and ending it waits until they have stopped, so no command one of them sends can follow
+/// the pause that comes after the end. The ended tenure stays installed, refusing requests,
+/// until that pause is queued, and only then does a new tenure admit them, so the pause never
+/// stops a command sent by a request the new tenure admits.
+///
+/// A request runs in the tenure only when it is session-scoped and runs on the local player,
+/// and no such request changes the current player. Player changes come from node-scoped
+/// requests, requests sent to another player and background tasks, and none of these holds the
+/// tenure, so ending the tenure never waits for the request that ends it.
+#[derive(Default)]
+pub(crate) struct LocalPlayerTenure {
+    ended: CancellationToken,
+    running: RwLock<()>,
+}
+
+impl LocalPlayerTenure {
+    /// Enters the tenure for one request, or fails if it has ended.
+    pub(crate) async fn enter(&self) -> Result<RwLockReadGuard<'_, ()>> {
+        let running = self.running.read().await;
+        if self.ended.is_cancelled() {
+            return Err(ExpectedRequestError::PlayerChanged.into());
+        }
+        Ok(running)
+    }
+
+    /// Resolves once the tenure has ended.
+    pub(crate) async fn ended(&self) {
+        self.ended.cancelled().await;
+    }
+
+    /// Ends the tenure: a request arriving from now on is refused, and those running in it are
+    /// cancelled.
+    fn close(&self) {
+        self.ended.cancel();
+    }
+
+    /// Ends the tenure and waits until no request is still running in it.
+    async fn end(&self) {
+        self.close();
+        drop(self.running.write().await);
+    }
+}
+
+fn lock_tenures(
+    tenures: &StdMutex<Arc<LocalPlayerTenure>>,
+) -> Result<StdMutexGuard<'_, Arc<LocalPlayerTenure>>> {
+    tenures
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Local player tenure lock poisoned"))
+}
+
+/// Waits until `ending`, the tenure the local player is leaving, has no request running, pauses
+/// the local player after every command its requests sent, and only then admits requests to a
+/// new tenure. A request arriving while this runs, if the local player is current again by then,
+/// is refused, so nothing it sends can land before this pause.
+async fn depart_local_player(
+    tenures: Arc<StdMutex<Arc<LocalPlayerTenure>>>,
+    ending: Arc<LocalPlayerTenure>,
+    session: Arc<PlayerSession>,
+) -> Result<()> {
+    ending.end().await;
+    let completion = {
+        let mut player = session.player.lock().await;
+        let mut tenure = lock_tenures(&tenures)?;
+        // Every departure that ends this tenure waits for it, and the first one through pauses
+        // after its requests and admits new ones. Another pause could follow a command a request
+        // in the new tenure has sent since, so it is not sent.
+        if !Arc::ptr_eq(&tenure, &ending) {
+            return Ok(());
+        }
+        // The pause follows the commands already sent, so it also stops a Play or a track loading
+        // to play that the cached status does not show as playing yet.
+        let completion = player.command_with_completion(PlayerCommand::Pause);
+        *tenure = Arc::default();
+        completion
+    };
+    completion
+        .await
+        .map_err(|error| anyhow::Error::new(player_command_error(error)))
+        .context("Pause local player when another player becomes current")
+}
+
 /// Process services shared by every local library and remote controller.
 pub struct NodeContext {
     protocol_version: StdMutex<ProtocolVersion>,
@@ -151,6 +230,14 @@ pub struct NodeContext {
     pub renderer_link: Arc<StdMutex<Option<Arc<RendererLink>>>>,
     ui_library: Arc<StdMutex<UiLibrary>>,
     current_player: Arc<StdMutex<CurrentPlayer>>,
+    /// How many times this device's session is yet to be shown again in the UI since its player
+    /// became current again. Its event loop shows it once it has handled what the player reported
+    /// before, and the session's events stay out of the UI until then.
+    pub(crate) local_session_hidden: Arc<AtomicUsize>,
+    /// Ends when another player takes over from the local player, which cancels the UI
+    /// requests to the local player that are still running. The ended tenure stays here until
+    /// the local player's departure has queued its pause.
+    local_player_tenure: Arc<StdMutex<Arc<LocalPlayerTenure>>>,
     open_generation: AtomicU64,
     reconnect_config: ReconnectConfig,
     visualizer: NodeVisualizer,
@@ -180,6 +267,7 @@ impl Debug for NodeContext {
 
 struct NodeBroadcaster {
     current_player: Arc<StdMutex<CurrentPlayer>>,
+    local_session_hidden: Arc<AtomicUsize>,
     local: Arc<dyn Broadcaster>,
     remote: Arc<WebSocketService>,
 }
@@ -202,10 +290,11 @@ pub(crate) enum HandoffPlaybackReport {
 impl Broadcaster for NodeBroadcaster {
     fn broadcast(&self, message: &dyn RinfRustSignal) {
         let remote_event = message.remote_event();
-        let suppress_local_status = self
+        let suppress_local_status = (self
             .current_player
             .lock()
             .is_ok_and(|player| player.suppresses_local_session_events())
+            || self.local_session_hidden.load(Ordering::Acquire) > 0)
             && remote_event == Some(RemoteEventScope::Session);
         if !suppress_local_status {
             self.local.broadcast(message);
@@ -318,6 +407,7 @@ impl NodeContext {
         let renderer_link = Arc::new(StdMutex::new(None));
         let ui_library = Arc::new(StdMutex::new(UiLibrary::Closed));
         let current_player = Arc::new(StdMutex::new(CurrentPlayer::Local));
+        let local_session_hidden = Arc::new(AtomicUsize::new(0));
         let sync_tokens = SyncTokenStore::default();
         let credentials = Arc::new(CredentialStore::open(Path::new(config_path)));
         let permission_manager = PermissionManager::new(config_path)?;
@@ -345,6 +435,7 @@ impl NodeContext {
             sync_settings: Arc::new(RwLock::new(SyncSettings::load(Path::new(config_path)))),
             broadcaster: Arc::new(NodeBroadcaster {
                 current_player: current_player.clone(),
+                local_session_hidden: local_session_hidden.clone(),
                 local: broadcaster.clone(),
                 remote: websocket_service.clone(),
             }),
@@ -354,6 +445,8 @@ impl NodeContext {
             renderer_link,
             ui_library,
             current_player,
+            local_session_hidden,
+            local_player_tenure: Arc::default(),
             open_generation: AtomicU64::new(0),
             reconnect_config,
             visualizer: NodeVisualizer::new(visualizer),
@@ -926,6 +1019,11 @@ impl NodeContext {
         Ok(())
     }
 
+    /// The current tenure of the local player as the UI's player.
+    pub(crate) fn local_player_tenure(&self) -> Result<Arc<LocalPlayerTenure>> {
+        lock_tenures(&self.local_player_tenure).map(|tenure| Arc::clone(&tenure))
+    }
+
     /// Publishes the current player's visualizer inputs again, for when what that player
     /// can feed changed while it stayed the current player.
     fn republish_current_player_inputs(&self) -> Result<()> {
@@ -963,21 +1061,39 @@ impl NodeContext {
                 }
             )
         );
-        self.refresh_current_player(current)?;
-        if leaving_local {
+        // This device's session stays out of the UI until its event loop has handled what the
+        // player reported before, so that no status from before the pause reaches the UI.
+        let hidden_session = if returning_local {
             let session = self.session()?;
-            let completion = {
-                let mut player = session.player.lock().await;
-                (player.get_status().state == PlaybackState::Playing)
-                    .then(|| player.command_with_completion(PlayerCommand::Pause))
-            };
-            if let Some(completion) = completion {
-                completion
-                    .await
-                    .map_err(|error| anyhow::Error::new(player_command_error(error)))
-                    .context("Pause local player when another player becomes current")?;
-            }
-        } else if returning_local || renderer_lost {
+            self.local_session_hidden.fetch_add(1, Ordering::AcqRel);
+            Some(session)
+        } else {
+            None
+        };
+        let leaving = {
+            // A departure admits a new tenure under this lock, so none can be admitted between
+            // the switch and taking the tenure it leaves. That tenure ends at the switch, so a
+            // request arriving from now on is refused even if the departure's task starts late.
+            let tenure = lock_tenures(&self.local_player_tenure)?;
+            self.refresh_current_player(current)?;
+            leaving_local.then(|| {
+                tenure.close();
+                Arc::clone(&tenure)
+            })
+        };
+        if let Some(ending) = leaving {
+            // The departure runs on its own task, so its pause still follows when the request
+            // that changed the player is cancelled, as a UI replacement cancels the UI's requests.
+            tokio::spawn(depart_local_player(
+                Arc::clone(&self.local_player_tenure),
+                ending,
+                self.session()?,
+            ))
+            .await
+            .context("Local player departure stopped")??;
+        } else if let Some(session) = hidden_session {
+            session.show_again().await;
+        } else if renderer_lost {
             self.session()?.reemit_current().await?;
         }
         Ok(())
@@ -1654,6 +1770,7 @@ mod tests {
         let mut received = remote.broadcast_tx.subscribe();
         let broadcaster = NodeBroadcaster {
             current_player: Arc::new(StdMutex::new(CurrentPlayer::Local)),
+            local_session_hidden: Arc::default(),
             local: Arc::new(Quiet(None)),
             remote,
         };
@@ -1723,6 +1840,35 @@ mod tests {
             ]
         );
         slot.current().await?.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ending_the_local_player_tenure_waits_for_the_requests_running_in_it()
+    -> anyhow::Result<()> {
+        use super::LocalPlayerTenure;
+        use crate::request_error::ExpectedRequestError;
+
+        let tenure = Arc::new(LocalPlayerTenure::default());
+        let running = tenure.enter().await?;
+        let mut end = Box::pin({
+            let tenure = Arc::clone(&tenure);
+            async move { tenure.end().await }
+        });
+
+        assert!(futures::poll!(end.as_mut()).is_pending());
+        assert!(futures::poll!(Box::pin(tenure.ended())).is_ready());
+        drop(running);
+        end.await;
+
+        let error = tenure
+            .enter()
+            .await
+            .expect_err("an ended tenure must not admit a request");
+        assert!(matches!(
+            error.downcast_ref::<ExpectedRequestError>(),
+            Some(ExpectedRequestError::PlayerChanged)
+        ));
         Ok(())
     }
 }
