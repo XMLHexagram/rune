@@ -71,9 +71,7 @@ void main() {
     expect(find.textContaining('TimeoutException'), findsOneWidget);
   });
 
-  testWidgets('a later page timing out keeps the loaded tracks', (
-    tester,
-  ) async {
+  testWidgets('a later page timing out shows the dialog once', (tester) async {
     tester.view.physicalSize = const Size(2400, 600);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
@@ -90,7 +88,9 @@ void main() {
     }
     expect(cursors, contains(20));
     expect(find.text('Track 0'), findsOneWidget);
-    expect(find.textContaining('TimeoutException'), findsNothing);
+    expect(find.textContaining('TimeoutException'), findsOneWidget);
+    expect(find.byType(ContentDialog), findsOneWidget);
+    expect(find.text('Unknown Error'), findsWidgets);
   });
 
   testWidgets('a later page failing at once is requested only once', (
@@ -116,5 +116,7 @@ void main() {
     }
     expect(cursors.where((c) => c == 20), hasLength(1));
     expect(find.text('Track 0'), findsOneWidget);
+    expect(find.byType(ContentDialog), findsOneWidget);
+    expect(find.text('Unknown Error'), findsWidgets);
   });
 }

@@ -1,6 +1,7 @@
 import '../../utils/api/request_failure.dart';
 import '../../utils/l10n.dart';
 import '../../utils/logger.dart';
+import '../../utils/dialogs/information/error.dart';
 import 'dart:async';
 
 import 'package:fluent_ui/fluent_ui.dart';
@@ -224,6 +225,7 @@ class QueryTrackListViewState extends State<QueryTrackListView> {
 
       SchedulerBinding.instance.addPostFrameCallback((_) {
         if (!mounted || generation != _generation) return;
+        var keptTracks = false;
         setState(() {
           _loadingIndices.remove(cursor);
           _failedPages.add(cursor);
@@ -232,9 +234,17 @@ class QueryTrackListViewState extends State<QueryTrackListView> {
           if (_loadedItems.isEmpty) {
             _failure = error;
           } else {
-            logger.w('Failed to load tracks from $cursor: $error');
+            keptTracks = true;
           }
         });
+        if (keptTracks) {
+          logger.w('Failed to load tracks from $cursor: $error');
+          showErrorDialog(
+            context: context,
+            title: S.of(context).unknownError,
+            errorMessage: requestErrorText(S.of(context), error),
+          );
+        }
       });
     }
   }
