@@ -164,6 +164,69 @@ async fn old_local_encoding_is_rebuilt_from_binary_source_rows() -> Result<()> {
 }
 
 #[tokio::test]
+async fn old_encoding_in_an_old_layout_is_rebuilt() -> Result<()> {
+    let namespace = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let local = support::SqlLibrary::new(namespace, actor).await?;
+    let fingerprint_id = catalog_identity::fingerprint(Uuid::from_u128(1), None, None, None);
+    let value = match fingerprint_payload(vec![0xa5; 128]) {
+        Payload::Fingerprint(value) => value,
+        _ => unreachable!(),
+    };
+    local
+        .peer
+        .write_local(
+            support::key(Collection::Fingerprints, fingerprint_id),
+            Some(Payload::Fingerprint(value.clone())),
+        )
+        .await?;
+    let mut update = Query::update()
+        .table(Alias::new("sync_meta"))
+        .value(Alias::new("schema"), "1")
+        .to_owned();
+    update.and_where(
+        Expr::col(Alias::new("namespace")).eq(Expr::value(namespace.as_bytes().to_vec())),
+    );
+    local.db.execute(&update).await?;
+    // The layout schema 1 replicas were created with, before export cursors,
+    // relay origins and persistent writer reservations.
+    local
+        .db
+        .execute_unprepared("DROP TABLE sync_export_cursors")
+        .await?;
+    for (table, column) in [
+        ("sync_journal", "origin_replica"),
+        ("sync_journal", "origin_generation"),
+        ("sync_meta", "writer_incarnation"),
+        ("sync_meta", "writer_author"),
+        ("sync_meta", "writer_reserved_counter"),
+        ("sync_meta", "writer_file_token"),
+        ("sync_meta", "writer_clean_counter"),
+    ] {
+        local
+            .db
+            .execute_unprepared(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+            .await?;
+    }
+
+    let reopened = LibrarySyncStore::open(local.db.clone(), actor, Some(namespace)).await?;
+    assert_eq!(
+        reopened
+            .get(&support::key(Collection::Fingerprints, fingerprint_id))
+            .await?
+            .and_then(|record| record.value),
+        Some(Payload::Fingerprint(value))
+    );
+    assert_eq!(
+        namespace_model_on(&local.db, namespace)
+            .await?
+            .map(|model| model.schema),
+        Some(RuneModel::schema_id().to_owned())
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn old_schema_peer_is_rejected_with_typed_incompatibility() -> Result<()> {
     let namespace = Uuid::new_v4();
     let source = support::SqlLibrary::new(namespace, Uuid::new_v4()).await?;

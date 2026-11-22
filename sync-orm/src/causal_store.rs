@@ -1,20 +1,19 @@
 //! Transaction-bound causal authoring, reception, and accepted-state queries.
 use crate::causal_candidates::CandidateRow;
 use crate::causal_leases::{begin_write, lock_on};
-use crate::causal_schema::{ensure_export_cursors_on, ensure_journal_origin_on};
+use crate::causal_schema::upgrade_on;
 use crate::causal_writer::WriterIncarnation;
 use anyhow::Error;
 use anyhow::{Result, ensure};
 use chrono::Utc;
 use sea_orm::sea_query::Order;
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, ExprTrait,
-    FromQueryResult, Statement, TransactionTrait,
+    ConnectionTrait, DatabaseConnection, DatabaseTransaction, ExprTrait, FromQueryResult,
+    TransactionTrait,
     sea_query::{Alias, Expr, Query},
 };
 use std::cmp;
 use std::collections;
-use std::result;
 use std::str;
 use std::{cmp::max, marker::PhantomData, sync::Arc};
 use sync::causal::{self, Context};
@@ -23,38 +22,12 @@ use uuid::Uuid;
 
 const WRITER_RESERVATION_SIZE: i64 = 1_000_000_000;
 
-async fn ensure_writer_columns_on<C: ConnectionTrait>(db: &C) -> Result<()> {
-    let statement = Statement::from_string(DbBackend::Sqlite, "PRAGMA table_info(sync_meta)");
-    let columns = db
-        .query_all_raw(statement)
-        .await?
-        .into_iter()
-        .map(|row| row.try_get_by_index::<String>(1))
-        .collect::<result::Result<Vec<_>, _>>()?;
-    for (name, sql_type) in [
-        ("writer_incarnation", "BLOB"),
-        ("writer_author", "BLOB"),
-        ("writer_reserved_counter", "BIGINT"),
-        ("writer_file_token", "BLOB"),
-        ("writer_clean_counter", "BIGINT"),
-    ] {
-        if !columns.iter().any(|column| column == name) {
-            db.execute_unprepared(&format!(
-                "ALTER TABLE sync_meta ADD COLUMN {name} {sql_type}"
-            ))
-            .await?;
-        }
-    }
-    Ok(())
-}
-
 async fn reserve_writer_on<C: ConnectionTrait>(
     db: &C,
     namespace: Uuid,
     author: Uuid,
     expected_file_token: Option<Uuid>,
 ) -> Result<WriterIncarnation> {
-    ensure_writer_columns_on(db).await?;
     let query = Query::select()
         .columns(
             [
@@ -335,9 +308,7 @@ impl<M: SyncModel> CausalReplica<M> {
             generation: Uuid::new_v4(),
         };
         let anchor = protocol::initial_anchor(&identity)?;
-        ensure_journal_origin_on(tx).await?;
-        ensure_export_cursors_on(tx).await?;
-        ensure_writer_columns_on(tx).await?;
+        upgrade_on(tx).await?;
         let q = Query::insert()
             .into_table(Alias::new("sync_meta"))
             .columns(
@@ -414,9 +385,7 @@ impl<M: SyncModel> CausalReplica<M> {
         );
         protocol::validate_model::<M>()?;
         let tx = begin_write(&db).await?;
-        ensure_journal_origin_on(&tx).await?;
-        ensure_export_cursors_on(&tx).await?;
-        ensure_writer_columns_on(&tx).await?;
+        upgrade_on(&tx).await?;
         let writer = Arc::new(reserve_writer_on(&tx, namespace, author, file_token).await?);
         let replica = Self {
             db,

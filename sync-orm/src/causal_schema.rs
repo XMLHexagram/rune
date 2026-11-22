@@ -357,6 +357,42 @@ pub async fn ensure_export_cursors_on<C: ConnectionTrait>(db: &C) -> Result<(), 
     Ok(())
 }
 
+/// Add persistent writer reservations to replicas created before them.
+async fn ensure_writer_columns_on<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
+    let columns = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA table_info(sync_meta)",
+        ))
+        .await?
+        .iter()
+        .map(|row| row.try_get_by_index::<String>(1))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, sql_type) in [
+        ("writer_incarnation", "BLOB"),
+        ("writer_author", "BLOB"),
+        ("writer_reserved_counter", "BIGINT"),
+        ("writer_file_token", "BLOB"),
+        ("writer_clean_counter", "BIGINT"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            db.execute_unprepared(&format!(
+                "ALTER TABLE sync_meta ADD COLUMN {name} {sql_type}"
+            ))
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Bring a layout installed by an earlier version up to date. Run it before
+/// anything reads or clears the replica tables.
+pub async fn upgrade_on<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
+    ensure_journal_origin_on(db).await?;
+    ensure_export_cursors_on(db).await?;
+    ensure_writer_columns_on(db).await
+}
+
 /// Install on the migration runner's transaction.
 pub async fn install_on<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
     if db.get_database_backend() != DbBackend::Sqlite {

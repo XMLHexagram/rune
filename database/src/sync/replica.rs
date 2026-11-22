@@ -40,7 +40,7 @@ use sync_orm::{
     causal_capabilities::CausalEndpoint,
     causal_export_cursors::read_on,
     causal_leases::lock_on,
-    causal_schema::clear_namespace_on,
+    causal_schema::{clear_namespace_on, upgrade_on},
     causal_store::namespace_model_on,
     registry::{ProjectionBudget, RegistryProjection},
 };
@@ -205,6 +205,8 @@ async fn rebuild_schema_1_encoding(
     use sea_orm::ExprTrait as _;
     let tx = db.begin().await?;
     lock_on(&tx, namespace).await?;
+    // A schema 1 replica can predate tables that clearing its history touches.
+    upgrade_on(&tx).await?;
     let meta_query = Query::select()
         .columns(
             [
