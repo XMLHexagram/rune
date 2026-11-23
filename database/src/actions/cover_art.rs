@@ -1,4 +1,4 @@
-use crate::actions::file::hash_file;
+use crate::actions::file::{hash_file, validate_digest};
 use crate::error::ExpectedError;
 use crate::sync::SeaOrmSyncStore;
 use crate::sync::accepted as crate_sync_accepted;
@@ -8,14 +8,14 @@ use std::{
     collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use anyhow::{Context, Result, ensure};
 use once_cell::sync::Lazy;
 use sea_orm::{
     ActiveValue, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QuerySelect,
+    QuerySelect, Value,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -90,8 +90,127 @@ pub async fn ensure_magic_cover_art_id(main_db: &DatabaseConnection) -> Result<i
 pub static COVER_TEMP_DIR: Lazy<PathBuf> =
     Lazy::new(|| env::temp_dir().join("rune").join("cover_arts"));
 
+/// Artwork rows are matched in groups this size while their bodies are not read.
+const STAMP_BATCH: usize = 500;
+
+/// Bodies are read a few at a time, since each one can be megabytes.
+const BODY_BATCH: usize = 4;
+
+/// An artwork row this library holds the body of: its id and source uuid.
+type LocalArtwork = (i32, String);
+
+/// The digest and size of each verified body with a baked file, by source uuid.
+/// A row stores these after its body, so reading them walks the whole body.
+/// The source uuid is derived from the digest, so an entry stays true whichever
+/// library it was read from.
+static BAKED_ARTWORK: Lazy<Mutex<HashMap<String, (String, u64)>>> = Lazy::new(Default::default);
+
+fn remember_baked(source_uuid: String, digest: String, size: u64) {
+    BAKED_ARTWORK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(source_uuid, (digest, size));
+}
+
+/// The digest and size a consistent row declares for its body.
+fn declared_body(source_uuid: &str, digest: String, size: i64) -> Option<(String, u64)> {
+    // The digest names a file, and rows can arrive from peers.
+    validate_digest(&digest).ok()?;
+    let size = u64::try_from(size).ok().filter(|size| *size > 0)?;
+    (catalog_identity::artwork(&digest).to_string() == source_uuid).then_some((digest, size))
+}
+
+async fn local_artwork<V: Into<Value> + Clone>(
+    main_db: &DatabaseConnection,
+    column: media_cover_art::Column,
+    values: Vec<V>,
+) -> Result<Vec<LocalArtwork>> {
+    let mut rows = Vec::new();
+    for values in values.chunks(STAMP_BATCH) {
+        rows.extend(
+            media_cover_art::Entity::find()
+                .select_only()
+                .columns([
+                    media_cover_art::Column::Id,
+                    media_cover_art::Column::SourceUuid,
+                ])
+                .filter(column.is_in(values.iter().cloned()))
+                .filter(media_cover_art::Column::LocalAvailable.eq(true))
+                .into_tuple::<LocalArtwork>()
+                .all(main_db)
+                .await?,
+        );
+    }
+    Ok(rows)
+}
+
+/// Bake these artwork rows, keyed by row id. A cover baked before is found by
+/// its digest and size, so its body is not read again. Files are checked,
+/// hashed and written on the blocking pool, off the caller's runtime thread.
+async fn bake_artwork(
+    main_db: &DatabaseConnection,
+    rows: Vec<LocalArtwork>,
+) -> Result<HashMap<i32, String>> {
+    let mut bodies = Vec::new();
+    let mut unknown = Vec::new();
+    {
+        let baked = BAKED_ARTWORK.lock().unwrap_or_else(PoisonError::into_inner);
+        for (id, source_uuid) in rows {
+            match baked.get(&source_uuid) {
+                Some((digest, size)) => bodies.push((id, source_uuid, digest.clone(), *size)),
+                None => unknown.push(id),
+            }
+        }
+    }
+    for ids in unknown.chunks(STAMP_BATCH) {
+        let declared = media_cover_art::Entity::find()
+            .select_only()
+            .columns([
+                media_cover_art::Column::Id,
+                media_cover_art::Column::SourceUuid,
+                media_cover_art::Column::ContentHash,
+                media_cover_art::Column::ContentSize,
+            ])
+            .filter(media_cover_art::Column::Id.is_in(ids.iter().copied()))
+            .into_tuple::<(i32, String, Option<String>, Option<i64>)>()
+            .all(main_db)
+            .await?;
+        bodies.extend(
+            declared
+                .into_iter()
+                .filter_map(|(id, source_uuid, digest, size)| {
+                    let (digest, size) = declared_body(&source_uuid, digest?, size?)?;
+                    Some((id, source_uuid, digest, size))
+                }),
+        );
+    }
+    let (mut paths, missing) = task::spawn_blocking(move || {
+        let mut paths = HashMap::new();
+        let mut missing = Vec::new();
+        for (id, source_uuid, digest, size) in bodies {
+            let path = COVER_TEMP_DIR.join(&digest);
+            if fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() == size) {
+                paths.insert(id, path.to_str().unwrap_or_default().to_string());
+                remember_baked(source_uuid, digest, size);
+            } else {
+                missing.push(id);
+            }
+        }
+        (paths, missing)
+    })
+    .await?;
+    for ids in missing.chunks(BODY_BATCH) {
+        let artwork = media_cover_art::Entity::find()
+            .filter(media_cover_art::Column::Id.is_in(ids.iter().copied()))
+            .filter(media_cover_art::Column::LocalAvailable.eq(true))
+            .all(main_db)
+            .await?;
+        paths.extend(task::spawn_blocking(move || bake_cover_art_by_cover_arts(artwork)).await??);
+    }
+    Ok(paths)
+}
+
 fn bake_cover_art_by_cover_arts(
-    _fsio: &FsIo,
     cover_arts: Vec<media_cover_art::Model>,
 ) -> Result<HashMap<i32, String>> {
     let mut cover_art_id_to_path: HashMap<i32, String> = HashMap::new();
@@ -110,33 +229,34 @@ fn bake_cover_art_by_cover_arts(
         {
             continue;
         }
-        let path: PathBuf = COVER_TEMP_DIR.clone().join(digest);
+        let path: PathBuf = COVER_TEMP_DIR.clone().join(&digest);
 
         if fs::read(&path).ok().as_deref() != Some(cover_art.binary.as_slice()) {
             fs::write(&path, &cover_art.binary)?;
         }
 
         cover_art_id_to_path.insert(id, path.to_str().unwrap_or_default().to_string());
+        remember_baked(
+            cover_art.source_uuid.clone(),
+            digest,
+            cover_art.binary.len() as u64,
+        );
     }
 
     Ok(cover_art_id_to_path)
 }
 
 pub async fn bake_cover_art_by_cover_art_ids(
-    fsio: &FsIo,
+    _fsio: &FsIo,
     main_db: &DatabaseConnection,
     cover_art_ids: Vec<i32>,
 ) -> Result<HashMap<i32, String>> {
-    let cover_arts: Vec<media_cover_art::Model> = media_cover_art::Entity::find()
-        .filter(media_cover_art::Column::Id.is_in(cover_art_ids))
-        .all(main_db)
-        .await?;
-
-    bake_cover_art_by_cover_arts(fsio, cover_arts)
+    let rows = local_artwork(main_db, media_cover_art::Column::Id, cover_art_ids).await?;
+    bake_artwork(main_db, rows).await
 }
 
 pub async fn bake_cover_art_by_media_files(
-    fsio: &FsIo,
+    _fsio: &FsIo,
     main_db: &DatabaseConnection,
     files: Vec<media_files::Model>,
 ) -> Result<HashMap<i32, String>> {
@@ -144,24 +264,18 @@ pub async fn bake_cover_art_by_media_files(
         .iter()
         .filter_map(|file| file.cover_art_uuid.as_deref())
         .collect();
-    let mut paths = HashMap::new();
-    for ids in ids.into_iter().collect::<Vec<_>>().chunks(4) {
-        let artwork = media_cover_art::Entity::find()
-            .filter(media_cover_art::Column::SourceUuid.is_in(ids.iter().copied()))
-            .filter(media_cover_art::Column::LocalAvailable.eq(true))
-            .all(main_db)
-            .await?;
-        let identity: Vec<_> = artwork
-            .iter()
-            .map(|row| (row.id, row.source_uuid.clone()))
-            .collect();
-        let baked = bake_cover_art_by_cover_arts(fsio, artwork)?;
-        for (id, uuid) in identity {
-            if let Some(path) = baked.get(&id) {
-                paths.insert(uuid, path.clone());
-            }
-        }
-    }
+    let rows = local_artwork(
+        main_db,
+        media_cover_art::Column::SourceUuid,
+        ids.into_iter().collect(),
+    )
+    .await?;
+    let uuids: HashMap<_, _> = rows.iter().cloned().collect();
+    let paths: HashMap<_, _> = bake_artwork(main_db, rows)
+        .await?
+        .into_iter()
+        .filter_map(|(id, path)| Some((uuids.get(&id)?.clone(), path)))
+        .collect();
     Ok(files
         .into_iter()
         .map(|file| {
@@ -187,6 +301,143 @@ pub async fn bake_cover_art_by_file_ids(
         .await?;
 
     bake_cover_art_by_media_files(fsio, main_db, files).await
+}
+
+#[cfg(test)]
+mod bake_tests {
+    use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database, IntoActiveModel, Set, sea_query::Expr};
+
+    async fn library() -> Result<DatabaseConnection> {
+        let _ = migration::initialize_node_id(Uuid::new_v4().to_string());
+        let db = Database::connect("sqlite::memory:").await?;
+        Migrator::up(&db, None).await?;
+        Ok(db)
+    }
+
+    /// Store a verified artwork body and return its source uuid.
+    async fn store_artwork(db: &DatabaseConnection, body: &[u8]) -> Result<String> {
+        let digest = blake3::hash(body).to_hex().to_string();
+        let source_uuid = catalog_identity::artwork(&digest).to_string();
+        media_cover_art::Entity::insert(media_cover_art::ActiveModel {
+            file_hash: Set(digest.clone()),
+            binary: Set(body.to_vec()),
+            content_hash: Set(Some(digest)),
+            content_size: Set(Some(body.len() as i64)),
+            local_available: Set(true),
+            source_uuid: Set(source_uuid.clone()),
+            ..Default::default()
+        })
+        .exec(db)
+        .await?;
+        Ok(source_uuid)
+    }
+
+    /// Add track 1 with this cover.
+    async fn add_file(db: &DatabaseConnection, cover_art_uuid: String) -> Result<()> {
+        media_files::Entity::insert(media_files::ActiveModel {
+            id: Set(1),
+            file_name: Set("a".into()),
+            directory: Set(String::new()),
+            extension: Set("ogg".into()),
+            file_hash: Set("a".into()),
+            last_modified: Set("2020".into()),
+            sample_rate: Set(44100),
+            duration: Set(1.into()),
+            source_uuid: Set(Uuid::new_v4().to_string()),
+            local_available: Set(true),
+            cover_art_uuid: Set(Some(cover_art_uuid)),
+            ..Default::default()
+        })
+        .exec(db)
+        .await?;
+        Ok(())
+    }
+
+    async fn bake(db: &DatabaseConnection) -> Result<String> {
+        let files = media_files::Entity::find().all(db).await?;
+        let mut paths = bake_cover_art_by_media_files(&FsIo::new(), db, files).await?;
+        Ok(paths.remove(&1).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn baked_covers_follow_the_files_artwork() -> Result<()> {
+        let db = library().await?;
+        let first = Uuid::new_v4().as_bytes().repeat(64);
+        let second = Uuid::new_v4().as_bytes().repeat(64);
+        add_file(&db, store_artwork(&db, &first).await?).await?;
+        let path = bake(&db).await?;
+        assert_eq!(fs::read(&path)?, first);
+
+        // A damaged or removed file is written again.
+        fs::write(&path, &first[..10])?;
+        assert_eq!(fs::read(bake(&db).await?)?, first);
+        fs::remove_file(&path)?;
+        assert_eq!(fs::read(bake(&db).await?)?, first);
+
+        // A changed cover is baked to its own file.
+        let mut file = media_files::Entity::find_by_id(1)
+            .one(&db)
+            .await?
+            .context("file")?
+            .into_active_model();
+        file.cover_art_uuid = Set(Some(store_artwork(&db, &second).await?));
+        file.update(&db).await?;
+        let changed = bake(&db).await?;
+        assert_ne!(changed, path);
+        assert_eq!(fs::read(&changed)?, second);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_baked_cover_is_served_without_reading_its_row_again() -> Result<()> {
+        let db = library().await?;
+        let body = Uuid::new_v4().as_bytes().repeat(64);
+        add_file(&db, store_artwork(&db, &body).await?).await?;
+        let path = bake(&db).await?;
+        // Change the row behind the baked file only to show it is not read
+        // again: its body no longer hashes to anything, and it has no digest.
+        media_cover_art::Entity::update_many()
+            .col_expr(
+                media_cover_art::Column::Binary,
+                Expr::value(b"changed".to_vec()),
+            )
+            .col_expr(
+                media_cover_art::Column::ContentHash,
+                Expr::value(Option::<String>::None),
+            )
+            .exec(&db)
+            .await?;
+        assert_eq!(bake(&db).await?, path);
+        assert_eq!(fs::read(&path)?, body);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_digests_must_be_file_names() -> Result<()> {
+        let db = library().await?;
+        let digest = format!("../escape-{}", Uuid::new_v4());
+        let outside = COVER_TEMP_DIR.join(&digest);
+        fs::create_dir_all(&*COVER_TEMP_DIR)?;
+        fs::write(&outside, b"cover")?;
+        let inserted = media_cover_art::Entity::insert(media_cover_art::ActiveModel {
+            file_hash: Set(digest.clone()),
+            binary: Set(b"cover".to_vec()),
+            content_hash: Set(Some(digest.clone())),
+            content_size: Set(Some(5)),
+            local_available: Set(true),
+            source_uuid: Set(catalog_identity::artwork(&digest).to_string()),
+            ..Default::default()
+        })
+        .exec(&db)
+        .await?;
+        let baked =
+            bake_cover_art_by_cover_art_ids(&FsIo::new(), &db, vec![inserted.last_insert_id]).await;
+        fs::remove_file(&outside)?;
+        assert!(baked?.is_empty());
+        Ok(())
+    }
 }
 
 pub fn extract_cover_art_by_file_id(
