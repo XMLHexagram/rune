@@ -15,7 +15,9 @@ use geometry::{CGPoint, CGSize};
 use gradient::{CGGradient, CGGradientDrawingOptions};
 use color::CGColor;
 use path::CGPathRef;
-use libc::{c_int, size_t};
+#[cfg(not(feature = "apple-app-store"))]
+use libc::c_int;
+use libc::size_t;
 use std::os::raw::c_void;
 
 use std::cmp;
